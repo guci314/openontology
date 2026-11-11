@@ -14,7 +14,7 @@
 
 - 设计依据：`docs/plans/2026-11-12-transparent-aspect-architecture.md`。
 - 上一轮已独立验证的项目基线为 234 passed；这是历史基线，不是本计划实施结果。
-- 项目当前不是 Git 仓库，不创建虚构工作树或运行 git 提交。用限定文件范围与检查前后哈希保护既有工作。
+- 项目已建立 Git 基线 `2341b04`。本阶段在分支 `feat/aspect-foundation`、工作树 `/Users/guci/.config/superpowers/worktrees/open-ontology/aspect-foundation` 实施；原 `/Users/guci/work/open-ontology` 的 main 不修改、不合并。施工前该工作树全仓实跑 234 passed（75.12s、零 skip），本地视频与 CRM 测试资产为独立副本，未提交到 Git。
 - 暂不修改 `runtime.py`、`spec.py`、`dev_factory.py`、`harness_drivers.py`、业务示例、Workshop、视频目录或现有测试。
 - 内部 `ExecutionFabric` 不加入 Agent SDK，不接到公开 HTTP/LLM 工具入口。未接入真实路径前，不声称 Agent 不能绕过工具已由本模块保证。
 - 本阶段记录调用级摘要，不保存原始敏感参数，不宣称逐字段血缘；观察者失败策略只适用于可选观察者，不适用于强制合规证据。
@@ -242,8 +242,8 @@ class ExecutionFabric:
 5. 对允许范围之外的源码/测试做前后 SHA256 比对，确认未改动。
 6. 汇报新文件、失败先行证据、实际测试数字、公开/内部边界与未实现项。不宣称已获得完整溯源或可靠外部事务。
 
-本阶段无真实 ERP/支付调用，无指挥台重启，无数据库迁移。项目无 Git，因此以限定范围、哈希与验收报告交付，不运行 Git 提交。
+本阶段新功能无真实 ERP/支付调用，无指挥台重启，无数据库迁移。既有全仓测试会按原用例调用本机测试 Odoo/Camel；不得把这个回归过程称为新执行边界已接入真实系统。程序员以限定范围、git diff、哈希与验收报告交付；不得自行合并 main、推送远端或修改本轮施工基线。
 
 ## 执行选择
 
-计划已准备，尚未实施。可选择：①使用既有 `cb-coder-01 + workflow_conductor.py` 流水线做第一阶段，架构师独立验收；②本轮只保留设计，暂不施工。未经执行确认不启动工作流。
+用户已授权启动，选择全局隔离工作树。执行工单为 `TK-ONTO-020`，使用既有 `cb-coder-01 + workflow_conductor.py` 流水线做第一阶段，架构师独立验收。
