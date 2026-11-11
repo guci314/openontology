@@ -1,11 +1,15 @@
-# OpenOntology（v7 纯业务本体版 · 标准 O2C + 双 Odoo + Camel + 钢厂 MDM）
+# OpenOntology · 业务本体、治理运行时与可替换工具
 
-从第一性原理复刻 Palantir Ontology + AIP 的轻量内核。**只依赖 Python 标准库 `sqlite3` + `pydantic` + `pytest`**；外部集成由真实的 Quarkus 3.15.1 + Apache Camel 4.8.0 独立 JVM 进程承担。
+受 Palantir Ontology + AIP 启发的轻量业务本体运行时。核心依赖 Python 标准库 `sqlite3` + `pydantic`；测试使用 `pytest`，浏览器验收另需 Playwright。外部集成通过 Python 适配器及 Quarkus / Apache Camel 工程完成。
 
-> **核心铁律：100% 业务纯洁性。**
-> Ontology 是纯领域的业务决策操作系统，内核、表结构、装饰器与领域代码中不出现任何外部 IT 系统或技术同步概念。Ontology 唯一的输出事实是纯业务的 `ontology_action_runs`（谁、在何时、执行/撤回/拒绝了哪个业务 Action、产生了什么业务 `ObjectDiff`）。
+> **核心原则：业务纯洁性是依赖边界，不是词汇禁令。**
+> 主干为 **Agent → Ontology → Tool**。业务蓝图表达对象、关系、规则与合法动作，不依赖 ERP、传输协议、宿主会话或 Aspect。运行时与外围执行层负责实现这些业务定义。
 >
-> **PIM / PSM 分离**：`open_ontology/`（含纯业务 HTTP 边界）与 `examples/odoo_orders_ontology.py` 只含业务模型；Odoo JSON-RPC、HTTP 调用、数据库克隆、Camel 路由全部隔离在 `examples/odoo_dual_erp_demo.py` 与 `camel-sync/`。
+> **透明 Aspect 目标架构**：工具调用连线上可织入审计、溯源和执行保障；业务无需主动上报事件或携带技术字段。溯源能力保留并分层，不能为了纯洁性全部删除。
+
+**架构入口：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。** [完整目标设计](docs/plans/2026-11-12-transparent-aspect-architecture.md)与[第一阶段计划](docs/plans/2026-11-12-aspect-execution-foundation.md)分别说明约束和实施边界。
+
+> **实施状态**：TK-ONTO-020 正在 `feat/aspect-foundation` 隔离分支实现内部能力绑定与透明可选观察。尚未验收、未合并 main，未接入真实工具路径；完整持久化溯源、可靠执行账本及控制型 Aspect 属于后续阶段。现有词汇黑名单测试本轮不修改。
 
 ## 快速开始
 
@@ -13,7 +17,7 @@
 cd /Users/guci/work/open-ontology
 pip install -r requirements.txt
 
-pytest -v                              # 87 项测试（43 单元 + 10 双 Odoo + 6 Camel + 14 钢厂 MDM + 14 O2C）
+pytest -v                              # 包含内核、治理、集成与界面验收，条数以本轮实际运行输出为准
 python3 -m examples.cold_chain         # 冷链示例
 python3 -m examples.odoo_dual_erp_demo # 真实双 Odoo 19 ERP 并购订单全链路
 python3 -m examples.steel_mdm_demo     # 钢厂主数据两大死结破局演示
@@ -42,7 +46,9 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 | L4 运行时 | `open_ontology/runtime.py` | put_object / load_snapshot / simulate / submit / approve / revert |
 | L4 查询 | `open_ontology/query.py` | `ObjectSet` 集合代数、`pivot`、`aggregate` |
 | L5 OSDK | `open_ontology/osdk.py` | LLM Tool JSON Schema 导出 + AIP 确定性评测器 |
-| 业务 HTTP 边界 | `open_ontology/http_server.py` | 标准库 `ThreadingHTTPServer` 暴露 health / snapshot / action-runs / objects |
+| HTTP 传输边界 | `open_ontology/http_server.py` | 标准库 `ThreadingHTTPServer` 暴露 health / snapshot / action-runs / objects；不是业务蓝图 |
+| 指挥台展示 | `open_ontology/workshop.py`、`workshop_ui.py` | 本体蓝图与运行实例双视图、中文展示与拓扑大图 |
+| 内部执行边界（施工中） | `open_ontology/execution/` | 实例级能力绑定与透明可选观察；尚未接入实际治理调用路径 |
 | 纯业务模型 | `examples/odoo_orders_ontology.py` | 双源订单并购场景的 PIM |
 | Odoo PSM | `examples/odoo_dual_erp_demo.py` | 真实 Odoo JSON-RPC 建库、同步、回写桥接 |
 | 钢厂 MDM | `examples/steel_mdm_demo.py` | 散码寄生归并、源头建码护栏、高维批次桶、三视角对账 |
@@ -75,7 +81,7 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 14. **ObjectSet 集合代数**：`search_set` / `union` / `intersect` / `subtract` / `pivot`（正向或反向群跳转，两端 RLS 过滤）/ `aggregate`（分组计数与求和）/ `filter_aggregation`。
 15. **OSDK / AIP**：`export_llm_tools` 导出 OpenAI Tool JSON Schema；`AIPAgentExecutor` 统一分派 `query_objects / call_function / simulate_action / submit_action / pivot / aggregate`；`run_eval_suite` 对模型决策产生的 `ObjectDiff` 做确定性评分。
 
-## 纯业务 HTTP 边界
+## HTTP 传输边界
 
 `open_ontology/http_server.py` 使用标准库 `ThreadingHTTPServer`：
 
@@ -86,7 +92,7 @@ GET  /api/action-runs?status=...    -> {"runs": [...]}
 GET  /api/objects/{object_type}     -> [objects...]
 ```
 
-该文件只做业务 JSON 的传输绑定，不知道任何 ERP、厂商或协议概念；内核其余模块保持 transport-agnostic。
+该文件做业务 JSON 与 HTTP 的传输绑定，不负责供应商 ERP 调用。业务定义不依赖它；HTTP 本身属于平台适配，不能因承载业务内容就称为“零技术概念”。
 
 ## 钢厂主数据两大死结破局
 
@@ -177,6 +183,8 @@ GET /camel/stats      -> ingest_count / north_writebacks / south_writebacks
 - 幂等：同一 `run_id` 只回写一次，`processed_run_ids` 可在 `/camel/stats` 查看。
 
 ## 测试覆盖
+
+下列分项为早期核心与集成用例说明，不代表当前全部测试数量。透明 Aspect 施工前，在隔离工作树独立实跑的基线为 **234 passed、零 skip**；新增功能的测试结果必须另行验证。
 
 - `tests/test_open_ontology.py`：43 条纯内核测试（写门禁、append-only、内容指纹幂等、RBAC、RLS、沙箱 RYOW、diff 逆转、零写入模拟、原子提交、幂等提交、审批挂起、并发冲突、时光机回滚、业务不变量、Tool Schema、AIP 分派、评测器、注册表持久化、字段级主权/overlay/快照防孤儿/主权边界/被拒审计/ObjectSet 代数，以及零 IT 概念污染断言）。
 - `tests/test_odoo_dual_erp.py`：10 条真实双 Odoo 集成测试（跨 ERP 查询与集合代数、RLS、已发货取消被拒、待发货取消真实回写、撤回真实恢复、AI 大额审批真实回写、全量重索引 overlay/OrderNote 存活、空原因拒绝、重复取消拒绝、回写幂等、PIM/PSM 分离）。

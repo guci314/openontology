@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-020",
+  "workspace_dir": "/Users/guci/.config/superpowers/worktrees/open-ontology/aspect-foundation",
+  "project_dir": "/Users/guci/.config/superpowers/worktrees/open-ontology/aspect-foundation",
+  "spec_path": "/Users/guci/.config/superpowers/worktrees/open-ontology/aspect-foundation/SPEC_ASPECT_FOUNDATION.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "TK-ONTO-020 架构终审打回第1轮，仍只在feat/aspect-foundation工作树修改新增的 execution/fabric.py 和 tests/test_execution_fabric.py，不改既有代码/测试/文档设计或main。架构师实跑原新专项17 passed、全仓251 passed，既有51个源码/测试/视频文件哈希未变；但追加的严格JSON契约7例全部失败。参考文件 /private/var/folders/nj/9yhn6dcd1xl3c7v6zs7fdqn40000gn/T/opencode/tk020_evidence/test_architect_json_contract.py，先原样复现，再纳入项目新专项并最小修复。根因：json.dumps可接受tuple和非字符串dict key并隐式编码为list/string key；工具却收到原始tuple/整数键。因此digest({1:'same'}) == digest({'1':'same'})，digest({'nested':(1,2)}) == digest({'nested':[1,2]})，违背本阶段声明的plain JSON值契约。请在摘要编码前验证严格JSON类型/键：对象键只能str，值递归为dict/list/str/int/float/bool/None且数值有限，拒绝tuple/自定义对象/循环等；不通过JSON roundtrip修改或强制转换业务参数来迎合摘要。无效请求在工具前抛TypeError/ValueError且零工具调用、零观察；非JSON返回值仍必须保留真实返回对象、一次Tool调用和succeeded记录，只将output_digest置None，不包装成失败。这是架构师参考实现把json可序列化误当严格JSON也有责任，本轮按规格新增明确JSON边界验收，不增加生产能力或额外框架。保存红绿日志，实跑追加7例、新专项、71条旧专项及全仓，Firefox零skip。记录真实exit status与前后源码哈希，不commit/merge/push，不停8765/8767。交卷说明修复及未实现项。",
+  "max_rework": 5,
+  "start_rework": 1,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_coder",
+      "label": "🔨 程序员(cb-coder-01)",
+      "title": "透明 Aspect 执行边界程序员",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-01",
+      "model": "deepseek-v4.1-flash",
+      "rules": "严格限定 feat/aspect-foundation 全局工作树。按本工单规格新增 execution 子包和 test_execution_fabric，业务不感知Aspect，不改既有代码/测试/视频/旧workflow，不切到main。测试先行并保存证据，基础Python+Firefox跑完整回归、零skip；不合并提交推送、不停演示服务，不夸大完整溯源或可靠外部执行。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}
