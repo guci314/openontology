@@ -1,0 +1,44 @@
+{
+  "ticket_id": "TK-ONTO-008",
+  "workspace_dir": "/Users/guci",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_MDM_VIDEO.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请严格按照 /Users/guci/work/open-ontology/SPEC_MDM_VIDEO.md (TK-ONTO-008 · 钢厂主数据两大死结破局高清演示视频自动生成) 实现：\n1. 注意并发隔离：隔壁『程序员』Session 正在制作 video/ 目录下的 O2C 视频，因此你只准在 /Users/guci/work/open-ontology/video_mdm/ 目录下读写文件（严禁修改 open_ontology/、examples/ 或 video/ 目录，严禁运行任何涉及 Odoo 的测试）！\n2. 编写 /Users/guci/work/open-ontology/video_mdm/build_steel_mdm_video.py，真实调用 examples.steel_mdm_demo 获取运行数据，用 Playwright (1920x1080) 渲染 6 幕左右分屏高清画面（video_mdm/frames/scene_01.png ~ scene_06.png），用 /Users/guci/.local/bin/edge-tts (或 /usr/bin/say) 生成 6 段中文配音，并用 /opt/homebrew/bin/ffmpeg 合成为 /Users/guci/work/open-ontology/video_mdm/steel_mdm_demo.mp4；\n3. 用 ffprobe 验证输出视频的分辨率 (1920x1080)、音轨、时长和文件大小，并只运行 pytest -v tests/test_steel_mdm.py 确认通过后汇报。",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "coder2",
+      "label": "🔨 程序员2",
+      "title": "程序员2",
+      "session_id": "ses_e35a1654bffe6k1wkxR0B0Te74",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_MDM_VIDEO.md，只准在 /Users/guci/work/open-ontology/video_mdm/ 下创建和写入文件，严禁触碰 video/ 目录或运行涉及 Odoo 的测试。完成后必须用 ffprobe 检查 /Users/guci/work/open-ontology/video_mdm/steel_mdm_demo.mp4 并在汇报中附上视频时长、分辨率和文件大小。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "coder2",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

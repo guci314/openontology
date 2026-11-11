@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-015",
+  "workspace_dir": "/Users/guci/work/open-ontology",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_OSV2_PARITY.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请严格按照 /Users/guci/work/open-ontology/SPEC_OSV2_PARITY.md (TK-ONTO-015 · 100% 追平 Palantir OSv2 四大核心原语 + 通用交互式 Workshop Web 作战台) 实现：\n1. 在 open_ontology/spec.py 与 runtime.py 中新增原语一 Automations (@spec.automation + runtime.evaluate_automations()，带 (automation_name, object_id, version) 去重防死循环)；\n2. 新增原语二 Interfaces (InterfaceType + ObjectType.__interfaces__ 必填字段校验 + runtime.query_interface() 多态联合查询)；\n3. 新增原语三 Column-Level Masking (ObjectType.__masked_fields__ / __mask_defaults__，在 get_object/query_objects/search_set/get_linked/query_interface 时对非授权角色自动脱敏敏感字段)；\n4. 新增原语四 Column-wise MDO (runtime.load_mdo_snapshots 多数据源按主键按列合并) 与冲突裁决策略 2 (load_snapshot 支持 conflict_strategy='most_recent_value' 及 source_timestamps UTC 时间戳比对)；\n5. 新增 open_ontology/workshop.py (WorkshopServer，传入任意 OntologyRuntime 即可在 GET / 打开交互式深色科技风 Palantir Workshop Lite Web 作战台，支持浏览对象、simulate_action、submit_action、approve_action、revert_action、evaluate_automations，并在 open_ontology/__init__.py 导出 InterfaceType, AutomationDef, WorkshopServer)；\n6. 编写 tests/test_osv2_parity.py（至少 12 条测试），实跑 pytest -v tests/test_osv2_parity.py tests/test_open_ontology.py tests/test_mcts_world_model.py 全部通过后汇报。",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_coder",
+      "label": "🔨 CodeBuddy程序员(cb-coder-01)",
+      "title": "CodeBuddy程序员(cb-coder-01)",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-01",
+      "model": "deepseek-v4.1-flash",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_OSV2_PARITY.md 实现四大 OSv2 原语、WorkshopServer 与 tests/test_osv2_parity.py，确保向后兼容已有全部测试。完成后实跑 pytest 验证并汇报。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

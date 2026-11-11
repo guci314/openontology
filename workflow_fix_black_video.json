@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-011-FIX",
+  "workspace_dir": "/Users/guci/work/open-ontology",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_ARCH_VIDEO.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "【紧急修复 · macOS QuickTime Player 黑屏 Bug】\n经排查，video_arch/open_ontology_architecture.mp4 和 video_mdm/steel_mdm_demo.mp4 在 macOS QuickTime Player 中打开黑屏，根因有二：\n1. build_arch_video.py 和 build_steel_mdm_video.py 在 build_segments 中使用了 fade=t=in:st=0:d=0.45，导致第 0 帧 (t=0.0s) 像素均值 mean=0.0 全黑；\n2. concat_segments 对带 adelay 的多个 MP4 分片使用了 -f concat -c copy，产生了 start_pts=323 (start_time=0.021029) 与多个 MP4 edit list 冲突，导致 QuickTime 硬件解码器黑屏（而 video/o2c_ontology_demo.mp4 的 start_pts=0、start_time=0.000000、frame0 mean=92.9 则完全正常）。\n\n请你立即修复 video_arch/build_arch_video.py 与 video_mdm/build_steel_mdm_video.py：\n1. 去掉 fade=t=in:st=0... 和 fade=t=out...，并且在 build_segments 生成分片时加上 -bf 0 -video_track_timescale 30000；\n2. 在 concat_segments 合成最终 MP4 时，不要用 -c copy，而是用 -c:v libx264 -preset veryfast -crf 18 -bf 0 -pix_fmt yuv420p -tag:v avc1 -c:a aac -b:a 192k -movflags +faststart 重新编码输出，确保最终 MP4 的 start_pts=0, start_time=0.000000；\n3. 直接复用 video_arch/ 和 video_mdm/ 下已有的 frames/scene_01~06.png 与 audio/scene_01~06.mp3（无需重新跑 Playwright 和 TTS！），重新运行 build_segments + concat_segments 生成新的 video_arch/open_ontology_architecture.mp4 和 video_mdm/steel_mdm_demo.mp4；\n4. 用 ffprobe 与 ffmpeg 抽第 0 帧验证两个 MP4 的 start_pts=0, start_time=0.000000 且第 0 帧像素均值 mean > 20 后汇报！",
+  "max_rework": 3,
+  "start_rework": 1,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_fixer",
+      "label": "🔨 CodeBuddy程序员(cb-coder-02)",
+      "title": "CodeBuddy程序员(cb-coder-02)",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-02",
+      "model": "deepseek-v4.1-flash",
+      "rules": "修复 video_arch/build_arch_video.py 与 video_mdm/build_steel_mdm_video.py 的 FFmpeg 编码参数并利用已有 frames/audio 快速重压 MP4，确保 start_pts=0、start_time=0.000000 且第 0 帧非黑屏 (mean > 20)。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_fixer",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

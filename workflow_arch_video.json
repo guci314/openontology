@@ -1,0 +1,44 @@
+{
+  "ticket_id": "TK-ONTO-011",
+  "workspace_dir": "/Users/guci",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_ARCH_VIDEO.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请严格按照 /Users/guci/work/open-ontology/SPEC_ARCH_VIDEO.md (TK-ONTO-011 · OpenOntology 架构与第一性原理高清讲解视频自动生成) 实现：\n1. 严格遵守并发隔离：只准在独立目录 /Users/guci/work/open-ontology/video_arch/ 下创建和写入文件（严禁修改 open_ontology/、examples/、tests/、video/ 或 video_mdm/）！\n2. 编写 /Users/guci/work/open-ontology/video_arch/build_arch_video.py，使用 Playwright (1920x1080) 渲染 6 幕高颜值科技风架构图解画面（video_arch/frames/scene_01.png ~ scene_06.png，包含内联 SVG 架构图、AlphaGo 神经符号分工对比、五层正交架构、EditBatch 流水线、四阶段寄居蟹式去 SaaS 演进刻度尺与三把物理防绕过锁），用 /Users/guci/.local/bin/edge-tts (zh-CN-YunxiNeural) 生成 6 段中文解说配音，并用 /opt/homebrew/bin/ffmpeg 合成为 /Users/guci/work/open-ontology/video_arch/open_ontology_architecture.mp4；\n3. 用 ffprobe 验证输出视频的分辨率 (1920x1080)、音轨、时长和文件大小后汇报。",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "coder3",
+      "label": "🔨 程序员3",
+      "title": "程序员3",
+      "session_id": "ses_e355c33a0ffeWe66fVUSQO9ub0",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_ARCH_VIDEO.md，只准在 /Users/guci/work/open-ontology/video_arch/ 下创建和写入文件。完成后必须用 ffprobe 检查 /Users/guci/work/open-ontology/video_arch/open_ontology_architecture.mp4 并在汇报中附上视频时长、分辨率和文件大小。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "coder3",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

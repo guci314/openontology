@@ -1,0 +1,44 @@
+{
+  "ticket_id": "TK-ONTO-010",
+  "workspace_dir": "/Users/guci",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_REAL_CRM_UNPLUG.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请按照 /Users/guci/work/open-ontology/SPEC_REAL_CRM_UNPLUG.md (TK-ONTO-010 · 下载真实开源 CRM BottleCRM/django-crm + 真实 Odoo 19 并实证『吸干 SaaS 后拔掉插头独立运行』) 实现：\n1. 使用 pip download django-crm==1.44.0 --no-deps -d /Users/guci/work/open-ontology/vendor_crm 将真实开源 BottleCRM 下载并解压到 vendor_crm/bottlecrm_src，使用其真实表结构初始化 BottleCRM 数据库，并与本机真实 Odoo 19 (erp_north) 配合构成真实的双开源 SaaS 环境；\n2. 实现 examples/real_crm_unplug_demo.py：演示 Phase A（连接真实 BottleCRM + 真实 Odoo 19 抽取数据、overlay 治理、重刷存活） -> Phase B（调用 unplug_all_saas() 彻底断开 BottleCRM 与 Odoo 连接，全对象晋升 __owned__=True，在零外部 SaaS 下用完全相同的上层 Action 与 AI Agent 工具独立跑完商机赢单转订单、建工单、退货退款护栏拦截、大额审批与时光机一键撤回）；\n3. 编写 tests/test_real_crm_unplug.py（至少 10 条测试），实跑 python3 -m examples.real_crm_unplug_demo 与 pytest -v tests/test_real_crm_unplug.py 全部通过后汇报。",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "coder",
+      "label": "🔨 程序员",
+      "title": "程序员",
+      "session_id": "ses_e393ec350ffePNbnrUIk0423tl",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_REAL_CRM_UNPLUG.md 真实下载开源 django-crm (BottleCRM 1.44.0) 并结合本机真实 Odoo 19 完成『吸干 SaaS 后拔掉插头独立运行』实证。完成后必须实跑 python3 -m examples.real_crm_unplug_demo 和 pytest -v tests/test_real_crm_unplug.py 并附上真实输出。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

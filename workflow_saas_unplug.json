@@ -1,0 +1,44 @@
+{
+  "ticket_id": "TK-ONTO-009",
+  "workspace_dir": "/Users/guci",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_SAAS_UNPLUG.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请按照 /Users/guci/work/open-ontology/SPEC_SAAS_UNPLUG.md (TK-ONTO-009 · 『用 Ontology 去掉 SaaS』从寄生多云 SaaS 到脱壳独立运行实证 Demo) 实现：\n1. 新增 examples/saas_unplug_demo.py，演示同一套纯业务 Action 与 AI Agent 工具如何在 Phase A（寄生在 Shopify + Stripe + Zendesk 快照之上）与 Phase B（彻底拔掉全部外部 SaaS，standalone=True 全对象 __owned__=True 纯 Ontology 原生运行）下无缝切换，上层业务代码与 AIP Evals 零改动（contract_identical=True）；\n2. 新增 tests/test_saas_unplug.py（至少 10 条测试），覆盖无 SaaS 原生建客下单、建工单、AI 分诊、超 30 天退货拦截、高欺诈分拦截、小额自动退、大额店长审批、时光机一键撤回退款、以及寄生态与无 SaaS 态契约一致性断言；\n3. 实跑 python3 -m examples.saas_unplug_demo 与 pytest -v tests/test_saas_unplug.py 全部通过后汇报。",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "coder2",
+      "label": "🔨 程序员2",
+      "title": "程序员2",
+      "session_id": "ses_e35a1654bffe6k1wkxR0B0Te74",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_SAAS_UNPLUG.md 实现 examples/saas_unplug_demo.py 与 tests/test_saas_unplug.py。完成后必须实际运行 python3 -m examples.saas_unplug_demo 和 pytest -v tests/test_saas_unplug.py，并在汇报中贴出真实运行输出与测试通过数。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "coder2",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

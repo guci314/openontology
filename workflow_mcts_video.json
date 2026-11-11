@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-013",
+  "workspace_dir": "/Users/guci/work/open-ontology",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_MCTS_VIDEO.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "【终审小修 · 消除 QuickTime 首帧黑场与 start_pts 偏移（直接复用已有 frames/ 与 audio/，10 秒重压）】\n6 张分镜图（尤其第 4 幕 SVG 搜索树）渲染效果极佳！但 FFmpeg 合成段存在与 video_arch 相同的 macOS QuickTime 兼容问题（has_b_frames=2, start_pts=323, 第 0 帧因 fade=t=in:st=0 导致 mean=0.0 全黑）。\n请直接参考已修复的 video_arch/build_arch_video.py 中的 build_segments 和 concat_segments：\n1. 在 video_mcts/build_mcts_video.py 中去掉 fade=t=in:st=0... 与 fade=t=out...，加上 -bf 0 -video_track_timescale 30000；\n2. 在 concat_segments 中去掉 -c copy，改为 -vf setpts=PTS-STARTPTS -af asetpts=PTS-STARTPTS -c:v libx264 -preset veryfast -crf 18 -bf 0 -pix_fmt yuv420p -tag:v avc1 -c:a aac -b:a 192k -movflags +faststart；\n3. 直接复用 video_mcts/frames/ 与 video_mcts/audio/ 重新合成 video_mcts/mcts_world_model_demo.mp4（不要重跑 Playwright 和 TTS），并用 ffprobe 确认 has_b_frames=0, start_pts=0, start_time=0.000000 且第 0 帧非黑屏后汇报！",
+  "max_rework": 5,
+  "start_rework": 1,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_coder",
+      "label": "🔨 CodeBuddy程序员(cb-coder-01)",
+      "title": "CodeBuddy程序员(cb-coder-01)",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-01",
+      "model": "deepseek-v4.1-flash",
+      "rules": "直接复用已有 video_mcts/frames 与 video_mcts/audio 快速重压 video_mcts/mcts_world_model_demo.mp4，确保 has_b_frames=0, start_pts=0, start_time=0.000000 且第 0 帧非黑屏。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

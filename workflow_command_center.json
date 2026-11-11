@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-018",
+  "workspace_dir": "/Users/guci/work/open-ontology",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_COMMAND_CENTER.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请严格按照 /Users/guci/work/open-ontology/SPEC_COMMAND_CENTER.md (TK-ONTO-018 · 统一作战指挥中心 Command Center：多 Ontology 蓝图列表 + 多 Instance 实例列表 + 世界状态 / Action / 沙盘推演联动台) 实现：\n1. 升级 open_ontology/workshop.py，新增 ConnectorMount、OntologyCatalogEntry、OntologyInstanceEntry、CommandCenterRegistry（并保持原有 WorkshopServer(addr, runtime) 单实例签名 100% 向后兼容！同时支持传入 registry=CommandCenterRegistry 或 start_command_center_server(registry, ...)）；\n2. 升级 open_ontology/workshop.py 的前端 HTML+JS 主界面：左栏分为【1. Ontology 蓝图列表】与【2. Instance 实例列表（含 DB 与后台 ERP/CRM/SaaS 连接器状态）】；点击一个 Ontology 时，右侧主舞台显示该本体的内联 SVG 关系拓扑图与 ObjectTypes / Interfaces / LinkTypes / Functions / Actions / Automations 规格详情；点击一个 Instance 时，右侧主舞台显示该实例的后台挂载栏、实时世界状态（Objects + Links + Functions）、Action 下拉列表（带自动参数表单与智能预填）、【🔍 单步沙盘推演 Simulate】、【🌲 MCTS 多步沙盘推演】、【⚡ 正式执行 Submit】按钮，点击执行后实时显示结果与 Diff 并同步刷新世界状态与审计账本（含 Approve / Revert / Fork 实例 / 拔除 SaaS 按钮）；\n3. 新增 examples/command_center_demo.py，实现 build_default_command_center() 预装 5 大核心 Ontology 蓝图（software_factory, coldchain_mcts, crm_saas_unplug, steel_mdm, osv2_governance）及其配置好真实数据、连接器、默认参数与 MCTS/Unplug 钩子的 Instances；\n4. 新增 tests/test_command_center.py（至少 12 条测试），实跑 pytest -v tests/test_command_center.py tests/test_osv2_parity.py 及全仓 pytest -q 100% 通过后汇报！",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_coder",
+      "label": "🔨 CodeBuddy程序员(cb-coder-01)",
+      "title": "CodeBuddy程序员(cb-coder-01)",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-01",
+      "model": "deepseek-v4.1-flash",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_COMMAND_CENTER.md 升级 open_ontology/workshop.py、编写 examples/command_center_demo.py 与 tests/test_command_center.py，确保向后兼容全部既有测试。完成后实跑 pytest 验证并汇报。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-017",
+  "workspace_dir": "/Users/guci/work/open-ontology",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_DEV_FACTORY.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请严格按照 /Users/guci/work/open-ontology/SPEC_DEV_FACTORY.md (TK-ONTO-017 · 业务纯洁的研发团队与工单本体 SoftwareFactoryOntology + 跨平台抗限流机械臂适配器) 实现：\n1. 新增 /Users/guci/work/open-ontology/open_ontology/dev_factory.py，构建 100% 业务纯洁的 SoftwareFactoryOntology（包含 Engineer, WorkTicket, Deliverable 三个纯业务 ObjectType，ticket_assigned_to / ticket_reviewed_by / ticket_deliverables 关系边，recruit_engineer / open_ticket / dispatch_ticket / submit_work / review_ticket / reassign_ticket 六大 Action，以及 factory_board_summary / build_engineer_briefing 函数）。严禁在 dev_factory.py 中出现任何 opencode, codebuddy, hermes, session_id, http, subprocess, rate_limit 等 IT 宿主词汇；特别注意 dispatch_ticket 必须包含 WORKSPACE_SCOPE_CONFLICT 并发目录冲突护栏！\n2. 新增 /Users/guci/work/open-ontology/open_ontology/harness_drivers.py，实现 PSM 外围可插拔机械臂驱动层（HarnessDriver 协议、CallableHarnessDriver、CodeBuddyCLIDriver、OpenCodeHTTPDriver、HermesCLIDriver / GenericCLIDriver，以及支持捕获 HarnessRateLimitError / HarnessUnavailableError 自动调用 reassign_ticket 无损换人接力的 FactoryOrchestrator），并在 open_ontology/__init__.py 中导出核心符号；\n3. 新增 /Users/guci/work/open-ontology/tests/test_dev_factory.py（至少 12 条测试，含 dev_factory.py 100% 业务纯洁性静态词汇扫描测试、全生命周期流转、WORKSPACE_SCOPE_CONFLICT 目录隔离锁、返工熔断、限流自动 Failover 换人零失忆接力、以及接入 WorkshopServer 看板验证）；\n4. 实跑 pytest -v tests/test_dev_factory.py 及全量 pytest -q 100% 通过后汇报！",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_coder",
+      "label": "🔨 CodeBuddy程序员(cb-coder-01)",
+      "title": "CodeBuddy程序员(cb-coder-01)",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-01",
+      "model": "deepseek-v4.1-flash",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_DEV_FACTORY.md 实现 open_ontology/dev_factory.py (100% 业务纯洁 PIM)、open_ontology/harness_drivers.py (可插拔多宿主 PSM) 与 tests/test_dev_factory.py。完成后实跑 pytest 验证并汇报。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

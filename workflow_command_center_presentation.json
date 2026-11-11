@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-019",
+  "workspace_dir": "/Users/guci/work/open-ontology",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_COMMAND_CENTER_PRESENTATION.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "TK-ONTO-019 架构终审打回第1轮，严格限定为验收测试同步修复。中文界面和拓扑已落地，不需重做。架构师独立使用 Firefox 运行原断言：四专项 70 passed/1 failed；全仓 233 passed/1 failed，均失败于 tests/test_command_center_presentation.py::test_browser_chinese_action_form_and_submit 第456行：#result 包含已执行时 #runs 仍为动作执行记录为空。独立真实浏览器探针证明点击后26ms结果先出现，57ms账本和对象完成刷新，零pageerror。根因是测试仅等结果而立即断言异步刷新的另两个面板，不是动作提交/刷新失效。请复现再最小修复：使用 Playwright 条件等待/expect 等待 #runs 真实包含已执行且 #objects 真实包含已分配，然后保留原断言；不得删断言、跳过测试、添加固定 sleep 或更改生产UI/内核去迎合测试。审查该测试及直接关联的切换导航等待，采用明确可观察条件，不做无关重构。本机 webapp-testing 要求 Firefox，请测试fixture默认用Firefox（可用环境变量显式选Chromium作额外兼容验证），生成器用try/finally关闭浏览器。不以缺少Playwright的cad解释器跳过6条浏览器测试；检测并使用已安装依赖的Python解释器。截图EVIDENCE_DIR改用规格规定的批准临时目录 /private/var/folders/nj/9yhn6dcd1xl3c7v6zs7fdqn40000gn/T/opencode/tk019_evidence，不再新增/tmp产物。将中文动作提交浏览器测试以3次独立pytest启动验证，再实跑四专项71条与全仓234条全部通过且零skip；运行过程完整汇报退出状态和实际数字，不用tail掩盖exit status。生产文件本轮不要修改，保留当前8765服务状态。完成后回报具体测试差异、重复运行结果、Firefox全回归数字与截图路径。",
+  "max_rework": 5,
+  "start_rework": 1,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_coder",
+      "label": "🔨 程序员(cb-coder-01)",
+      "title": "指挥台客户演示版程序员",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-01",
+      "model": "deepseek-v4.1-flash",
+      "rules": "严格按 SPEC_COMMAND_CENTER_PRESENTATION.md 施工，中文仅为展示层；不得改真实 API/角色/动作 ID，不改核心本体，不动任何视频或未知服务。新需求先写失败测试，真实浏览器验收缩放拖拽并截图，运行专项与全仓测试后交卷。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

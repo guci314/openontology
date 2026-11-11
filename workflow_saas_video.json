@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-016",
+  "workspace_dir": "/Users/guci/work/open-ontology",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_SAAS_VIDEO.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请严格按照 /Users/guci/work/open-ontology/SPEC_SAAS_VIDEO.md (TK-ONTO-016 · OpenOntology 驱动与无感拔除 SaaS 1080p 演示视频) 实现：\n1. 只准在独立目录 /Users/guci/work/open-ontology/video_saas/ 下创建和写入文件（严禁修改 open_ontology/、examples/、tests/ 或其他 video* 目录）；\n2. 编写 /Users/guci/work/open-ontology/video_saas/build_saas_video.py，直接參考已验证通过零黑屏的 /Users/guci/work/open-ontology/video_mcts/build_mcts_video.py 和 /Users/guci/work/open-ontology/video_arch/build_arch_video.py 的 FFmpeg 合成参数（严禁加 fade=t=in:st=0，concat 时必须用 -vf setpts=PTS-STARTPTS -af asetpts=PTS-STARTPTS -c:v libx264 -bf 0 -tag:v avc1 全量重编码，确保 has_b_frames=0, start_pts=0, start_time=0.000000 且第 0 帧亮度均值 > 20）；\n3. 只读调用 examples.real_crm_unplug_demo 与 examples.saas_unplug_demo 采集真实运行数据（真实 BottleCRM + Odoo 19 吸收、AI 分诊写入 overlay、重刷存活、unplug_all_saas() 物理断连与拦截、脱壳后赢单转订单/小额自动退/大额审批/撤回、以及寄生态与脱壳态 contract_identical=True 对拍结果）；\n4. 使用 Playwright 渲染 6 张 1920x1080 分镜图（video_saas/frames/scene_01~06.png），合成配音与最终视频 /Users/guci/work/open-ontology/video_saas/saas_unplug_demo.mp4，并用 ffprobe 校验全部指标达标后汇报！",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_video_saas",
+      "label": "🔨 CodeBuddy程序员(cb-coder-03)",
+      "title": "CodeBuddy程序员(cb-coder-03)",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-03",
+      "model": "deepseek-v4.1-flash",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_SAAS_VIDEO.md，只准在 /Users/guci/work/open-ontology/video_saas/ 下创建和写入文件。必须确保生成的 saas_unplug_demo.mp4 满足 has_b_frames=0, start_pts=0, start_time=0.000000 且第 0 帧非黑屏 (mean > 20)。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_video_saas",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

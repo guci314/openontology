@@ -1,0 +1,44 @@
+{
+  "ticket_id": "TK-ONTO-007",
+  "workspace_dir": "/Users/guci",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请按照 /Users/guci/work/open-ontology/SPEC.md (TK-ONTO-007 · O2C 左右分屏真实 Odoo 19 联动高清演示视频自动生成) 实现：\n1. 编写 /Users/guci/work/open-ontology/video/build_o2c_video.py，真实驱动 O2C 状态流转并用 Playwright 登录 http://localhost:8069 (erp_north, admin/admin) 截取各阶段真实 Odoo 19 网页画面（报价单、销售单、交货单 Done、发票 Paid、超额大单审批确认）；\n2. 将左屏 OpenOntology AI 作战指挥台与右屏真实 Odoo 19 截图合成为 6 张 1920x1080 高清分镜帧（video/frames/scene_01.png ~ scene_06.png）；\n3. 使用 /Users/guci/.local/bin/edge-tts (或 /usr/bin/say) 生成 6 段中文解说配音，并用 /opt/homebrew/bin/ffmpeg 合成为音画同步的 /Users/guci/work/open-ontology/video/o2c_ontology_demo.mp4；\n4. 用 ffprobe 验证输出视频的分辨率 (1920x1080)、时长、音视频流完整性后汇报。",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "coder",
+      "label": "🔨 程序员",
+      "title": "程序员",
+      "session_id": "ses_e393ec350ffePNbnrUIk0423tl",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC.md (TK-ONTO-007) 生成真实的左右分屏演示视频 /Users/guci/work/open-ontology/video/o2c_ontology_demo.mp4。右屏必须使用 Playwright 从 http://localhost:8069 截取真实的 Odoo 19 页面，严禁画假 Odoo UI。完成后必须用 ffprobe 检查视频并在汇报中附上视频时长、分辨率和文件大小。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

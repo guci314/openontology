@@ -1,0 +1,73 @@
+# Python environments, dependency packages and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.venv_*/
+venv/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local extracted BottleCRM dependency; retain init/seed scripts
+/vendor_crm/bottlecrm_src/
+*.whl
+
+# Java and other build outputs
+target/
+node_modules/
+dist/
+*.class
+*.jar
+
+# Local runtime databases and journals
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite3-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Generated video/audio/screenshot artefacts; retain builder scripts
+/video*/assets/
+/video*/audio/
+/video*/frames/
+/video*/segments/
+*.mp4
+*.mov
+*.m4a
+*.mp3
+*.wav
+*.webm
+
+# Generated IDE modernization assessments
+/.github/modernize/
+
+# Local secrets (example templates may be committed)
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+auth.json
+
+# Machine-local and temporary files
+.DS_Store
+*.log
+*.pid
+*.tmp
+*.swp
+*.bak

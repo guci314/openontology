@@ -1,0 +1,46 @@
+{
+  "ticket_id": "TK-ONTO-014",
+  "workspace_dir": "/Users/guci/work/open-ontology",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_CORE_MCTS.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请严格按照 /Users/guci/work/open-ontology/SPEC_CORE_MCTS.md (TK-ONTO-014 · 将多步平行宇宙沙盘 fork() 与通用 MCTS 规划引擎正式整合进 open_ontology 核心包) 实现：\n1. 新增核心模块 open_ontology/mcts.py（包含领域无关的 OntologyMCTSPlanner, CandidateAction, MCTSNode, MCTSPlanResult, fork_runtime, state_fingerprint）；\n2. 在 open_ontology/runtime.py 的 OntologyRuntime 上新增原生 .fork()、.state_fingerprint() 与 .plan_mcts(...) 方法；\n3. 在 open_ontology/osdk.py 的 AIPAgentExecutor 中新增 simulate_sequence 多步连续沙盘推演工具分派；\n4. 在 open_ontology/__init__.py 中导出上述核心组件，并更新 examples/mcts_world_model_demo.py 从 open_ontology 直接导入，在 tests/test_mcts_world_model.py 中补充核心包与 simulate_sequence 测试；\n5. 实跑 pytest -v tests/test_mcts_world_model.py tests/test_open_ontology.py 与 python3 -m examples.mcts_world_model_demo 全部通过后汇报。",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "cb_coder",
+      "label": "🔨 CodeBuddy程序员(cb-coder-01)",
+      "title": "CodeBuddy程序员(cb-coder-01)",
+      "engine": "codebuddy",
+      "session_id": "cb-coder-01",
+      "model": "deepseek-v4.1-flash",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_CORE_MCTS.md 将多步沙盘与 MCTS 规划器整合进 open_ontology/ 核心包，保持 100% 领域无关与业务纯洁性。完成后实跑 pytest 验证并汇报。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "cb_coder",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}

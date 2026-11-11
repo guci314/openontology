@@ -1,0 +1,44 @@
+{
+  "ticket_id": "TK-ONTO-012",
+  "workspace_dir": "/Users/guci",
+  "project_dir": "/Users/guci/work/open-ontology",
+  "spec_path": "/Users/guci/work/open-ontology/SPEC_MCTS.md",
+  "conductor_session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+  "initiator_label": "🏛️ 架构师(Argon)",
+  "initial_state": "STEP2_CODING",
+  "initial_instructions": "请严格按照 /Users/guci/work/open-ontology/SPEC_MCTS.md (TK-ONTO-012 · AlphaGo 蒙特卡洛树搜索 MCTS 在符号世界模型中的多步沙盘推演 Demo) 实现：\n1. 注意并发隔离：只允许创建和修改 examples/mcts_world_model_demo.py 与 tests/test_mcts_world_model.py，严禁修改 open_ontology/ 已有文件或触碰 video* 目录，测试只运行 pytest -v tests/test_mcts_world_model.py！\n2. 实现 OntologyMCTSPlanner（含 fork_runtime 平行宇宙沙盘克隆、PUCT/UCT 选择、基于 InvariantError 的符号规则剪枝、基于 @spec.function 的终局价值评估 V(s) 与反向传播 Backpropagation）；\n3. 演示『三波次急救冷链连环调度』：证明单步贪心策略（Greedy）因第 1 步抢占王牌车导致第 2 步撞上 InvariantError 陷入死局，而 MCTS 在 OpenOntology 符号沙盘中通过多步推演避开贪心陷阱、找到全局最优解（净收益 44,600 元），且推演过程主库零污染；\n4. 实跑 python3 -m examples.mcts_world_model_demo 与 pytest -v tests/test_mcts_world_model.py 全部通过后汇报。",
+  "max_rework": 5,
+  "start_rework": 0,
+  "roles": [
+    {
+      "id": "architect",
+      "label": "🏛️ 架构师(Argon)",
+      "session_id": "ses_e396aec01ffeDLevY7vuCW4rbV",
+      "external_control": true
+    },
+    {
+      "id": "coder4",
+      "label": "🔨 程序员4",
+      "title": "程序员4",
+      "session_id": "ses_e3551bbf5ffe0u5F643tmixhMn",
+      "rules": "严格遵循 /Users/guci/work/open-ontology/SPEC_MCTS.md，只允许写入 examples/mcts_world_model_demo.py 和 tests/test_mcts_world_model.py。完成后必须实际运行 python3 -m examples.mcts_world_model_demo 和 pytest -v tests/test_mcts_world_model.py 并附上完整输出。"
+    }
+  ],
+  "states": {
+    "STEP2_CODING": {
+      "role": "coder4",
+      "expect_verdict": false,
+      "transitions": {
+        "SUBMIT": "STEP4_ARCH_REVIEW"
+      }
+    },
+    "STEP4_ARCH_REVIEW": {
+      "role": "architect",
+      "callback_only": true,
+      "transitions": {
+        "PASS": "DONE",
+        "FAIL": "STEP2_CODING"
+      }
+    }
+  }
+}
