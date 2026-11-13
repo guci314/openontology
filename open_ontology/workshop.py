@@ -21,13 +21,14 @@ from __future__ import annotations
 import copy
 import json
 import threading
-import types as _types
 import uuid
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Iterable, Union, get_args, get_origin
+from pathlib import Path
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlparse
 
+from .model_views import describe_behavior, describe_tbox
 from .runtime import OntologyRuntime
 from .spec import Actor, ObjectType, OntologySpec, OpenOntologyError
 from .workshop_ui import (
@@ -36,6 +37,11 @@ from .workshop_ui import (
     TOPOLOGY_JS,
     TOPOLOGY_PAGE_HTML,
     display_json,
+)
+from .workspaces import (
+    WorkspaceCatalog,
+    WorkspaceConflictError,
+    WorkspaceDescriptor,
 )
 
 __all__ = [
@@ -110,6 +116,16 @@ class OntologyInstanceEntry:
     sample_action_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     mcts_config: dict[str, Any] | None = None
     unplug_fn: Callable[[], dict[str, Any]] | None = None
+
+    @property
+    def workspace_id(self) -> str:
+        """工作空间身份；与历史 ``instance_id`` 是同一个值、同一份条目。"""
+        return self.instance_id
+
+    @property
+    def model_id(self) -> str:
+        """领域模型身份；与历史 ``ontology_id`` 是同一个值。"""
+        return self.ontology_id
 
 
 @dataclass
@@ -195,15 +211,32 @@ class _WorkspaceUnavailableError(Exception):
     """
 
 
+def _workspace_runtime_id(
+    workspace_id: str,
+    db_uri: str,
+    connectors: Iterable[ConnectorMount],
+) -> str:
+    """按存储类型与外设决定宿体编号（注册与清单持久化共用同一规则）。"""
+    storage_kind = "memory" if ":memory:" in db_uri else "sqlite"
+    has_peripherals = any(
+        connector.kind not in CONNECTIONIST_KINDS for connector in connectors
+    )
+    if storage_kind == "memory" and not has_peripherals:
+        return DEFAULT_RUNTIME_ID
+    return f"rt-{workspace_id}"
+
+
 class CommandCenterRegistry:
     """多蓝图 / 多实例注册中心。"""
 
-    def __init__(self) -> None:
+    def __init__(self, catalog: WorkspaceCatalog | None = None) -> None:
         self.ontologies: dict[str, OntologyCatalogEntry] = {}
         self.instances: dict[str, OntologyInstanceEntry] = {}
         self.runtimes: dict[str, RuntimeCatalogEntry] = {}
         self.symbolic_devices: dict[str, SymbolicDeviceEntry] = {}
         self.connectionist_devices: dict[str, AgentCardDeviceEntry] = {}
+        #: 可选的工作空间身份清单；只有文件落盘的 runtime 会被写入。
+        self.catalog = catalog
         self.lock = threading.RLock()
         self.register_runtime(
             DEFAULT_RUNTIME_ID,
@@ -306,16 +339,16 @@ class CommandCenterRegistry:
                     connector.status,
                     _openapi_schema(connector),
                 )
-        entry.runtime_id = self._bind_runtime(entry, has_peripherals=symbolic > 0)
+        entry.runtime_id = self._bind_runtime(entry)
 
-    def _bind_runtime(
-        self, entry: OntologyInstanceEntry, has_peripherals: bool
-    ) -> str:
+    def _bind_runtime(self, entry: OntologyInstanceEntry) -> str:
         """为实例绑定宿体：零外设内存沙盘共用默认宿体，其余各建一台。"""
         storage_kind = "memory" if ":memory:" in entry.db_uri else "sqlite"
         adapters = [connector.name for connector in entry.connectors]
-        if storage_kind == "memory" and not has_peripherals:
-            runtime_id = DEFAULT_RUNTIME_ID
+        runtime_id = _workspace_runtime_id(
+            entry.instance_id, entry.db_uri, entry.connectors
+        )
+        if runtime_id == DEFAULT_RUNTIME_ID:
             runtime = self.runtimes.get(runtime_id)
             if runtime is None:
                 runtime = self.register_runtime(
@@ -370,6 +403,63 @@ class CommandCenterRegistry:
         self.ontologies[ontology_id] = entry
         return entry
 
+    def register_workspace(
+        self,
+        workspace_id: str,
+        model_id: str,
+        label: str,
+        runtime: OntologyRuntime,
+        db_uri: str = "sqlite://:memory:",
+        description: str = "",
+        connectors: Iterable[ConnectorMount] | None = None,
+        default_actor: Actor | None = None,
+        sample_action_params: dict[str, dict[str, Any]] | None = None,
+        mcts_config: dict[str, Any] | None = None,
+        unplug_fn: Callable[[], dict[str, Any]] | None = None,
+    ) -> OntologyInstanceEntry:
+        """注册工作空间；``instance_id`` 是其历史别名，指向同一份条目。
+
+        只有 ``runtime.db_path`` 真正落盘的工作空间才会写入可选清单；展示用
+        的 ``db_uri`` 绝不参与持久化判断。冲突注册在改动任何内存状态之前失败。
+        """
+        if model_id not in self.ontologies:
+            raise KeyError(f"unknown ontology {model_id!r}")
+        connector_list = list(connectors or [])
+        with self.lock:
+            existing = self.instances.get(workspace_id)
+            if existing is not None:
+                if self._same_workspace(existing, model_id, runtime, db_uri, connector_list):
+                    return existing
+                raise WorkspaceConflictError(
+                    f"workspace {workspace_id!r} is already registered "
+                    "with a different identity"
+                )
+
+            entry = OntologyInstanceEntry(
+                instance_id=workspace_id,
+                ontology_id=model_id,
+                label=label,
+                description=description,
+                db_uri=db_uri,
+                runtime=runtime,
+                connectors=connector_list,
+                default_actor=default_actor,
+                sample_action_params=dict(sample_action_params or {}),
+                mcts_config=dict(mcts_config) if mcts_config else None,
+                unplug_fn=unplug_fn,
+            )
+            entry.runtime_id = _workspace_runtime_id(
+                workspace_id, db_uri, connector_list
+            )
+            descriptor = self._workspace_descriptor(entry)
+            if descriptor is not None:
+                # 先写清单：清单冲突 / 写入失败时内存注册中心保持原样。
+                self.catalog.register(descriptor)  # type: ignore[union-attr]
+
+            self.instances[workspace_id] = entry
+            self._sync_devices(entry)
+            return entry
+
     def register_instance(
         self,
         instance_id: str,
@@ -384,24 +474,58 @@ class CommandCenterRegistry:
         mcts_config: dict[str, Any] | None = None,
         unplug_fn: Callable[[], dict[str, Any]] | None = None,
     ) -> OntologyInstanceEntry:
-        if ontology_id not in self.ontologies:
-            raise KeyError(f"unknown ontology {ontology_id!r}")
-        entry = OntologyInstanceEntry(
-            instance_id=instance_id,
-            ontology_id=ontology_id,
-            label=label,
-            description=description,
+        """历史入口：与 :meth:`register_workspace` 共用同一份底层条目。"""
+        return self.register_workspace(
+            instance_id,
+            ontology_id,
+            label,
+            runtime,
             db_uri=db_uri,
-            runtime=runtime,
-            connectors=list(connectors or []),
+            description=description,
+            connectors=connectors,
             default_actor=default_actor,
-            sample_action_params=dict(sample_action_params or {}),
-            mcts_config=dict(mcts_config) if mcts_config else None,
+            sample_action_params=sample_action_params,
+            mcts_config=mcts_config,
             unplug_fn=unplug_fn,
         )
-        self.instances[instance_id] = entry
-        self._sync_devices(entry)
-        return entry
+
+    def _workspace_descriptor(
+        self, entry: OntologyInstanceEntry
+    ) -> WorkspaceDescriptor | None:
+        """只为真正文件落盘的 runtime 生成清单条目；内存 runtime 永远临时。"""
+        if self.catalog is None:
+            return None
+        db_path = str(entry.runtime.db_path)
+        if db_path == ":memory:":
+            return None
+        return WorkspaceDescriptor(
+            workspace_id=entry.instance_id,
+            model_id=entry.ontology_id,
+            runtime_id=entry.runtime_id,
+            db_path=db_path,
+        )
+
+    def _same_workspace(
+        self,
+        existing: OntologyInstanceEntry,
+        model_id: str,
+        runtime: OntologyRuntime,
+        db_uri: str,
+        connectors: Iterable[ConnectorMount],
+    ) -> bool:
+        if existing.ontology_id != model_id:
+            return False
+        existing_db = str(existing.runtime.db_path)
+        incoming_db = str(runtime.db_path)
+        if existing_db == ":memory:" or incoming_db == ":memory:":
+            if existing.runtime is not runtime:
+                return False
+        elif Path(existing_db).resolve() != Path(incoming_db).resolve():
+            return False
+        expected_runtime_id = _workspace_runtime_id(
+            existing.instance_id, db_uri, connectors
+        )
+        return existing.runtime_id == expected_runtime_id
 
     # -- lookup ------------------------------------------------------------
     def get_ontology(self, ontology_id: str) -> OntologyCatalogEntry:
@@ -413,6 +537,10 @@ class CommandCenterRegistry:
         if instance_id not in self.instances:
             raise KeyError(f"unknown instance {instance_id!r}")
         return self.instances[instance_id]
+
+    def get_workspace(self, workspace_id: str) -> OntologyInstanceEntry:
+        """按工作空间身份取已加载条目；仅清单中存在但未加载的请用清单解析。"""
+        return self.get_instance(workspace_id)
 
     def instances_for(self, ontology_id: str) -> list[OntologyInstanceEntry]:
         return [
@@ -437,11 +565,48 @@ class CommandCenterRegistry:
         同源），根对象的完整身份是 工作空间 + 类型 + 对象 ID。根对象一律经
         ``runtime.query_objects`` 读取，因此行级安全与列级脱敏照常生效。
         不可读工作空间的 ``aggregate_roots`` 是 ``None``（不是空列表），并给出
-        只含可信固定字面量或异常类型的 ``reason``。
+        只含可信固定字面量或异常类型的 ``reason``。仅在身份清单中存在、尚未
+        打开的工作空间也会显式出现（``availability='not_loaded'``），列表过程
+        绝不打开或创建数据库。
         """
         with self.lock:
             entries = [self.instances[key] for key in sorted(self.instances)]
-        return [self._workspace_record(entry, actor) for entry in entries]
+            loaded = set(self.instances)
+            catalog = self.catalog
+            descriptors = catalog.descriptors() if catalog is not None else ()
+        rows = [self._workspace_record(entry, actor) for entry in entries]
+        rows.extend(
+            self._catalog_workspace_record(descriptor)
+            for descriptor in descriptors
+            if descriptor.workspace_id not in loaded
+        )
+        rows.sort(key=lambda row: row["workspace_id"])
+        return rows
+
+    def _catalog_workspace_record(
+        self, descriptor: WorkspaceDescriptor
+    ) -> dict[str, Any]:
+        """清单里存在但未加载的工作空间：只读声明，不碰数据库。"""
+        model = self.ontologies.get(descriptor.model_id)
+        root_types = (
+            sorted(
+                name
+                for name, cls in model.spec.object_types.items()
+                if cls.is_aggregate_root()
+            )
+            if model is not None
+            else []
+        )
+        return {
+            "workspace_id": descriptor.workspace_id,
+            "model_id": descriptor.model_id,
+            "runtime_id": descriptor.runtime_id,
+            "availability": "not_loaded",
+            "root_status": "not_loaded",
+            "reason": None if model is not None else "model_not_registered",
+            "aggregate_root_types": root_types,
+            "aggregate_roots": None,
+        }
 
     def _workspace_record(
         self, entry: OntologyInstanceEntry, actor: Actor
@@ -576,30 +741,6 @@ class CommandCenterRegistry:
 # ---------------------------------------------------------------------------
 # 元模型投影
 # ---------------------------------------------------------------------------
-def _owned_field_names(cls: type[ObjectType]) -> list[str]:
-    owned = cls.owned_spec()
-    if isinstance(owned, dict):
-        return sorted(owned)
-    if owned is True:
-        return sorted(cls.model_fields)
-    return []
-
-
-def _type_name(annotation: Any) -> str:
-    """把 Python 注解渲染成简洁的类型名（``<class 'str'>`` → ``str``）。"""
-    if annotation is type(None):
-        return "None"
-    origin = get_origin(annotation)
-    if origin is Union or origin is _types.UnionType:
-        return " | ".join(_type_name(arg) for arg in get_args(annotation))
-    if origin is not None:
-        name = getattr(origin, "__name__", str(origin))
-        args = ", ".join(_type_name(arg) for arg in get_args(annotation))
-        return f"{name}[{args}]" if args else str(name)
-    name = getattr(annotation, "__name__", None)
-    return str(name) if name else str(annotation).replace("typing.", "")
-
-
 def _ontology_roles(
     spec: OntologySpec,
     instances: Iterable[OntologyInstanceEntry] = (),
@@ -641,84 +782,22 @@ def _spec_meta(
     spec: OntologySpec,
     instances: Iterable[OntologyInstanceEntry] = (),
 ) -> dict[str, Any]:
-    """把一个 OntologySpec 投影成前端可渲染的完整元模型。"""
-    object_types = []
-    for name, cls in spec.object_types.items():  # declaration order
-        owned_fields = _owned_field_names(cls)
-        masked = getattr(cls, "__masked_fields__", {}) or {}
-        object_types.append(
-            {
-                "name": name,
-                "primary_key": cls.primary_key_name(),
-                "title": getattr(cls, "__title__", None),
-                "fields": [
-                    {
-                        "name": field_name,
-                        "type": _type_name(info.annotation),
-                        "masked": field_name in masked,
-                        "masked_roles": list(masked.get(field_name, ())),
-                        "owned": field_name in owned_fields,
-                    }
-                    for field_name, info in cls.model_fields.items()
-                ],
-                "interfaces": list(getattr(cls, "__interfaces__", ()) or ()),
-                "owned": bool(cls.owned_spec()),
-                "owned_fields": owned_fields,
-                "security_tag_fields": list(
-                    getattr(cls, "__security_tag_fields__", ()) or ()
-                ),
-            }
-        )
-    interfaces = [
-        {
-            "name": decl.name,
-            "required_fields": list(decl.required_fields),
-            "description": decl.description,
-            "implementations": [
-                cls.__name__ for cls in spec.object_types_for_interface(decl)
-            ],
-        }
-        for decl in sorted(spec.interfaces.values(), key=lambda d: d.name)
-    ]
+    """把一个 OntologySpec 投影成前端可渲染的完整元模型。
+
+    结构（TBox）与行为（Behavior）直接复用 :mod:`open_ontology.model_views`
+    的只读投影；这里只补充工作空间派生的角色体系与 ``spec`` 摘要。
+    """
+    tbox = describe_tbox(spec)
+    behavior = describe_behavior(spec)
     return {
         "spec": spec.summary(),
         "roles": _ontology_roles(spec, instances),
-        "object_types": object_types,
-        "interfaces": interfaces,
-        "link_types": [
-            {
-                "name": decl.name,
-                "source": decl.source,
-                "target": decl.target,
-                "cardinality": decl.cardinality,
-                "owned": decl.owned,
-                "description": decl.description,
-            }
-            for decl in sorted(spec.link_types.values(), key=lambda d: d.name)
-        ],
-        "functions": [
-            {"name": fn.name, "description": fn.description}
-            for fn in sorted(spec.functions.values(), key=lambda d: d.name)
-        ],
-        "actions": [
-            {
-                "name": action.name,
-                "description": action.description,
-                "allowed_roles": list(action.allowed_roles),
-                "approver_roles": list(action.approver_roles),
-                "affects_source": action.affects_source,
-                "params": action.params.model_json_schema(),
-            }
-            for action in sorted(spec.actions.values(), key=lambda d: d.name)
-        ],
-        "automations": [
-            {
-                "name": decl.name,
-                "watch_object_type": decl.watch_object_type,
-                "description": decl.description,
-            }
-            for decl in sorted(spec.automations.values(), key=lambda d: d.name)
-        ],
+        "object_types": tbox["object_types"],
+        "interfaces": tbox["interfaces"],
+        "link_types": tbox["link_types"],
+        "functions": behavior["functions"],
+        "actions": behavior["actions"],
+        "automations": behavior["automations"],
     }
 
 
@@ -925,7 +1004,7 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
 <body><div class="shell">
 <header>
   <div class="mark">◈</div>
-  <div class="brand"><b>__TITLE__</b><span>统一作战指挥中心 · 本体蓝图 × 运行实例</span></div>
+  <div class="brand"><b>__TITLE__</b><span>统一作战指挥中心 · 领域模型 × 工作空间</span></div>
   <div class="chips" id="chips"></div>
   <div class="role">角色
     <select id="role" onchange="loadAll()">
@@ -945,9 +1024,9 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
   </div>
 </header>
 <nav class="pillarnav" id="pillarTabs">
-  <button class="pillar-tab on" id="tab-ontology" onclick="switchPillar('ontology')">📐 Ontology · 未激活的知识</button>
+  <button class="pillar-tab on" id="tab-ontology" onclick="switchPillar('ontology')">📐 Model · 领域模型</button>
   <button class="pillar-tab" id="tab-runtime" onclick="switchPillar('runtime')">⚙️ Runtime · 算力与治理宿体</button>
-  <button class="pillar-tab" id="tab-instance" onclick="switchPillar('instance')">🌍 Instance · 激活的知识与沙盘</button>
+  <button class="pillar-tab" id="tab-instance" onclick="switchPillar('instance')">🌍 Workspace · 工作空间</button>
   <button class="pillar-tab" id="tab-device" onclick="switchPillar('device')">🔌 Device · 外部世界(符号+联结)</button>
 </nav>
 <main>
@@ -1019,13 +1098,13 @@ function toast(msg, bad) {
 
 async function api(path, body) {
   let url = path + (path.includes('?') ? '&' : '?') + 'role=' + encodeURIComponent(role());
-  if (S.inst && !path.includes('instance=')) {
-    url += '&instance=' + encodeURIComponent(S.inst.instance_id);
+  if (S.inst && !path.includes('instance=') && !path.includes('workspace=')) {
+    url += '&workspace=' + encodeURIComponent(S.inst.instance_id);
   }
   const opt = body === undefined ? {} : {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(Object.assign({instance: S.inst && S.inst.instance_id}, body))
+    body: JSON.stringify(Object.assign({workspace: S.inst && S.inst.instance_id}, body))
   };
   const res = await fetch(url, opt);
   const data = await res.json().catch(() => ({ok: false, error: 'invalid JSON'}));
@@ -1036,8 +1115,8 @@ async function api(path, body) {
 function chips() {
   const c = S.catalog;
   const parts = [
-    ['本体蓝图', c.ontologies.length],
-    ['运行实例', c.instances.length],
+    ['领域模型', c.ontologies.length],
+    ['工作空间', c.instances.length],
     ['Runtime 宿体', (c.runtimes || []).length],
     ['外部设备', ((c.devices && c.devices.symbolic) || []).length +
       ((c.devices && c.devices.connectionist) || []).length],
@@ -1230,9 +1309,12 @@ function renderOntologyView(detail) {
 
   $('stage').innerHTML =
     '<div class="hero"><h2>📐 ' + esc(zh('ontologies', o.ontology_id, o.name)) +
-    ' <span class="badge c">' + esc(zh('categories', o.category, o.category)) + '</span></h2>' +
+    ' <span class="badge c">Model · 领域模型</span> <span class="badge">' +
+    esc(zh('categories', o.category, o.category)) + '</span></h2>' +
     '<p>' + esc(o.description) + '</p><div class="acts">' +
-    (first ? '<button class="g" onclick="selectInstance(\'' + first.instance_id + '\')">🚀 进入该蓝图的首个运行实例</button>' : '') +
+    '<span class="badge v">TBox · 结构声明</span>' +
+    '<span class="badge a">Behavior · 受控行为</span>' +
+    (first ? '<button class="g" onclick="selectInstance(\'' + first.instance_id + '\')">🚀 进入该模型的首个工作空间</button>' : '') +
     '<span class="badge">' + m.counts.object_types + ' 对象类型</span>' +
     '<span class="badge">' + m.counts.interfaces + ' 共享接口</span>' +
     '<span class="badge">' + m.counts.link_types + ' 关系类型</span>' +
@@ -1241,18 +1323,18 @@ function renderOntologyView(detail) {
     '<span class="badge">' + m.counts.automations + ' 自动化规则</span></div></div>' +
     '<div class="grid2"><section class="panel"><div class="ph">' +
     '<a class="ph-link" href="' + topoHref + '" target="_blank" rel="noopener" tabindex="0" ' +
-    'title="在新标签页打开可缩放的本体关系图"><i>▍</i>本体关系图<small>METAMODEL TOPOLOGY</small></a>' +
+    'title="在新标签页打开可缩放的本体关系图"><i>▍</i>本体关系图<small>TBOX · TOPOLOGY</small></a>' +
     '<a class="ph-more" href="' + topoHref + '" target="_blank" rel="noopener" tabindex="0">查看大图 ↗</a></div>' +
     '<div class="body"><a class="topo-link" href="' + topoHref + '" target="_blank" rel="noopener" tabindex="0" ' +
     'title="在新标签页打开可缩放的本体关系图">' + svg + '</a></div></section>' +
-    '<section class="panel flat"><div class="ph"><span><i>▍</i>📦 对象类型与共享接口</span><small>SCHEMA</small></div>' +
-    '<div class="body">' + objects + '</div></section></div>' +
-    '<div class="grid2b"><section class="panel flat"><div class="ph"><span><i>▍</i>🔗 关系类型</span><small>RELATIONS</small></div>' +
+    '<section class="panel flat"><div class="ph"><span><i>▍</i>📦 对象类型与共享接口</span><small>TBOX · SCHEMA</small></div>' +
+    '<div class="body"><div class="sect">TBox · 结构声明</div>' + objects + '</div></section></div>' +
+    '<div class="grid2b"><section class="panel flat"><div class="ph"><span><i>▍</i>🔗 关系类型</span><small>TBOX · RELATIONS</small></div>' +
     '<div class="body">' + links + '</div></section>' +
-    '<section class="panel flat"><div class="ph"><span><i>▍</i>🧮 查询与计算 / ⚡ 自动化规则</span><small>READ & REFLEX</small></div>' +
-    '<div class="body"><div class="sect">查询与计算</div>' + funcs + '<div class="sect">自动化规则</div>' + autos + '</div></section></div>' +
-    '<section class="panel flat"><div class="ph"><span><i>▍</i>🎯 业务动作</span><small>GOVERNED ACTIONS</small></div>' +
-    '<div class="body">' + actions + '</div></section>';
+    '<section class="panel flat"><div class="ph"><span><i>▍</i>🧮 查询与计算 / ⚡ 自动化规则</span><small>BEHAVIOR · FUNCTIONS &amp; AUTOMATIONS</small></div>' +
+    '<div class="body"><div class="sect">Behavior · 查询与计算</div>' + funcs + '<div class="sect">Behavior · 自动化规则</div>' + autos + '</div></section></div>' +
+    '<section class="panel flat"><div class="ph"><span><i>▍</i>🎯 业务动作</span><small>BEHAVIOR · GOVERNED ACTIONS</small></div>' +
+    '<div class="body"><div class="sect">Behavior · 受控行为</div>' + actions + '</div></section>';
 }
 
 function topology(m) {
@@ -1298,11 +1380,11 @@ function renderInstanceView(meta, fp, runs, links) {
     esc(zh('interfaces', f.name, f.name)) + '</span>').join('');
 
   $('stage').innerHTML =
-    '<div class="hero"><h2>🌍 ' + esc(i.label) + ' <span class="badge c">' +
-    esc(zh('ontologies', i.ontology_id, i.ontology_name)) + '</span></h2>' +
+    '<div class="hero"><h2>🌍 ' + esc(i.label) + ' <span class="badge c">Workspace · 工作空间</span>' +
+    ' <span class="badge">' + esc(zh('ontologies', i.ontology_id, i.ontology_name)) + '</span></h2>' +
     '<p>' + esc(i.description || '') + ' · <b style="color:#a5e4ff">数据源 ' + esc(i.db_uri) + '</b></p>' +
-    '<div class="acts"><span class="badge v" id="formula" title="Instance = Ontology + Runtime">🧬 认知降维：' +
-    esc(i.formula || '') + '</span>' + connectorChips(i.connectors) + '</div></div>' +
+    '<div class="acts"><span class="badge v" id="formula" title="Workspace = Model + Runtime">🧬 认知降维：' +
+    esc(i.formula || '') + '</span><span class="badge">ABox · 事实状态</span>' + connectorChips(i.connectors) + '</div></div>' +
     '<section class="panel"><div class="mount"><b>实例环境与后台挂载栏</b>' +
     '<span class="badge">' + esc(i.instance_id) + '</span><span class="sp"></span>' +
     '<small style="color:#8ea3bd;font-size:9.5px;letter-spacing:1px">当前状态指纹</small>' +
@@ -1311,7 +1393,7 @@ function renderInstanceView(meta, fp, runs, links) {
     '<button class="v" onclick="forkInstance()">🍴 克隆沙盘</button>' +
     (i.supports_unplug ? '<button class="r" onclick="unplug()">🔌 断开外部系统</button>' : '') +
     '</div></section>' +
-    '<div class="grid2"><section class="panel"><div class="ph"><span><i>▍</i>🌍 当前业务状态</span><small>OBJECT EXPLORER · WORLD STATE</small></div>' +
+    '<div class="grid2"><section class="panel"><div class="ph"><span><i>▍</i>🌍 当前业务状态 · ABox 事实</span><small>ABOX · WORLD STATE</small></div>' +
     '<div class="tabs">' + objectTabs + ifaceTabs + '</div><div class="body" id="objects"></div></section>' +
     '<section class="panel"><div class="ph"><span><i>▍</i>🎯 业务动作与沙盘推演台</span><small>GOVERNED ACTION</small></div>' +
     '<div class="body"><div class="row"><select id="action" onchange="fillParams()"></select>' +
@@ -1368,7 +1450,7 @@ function renderRuntimeView() {
 
   $('stage').innerHTML = '<div class="hero"><h2>⚙️ Runtime · 算力与治理宿体</h2>' +
     '<p>Runtime = Core 微内核 + Aspect 系统调用切面 + DeviceAdapter 设备驱动。' +
-    '同一套微内核在不同宿体上承载不同的 Ontology 与 Instance：知识因此被激活。</p>' +
+    '同一套微内核在不同宿体上执行领域模型定义，隔离承载各工作空间的 ABox 事实与审计历史。</p>' +
     '<div class="acts"><span class="badge c">' + list.length + ' 台宿体</span>' +
     '<span class="badge v">' + list.reduce((n, r) => n + (r.aspects || []).length, 0) +
     ' 个切面挂载</span><span class="badge a">' +
@@ -1811,6 +1893,52 @@ def _render_ui_page(
     )
 
 
+def _routing_instance_id(
+    body: dict[str, Any] | None,
+    query: dict[str, list[str]] | None,
+) -> str | None:
+    """解析工作空间身份，兼容新旧别名 ``workspace`` / ``instance``。
+
+    两个名字指向同一份注册条目。若调用方同时给出**不同**的值，说明意图
+    不明确：这里直接以 :class:`OpenOntologyError`（HTTP 400）拒绝，绝不
+    静默挑一个工作空间。相同值重复给出属于合法迁移期写法。
+    """
+    candidates: list[str] = []
+    if body:
+        for key in ("instance", "workspace"):
+            value = body.get(key)
+            if value:
+                candidates.append(str(value))
+    if query:
+        for key in ("instance", "workspace"):
+            for value in query.get(key, ()):
+                if value:
+                    candidates.append(str(value))
+    distinct = sorted(set(candidates))
+    if len(distinct) > 1:
+        raise OpenOntologyError(
+            "conflicting 'instance' and 'workspace' parameters: "
+            + ", ".join(distinct)
+        )
+    return distinct[0] if distinct else None
+
+
+def _topology_model_id(query: dict[str, list[str]]) -> str | None:
+    """解析拓扑页的模型参数；``model`` 是 ``ontology`` 的等价别名。"""
+    candidates: list[str] = []
+    for key in ("ontology", "model"):
+        for value in query.get(key, ()):
+            if value:
+                candidates.append(str(value))
+    distinct = sorted(set(candidates))
+    if len(distinct) > 1:
+        raise OpenOntologyError(
+            "conflicting 'ontology' and 'model' parameters: "
+            + ", ".join(distinct)
+        )
+    return distinct[0] if distinct else None
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -1832,14 +1960,10 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
         return self.server.title  # type: ignore[attr-defined]
 
     def _instance_entry(self, body: dict[str, Any] | None, query: dict[str, list[str]] | None) -> OntologyInstanceEntry:
-        instance_id = None
-        if body:
-            instance_id = body.get("instance")
-        if not instance_id and query:
-            instance_id = query.get("instance", [None])[0]
+        instance_id = _routing_instance_id(body, query)
         if not instance_id:
             return self._registry.default_instance()
-        return self._registry.get_instance(str(instance_id))
+        return self._registry.get_instance(instance_id)
 
     def _runtime(self, body: dict[str, Any] | None = None, query: dict[str, list[str]] | None = None) -> OntologyRuntime:
         return self._instance_entry(body, query).runtime
@@ -1931,8 +2055,12 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
         ]
         return {
             "ok": True,
+            # ``models`` / ``workspaces`` 是 ``ontologies`` / ``instances`` 的
+            # 新名字；两套键同时返回，旧客户端无需改动。
             "ontologies": ontologies,
+            "models": ontologies,
             "instances": instances,
+            "workspaces": instances,
             "runtimes": [asdict(item) for item in self._registry.runtimes.values()],
             "devices": {
                 "symbolic": [
@@ -1950,15 +2078,22 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
         payload = _spec_meta(
             entry.spec, self._registry.instances_for(entry.ontology_id)
         )
+        model_info = {
+            "ontology_id": entry.ontology_id,
+            "model_id": entry.ontology_id,
+            "name": entry.name,
+            "category": entry.category,
+            "description": entry.description,
+        }
+        workspaces = [
+            _instance_summary(item, self._registry)
+            for item in self._registry.instances_for(entry.ontology_id)
+        ]
         payload.update(
             {
                 "ok": True,
-                "ontology": {
-                    "ontology_id": entry.ontology_id,
-                    "name": entry.name,
-                    "category": entry.category,
-                    "description": entry.description,
-                },
+                "ontology": model_info,
+                "model": model_info,
                 "counts": {
                     "object_types": len(payload["object_types"]),
                     "interfaces": len(payload["interfaces"]),
@@ -1966,12 +2101,11 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     "functions": len(payload["functions"]),
                     "actions": len(payload["actions"]),
                     "automations": len(payload["automations"]),
-                    "instances": len(self._registry.instances_for(entry.ontology_id)),
+                    "instances": len(workspaces),
+                    "workspaces": len(workspaces),
                 },
-                "instances": [
-                    _instance_summary(item, self._registry)
-                    for item in self._registry.instances_for(entry.ontology_id)
-                ],
+                "instances": workspaces,
+                "workspaces": workspaces,
             }
         )
         return payload
@@ -1994,8 +2128,14 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/topology":
-            # 独立、可刷新的矢量关系图页面：不读取也不回显 ontology 查询参数，
-            # 前端再按 ?ontology=<编号> 请求 /api/ontology/<编号>。
+            # 独立、可刷新的矢量关系图页面：不读取也不回显模型查询参数，
+            # 前端再按 ?ontology=<编号>（或新别名 ?model=<编号>）请求
+            # /api/ontology/<编号>。冲突的新旧参数在这里直接拒绝。
+            try:
+                _topology_model_id(query)
+            except OpenOntologyError as exc:
+                self._error(400, str(exc))
+                return
             self._send(
                 200,
                 _render_ui_page(
@@ -2042,9 +2182,25 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     )
                     return
 
+                if path == "/api/workspaces":
+                    actor = self._actor(role, None)
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "workspaces": self._registry.list_workspaces(actor),
+                        },
+                    )
+                    return
+
                 if path.startswith("/api/ontology/"):
                     ontology_id = path[len("/api/ontology/"):]
                     self._send_json(200, self._ontology_detail(ontology_id))
+                    return
+
+                if path.startswith("/api/model/"):
+                    model_id = path[len("/api/model/"):]
+                    self._send_json(200, self._ontology_detail(model_id))
                     return
 
                 entry = self._instance_entry(None, query)
@@ -2091,7 +2247,21 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                         FROM ontology_links ORDER BY link_type, source_id, target_id
                         """
                     ).fetchall()
-                    links = [dict(row) for row in rows]
+                    visible = {
+                        (row["object_type"], row["object_id"])
+                        for row in runtime.connection.execute(
+                            "SELECT object_type, object_id, security_tags_json "
+                            "FROM ontology_objects"
+                        ).fetchall()
+                        if actor.has_access(json.loads(row["security_tags_json"]))
+                    }
+                    # 任一端的对象缺失（悬空边）或被 RLS 隐藏，整条边都不出口。
+                    links = [
+                        dict(row)
+                        for row in rows
+                        if (row["source_type"], row["source_id"]) in visible
+                        and (row["target_type"], row["target_id"]) in visible
+                    ]
                     self._send_json(
                         200,
                         {"ok": True, "count": len(links), "links": links},
@@ -2239,30 +2409,33 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     for key, value in (body.get("source_timestamps") or {}).items()
                 }
                 or None,
+                actor=actor,
             )
             self._send_json(200, {"ok": True, **summary})
             return
 
-        if path == "/api/instance/fork":
+        if path in ("/api/instance/fork", "/api/workspace/fork"):
             forked = self._registry.fork_instance(
-                body.get("instance") or entry.instance_id,
-                body.get("new_instance_id"),
+                body.get("workspace") or body.get("instance") or entry.instance_id,
+                body.get("new_workspace_id") or body.get("new_instance_id"),
                 body.get("label"),
             )
+            summary = _instance_summary(forked, self._registry)
             self._send_json(
                 200,
                 {
                     "ok": True,
-                    "instance": _instance_summary(forked, self._registry),
+                    "instance": summary,
+                    "workspace": summary,
                 },
             )
             return
 
-        if path == "/api/instance/mcts":
+        if path in ("/api/instance/mcts", "/api/workspace/mcts"):
             self._run_mcts(body, actor, entry)
             return
 
-        if path == "/api/instance/unplug":
+        if path in ("/api/instance/unplug", "/api/workspace/unplug"):
             self._unplug(body, entry)
             return
 

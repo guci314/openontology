@@ -1117,12 +1117,12 @@ def test_ingestion_driver_is_a_device_driver_not_kernel():
 
 
 # ---------------------------------------------------------------------------
-# 7. 指挥台四个一级标签页（Ontology / Runtime / Instance / Device）
+# 7. 指挥台四个一级标签页（Model / Runtime / Workspace / Device）
 # ---------------------------------------------------------------------------
 PILLAR_TABS = (
-    ("tab-ontology", "Ontology · 未激活的知识"),
+    ("tab-ontology", "Model · 领域模型"),
     ("tab-runtime", "Runtime · 算力与治理宿体"),
-    ("tab-instance", "Instance · 激活的知识与沙盘"),
+    ("tab-instance", "Workspace · 工作空间"),
     ("tab-device", "Device · 外部世界(符号+联结)"),
 )
 
@@ -1251,6 +1251,302 @@ def test_browser_pillar_tabs_switch_four_views(live, browser):
             "() => document.getElementById('tab-ontology').classList.contains('on')"
         )
 
+        assert errors == [], errors
+    finally:
+        context.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. C-WS-05：Model / Workspace 展示与新旧 API 兼容
+# ---------------------------------------------------------------------------
+MODEL_WORKSPACE_PILLARS = (
+    ("tab-ontology", "Model · 领域模型"),
+    ("tab-runtime", "Runtime · 算力与治理宿体"),
+    ("tab-instance", "Workspace · 工作空间"),
+    ("tab-device", "Device · 外部世界(符号+联结)"),
+)
+
+
+def test_pillar_tabs_use_model_and_workspace_labels(base):
+    """一级标签页文案迁移为 Model / Workspace，且不新增 TBox / ABox 一级页。"""
+    html = _html(base + "/")
+
+    assert 'id="pillarTabs"' in html
+    for tab_id, label in MODEL_WORKSPACE_PILLARS:
+        assert f'id="{tab_id}"' in html, tab_id
+        assert label in html, label
+        assert f"switchPillar('{tab_id[len('tab-'):]}')" in html, tab_id
+    # 旧的 Ontology / Instance 一级标签文案彻底退役。
+    assert "Ontology · 未激活的知识" not in html
+    assert "Instance · 激活的知识与沙盘" not in html
+    # 不新增 TBox / ABox 一级标签，也不新增一级 DOM 主键。
+    for forbidden in (
+        'id="tab-tbox"',
+        'id="tab-abox"',
+        "switchPillar('tbox')",
+        "switchPillar('abox')",
+    ):
+        assert forbidden not in html, forbidden
+    # 仍然恰好四个一级标签，且默认高亮 Model 页。
+    assert html.count('class="pillar-tab') == 4
+    assert 'class="pillar-tab on" id="tab-ontology"' in html
+    # 既有 DOM 主键全部保留。
+    for dom_id in ("tab-ontology", "tab-runtime", "tab-instance", "tab-device"):
+        assert f'id="{dom_id}"' in html, dom_id
+
+
+def test_catalog_exposes_model_and_workspace_aliases(base):
+    """catalog 同时提供 models / workspaces 别名，旧键原样保留。"""
+    catalog = _get_json(base, "/api/catalog")
+
+    assert catalog["models"] == catalog["ontologies"]
+    assert catalog["workspaces"] == catalog["instances"]
+    assert len(catalog["models"]) == 6
+    assert len(catalog["workspaces"]) == 8
+    assert [row["ontology_id"] for row in catalog["ontologies"]] == [
+        row["ontology_id"] for row in catalog["models"]
+    ]
+    assert [row["instance_id"] for row in catalog["instances"]] == [
+        row["instance_id"] for row in catalog["workspaces"]
+    ]
+
+
+def test_workspace_query_alias_matches_legacy_instance_query(base):
+    """?workspace= 与 ?instance= 指向同一个工作空间，响应逐字节一致。"""
+    legacy = _get_json(base, "/api/meta", instance="coldchain-wave3")
+    alias = _get_json(base, "/api/meta", workspace="coldchain-wave3")
+
+    assert alias == legacy
+    assert alias["instance"]["instance_id"] == "coldchain-wave3"
+    assert alias["instance"]["ontology_id"] == "coldchain_mcts"
+
+
+def test_workspace_alias_covers_every_model_and_workspace(base):
+    """6 个模型 + 8 个工作空间在新旧参数下都可寻址且身份一致。"""
+    catalog = _get_json(base, "/api/catalog")
+
+    for model in catalog["models"]:
+        detail = _get_json(base, f"/api/ontology/{model['ontology_id']}")
+        assert detail["ok"] is True
+        assert detail["ontology"]["ontology_id"] == model["ontology_id"]
+        assert len(detail["object_types"]) == model["counts"]["object_types"]
+
+    for workspace in catalog["workspaces"]:
+        workspace_id = workspace["instance_id"]
+        meta = _get_json(base, "/api/meta", workspace=workspace_id)
+        assert meta["instance"]["instance_id"] == workspace_id
+        assert meta["instance"]["ontology_id"] == workspace["ontology_id"]
+        assert meta["instance"]["runtime_id"] == workspace["runtime_id"]
+        assert meta["instance"] == _get_json(
+            base, "/api/meta", instance=workspace_id
+        )["instance"]
+
+
+def test_conflicting_workspace_and_instance_parameters_are_rejected(base):
+    """新旧参数冲突必须 400，绝不静默选中其中一个工作空间。"""
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get_json(
+            base, "/api/meta", instance="coldchain-wave3", workspace="factory-prod"
+        )
+    assert exc.value.code == 400
+    error = json.loads(exc.value.read().decode("utf-8"))
+    assert error["ok"] is False
+    assert "workspace" in error["error"] and "instance" in error["error"]
+
+    params = {"order_id": "ORD-1", "truck_id": "TRK-HEAVY"}
+
+    # POST 查询参数冲突
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _post_json(
+            base,
+            "/api/simulate?instance=coldchain-wave3&workspace=factory-prod",
+            {"action": "dispatch_order", "params": params},
+        )
+    assert exc.value.code == 400
+
+    # POST 请求体冲突
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _post_json(
+            base,
+            "/api/simulate",
+            {
+                "instance": "coldchain-wave3",
+                "workspace": "factory-prod",
+                "action": "dispatch_order",
+                "params": params,
+            },
+        )
+    assert exc.value.code == 400
+
+    # 新旧别名给出相同值不算冲突（迁移期可共存）。
+    same = _post_json(
+        base,
+        "/api/simulate?instance=coldchain-wave3&workspace=coldchain-wave3",
+        {"action": "dispatch_order", "params": params},
+    )
+    assert same["valid"] is True
+
+
+def test_workspace_alias_drives_actions_approval_audit_and_simulation(base):
+    """新路由参数贯通沙盘预演、正式执行、审批与审计账本。"""
+    params = {"order_id": "ORD-2", "truck_id": "TRK-FAST"}
+    simulated = _post_json(
+        base,
+        "/api/simulate?workspace=coldchain-wave3",
+        {"workspace": "coldchain-wave3", "action": "dispatch_order", "params": params},
+    )
+    assert simulated["valid"] is True
+    assert simulated["diff"]["object_changes"]
+
+    submitted = _post_json(
+        base,
+        "/api/submit?workspace=coldchain-wave3",
+        {
+            "workspace": "coldchain-wave3",
+            "run_id": "CWS05-RUN-1",
+            "action": "dispatch_order",
+            "params": params,
+        },
+    )
+    assert submitted["run"]["status"] == "COMMITTED"
+
+    runs = _get_json(base, "/api/action-runs", workspace="coldchain-wave3")
+    assert runs["instance"] == "coldchain-wave3"
+    assert any(run["run_id"] == "CWS05-RUN-1" for run in runs["runs"])
+
+    pending = _post_json(
+        base,
+        "/api/submit?workspace=osv2-coil-prod",
+        {
+            "workspace": "osv2-coil-prod",
+            "run_id": "CWS05-APPROVE-1",
+            "action": "request_price_change",
+            "params": {"asset_id": "C-2", "unit_price_ton": 24500.0},
+        },
+    )
+    assert pending["run"]["status"] == "PENDING_APPROVAL"
+
+    approved = _post_json(
+        base,
+        "/api/approve?workspace=osv2-coil-prod&role=finance_manager",
+        {"workspace": "osv2-coil-prod", "run_id": "CWS05-APPROVE-1"},
+    )
+    assert approved["run"]["status"] == "COMMITTED"
+
+
+def test_workspace_alias_preserves_role_masking(base):
+    """新路由参数不绕过列级脱敏。"""
+    ops_view = _get_json(
+        base, "/api/objects/SteelCoil", workspace="osv2-coil-prod", role="ops"
+    )
+    coil = next(row for row in ops_view["objects"] if row["asset_id"] == "C-1")
+    assert coil["unit_price_ton"] == 0.0
+    assert coil["cost_note"] is None
+    assert coil["internal_code"] == "REDACTED"
+
+    finance_view = _get_json(
+        base, "/api/objects/SteelCoil", workspace="osv2-coil-prod", role="finance"
+    )
+    coil = next(row for row in finance_view["objects"] if row["asset_id"] == "C-1")
+    assert coil["unit_price_ton"] == 18000.0
+    assert coil["cost_note"] == "主力现货"
+    assert coil["internal_code"] == "NC-304"
+
+
+def test_workspace_alias_fork_isolation(base):
+    """经新路由参数克隆沙盘后，母体与子体事实严格隔离。"""
+    forked = _post_json(
+        base,
+        "/api/instance/fork",
+        {"workspace": "coldchain-wave3", "label": "别名沙盘"},
+    )
+    new_id = forked["instance"]["instance_id"]
+    assert new_id.startswith("coldchain-wave3-fork-")
+
+    _post_json(
+        base,
+        f"/api/submit?workspace={new_id}",
+        {
+            "workspace": new_id,
+            "run_id": "CWS05-FORK-1",
+            "action": "dispatch_order",
+            "params": {"order_id": "ORD-1", "truck_id": "TRK-HEAVY"},
+        },
+    )
+
+    mother = _get_json(base, "/api/objects/EmergencyOrder", workspace="coldchain-wave3")
+    assert next(o for o in mother["objects"] if o["order_id"] == "ORD-1")[
+        "status"
+    ] == "pending"
+    child = _get_json(base, "/api/objects/EmergencyOrder", workspace=new_id)
+    assert next(o for o in child["objects"] if o["order_id"] == "ORD-1")[
+        "status"
+    ] == "assigned"
+
+
+def test_topology_page_accepts_model_alias(base):
+    """?model= 是 ?ontology= 的等价别名，渲染同一页面。"""
+    legacy = _html(base + "/topology?ontology=task_board")
+    alias = _html(base + "/topology?model=task_board")
+
+    assert alias == legacy
+    assert "本体关系图" in alias
+
+
+def test_topology_conflicting_ontology_and_model_rejected(base):
+    """?ontology= 与 ?model= 冲突必须 400；同值可共存。"""
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _request(base + "/topology?ontology=task_board&model=coldchain_mcts")
+    assert exc.value.code == 400
+
+    same = _html(base + "/topology?ontology=task_board&model=task_board")
+    assert same == _html(base + "/topology?ontology=task_board")
+
+
+def test_browser_model_and_workspace_views_label_tbox_behavior_abox(live, browser):
+    """模型视图区分 TBox 结构与 Behavior 行为；工作空间事实标注 ABox。"""
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 1000})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    try:
+        page.goto(base_url, wait_until="networkidle")
+        page.wait_for_selector("#pillarTabs .pillar-tab")
+        pillars = page.inner_text("#pillarTabs")
+        assert "Model · 领域模型" in pillars
+        assert "Workspace · 工作空间" in pillars
+
+        page.locator("#ontologies .card").first.click()
+        page.wait_for_selector("#stage .topo-link")
+        model_stage = page.inner_text("#stage")
+        assert "TBox" in model_stage, model_stage
+        assert "Behavior" in model_stage, model_stage
+
+        page.locator("#tab-instance").click()
+        page.locator("#instancesPanel").wait_for(state="visible")
+        page.locator("#instances .card").first.click()
+        page.locator("#action").wait_for(state="visible")
+        page.wait_for_selector("#objects .obj")
+        workspace_stage = page.inner_text("#stage")
+        assert "ABox" in workspace_stage, workspace_stage
+        assert "Workspace · 工作空间" in workspace_stage
+
+        assert errors == [], errors
+    finally:
+        context.close()
+
+
+def test_browser_topology_model_alias_renders_same_scene(live, browser):
+    """独立拓扑页经 ?model= 也能加载同一张场景图。"""
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    try:
+        page.goto(base_url + "/topology?model=task_board", wait_until="networkidle")
+        page.wait_for_selector("#scene rect.node")
+        assert page.locator("#scene rect.node").count() == 6
+        assert "多智能体任务看板" in page.inner_text("#title")
         assert errors == [], errors
     finally:
         context.close()

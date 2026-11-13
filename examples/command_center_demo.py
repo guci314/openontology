@@ -33,6 +33,11 @@ from open_ontology import (
     OntologySpec,
     start_command_center_server,
 )
+from open_ontology.agent_hosts import (
+    DEFAULT_GOAL_RELPATH,
+    GOAL_DOC_SEPARATOR,
+    TASK_BOARD_DOC_RELPATH,
+)
 from open_ontology.dev_factory import FACTORY_MANAGER
 from open_ontology.dev_factory import spec as factory_spec
 from open_ontology.kanban import BOARD_MANAGER
@@ -42,6 +47,7 @@ from open_ontology.workshop import (
     ConnectorMount,
     OntologyInstanceEntry,
 )
+from open_ontology.workspaces import WorkspaceCatalog
 
 from .mcts_world_model_demo import (
     ActionCandidate,
@@ -175,6 +181,19 @@ def _read_repo_doc(relpath: str) -> str:
         return ""
     return path.read_text(encoding="utf-8").strip()
 
+
+def _read_goal_docs() -> str:
+    """组装 ``Board.goal``：M2 平台宪法 + M1/M0 看板规范。
+
+    两份文档都存在时以 :data:`GOAL_DOC_SEPARATOR` 连接，保留各自的文档边界；
+    只有 ``docs/ARCHITECTURE.md``（例如裁剪过的部署目录）时保持旧的单文件
+    行为，不凭空拼出空段。
+    """
+    architecture = _read_repo_doc(DEFAULT_GOAL_RELPATH)
+    task_board = _read_repo_doc(TASK_BOARD_DOC_RELPATH)
+    if architecture and task_board:
+        return f"{architecture}{GOAL_DOC_SEPARATOR}{task_board}"
+    return architecture
 
 
 def _submit(runtime: OntologyRuntime, run_id: str, action: str, params: dict[str, Any], actor: Actor) -> dict[str, Any]:
@@ -388,7 +407,7 @@ def _seed_task_board(runtime: OntologyRuntime) -> None:
     run = 0
 
     # Board.goal / Board.state 直接承载完整文档全文，指挥台与换代供血都不再缺上下文。
-    arch_doc = _read_repo_doc("docs/ARCHITECTURE.md")
+    goal_doc = _read_goal_docs()
     state_doc = _read_repo_doc("_state.md")
 
     def act(action: str, params: dict[str, Any]) -> None:
@@ -404,7 +423,7 @@ def _seed_task_board(runtime: OntologyRuntime) -> None:
             "tenant": "acme",
             "created_by": "board-manager-01",
             "description": "列拓扑即数据：谁可认领、哪列是终态、失败回哪列，全部声明式。",
-            "goal": arch_doc
+            "goal": goal_doc
             or "四层元模型（M2→M1→PSM→M0）单向依赖，M2 内核零业务污染，脑手分离协同。",
             # 建板只是初始化；首个完工才会把完整基线真值表折叠进 Board.state。
             "state": "初始化：看板已建立，等待首个完工基线。",
@@ -548,7 +567,7 @@ def _build_task_board(
         category="Agentic Delivery",
         description="看板列拓扑即数据；认领、裁决、带数字的证据全部由本体判定。",
     )
-    registry.register_instance(
+    registry.register_workspace(
         "board-prod",
         "task_board",
         "任务看板 · 生产实例",
@@ -1045,21 +1064,29 @@ def build_default_command_center(
     data_dir: str | Path | None = None,
     *,
     reset: bool = False,
+    workspace_catalog: WorkspaceCatalog | None = None,
 ) -> CommandCenterRegistry:
     """预装 5 个 Ontology 蓝图 + 7 个真实数据 Instance。
 
     默认把 ``board-prod`` 的 SQLite 库落在 ``.instances/board_prod.sqlite3``，
-    使实例真实落盘可被新会话按对象 ID 检索。
+    使实例真实落盘可被新会话按对象 ID 检索。文件落盘的 runtime 身份写入
+    ``.instances/workspaces.json``（可选清单，显式格式版本），供新的清单读取器
+    在不构造 / 重置演示的情况下定位工作空间并校验可信模型绑定。
 
     **默认非破坏性**：库已存在且含看板时直接打开，原有对象值、版本、关系与
     动作账本全部保留。只有显式 ``reset=True`` 才会重建**指定的这一个库**
     （绝不删除目录）；传入不兼容 / 半成品 / 损坏的库会明确报错。
     """
-    registry = CommandCenterRegistry()
+    if data_dir is not None and str(data_dir).strip() == ":memory:":
+        raise ValueError("data_dir must be a filesystem directory path, not ':memory:'")
+    data_root = Path(data_dir or _DEFAULT_DATA_DIR)
+    if workspace_catalog is None:
+        workspace_catalog = WorkspaceCatalog.load(data_root / "workspaces.json")
+    registry = CommandCenterRegistry(catalog=workspace_catalog)
     _build_software_factory(registry)
     _build_task_board(
         registry,
-        db_path=Path(data_dir or _DEFAULT_DATA_DIR) / "board_prod.sqlite3",
+        db_path=data_root / "board_prod.sqlite3",
         reset=reset,
     )
     _build_coldchain(registry)

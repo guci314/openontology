@@ -183,3 +183,43 @@ FOR EACH ROW
 BEGIN
     SELECT RAISE(ABORT, 'GOVERNANCE_VIOLATION: ontology_action_runs is append-only; DELETE is forbidden');
 END;
+
+CREATE TRIGGER IF NOT EXISTS trg_action_runs_guard_insert
+BEFORE INSERT ON ontology_action_runs
+FOR EACH ROW
+WHEN (SELECT is_open FROM ontology_write_gate WHERE id = 1) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'GOVERNANCE_VIOLATION: direct INSERT into ontology_action_runs is blocked (write gate closed)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_action_runs_guard_update
+BEFORE UPDATE ON ontology_action_runs
+FOR EACH ROW
+WHEN (SELECT is_open FROM ontology_write_gate WHERE id = 1) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'GOVERNANCE_VIOLATION: direct UPDATE on ontology_action_runs is blocked (write gate closed)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_registry_guard_insert
+BEFORE INSERT ON ontology_registry
+FOR EACH ROW
+WHEN (SELECT is_open FROM ontology_write_gate WHERE id = 1) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'GOVERNANCE_VIOLATION: direct INSERT into ontology_registry is blocked (write gate closed)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_registry_guard_update
+BEFORE UPDATE ON ontology_registry
+FOR EACH ROW
+WHEN (SELECT is_open FROM ontology_write_gate WHERE id = 1) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'GOVERNANCE_VIOLATION: direct UPDATE on ontology_registry is blocked (write gate closed)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_registry_guard_delete
+BEFORE DELETE ON ontology_registry
+FOR EACH ROW
+WHEN (SELECT is_open FROM ontology_write_gate WHERE id = 1) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'GOVERNANCE_VIOLATION: direct DELETE from ontology_registry is blocked (write gate closed)');
+END;

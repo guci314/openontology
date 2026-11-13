@@ -15,12 +15,18 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
 
 from open_ontology import (
+    Actor,
+    CommandCenterRegistry,
+    LinkType,
+    ObjectType,
     OntologyRuntime,
+    OntologySpec,
     WorkshopServer,
     start_command_center_server,
     start_workshop_server,
@@ -354,7 +360,7 @@ def test_command_center_html_markers(base):
     for marker in (
         "<!doctype html>",
         "统一作战指挥中心",
-        "object explorer",
+        "abox · world state",  # C-WS-05：事实面板改标 ABox，原 OBJECT EXPLORER 退役
         "governed action",
         "action runs",
         "当前状态指纹",
@@ -416,6 +422,7 @@ def test_interface_query_and_function_call(base):
             "instance": "osv2-coil-prod",
             "function": "portfolio_value",
             "params": {},
+            "role": "finance",
         },
     )
     assert result["result"]["total_value"] == 4_080_000.0
@@ -505,6 +512,21 @@ def test_factory_instance_board_data(base):
     deliverables = _get(base, "/api/objects/Deliverable", instance="factory-prod")
     assert deliverables["count"] == 1
     assert deliverables["objects"][0]["verified"] is True
+
+
+def test_seeded_board_goal_combines_architecture_and_task_board_docs(base):
+    """预装看板的 goal 同时承载 M2 宪法与 M1/M0 看板规范（单文件目录仍兼容）。"""
+    repo_root = Path(__file__).resolve().parent.parent
+    architecture = (repo_root / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8").strip()
+    task_board = (repo_root / "docs" / "TASK_BOARD.md").read_text(encoding="utf-8").strip()
+
+    payload = _get(base, "/api/objects/Board", instance="board-prod")
+    boards = {item["board_key"]: item for item in payload["objects"]}
+    goal = boards["BD-CC-001"]["goal"]
+
+    assert goal == architecture + "\n\n---\n\n" + task_board
+    assert goal.startswith("# OpenOntology 架构设计规范")
+    assert goal.endswith(task_board[-40:])
 
 
 # ---------------------------------------------------------------------------
@@ -605,3 +627,157 @@ def test_fork_registers_its_own_runtime_and_devices(base):
     assert len(cloned) == 3
     assert all(d["openapi_schema"]["openapi"] == "3.1.0" for d in cloned)
 
+
+def test_model_and_workspaces_additive_endpoints_and_repeated_query_conflict(base):
+    model_detail = _get(base, "/api/model/task_board")
+    onto_detail = _get(base, "/api/ontology/task_board")
+    assert model_detail["ok"] is True
+    assert model_detail["model"] == model_detail["ontology"]
+    assert model_detail["object_types"] == onto_detail["object_types"]
+
+    ws_payload = _get(base, "/api/workspaces", role="board_manager")
+    assert ws_payload["ok"] is True
+    by_ws = {row["workspace_id"]: row for row in ws_payload["workspaces"]}
+    assert "board-prod" in by_ws
+    assert [r["object_id"] for r in by_ws["board-prod"]["aggregate_roots"]] == ["BD-CC-001"]
+
+    forked = _post(
+        base,
+        "/api/workspace/fork",
+        {"workspace": "factory-prod", "label": "工作空间沙盘分支"},
+    )
+    assert forked["ok"] is True
+    assert forked["workspace"] == forked["instance"]
+
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _request(f"{base}/api/meta?workspace=board-prod&workspace=factory-prod")
+    assert excinfo.value.code == 400
+    excinfo.value.close()
+
+
+
+# ---------------------------------------------------------------------------
+# 15. C-KERNEL-SEC-01：外部边界的 RLS / 列脱敏闭合
+# ---------------------------------------------------------------------------
+#: 只有 north 区域可见的受限调用方。
+ACTOR_SCOPE = Actor(
+    actor_id="scope-north", role="ops", clearance_tags={"region:north"}
+)
+
+
+def test_links_endpoint_hides_rows_the_actor_cannot_see():
+    """``/api/links`` 不得把 RLS 隐藏对象、悬空端点暴露给调用方。"""
+    spec = OntologySpec()
+
+    class Node(ObjectType):
+        __primary_key__ = "node_id"
+        __security_tag_fields__ = ("region",)
+
+        node_id: str
+        region: str = "north"
+
+    spec.object_type(Node)
+    spec.add_link_type(
+        LinkType(
+            name="node_links",
+            source="Node",
+            target="Node",
+            cardinality="many-to-many",
+            owned=False,
+        )
+    )
+
+    runtime = OntologyRuntime(spec)
+    try:
+        for node in (
+            Node(node_id="N-NORTH-1", region="north"),
+            Node(node_id="N-NORTH-2", region="north"),
+            Node(node_id="N-SOUTH-1", region="south"),
+        ):
+            runtime.put_object(node)
+        north_1 = runtime.get_object(Node, "N-NORTH-1", ACTOR_SCOPE)
+        north_2 = runtime.get_object(Node, "N-NORTH-2", ACTOR_SCOPE)
+        south_1 = Node(node_id="N-SOUTH-1", region="south")
+        runtime.link_objects(north_1, "node_links", north_2)
+        runtime.link_objects(north_1, "node_links", south_1)
+        # 悬空边：目标对象从未落库
+        runtime.link_objects(
+            north_1, "node_links", Node(node_id="N-GHOST", region="north")
+        )
+
+        registry = CommandCenterRegistry.from_runtime(runtime, actor=ACTOR_SCOPE)
+        handle = start_command_center_server(registry, port=0, title="RLS 链路")
+        try:
+            payload = _get(handle.base_url, "/api/links")
+        finally:
+            handle.stop()
+    finally:
+        runtime.close()
+
+    assert payload["ok"] is True
+    pairs = {(row["source_id"], row["target_id"]) for row in payload["links"]}
+    assert pairs == {("N-NORTH-1", "N-NORTH-2")}
+    assert payload["count"] == 1
+
+
+def test_function_reads_are_masked_for_non_whitelisted_roles(base):
+    """``/api/function`` 用调用方 Actor 执行，列级白名单外必须脱敏。"""
+    def portfolio(role: str | None) -> float:
+        body = {
+            "instance": "osv2-coil-prod",
+            "function": "portfolio_value",
+            "params": {},
+        }
+        if role is not None:
+            body["role"] = role
+        return _post(base, "/api/function", body)["result"]["total_value"]
+
+    assert portfolio("finance") == 4_080_000.0
+    assert portfolio("ops") == 0.0
+    assert portfolio("admin") == 0.0
+
+
+def test_http_boundary_enumeration_honours_explicit_actor():
+    """裸 HTTP 边界的枚举接口在给了 Actor 时必须走 RLS + 脱敏投影。"""
+    from open_ontology.http_server import start_http_server
+
+    spec = OntologySpec()
+
+    class Node(ObjectType):
+        __primary_key__ = "node_id"
+        __security_tag_fields__ = ("region",)
+        __masked_fields__ = {"secret": ("auditor",)}
+
+        node_id: str
+        region: str = "north"
+        secret: str = "s3cr3t"
+
+    spec.object_type(Node)
+    spec.add_link_type(
+        LinkType(
+            name="node_links",
+            source="Node",
+            target="Node",
+            cardinality="many-to-many",
+        )
+    )
+
+    runtime = OntologyRuntime(spec)
+    try:
+        runtime.put_object(Node(node_id="N-1", region="north"))
+        runtime.put_object(Node(node_id="N-2", region="south"))
+        handle = start_http_server(
+            runtime,
+            actor=Actor(
+                actor_id="audit", role="auditor", clearance_tags={"region:north"}
+            ),
+        )
+        try:
+            rows = _get(handle.base_url, "/api/objects/Node")
+        finally:
+            handle.stop()
+    finally:
+        runtime.close()
+
+    assert [row["object_id"] for row in rows] == ["N-1"]
+    assert rows[0]["properties"]["secret"] == "s3cr3t"  # auditor 在白名单内

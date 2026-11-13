@@ -32,7 +32,7 @@ Workspace <workspace_id>（M0 隔离业务运行空间）
 └─ 执行与审计历史（ontology_action_runs）
 ```
 
-* **TBox** 描述类型与关系结构定义，**ABox** 描述个体与事实断言；两者是元层次区分，不是“未激活的知识 / 已激活的知识”两个阶段。
+* **TBox** 描述类型与关系结构定义，**ABox** 描述个体与事实断言；两者是元层次区分，不是知识激活流程的两个阶段。
 * **Behavior** 决定事实如何受控变化，不能全部硬塞入静态结构 TBox。此处借用 TBox/ABox 做逻辑投影，不承诺 OWL 推理机或任意 Python 校验函数的逻辑序列化。
 * 工作空间本质上是 `模型引用 + ABox + Runtime 绑定 + 执行历史`，不是把同一份模型或数据库换名复制两遍。
 * 当前 `OntologyRuntime(spec, db_path)` 绑定单个模型与单个存储。同一模型复用于多个工作空间是核心能力；单个引擎同时装载多个不同模型不属于现阶段承诺。
@@ -103,8 +103,8 @@ Workspace <workspace_id>（M0 隔离业务运行空间）
 │ 内核外围 M2 通用支撑与传输边界（领域无关，零具体行业语义）：         │
 │   mcts.py              基于 fork() 的蒙特卡洛树搜索规划器            │
 │   osdk.py              受控 LLM 工具 Schema 导出、执行器与评测套件   │
-│   execution/fabric.py  纯 JSON 调用边界与非干涉观察织入 ExecutionFabric│
-│   workspaces.py / model_views.py（目标模块） 工作空间目录与 TBox 投影│
+│   execution/fabric.py  JSON 调用边界与非干涉观察织入 ExecutionFabric │
+│   workspaces.py / model_views.py  工作空间目录与 TBox/Behavior 投影  │
 │   workshop.py / workshop_ui.py / http_server.py                      │
 │                        指挥台 HTTP 传输边界与双标准设备目录承载      │
 └──────────────────────────────────────────────────────────────────────┘
@@ -137,7 +137,7 @@ Workspace <workspace_id>（M0 隔离业务运行空间）
 ### 3.2 动力学层（Kinetic Layer）：沙箱先行与确定性治理管线
 * **禁止裸 CRUD 与防误用写门禁**：
   * 业务状态变更必须且只能通过具名 `ActionDef` 提交；`FunctionDef` 为严格只读计算（暂存变更一律丢弃）。
-  * `schema.sql` 中的 `ontology_write_gate` 触发器提供**同一连接内的防裸写工程护栏（Accidental-CRUD Guardrail）**，防止业务或驱动代码误发裸 SQL 篡改事实表；它不是隔离同进程恶意特权代码的安全沙箱（目标补强方向是使全部 5 张业务治理表均受门禁触发器保护）。
+  * `schema.sql` 中的 `ontology_write_gate` 触发器提供**同一连接内的防裸写工程护栏（Accidental-CRUD Guardrail）**，防止业务或驱动代码误发裸 SQL 篡改事实表；它不是隔离同进程恶意特权代码的安全沙箱。全部 5 张业务治理表均受门禁触发器保护：`ontology_objects` / `ontology_links` / `ontology_overlay` 与 `ontology_registry` 的 `INSERT / UPDATE / DELETE`、`ontology_action_runs` 的 `INSERT / UPDATE` 只在门禁打开的事务内放行，而 `ontology_action_runs` 的 `DELETE` 无条件禁止（追加式账本）。
 * **沙箱先行（Sandbox-First Execution）**：
   1. 动作处理器仅读写内存叠加沙箱 `EditBatch`，不触碰物理 SQLite 或外部 `Device`；
   2. 执行后编译生成精确可逆的 `ObjectDiff`（字段前后值、连边增删）与读取版本集 `read_versions`；
@@ -147,9 +147,10 @@ Workspace <workspace_id>（M0 隔离业务运行空间）
   2. **RBAC 角色授权**（校验 `actor.role in action.allowed_roles`）
   3. **Pydantic 入参 Schema 校验**（构造强类型参数模型）
   4. **沙箱处理器执行**（期间按访问动态执行 **RLS 行级安全标签校验**——读不可见行隐藏、写无权限行抛错——以及领域 **`InvariantError` 业务不变量校验**；若在 `submit_action` 中违反不变量则由 `RejectionAuditAspect` 记录 `REJECTED` 审计并重抛）
-  5. **字段主权门禁**（`SecurityAndAuthorityAspect` 校验变更未越界混写 Source-Backed 与 `__owned__` 字段；目标要求涵盖 `post_approval` 钩子阶段的全部变更）
+  5. **字段主权门禁**（`SecurityAndAuthorityAspect` 校验变更未越界混写 Source-Backed 与 `__owned__` 字段）。若动作声明了 `post_approval` 钩子，则第一段 `handler` 的 diff 先受检，钩子执行后再由 `SecurityAndAuthorityAspect.check_post_approval_authority` **只针对钩子追加出来的增量**（新对象/新连边，以及既有对象在钩子前后的字段差）复检：两段各自只允许落在**一个**主权平面上，钩子增量自身跨平面即抛 `MIXED_AUTHORITY`，而合并后的整份 diff 不参与跨平面比对（同平面两段式提交是合法的）。
   6. **审批软中断或 OCC 原子提交**：需审批时挂起为 `PENDING_APPROVAL`（对象表零改动）；无需审批（或后续 `approve_action` 批准）时，在写门禁事务内执行 **OCC 乐观并发版本复核（`ConcurrencyConflictError`）** 并原子写入对象、连边与 `COMMITTED` 审计记录。
 * **显式 `Actor` 零信任约束**：面向 HTTP 路由、指挥台 UI、工作空间枚举或外部 Agent 的一切查询与 `FunctionDef` 调用，必须显式传入真实调用方 `Actor`，严禁在外部可达入口依赖缺省 `system` 角色绕过 RLS 或列级脱敏。
+* **读出口脱敏的作用面**：`EditBatch` 可注入读脱敏回调，但只有**只读** `FunctionDef` 批处理会注入；动作批处理永不脱敏，确保暂存 diff 只会写入真实值，绝不会把 `***MASKED***` 落库。
 
 ### 3.3 虚拟现实沙盘推演与时光机（Simulation & Time-Travel）
 * **隔离分叉（`runtime.fork()`）**：复用同一 `OntologySpec`，通过 SQLite backup 将当前工作空间事实与历史克隆至独立 `:memory:` 实例形成平行沙盘（非操作系统页级零拷贝，但与原空间物理隔离）。
@@ -157,11 +158,11 @@ Workspace <workspace_id>（M0 隔离业务运行空间）
 * **因果账本与逆向冲正（`runtime.approve_action` / `runtime.revert_action`，委托 `aspects.ApprovalGateAspect`）**：基于持久化 `ObjectDiff` 与版本号执行带冲突检测的精确逆向回滚，并支持提交后 `evaluate_automations` 条件反射与版本级去重。
 
 ### 3.4 指挥台四展示视角与领域无关图形协议（4-View Command Center）
-* **指挥台目标展示视角**（具体前端标签与路由的兼容迁移进度见 `_state.md`）：
-  1. **Model / 领域模型视角**：查看结构 TBox、Behavior 操作契约及 `/topology` 全景矢量图（对象、关系、动作、函数及可选自动化规则）；
-  2. **Runtime / 执行引擎视角**：查看运行宿体配置（`:memory:` / `.sqlite3`、已挂载的七大 `Aspect` 与适配器）；
-  3. **Workspace / 工作空间视角**：选择工作空间及聚合根入口，查看 ABox 事实，执行干跑、正式提交、`fork()` / MCTS 推演、审批与时光机回滚；
-  4. **Device / 外部设备视角**：分栏检视 **符号主义设备（OpenAPI Schema）** 与 **联结主义设备（A2A Agent Card）**。
+* **指挥台展示视角**（一级标签与路由已按 Model / Workspace 完成迁移，兼容映射见第 6 节）：
+  1. **Model / 领域模型视角**（`Model · 领域模型`）：查看结构 TBox、Behavior 操作契约及 `/topology` 全景矢量图（对象、关系、动作、函数及可选自动化规则）；
+  2. **Runtime / 执行引擎视角**（`Runtime · 算力与治理宿体`）：查看运行宿体配置（`:memory:` / `.sqlite3`、已挂载的七大 `Aspect` 与适配器）；
+  3. **Workspace / 工作空间视角**（`Workspace · 工作空间`）：选择工作空间及聚合根入口，查看 ABox 事实，执行干跑、正式提交、`fork()` / MCTS 推演、审批与时光机回滚；
+  4. **Device / 外部设备视角**（`Device · 外部世界(符号+联结)`）：分栏检视 **符号主义设备（OpenAPI Schema）** 与 **联结主义设备（A2A Agent Card）**。
 * **展示词条自治（`OntologySpec.display`）**：内核 `ui_display.json` 仅保留跨领域通用界面词汇；各 M1 模型必须在自身 `spec.display` 中自带中文词条。TBox/ABox 为逻辑投影，不拆成两个一级标签页。
 
 ---
@@ -193,7 +194,7 @@ Workspace <workspace_id>（M0 隔离业务运行空间）
 
 ## 6. 旧代码拼写的兼容范围
 
-架构正文统一使用 **Model / Workspace**。下列现有代码标识符仅说明向后兼容映射，不代表另一套并列概念，也不据此声称尚未完成的迁移卡片已经上线：
+架构正文统一使用 **Model / Workspace**。下列现有代码标识符仅说明向后兼容映射，不代表另一套并列概念：
 
 | 现有代码拼写 | 架构含义 / 渐进迁移方向 |
 |---|---|

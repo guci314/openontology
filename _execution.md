@@ -259,3 +259,33 @@
      * 更新 `~/.claude/skills/onto-board/SKILL.md`、`docs/ARCHITECTURE.md` 与 `_state.md`：去掉架构师自动换代描述，改为「手动开启空 OpenCode Session → 说『接管 openontology 实例 BD-CC-001 做 X』→ 自动检索 SQLite 数据库定位实例构成上下文 → 驱动任务 X」；
      * 实跑 `/Users/guci/miniforge3/bin/pytest -q` 全量测试 100% 通过（0 failed, 0 skipped 或仅必要 skip），`git diff open_ontology/__init__.py open_ontology/ui_display.json` 为空，并重启 `8765` 端口常驻服务使 `.instances/board_prod.sqlite3` 真实落盘。
 
+
+---
+
+## 当前战役：Model / Workspace 术语迁移（Batch 1 + Batch 2）
+
+### 11. `C-WS-06` —— 集成验收：术语文档、全量回归与看板基线折叠
+* **状态**：🟢 `DONE`（工作树实施完成，等待架构师独立复审与 `Board.goal` / `Board.state` 折叠收单）
+* **已完成结果**：
+  1. **新增 `GLOSSARY.md`**：统一 Model / Workspace / TBox / ABox / Behavior / Runtime / Device 词汇；明确 `workspace_id / object_type / object_id` 三级地址、工作空间身份与业务对象身份的区别、`workspace_root` 只是代码目录、聚合根声明与 `loaded / not_loaded / unavailable` 可用性语义。
+  2. **规范分层保持**：`docs/ARCHITECTURE.md` 维持 M2 平台宪法（移除旧「知识激活」措辞、更新外围模块与四视角标签为实际实现、保留兼容映射）；`docs/TASK_BOARD.md` 维持 M1 `task_board` 与 M0 `BD-CC-001` 契约，两份文档互链。
+  3. **实现状态同步**：`README.md` / `_state.md` / `_execution.md` 反映 Model/Workspace 迁移、工作空间目录、TBox/Behavior 投影、显式接管与双栈 HTTP 的实际水位；不再把已完成能力写成「施工中 / 尚未验收」。
+  4. **双文档 `Board.goal` 装载**：`BoardRunner.sync_board_docs` / `fold_board_state` 与 `examples/command_center_demo.py` 种子在 `docs/ARCHITECTURE.md` 与 `docs/TASK_BOARD.md` 同时存在时按 `ARCHITECTURE + '\n\n---\n\n' + TASK_BOARD` 组合；单文件目录（仅有宪法）逐字节保持旧行为，显式自定义 `goal_relpath` 不追加看板规范。
+  5. **文档一致性门禁**：新增 `tests/test_docs_consistency.py`，锁定术语表存在、M2 宪法不夹带 M0 看板 ID、实现状态文档不再使用旧标签措辞。
+  6. **验收范围**：无损重开、目录身份、显式寻址、重复 ID 歧义、模型/事实隔离、`fork()` 隔离、旧 API 兼容与治理门禁均由既有测试与新增用例覆盖；全部数据库行为使用 `tmp_path`，未触碰生产看板库或服务。
+* **限制**：`Board.goal` / `Board.state` 的生产库同步与已完成卡片折叠须在架构师复审通过后由主控会话执行；本单只交付机制与证据，不代替业务收单。
+
+---
+
+## 当前战役：M2 微内核门禁补强（Post-Batch）
+
+### 12. `C-KERNEL-SEC-01` —— `post_approval` 主权复核、审计/注册表写门禁与外部入口 `Actor` 护栏
+* **状态**：🟢 `DONE`（工作树实施完成，等待架构师独立复审与 `Board.state` 折叠收单）
+* **已完成结果**：
+  1. **两相 `post_approval` 主权复核**：`_run_handler` 先对 `handler` 阶段 diff 执行 `_check_authority`；钩子执行后再由 `SecurityAndAuthorityAspect.check_post_approval_authority(spec, action, pre_diff, full_diff)` 只判定**钩子追加出来的增量**（新增/删除对象、新增/删除连边、既有对象在 `pre_diff.after → full_diff.after` 之间的字段差），增量自身跨 source / ontology 双平面即抛 `InvariantError(code='MIXED_AUTHORITY')`。合并后的整份 diff 不参与跨平面比对，`steel_mdm_demo`（source → 自有）与 `saas_unplug_demo`（自有 → source）两段式单平面动作继续合法；抽出 `_field_side` 复用字段级平面判定，`object_change_side` 语义保持不变。
+  2. **SQLite 写门禁触发器闭环**：`ontology_action_runs` 新增 `BEFORE INSERT / UPDATE` 门禁触发器（保留 `BEFORE DELETE` 无条件禁止），`ontology_registry` 新增 `BEFORE INSERT / UPDATE / DELETE` 门禁触发器；内核与切面自身的合法写入改走 `_write_gate()`（`_sync_registry`、`ApprovalGateAspect.stage_pending_approval`、`RejectionAuditAspect.record_rejection`），裸连接直写全部被 `GOVERNANCE_VIOLATION` 拦截且门禁事后保持关闭。
+  3. **外部边界 RLS / 脱敏闭合**：`workshop` 的 `/api/links` 过滤掉任一端对象缺失（悬空边）或被 RLS 隐藏的连边；`/api/snapshot` 显式传入调用方 `Actor`；`runtime.call_function` 为只读函数批处理注入 `EditBatch(mask_fn=self._apply_masking)`，`ctx.get / ctx.query / ctx.query_linked` 对列白名单外角色脱敏，动作批处理不注入（暂存 diff 绝不写入 `***MASKED***`）；`http_server` 新增可选 `actor`，注入后枚举接口按 RLS + 列脱敏投影，不注入则逐字节保持历史裸行行为。
+  4. **TDD 与验收**：先写 RED（`tests/test_kernel_aspects.py` 新增 10 条、`tests/test_command_center.py` 新增 3 条并实跑确认失败）再实现；定向 `test_kernel_aspects.py` **54 passed**、`test_command_center.py` **25 passed**；全仓 `pytest -q` **584 passed, 2 skipped（103.03s）**。
+  5. **红线守恒**：`runtime.py` **1,388** 行（预算 1,400）、`aspects.py` **789** 行且不 import `runtime.py`、`git diff open_ontology/__init__.py open_ontology/ui_display.json` 为空、`workshop.py` / `workshop_ui.py` 仍无业务领域字段。
+* **背景与架构决策**：`post_approval` 是「另一主权平面的第二次单相提交」，因此不能用合并 diff 比对 `action.affects_source`，否则会误杀既有的两段式演示动作；正确口径是「两段各自单平面、钩子增量自身不得跨平面」。
+* **限制**：既有 `/api/function` 用例改为以 `finance` 角色调用 `portfolio_value`（断言值 4,080,000 不变）——非白名单角色（`ops` / `admin`）读到脱敏后的 0.0，这是本卡刻意关闭的读出口缺口；生产 `Board.goal` / `Board.state` 折叠仍须架构师复审后由主控会话执行。

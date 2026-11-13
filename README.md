@@ -7,9 +7,9 @@
 >
 > **透明 Aspect 目标架构**：工具调用连线上可织入审计、溯源和执行保障；业务无需主动上报事件或携带技术字段。溯源能力保留并分层，不能为了纯洁性全部删除。
 
-**架构入口：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。** [完整目标设计](docs/plans/2026-11-12-transparent-aspect-architecture.md)与[第一阶段计划](docs/plans/2026-11-12-aspect-execution-foundation.md)分别说明约束和实施边界。
+**架构入口：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（M2 平台宪法）。** 看板领域与自举规程见 [docs/TASK_BOARD.md](docs/TASK_BOARD.md)，跨文档词汇见 **[GLOSSARY.md](GLOSSARY.md)**。[完整目标设计](docs/plans/2026-11-12-transparent-aspect-architecture.md)与[第一阶段计划](docs/plans/2026-11-12-aspect-execution-foundation.md)分别说明约束和实施边界。
 
-> **实施状态**：TK-ONTO-020 正在 `feat/aspect-foundation` 隔离分支实现内部能力绑定与透明可选观察。尚未验收、未合并 main，未接入真实工具路径；完整持久化溯源、可靠执行账本及控制型 Aspect 属于后续阶段。现有词汇黑名单测试本轮不修改。
+> **实施状态**：Model / Workspace 术语迁移（C-WS-01 ～ C-WS-06）已在隔离工作树完成并通过全量回归：无损重开、工作空间目录、TBox/Behavior 只读投影、通用 `takeover_workspace`、指挥台 `Model · 领域模型` / `Workspace · 工作空间` 双栈路由均已落地。随后的微内核门禁补强（C-KERNEL-SEC-01）亦在工作树完成：`post_approval` 增量主权复核、审计账本与注册表的写门禁触发器闭环、外部入口显式 `Actor` 与只读函数读出口脱敏。本文档描述的是**工作树实现**；生产服务是否升级以 `_state.md` 的部署说明为准。透明切面（`aspects.py` 七大切面）是现行运行时治理实现；执行织入（`execution/fabric.py`）已落盘并有测试覆盖，但未宣称已接入全部外部工具路径。
 
 ## 快速开始
 
@@ -49,10 +49,12 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 | L5 OSDK | `open_ontology/osdk.py` | LLM Tool JSON Schema 导出 + AIP 确定性评测器 |
 | 设备驱动 · 摄入 | `open_ontology/ingestion.py` | 外部快照解析、多源列拼接（MDO）、时间戳冲突裁决、overlay 重放 |
 | HTTP 传输边界 | `open_ontology/http_server.py` | 标准库 `ThreadingHTTPServer` 暴露 health / snapshot / action-runs / objects；不是业务蓝图 |
-| 指挥台展示 | `open_ontology/workshop.py`、`workshop_ui.py` | 本体蓝图与运行实例双视图、中文展示与拓扑大图 |
+| 工作空间目录 | `open_ontology/workspaces.py` | `WorkspaceDescriptor` + `workspaces.json` 清单、可信模型解析、`takeover_workspace`；不建业务表 |
+| 模型只读投影 | `open_ontology/model_views.py` | `describe_tbox(spec)` / `describe_behavior(spec)`：结构 TBox 与行为契约的纯 JSON 视图 |
+| 指挥台展示 | `open_ontology/workshop.py`、`workshop_ui.py` | `Model · 领域模型` / `Workspace · 工作空间` / Runtime / Device 四视角、中文展示与拓扑大图 |
 | 纯业务任务看板 | `open_ontology/kanban.py` | 看板 / 列语义 / 卡片 / 认领 / 裁决 / 带数字的证据 |
 | 智能体宿主 PSM | `open_ontology/agent_hosts.py` | CodeBuddy CLI 与 OpenCode HTTP 宿主 → 结构化裁决；会话世代轮转与按角色路由 |
-| 内部执行边界（施工中） | `open_ontology/execution/` | 实例级能力绑定与透明可选观察；尚未接入实际治理调用路径 |
+| 内部执行边界 | `open_ontology/execution/` | 实例级能力绑定与透明可选观察；已落盘并有测试，未宣称接入全部外部工具路径 |
 | 纯业务模型 | `examples/odoo_orders_ontology.py` | 双源订单并购场景的 PIM |
 | Odoo PSM | `examples/odoo_dual_erp_demo.py` | 真实 Odoo JSON-RPC 建库、同步、回写桥接 |
 | 钢厂 MDM | `examples/steel_mdm_demo.py` | 散码寄生归并、源头建码护栏、高维批次桶、三视角对账 |
@@ -63,6 +65,16 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 ## 五张纯业务表
 
 `ontology_registry`、`ontology_objects`、`ontology_links`、`ontology_action_runs`、`ontology_overlay`，外加物理门禁表 `ontology_write_gate`。
+
+## Model / Workspace 术语
+
+| 概念 | 说明 |
+|---|---|
+| **Model · 领域模型** | 可复用的 `model_id` 定义包：TBox（类型/字段/关系/约束）+ Behavior（动作/函数/自动化契约） |
+| **Workspace · 工作空间** | 绑定模型引用、ABox 事实、Runtime 与执行历史的隔离运行范围，以 `workspace_id` 标识 |
+| **业务对象地址** | `workspace_id / object_type / object_id`；聚合根对象 ID 不等于工作空间 ID |
+
+`instance_id` / `?instance=` / `register_instance` 等旧拼写与 `workspace_id` / `?workspace=` 双栈兼容，指向同一份底层条目。完整词汇与身份边界见 [GLOSSARY.md](GLOSSARY.md)。
 
 ## 核心机制
 
@@ -203,7 +215,7 @@ GET /camel/stats      -> ingest_count / north_writebacks / south_writebacks
 
 ## 测试覆盖
 
-下列分项为早期核心与集成用例说明，不代表当前全部测试数量。透明 Aspect 施工前，在隔离工作树独立实跑的基线为 **234 passed、零 skip**；新增功能的测试结果必须另行验证。
+下列分项为核心与集成用例说明，不构成当前测试总数。当前工作树全量基线以 `_state.md` 记录的实际运行结果为准（`/Users/guci/miniforge3/bin/python -m pytest -q`）；历史条数不当作现行证据。
 
 - `tests/test_open_ontology.py`：43 条纯内核测试（写门禁、append-only、内容指纹幂等、RBAC、RLS、沙箱 RYOW、diff 逆转、零写入模拟、原子提交、幂等提交、审批挂起、并发冲突、时光机回滚、业务不变量、Tool Schema、AIP 分派、评测器、注册表持久化、字段级主权/overlay/快照防孤儿/主权边界/被拒审计/ObjectSet 代数，以及零 IT 概念污染断言）。
 - `tests/test_odoo_dual_erp.py`：10 条真实双 Odoo 集成测试（跨 ERP 查询与集合代数、RLS、已发货取消被拒、待发货取消真实回写、撤回真实恢复、AI 大额审批真实回写、全量重索引 overlay/OrderNote 存活、空原因拒绝、重复取消拒绝、回写幂等、PIM/PSM 分离）。

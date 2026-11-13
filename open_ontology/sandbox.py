@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .spec import (
     Actor,
@@ -201,10 +201,14 @@ class EditBatch:
         spec: OntologySpec,
         loader: BatchLoader,
         actor: Actor,
+        *,
+        mask_fn: Callable[[ObjectType, Actor], ObjectType] | None = None,
     ) -> None:
         self.spec = spec
         self.loader = loader
         self.actor = actor
+        #: 读出口脱敏回调；只有只读函数批处理会注入，动作批处理永不脱敏。
+        self._mask_fn = mask_fn
 
         # key "ObjectType:id" -> current staged properties
         self._objects: dict[str, dict[str, Any]] = {}
@@ -234,6 +238,12 @@ class EditBatch:
 
     def _model_for(self, cls: type[ObjectType], data: dict[str, Any]) -> ObjectType:
         return cls(**data)
+
+    def _project(self, obj: ObjectType) -> ObjectType:
+        """读出口投影：只有注入了脱敏回调的只读批处理才会脱敏。"""
+        if self._mask_fn is None:
+            return obj
+        return self._mask_fn(obj, self.actor)
 
     def _meta(
         self, object_type: str, data: dict[str, Any] | None
@@ -314,7 +324,7 @@ class EditBatch:
             self.actor.can_access(self._meta(object_type, self._objects[key])[1])
             if key in self._versions:
                 self.read_versions.setdefault(key, self._versions[key])
-            return self._model_for(cls, self._objects[key])
+            return self._project(self._model_for(cls, self._objects[key]))
 
         row = self._load_visible(object_type, object_id)
         if row is None:
@@ -323,7 +333,7 @@ class EditBatch:
         self._original[key] = copy.deepcopy(row.data)
         self._versions[key] = row.version
         self.read_versions[key] = row.version
-        return self._model_for(cls, row.data)
+        return self._project(self._model_for(cls, row.data))
 
     def query(self, cls: type[ObjectType]) -> list[ObjectType]:
         """List every visible instance of ``cls`` (RLS filtered)."""
@@ -333,7 +343,7 @@ class EditBatch:
             if not self.actor.has_access(row.security_tags):
                 continue
             key = self._key(object_type, row.object_id)
-            results[key] = self._model_for(cls, row.data)
+            results[key] = self._project(self._model_for(cls, row.data))
             if key not in self._versions:
                 self._versions[key] = row.version
                 self.read_versions[key] = row.version
@@ -343,7 +353,7 @@ class EditBatch:
             if otype != object_type or self._kinds.get(key) == "delete":
                 continue
             if self.actor.has_access(self._meta(otype, data)[1]):
-                results[key] = self._model_for(cls, data)
+                results[key] = self._project(self._model_for(cls, data))
         return list(results.values())
 
     def query_linked(

@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -839,3 +841,418 @@ def test_idle_aware_callback_flush_marks_failed_items():
     assert aspect.flush() == 0
     assert aspect.pending_queue == []
     assert len(aspect.failed_deliveries) == 2
+
+
+# ---------------------------------------------------------------------------
+# 10. 两相 post_approval 的主权门禁（C-KERNEL-SEC-01）
+# ---------------------------------------------------------------------------
+class PhaseParams(BaseModel):
+    account_id: str
+    name: str
+    note: str
+
+
+def _phase_write_source(ctx, params):
+    obj = ctx.get(Account, params.account_id)
+    ctx.modify(obj, name=params.name)
+
+
+def _phase_write_owned(ctx, params):
+    obj = ctx.get(Account, params.account_id)
+    ctx.modify(obj, internal_note=params.note)
+
+
+def _phase_write_mixed(ctx, params):
+    obj = ctx.get(Account, params.account_id)
+    ctx.modify(obj, name=f"{params.name}!", internal_note=params.note)
+
+
+spec.add_link_type(
+    LinkType(
+        name="account_owned_links",
+        source="Account",
+        target="Account",
+        cardinality="many-to-many",
+        owned=True,
+    )
+)
+
+#: 第一阶段写 source 平面，第二阶段（post_approval）只写自有平面。
+spec.action(
+    "phase_source_then_owned",
+    PhaseParams,
+    allowed_roles=("admin",),
+    affects_source=True,
+    post_approval=_phase_write_owned,
+)(_phase_write_source)
+
+#: 第一阶段写自有平面，第二阶段只写 source 平面。
+spec.action(
+    "phase_owned_then_source",
+    PhaseParams,
+    allowed_roles=("admin",),
+    affects_source=False,
+    post_approval=_phase_write_source,
+)(_phase_write_owned)
+
+#: 第二阶段在同一个对象上同时改 source 字段与自有字段 —— 必须被拒。
+spec.action(
+    "phase_mixed_second_stage",
+    PhaseParams,
+    allowed_roles=("admin",),
+    affects_source=True,
+    post_approval=_phase_write_mixed,
+)(_phase_write_source)
+
+
+def test_post_approval_second_stage_mixing_planes_is_rejected(runtime):
+    """post_approval 里的混写必须被 MIXED_AUTHORITY 拒绝，且对象零改动。"""
+    params = {"account_id": "A1", "name": "李四", "note": "治理备注"}
+
+    sim = runtime.simulate_action("phase_mixed_second_stage", params, ADMIN)
+    assert sim.valid is False
+    assert sim.error_code == "MIXED_AUTHORITY"
+
+    with pytest.raises(InvariantError) as excinfo:
+        runtime.submit_action("RUN-PHASE-MIXED", "phase_mixed_second_stage", params, ADMIN)
+    assert excinfo.value.code == "MIXED_AUTHORITY"
+
+    run = runtime.get_action_run("RUN-PHASE-MIXED")
+    assert run["status"] == AUDIT_STATUS_REJECTED
+    assert run["error_code"] == "MIXED_AUTHORITY"
+    account = runtime.get_object(Account, "A1", ADMIN)
+    assert account.name == "张三"
+    assert account.internal_note == ""
+
+
+def test_post_approval_second_stage_on_one_plane_is_allowed(runtime):
+    """两段各自只碰一个主权平面：这是 steel_mdm / saas_unplug 的合法两相。"""
+    run = runtime.submit_action(
+        "RUN-PHASE-SOURCE-FIRST",
+        "phase_source_then_owned",
+        {"account_id": "A1", "name": "李四", "note": "治理备注"},
+        ADMIN,
+    )
+    assert run["status"] == AUDIT_STATUS_COMMITTED
+    account = runtime.get_object(Account, "A1", ADMIN)
+    assert account.name == "李四"
+    assert account.internal_note == "治理备注"
+
+    run = runtime.submit_action(
+        "RUN-PHASE-OWNED-FIRST",
+        "phase_owned_then_source",
+        {"account_id": "A1", "name": "王五", "note": "另一条备注"},
+        ADMIN,
+    )
+    assert run["status"] == AUDIT_STATUS_COMMITTED
+    account = runtime.get_object(Account, "A1", ADMIN)
+    assert account.name == "王五"
+    assert account.internal_note == "另一条备注"
+
+
+def test_check_post_approval_authority_only_judges_the_incremental_delta():
+    """只有 post_approval 追加出来的增量参与判定，不含第一阶段 diff。"""
+    from open_ontology.sandbox import ObjectChange
+
+    action = spec.get_action("phase_source_then_owned")
+    pre = ObjectDiff(
+        object_changes=[
+            ObjectChange(
+                object_type="Account",
+                object_id="A1",
+                kind="update",
+                before={"name": "a", "internal_note": ""},
+                after={"name": "b", "internal_note": ""},
+            )
+        ]
+    )
+    owned_only = ObjectDiff(
+        object_changes=[
+            ObjectChange(
+                object_type="Account",
+                object_id="A1",
+                kind="update",
+                before={"name": "a", "internal_note": ""},
+                after={"name": "b", "internal_note": "n"},
+            )
+        ]
+    )
+    # 增量只碰自有字段：放行（即便整份 diff 横跨两个平面）。
+    SecurityAndAuthorityAspect.check_post_approval_authority(
+        spec, action, pre, owned_only
+    )
+
+    mixed = ObjectDiff(
+        object_changes=[
+            ObjectChange(
+                object_type="Account",
+                object_id="A1",
+                kind="update",
+                before={"name": "a", "internal_note": ""},
+                after={"name": "c", "internal_note": "n"},
+            )
+        ]
+    )
+    with pytest.raises(InvariantError) as excinfo:
+        SecurityAndAuthorityAspect.check_post_approval_authority(
+            spec, action, pre, mixed
+        )
+    assert excinfo.value.code == "MIXED_AUTHORITY"
+
+
+def test_check_post_approval_authority_detects_new_object_and_link_planes():
+    """post_approval 新建对象 / 新建关系同样要按平面判定。"""
+    from open_ontology.sandbox import LinkChange, ObjectChange
+
+    action = spec.get_action("phase_source_then_owned")
+    pre = ObjectDiff()
+    mixed_links = ObjectDiff(
+        link_changes=[
+            LinkChange(
+                link_type="account_links",
+                source_type="Account",
+                source_id="A1",
+                target_type="Account",
+                target_id="A2",
+                kind="create",
+            ),
+            LinkChange(
+                link_type="account_owned_links",
+                source_type="Account",
+                source_id="A1",
+                target_type="Account",
+                target_id="A2",
+                kind="create",
+            ),
+        ]
+    )
+    with pytest.raises(InvariantError) as excinfo:
+        SecurityAndAuthorityAspect.check_post_approval_authority(
+            spec, action, pre, mixed_links
+        )
+    assert excinfo.value.code == "MIXED_AUTHORITY"
+
+    new_source_object = ObjectDiff(
+        object_changes=[
+            ObjectChange(
+                object_type="Account",
+                object_id="A9",
+                kind="create",
+                after={"name": "新账户", "internal_note": ""},
+            )
+        ]
+    )
+    # 新对象是 source 侧行为，增量只有一个平面：放行。
+    SecurityAndAuthorityAspect.check_post_approval_authority(
+        spec, action, pre, new_source_object
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11. 审计账本 / 注册表的写门禁触发器（C-KERNEL-SEC-01）
+# ---------------------------------------------------------------------------
+def test_action_runs_insert_and_update_are_gate_protected(runtime):
+    conn = runtime.connection
+    with pytest.raises(sqlite3.IntegrityError, match="GOVERNANCE_VIOLATION"):
+        conn.execute(
+            """
+            INSERT INTO ontology_action_runs
+                (run_id, action_type, actor_id, actor_role, params_json,
+                 status, executed_at)
+            VALUES ('RAW-INSERT', 'rename_account', 'x', 'admin', '{}',
+                    'COMMITTED', 'now')
+            """
+        )
+
+    runtime.submit_action(
+        "RUN-GATE", "rename_account", {"account_id": "A1", "name": "李四"}, ADMIN
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="GOVERNANCE_VIOLATION"):
+        conn.execute(
+            "UPDATE ontology_action_runs SET status = 'REJECTED' "
+            "WHERE run_id = 'RUN-GATE'"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM ontology_action_runs WHERE run_id = 'RUN-GATE'")
+
+    assert runtime.get_action_run("RUN-GATE")["status"] == AUDIT_STATUS_COMMITTED
+    assert conn.execute(
+        "SELECT is_open FROM ontology_write_gate WHERE id = 1"
+    ).fetchone()["is_open"] == 0
+
+
+def test_registry_insert_update_delete_are_gate_protected(runtime):
+    conn = runtime.connection
+    with pytest.raises(sqlite3.IntegrityError, match="GOVERNANCE_VIOLATION"):
+        conn.execute(
+            """
+            INSERT INTO ontology_registry (kind, name, spec_json, updated_at)
+            VALUES ('object_type', 'Injected', '{}', 'now')
+            """
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="GOVERNANCE_VIOLATION"):
+        conn.execute("UPDATE ontology_registry SET updated_at = 'now'")
+    with pytest.raises(sqlite3.IntegrityError, match="GOVERNANCE_VIOLATION"):
+        conn.execute("DELETE FROM ontology_registry")
+
+    # 内核自身的登记刷新仍然在 _write_gate() 内正常工作。
+    before = conn.execute(
+        "SELECT COUNT(*) AS n FROM ontology_registry"
+    ).fetchone()["n"]
+    runtime._sync_registry()
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM ontology_registry"
+    ).fetchone()["n"] == before
+    assert conn.execute(
+        "SELECT is_open FROM ontology_write_gate WHERE id = 1"
+    ).fetchone()["is_open"] == 0
+
+
+class GuardedParams(BaseModel):
+    account_id: str
+    name: str
+
+
+@spec.action(
+    "guarded_rename",
+    GuardedParams,
+    allowed_roles=("admin",),
+    approver_roles=("admin",),
+    approval_rule=lambda params, actor: params.name.startswith("VIP"),
+    affects_source=True,
+)
+def guarded_rename(ctx, params):
+    if not params.name:
+        ctx.invalidate("name must not be empty", code="EMPTY_NAME")
+    obj = ctx.get(Account, params.account_id)
+    ctx.modify(obj, name=params.name)
+
+
+def test_pending_approval_and_rejection_writes_pass_through_the_gate(runtime):
+    """挂起审批 / 拒绝入账 / 批准 / 回滚都在写门禁内落账。"""
+    with pytest.raises(InvariantError) as excinfo:
+        runtime.submit_action(
+            "RUN-REJECT", "guarded_rename", {"account_id": "A1", "name": ""}, ADMIN
+        )
+    assert excinfo.value.code == "EMPTY_NAME"
+    rejected = runtime.get_action_run("RUN-REJECT")
+    assert rejected["status"] == AUDIT_STATUS_REJECTED
+    assert rejected["error_code"] == "EMPTY_NAME"
+
+    pending = runtime.submit_action(
+        "RUN-PENDING",
+        "guarded_rename",
+        {"account_id": "A1", "name": "VIP-李四"},
+        ADMIN,
+    )
+    assert pending["status"] == AUDIT_STATUS_PENDING
+    assert runtime.get_object(Account, "A1", ADMIN).name == "张三"
+
+    approved = runtime.approve_action("RUN-PENDING", ADMIN)
+    assert approved["status"] == AUDIT_STATUS_COMMITTED
+    assert runtime.get_object(Account, "A1", ADMIN).name == "VIP-李四"
+
+    reverted = runtime.revert_action("RUN-PENDING", "RUN-PENDING-REV", ADMIN)
+    assert reverted["status"] == AUDIT_STATUS_COMMITTED
+    assert runtime.get_object(Account, "A1", ADMIN).name == "张三"
+    assert runtime.get_action_run("RUN-PENDING")["status"] == AUDIT_STATUS_REVERTED
+    assert runtime.connection.execute(
+        "SELECT is_open FROM ontology_write_gate WHERE id = 1"
+    ).fetchone()["is_open"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 12. 只读函数的读出口脱敏（C-KERNEL-SEC-01）
+# ---------------------------------------------------------------------------
+class PeekParams(BaseModel):
+    account_id: str
+
+
+@spec.function("peek_balance", PeekParams, description="只读：读单个账户余额")
+def peek_balance(ctx, params):
+    account = ctx.get(Account, params.account_id)
+    return {"balance": None if account is None else account.balance}
+
+
+class ScanParams(BaseModel):
+    pass
+
+
+@spec.function("scan_balances", ScanParams, description="只读：扫描全部账户余额")
+def scan_balances(ctx, params):
+    return {"balances": [account.balance for account in ctx.query(Account)]}
+
+
+@spec.function("linked_balances", PeekParams, description="只读：沿关系遍历余额")
+def linked_balances(ctx, params):
+    account = ctx.get(Account, params.account_id)
+    return {
+        "balances": [
+            target.balance
+            for target in ctx.query_linked(account, "account_links", Account)
+        ]
+    }
+
+
+class SetBalanceParams(BaseModel):
+    account_id: str
+    balance: int
+
+
+@spec.action(
+    "set_balance",
+    SetBalanceParams,
+    allowed_roles=("admin", "guest"),
+    affects_source=True,
+)
+def set_balance(ctx, params):
+    obj = ctx.get(Account, params.account_id)
+    ctx.modify(obj, balance=params.balance)
+
+
+def test_call_function_masks_columns_for_unauthorized_actor(runtime):
+    assert runtime.call_function(
+        "peek_balance", {"account_id": "A1"}, NOBODY
+    )["balance"] == -1
+    assert runtime.call_function(
+        "peek_balance", {"account_id": "A1"}, OPS
+    )["balance"] == 1000
+    system = Actor(actor_id="sys", role="system", clearance_tags={"*"})
+    assert runtime.call_function(
+        "peek_balance", {"account_id": "A1"}, system
+    )["balance"] == 1000
+
+
+def test_call_function_query_and_query_linked_mask_columns(runtime):
+    runtime.put_object(Account(account_id="A2", name="李四", balance=500), actor=ADMIN)
+    a1 = runtime.get_object(Account, "A1", ADMIN)
+    a2 = runtime.get_object(Account, "A2", ADMIN)
+    runtime.link_objects(a1, "account_links", a2)
+
+    assert runtime.call_function("scan_balances", {}, NOBODY)["balances"] == [-1, -1]
+    assert sorted(runtime.call_function("scan_balances", {}, OPS)["balances"]) == [
+        500,
+        1000,
+    ]
+    assert runtime.call_function(
+        "linked_balances", {"account_id": "A1"}, NOBODY
+    )["balances"] == [-1]
+    assert runtime.call_function(
+        "linked_balances", {"account_id": "A1"}, OPS
+    )["balances"] == [500]
+
+
+def test_action_batches_never_mask_staged_diffs(runtime):
+    """动作沙盘不脱敏：非白名单角色执行动作也只会写入真实值。"""
+    run = runtime.submit_action(
+        "RUN-MASK-FREE",
+        "set_balance",
+        {"account_id": "A1", "balance": 1234},
+        NOBODY,
+    )
+    assert run["status"] == AUDIT_STATUS_COMMITTED
+    change = run["object_diff"]["object_changes"][0]
+    assert change["after"]["balance"] == 1234
+    assert MASKED_STRING not in json.dumps(run["object_diff"], ensure_ascii=False)
+    stored = runtime.load_object("Account", "A1")
+    assert stored is not None and stored.data["balance"] == 1234

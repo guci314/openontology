@@ -471,7 +471,8 @@ main{position:relative;flex:1;min-height:0}
 __UI_BUNDLE__
 __TOPOLOGY_JS__
 const params = new URLSearchParams(location.search);
-const ontologyId = params.get('ontology') || '';
+// ``model`` 是 ``ontology`` 的等价新别名；服务端已拒绝二者冲突的请求。
+const ontologyId = params.get('ontology') || params.get('model') || '';
 const canvas = document.getElementById('canvas');
 const sceneG = document.getElementById('scene');
 const pctEl = document.getElementById('zoomPct');
@@ -591,7 +592,7 @@ function showError(title, detail) {
 
 async function load() {
   if (!ontologyId) {
-    showError('缺少本体参数', '请从指挥台点击“查看大图”，或使用 ?ontology=<本体编号> 访问。');
+    showError('缺少模型参数', '请从指挥台点击“查看大图”，或使用 ?ontology=<模型编号>（等价 ?model=<模型编号>）访问。');
     return;
   }
   try {

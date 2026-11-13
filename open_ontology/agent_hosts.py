@@ -36,9 +36,19 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from .aspects import IdleAwareCallbackAspect
+from .workspaces import (
+    AmbiguousTakeoverError,
+    IncompleteKernelDatabaseError,
+    WorkspaceCatalog,
+    WorkspaceCatalogError,
+    WorkspaceModelUnavailableError,
+    check_kernel_database,
+    load_catalog,
+    takeover_workspace,
+)
 
 __all__ = [
     "RESULT_SCHEMA",
@@ -50,13 +60,25 @@ __all__ = [
     "OpenCodeHost",
     "RoleRoutedHost",
     "BoardRunner",
+    "AmbiguousTakeoverError",
     "extract_json_object",
     "parse_codebuddy_output",
     "parse_opencode_messages",
     "find_ontology_sqlite_files",
     "locate_object_in_databases",
+    "takeover_board",
     "takeover_board_from_db",
+    "takeover_workspace",
 ]
+
+#: 默认目标规范文档（M2 平台宪法）。
+DEFAULT_GOAL_RELPATH = "docs/ARCHITECTURE.md"
+
+#: 与 M2 宪法并列进入 ``Board.goal`` 的 M1/M0 看板规范。
+TASK_BOARD_DOC_RELPATH = "docs/TASK_BOARD.md"
+
+#: 多份规范文档组合时的分隔线：各自独立成篇，保留文档边界。
+GOAL_DOC_SEPARATOR = "\n\n---\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -975,21 +997,40 @@ class BoardRunner:
         except OSError:
             return ""
 
+    def _read_goal_text(self, workspace: Path, goal_relpath: str) -> str:
+        """读取目标规范全文；默认宪法旁若还有看板规范，则组合装载。
+
+        只有 ``goal_relpath`` 为默认的 ``docs/ARCHITECTURE.md`` 且同目录存在
+        ``docs/TASK_BOARD.md`` 时才追加，显式指定别的目标文档或只有单份文档时
+        保持旧行为不变。
+        """
+        primary = self._read_doc(workspace, goal_relpath)
+        if not primary or goal_relpath != DEFAULT_GOAL_RELPATH:
+            return primary
+        task_board = self._read_doc(workspace, TASK_BOARD_DOC_RELPATH)
+        if not task_board:
+            return primary
+        return f"{primary}{GOAL_DOC_SEPARATOR}{task_board}"
+
     def sync_board_docs(
         self,
         board_key: str,
         *,
-        goal_relpath: str = "docs/ARCHITECTURE.md",
+        goal_relpath: str = DEFAULT_GOAL_RELPATH,
         state_relpath: str = "_state.md",
     ) -> dict[str, str]:
         """把工作目录里的架构宪法与基线真值表**全文**写回 ``Board.goal`` / ``Board.state``。
 
         工作目录缺文件时回退到本体里已有的 ``goal`` / ``state``，
         因此这个方法是幂等的：有文档就覆盖成最新全文，没有就保持原样。
+
+        默认目标文档是 ``docs/ARCHITECTURE.md``；若同目录还有
+        ``docs/TASK_BOARD.md``（M1/M0 看板规范），两者按文档边界组合装载，
+        而不是把后一份静默丢掉。单文件目录保持逐字节旧行为。
         """
         actor = self._actor()
         workspace = Path(self._workspace(board_key))
-        goal_text = self._read_doc(workspace, goal_relpath)
+        goal_text = self._read_goal_text(workspace, goal_relpath)
         state_text = self._read_doc(workspace, state_relpath)
 
         board = self.runtime.get_object("Board", board_key, actor)
@@ -1040,10 +1081,11 @@ class BoardRunner:
         """
         actor = self._actor()
 
-        # 工作目录里的 _state.md / docs/ARCHITECTURE.md 是项目真值，存在且非空时优先采用。
+        # 工作目录里的 _state.md / docs/ARCHITECTURE.md 是项目真值，存在且非空时优先采用；
+        # 若还有 docs/TASK_BOARD.md，目标全文按文档边界组合装载。
         workspace = Path(self._workspace(board_key))
         workspace_state = self._read_doc(workspace, "_state.md")
-        goal_override = self._read_doc(workspace, "docs/ARCHITECTURE.md")
+        goal_override = self._read_goal_text(workspace, DEFAULT_GOAL_RELPATH)
 
         overview = self.runtime.call_function(
             "board_overview", {"board_key": board_key}, actor
@@ -1389,52 +1431,231 @@ def locate_object_in_databases(
     return matches
 
 
-def takeover_board_from_db(
-    target_id: str, search_root: str | Path = "."
+def _board_candidates_in_database(
+    db_path: Path,
+    target_id: str | None,
+    *,
+    workspace_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """在单个库里只读解析 Board / Card 身份，返回去重后的候选。
+
+    ``target_id`` 为空表示「这个工作空间里的看板」：列出全部 ``Board``。
+    同一个 ``board_key`` 只保留一个候选（Board 行优先于引用它的 Card 行）。
+    """
+    path = Path(db_path).resolve()
+    conn = _open_readonly(path)
+    if conn is None:
+        raise IncompleteKernelDatabaseError(
+            f"cannot open workspace database {path} read-only"
+        )
+    try:
+        if target_id is None:
+            rows = conn.execute(
+                """
+                SELECT object_type, object_id, title, properties_json
+                FROM ontology_objects
+                WHERE object_type = 'Board'
+                ORDER BY object_id
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT object_type, object_id, title, properties_json
+                FROM ontology_objects
+                WHERE object_type IN ('Board', 'Card') AND object_id = ?
+                ORDER BY object_type, object_id
+                """,
+                (str(target_id),),
+            ).fetchall()
+        if not rows:
+            return []
+        registered_types = [
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM ontology_registry "
+                "WHERE kind='object_type' ORDER BY name"
+            ).fetchall()
+        ]
+    except sqlite3.Error as exc:
+        raise IncompleteKernelDatabaseError(
+            f"{path} is not a readable kernel database: {exc}"
+        ) from exc
+    finally:
+        conn.close()
+
+    candidates: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        object_type = str(row["object_type"])
+        properties = json.loads(row["properties_json"])
+        if object_type == "Board":
+            board_key = str(row["object_id"])
+        else:
+            board_key = str(properties.get("board_key") or "")
+            if not board_key:
+                raise LookupError(
+                    f"命中对象 {object_type}({row['object_id']}) 未关联任何看板"
+                )
+        if board_key in candidates:
+            continue
+        candidates[board_key] = {
+            "workspace_id": workspace_id,
+            "db_path": str(path),
+            "board_key": board_key,
+            "match": {
+                "db_path": str(path),
+                "object_type": object_type,
+                "object_id": row["object_id"],
+                "title": row["title"],
+                "properties": properties,
+                "registered_types": list(registered_types),
+            },
+        }
+    return list(candidates.values())
+
+
+def _select_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    target_id: str | None,
+    workspace_id: str | None,
 ) -> dict[str, Any]:
-    """在空会话里按对象 ID 接管一块看板。
+    """0 个候选 → ``LookupError``；多个 → 显式候选，绝不取第一个。"""
+    if not candidates:
+        where = (
+            f"工作空间 {workspace_id!r} 中" if workspace_id is not None else "任何库中"
+        )
+        what = f"对象 {target_id!r}" if target_id is not None else "任何看板"
+        raise LookupError(f"在{where}未找到{what}")
+    if len(candidates) > 1:
+        detail = "; ".join(
+            f"{item['db_path']}#{item['board_key']}" for item in candidates
+        )
+        raise AmbiguousTakeoverError(
+            f"多个候选同时匹配 {target_id or '工作空间看板'!r}：{detail}；"
+            "请显式指定 workspace_id 或 Board/Card 对象 ID",
+            candidates,
+        )
+    return candidates[0]
+
+
+def _open_board_takeover(candidate: dict[str, Any]) -> dict[str, Any]:
+    """预检通过后打开 runtime，还原看板上下文（Board.goal/state + 卡片分布）。"""
+    from .kanban import BOARD_MANAGER, render_board_handover, spec as board_spec
+    from .runtime import OntologyRuntime
+
+    db_path = check_kernel_database(candidate["db_path"])
+    runtime = OntologyRuntime(board_spec, db_path=db_path)
+    try:
+        overview = runtime.call_function(
+            "board_overview", {"board_key": candidate["board_key"]}, BOARD_MANAGER
+        )
+        context = render_board_handover(overview)
+    except Exception:
+        runtime.close()
+        raise
+    return {
+        "workspace_id": candidate.get("workspace_id"),
+        "db_path": str(db_path),
+        "board_key": candidate["board_key"],
+        "runtime": runtime,
+        "overview": overview,
+        "context": context,
+        "match": candidate["match"],
+    }
+
+
+def takeover_board(
+    workspace_id: str,
+    target_id: str | None = None,
+    *,
+    models: Mapping[str, Any] | None = None,
+    catalog: WorkspaceCatalog | None = None,
+    search_root: str | Path = ".",
+) -> dict[str, Any]:
+    """在指定工作空间里显式接管一块看板（Board/Card 身份是领域适配）。
+
+    ``target_id`` 可以是 ``Board`` 的 ``board_key``，也可以是某张 ``Card``
+    的 ``card_id``（反查它所属的看板）；为空时要求该工作空间里恰好只有一块
+    看板，否则抛 :class:`AmbiguousTakeoverError` 列出全部候选。
+
+    工作空间必须先在可信清单里注册，模型必须是 ``task_board``；缺失时
+    不会创建任何目录、数据库或数据。
+    """
+    from .kanban import spec as board_spec
+
+    trusted = dict(models) if models is not None else {"task_board": board_spec}
+    resolved = (catalog or load_catalog(search_root)).resolve(workspace_id, trusted)
+    if resolved.model is not board_spec:
+        raise WorkspaceModelUnavailableError(
+            f"workspace {workspace_id!r} is not bound to the task_board model"
+        )
+    if target_id is not None and not str(target_id).strip():
+        raise LookupError("target_id must not be blank when explicitly provided")
+    db_path = check_kernel_database(resolved.db_path)
+
+    candidates = _board_candidates_in_database(
+        db_path,
+        str(target_id).strip() if target_id is not None else None,
+        workspace_id=workspace_id,
+    )
+    candidate = _select_candidate(
+        candidates, target_id=target_id, workspace_id=workspace_id
+    )
+    return _open_board_takeover(candidate)
+
+
+def takeover_board_from_db(
+    target_id: str,
+    search_root: str | Path = ".",
+    *,
+    workspace_id: str | None = None,
+    catalog: WorkspaceCatalog | None = None,
+) -> dict[str, Any]:
+    """在空会话里按对象 ID 接管一块看板（旧入口，行为保持不变）。
 
     支持直接传 ``board_key``（如 ``"BD-CC-001"``），也支持传某张卡片的
     ``card_id`` 反查它所属的看板。命中后以该库打开 ``OntologyRuntime``，
     用 ``board_overview`` + ``render_board_handover`` 组装出完整上下文
     （``Board.goal`` + ``Board.state`` + 卡片分布），直接可驱动后续执行。
 
+    给了 ``workspace_id`` 时改走清单寻址（见 :func:`takeover_board`），只在
+    该工作空间的库里查找。否则扫描 ``search_root``：若多个不同的
+    ``(db_path, board_key)`` 同时命中，抛 :class:`AmbiguousTakeoverError`
+    并列出候选，**绝不**取第一个。
+
     查找不是初始化：查不到就抛 ``LookupError``，**绝不**顺手建目录、建库
     或播种演示数据。需要新建实例库请显式调用演示装配函数。
     """
-    root = Path(search_root)
-    matches = locate_object_in_databases(target_id, root)
-    if not matches:
-        raise LookupError(
-            f"未在任何 OpenOntology 数据库中找到实例或对象 {target_id!r}"
+    if workspace_id is not None:
+        return takeover_board(
+            workspace_id,
+            target_id,
+            catalog=catalog,
+            search_root=search_root,
         )
 
-    # 优先取看板本体自身的命中，其次才按 properties 里的 board_key 反查。
-    match = sorted(
-        matches, key=lambda item: 0 if item["object_type"] == "Board" else 1
-    )[0]
-    if match["object_type"] == "Board":
-        board_key = str(match["object_id"])
-    else:
-        board_key = str(match["properties"].get("board_key") or "")
-    if not board_key:
-        raise LookupError(
-            f"命中对象 {match['object_type']}({match['object_id']}) 未关联任何看板"
+    target = str(target_id or "").strip()
+    if not target:
+        raise LookupError("接管需要对象 ID 或显式 workspace_id")
+
+    ws_by_path: dict[Path, str] = {}
+    try:
+        active_catalog = catalog or load_catalog(search_root)
+        for desc in active_catalog.descriptors():
+            ws_by_path[desc.resolved_db_path(active_catalog.manifest_dir)] = desc.workspace_id
+    except WorkspaceCatalogError:
+        ws_by_path = {}
+
+    candidates: list[dict[str, Any]] = []
+    for db_path in find_ontology_sqlite_files(search_root):
+        resolved_path = db_path.resolve()
+        candidates.extend(
+            _board_candidates_in_database(
+                resolved_path,
+                target,
+                workspace_id=ws_by_path.get(resolved_path),
+            )
         )
-
-    from .kanban import BOARD_MANAGER, render_board_handover, spec as board_spec
-    from .runtime import OntologyRuntime
-
-    runtime = OntologyRuntime(board_spec, db_path=match["db_path"])
-    overview = runtime.call_function(
-        "board_overview", {"board_key": board_key}, BOARD_MANAGER
-    )
-    context = render_board_handover(overview)
-    return {
-        "db_path": match["db_path"],
-        "board_key": board_key,
-        "runtime": runtime,
-        "overview": overview,
-        "context": context,
-        "match": match,
-    }
+    candidate = _select_candidate(candidates, target_id=target, workspace_id=None)
+    return _open_board_takeover(candidate)

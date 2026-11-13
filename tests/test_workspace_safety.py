@@ -420,7 +420,8 @@ def test_reopening_under_uri_reserved_directory_stays_on_target(tmp_path, dirnam
     runtime.close()
 
     entries_after_first = _entries(data_dir)
-    assert entries_after_first == ["board_prod.sqlite3"]
+    # 工作空间身份清单与看板库同目录（C-WS-02）；除此之外不允许旁路文件。
+    assert entries_after_first == ["board_prod.sqlite3", "workspaces.json"]
 
     second = build_default_command_center(data_dir=data_dir)
     reopened = _runtime(second)

@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .runtime import OntologyRuntime
-from .spec import OpenOntologyError
+from .spec import Actor, OpenOntologyError
 
 __all__ = ["OntologyHTTPServer", "HTTPHandle", "start_http_server"]
 
@@ -32,6 +32,10 @@ class _Handler(BaseHTTPRequestHandler):
     @property
     def _lock(self) -> threading.RLock:
         return self.server.runtime_lock  # type: ignore[attr-defined]
+
+    @property
+    def _actor(self) -> Actor | None:
+        return self.server.actor  # type: ignore[attr-defined]
 
     def _send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -68,9 +72,7 @@ class _Handler(BaseHTTPRequestHandler):
                     if not object_type or "/" in object_type:
                         self._error(404, "object type required")
                         return
-                    self._send_json(
-                        200, self._runtime.list_objects(object_type)
-                    )
+                    self._send_json(200, self._objects(object_type))
                     return
 
                 self._error(404, "not found")
@@ -78,6 +80,22 @@ class _Handler(BaseHTTPRequestHandler):
                 self._error(400, str(exc))
             except Exception as exc:  # pragma: no cover - defensive boundary
                 self._error(500, str(exc))
+
+    def _objects(self, object_type: str) -> list[dict[str, Any]]:
+        """枚举投影：未注入 Actor 时保持裸行兼容，注入后走 RLS + 列脱敏。"""
+        actor = self._actor
+        if actor is None:
+            return self._runtime.list_objects(object_type)
+        cls = self._runtime.spec.get_object_type(object_type)
+        visible = {
+            obj.primary_key_value(): obj.to_properties()
+            for obj in self._runtime.query_objects(cls, actor)
+        }
+        return [
+            {**row, "properties": visible[row["object_id"]]}
+            for row in self._runtime.list_objects(object_type)
+            if row["object_id"] in visible
+        ]
 
     # -- POST --------------------------------------------------------------
     def do_POST(self) -> None:  # noqa: N802 - stdlib naming
@@ -137,8 +155,10 @@ class OntologyHTTPServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         runtime: OntologyRuntime,
+        actor: Actor | None = None,
     ) -> None:
         self.runtime = runtime
+        self.actor = actor
         self.runtime_lock = threading.RLock()
         super().__init__(server_address, _Handler)
 
@@ -164,9 +184,15 @@ def start_http_server(
     runtime: OntologyRuntime,
     host: str = "127.0.0.1",
     port: int = 0,
+    *,
+    actor: Actor | None = None,
 ) -> HTTPHandle:
-    """Start a background HTTP server and return its handle."""
-    server = OntologyHTTPServer((host, port), runtime)
+    """Start a background HTTP server and return its handle.
+
+    传入 ``actor`` 时枚举接口按该调用方做 RLS + 列脱敏投影；不传则保持
+    历史裸行行为。
+    """
+    server = OntologyHTTPServer((host, port), runtime, actor)
     actual_host, actual_port = server.server_address[:2]
     thread = threading.Thread(
         target=server.serve_forever,

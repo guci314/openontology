@@ -584,7 +584,7 @@ def test_workshop_index_returns_interactive_html(workshop):
     for marker in (
         "<!doctype html>",
         "统一作战指挥中心",
-        "OBJECT EXPLORER",
+        "ABOX · WORLD STATE",  # C-WS-05：事实面板改标 ABox，原 OBJECT EXPLORER 退役
         "GOVERNED ACTION",
         "ACTION RUNS",
         "当前状态指纹",

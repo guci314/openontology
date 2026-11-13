@@ -204,16 +204,6 @@ class OntologyRuntime:
 
     # -- transactions ------------------------------------------------------
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._conn
-            self._conn.execute("COMMIT")
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
-
-    @contextmanager
     def _write_gate(self) -> Iterator[sqlite3.Connection]:
         """Open the physical gate for exactly one committed transaction.
 
@@ -272,7 +262,7 @@ class OntologyRuntime:
             )
 
         now = _utcnow()
-        with self._transaction() as conn:
+        with self._write_gate() as conn:
             for kind, name, spec in rows:
                 conn.execute(
                     """
@@ -933,10 +923,10 @@ class OntologyRuntime:
     ) -> Any:
         fn = self.spec.get_function(name)
         model = self._build_params(fn.params, params)
-        batch = EditBatch(self.spec, self, actor or Actor(actor_id="system", role="system"))
-        result = fn.handler(batch, model)
+        actor = actor or Actor(actor_id="system", role="system")
+        batch = EditBatch(self.spec, self, actor, mask_fn=self._apply_masking)
         # functions are read-only: any staged diff is intentionally discarded
-        return result
+        return fn.handler(batch, model)
 
     # -- simulate ----------------------------------------------------------
     def _run_handler(
@@ -950,10 +940,15 @@ class OntologyRuntime:
         """跑一次动作 handler 并产出已通过主权校验的 diff。"""
         batch = batch or EditBatch(self.spec, self, actor)
         action.handler(batch, model)
-        self._check_authority(action, batch.build_diff())
+        pre_diff = batch.build_diff()
+        self._check_authority(action, pre_diff)
         if action.post_approval is not None:
             action.post_approval(batch, model)
+            SecurityAndAuthorityAspect.check_post_approval_authority(
+                self.spec, action, pre_diff, batch.build_diff()
+            )
         return batch.build_diff()
+
     def simulate_action(
         self,
         action_name: str,

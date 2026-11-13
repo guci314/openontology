@@ -13,15 +13,18 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from open_ontology import Actor, OntologyRuntime
+from open_ontology import Actor, ObjectType, OntologyRuntime, OntologySpec
 from open_ontology.agent_hosts import (
     RESULT_SCHEMA,
+    AmbiguousTakeoverError,
     BoardRunner,
     CallableHost,
     CodeBuddyHost,
@@ -34,9 +37,20 @@ from open_ontology.agent_hosts import (
     locate_object_in_databases,
     parse_codebuddy_output,
     parse_opencode_messages,
+    takeover_board,
     takeover_board_from_db,
+    takeover_workspace,
 )
 from open_ontology.kanban import Board, Card, spec
+from open_ontology.workspaces import (
+    MANIFEST_FILENAME,
+    IncompleteKernelDatabaseError,
+    WorkspaceCatalog,
+    WorkspaceDatabaseMissingError,
+    WorkspaceDescriptor,
+    WorkspaceModelUnavailableError,
+    WorkspaceNotFoundError,
+)
 
 MANAGER = Actor(
     actor_id="board-manager-01",
@@ -1319,6 +1333,88 @@ def test_board_runner_syncs_full_architecture_and_state_docs(board, tmp_path):
     assert len(folded.state) > len(STATE_DOC_TEXT)
 
 
+TASK_BOARD_DOC_TEXT = "# 任务看板领域模型与自举协同规范\n\n" + "M1 看板契约与 M0 自举规程。\n" * 40
+
+
+def test_board_runner_combines_architecture_and_task_board_docs(board, tmp_path):
+    """M2 宪法与 M1/M0 看板规范同时存在时，组合装载为 Board.goal。
+
+    单文件目录（只有 ``docs/ARCHITECTURE.md``）的旧行为由上一个用例锁定；
+    本用例锁定双文档组合：``ARCHITECTURE + '\\n\\n---\\n\\n' + TASK_BOARD``。
+    """
+    setup_board(board)
+    workspace = tmp_path / "BD-1"
+    (workspace / "docs").mkdir(parents=True)
+    (workspace / "_state.md").write_text(STATE_DOC_TEXT, encoding="utf-8")
+    (workspace / "docs" / "ARCHITECTURE.md").write_text(ARCH_DOC_TEXT, encoding="utf-8")
+    (workspace / "docs" / "TASK_BOARD.md").write_text(
+        TASK_BOARD_DOC_TEXT, encoding="utf-8"
+    )
+
+    runner = BoardRunner(
+        runtime=board,
+        host=CallableHost(lambda task: None),
+        workspace_root=str(tmp_path),
+    )
+    expected_goal = (
+        ARCH_DOC_TEXT.strip() + "\n\n---\n\n" + TASK_BOARD_DOC_TEXT.strip()
+    )
+
+    synced = runner.sync_board_docs("BD-1")
+    assert synced["goal"] == expected_goal
+    assert synced["state"] == STATE_DOC_TEXT.strip()
+
+    stored = board.get_object("Board", "BD-1", MANAGER)
+    assert stored.goal == expected_goal
+    assert stored.state == STATE_DOC_TEXT.strip()
+    assert stored.goal.count("\n\n---\n\n") == 1
+
+    # 折叠只在 state 末尾追加摘要，不拆散组合后的目标全文。
+    act(board, "claim_card", {"card_id": "C-1", "member_id": "M-1"})
+    act(
+        board,
+        "record_outcome",
+        {
+            "card_id": "C-1",
+            "member_id": "M-1",
+            "outcome": "completed",
+            "summary": "内核写完",
+            "evidence": [{"metric": "测试条数", "value": "9 passed"}],
+            "board_state": "新基线：9 passed",
+            "goal_changed": False,
+            "goal_review_reason": "目标未变。",
+        },
+    )
+    folded_state = runner.fold_board_state("BD-1")
+    assert "最新折叠完工：C-1(写内核)" in folded_state
+    folded = board.get_object("Board", "BD-1", MANAGER)
+    assert folded.goal == expected_goal
+    assert folded.state.startswith(STATE_DOC_TEXT.strip())
+
+
+def test_board_runner_custom_goal_relpath_keeps_single_document_semantics(
+    board, tmp_path
+):
+    """显式自定义 goal_relpath 时不偷偷拼入看板规范，保持单文档语义。"""
+    setup_board(board)
+    workspace = tmp_path / "BD-1"
+    (workspace / "docs").mkdir(parents=True)
+    (workspace / "docs" / "ARCHITECTURE.md").write_text(ARCH_DOC_TEXT, encoding="utf-8")
+    (workspace / "docs" / "TASK_BOARD.md").write_text(
+        TASK_BOARD_DOC_TEXT, encoding="utf-8"
+    )
+    custom = workspace / "docs" / "CUSTOM.md"
+    custom.write_text("# 自定义目标\n\n只装这一份。\n", encoding="utf-8")
+
+    runner = BoardRunner(
+        runtime=board,
+        host=CallableHost(lambda task: None),
+        workspace_root=str(tmp_path),
+    )
+    synced = runner.sync_board_docs("BD-1", goal_relpath="docs/CUSTOM.md")
+    assert synced["goal"] == "# 自定义目标\n\n只装这一份。"
+
+
 # ---------------------------------------------------------------------------
 # 16. 完工检查点与 goal 评估契约（宿主 → 本体）
 # ---------------------------------------------------------------------------
@@ -1774,3 +1870,388 @@ def test_runner_explicit_blank_caller_reason_is_rejected(
     stored = board.get_object("Board", "BD-1", MANAGER)
     assert stored.state == ""
     assert stored.goal == ""
+
+
+# ---------------------------------------------------------------------------
+# 17. C-WS-04 显式接管寻址：workspace + Board/Card，重名绝不猜
+# ---------------------------------------------------------------------------
+class Ledger(ObjectType):
+    """本地极小模型：与看板无关，用来证明通用接管不依赖 kanban。"""
+
+    __primary_key__ = "ledger_id"
+    __title__ = "name"
+    __security_tag_fields__ = ("region",)
+    __aggregate_root__ = True
+
+    ledger_id: str
+    name: str
+    region: str
+
+
+def _ledger_spec() -> OntologySpec:
+    spec_ = OntologySpec()
+    spec_.object_type(Ledger)
+    return spec_
+
+
+LEDGER_SPEC = _ledger_spec()
+EAST_READER = Actor(
+    actor_id="reader-east", role="reader", clearance_tags={"region:east"}
+)
+
+
+def _seed_ledger_workspace(
+    tmp_path: Path,
+    *,
+    workspace_id: str = "ledger-ws",
+    model_id: str = "ledger",
+) -> Path:
+    """真实落盘两个聚合根事实 + 一份身份清单。"""
+    data_dir = tmp_path / ".instances"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "ledger.sqlite3"
+    runtime = OntologyRuntime(LEDGER_SPEC, db_path=db_path)
+    try:
+        runtime.put_object(Ledger(ledger_id="L-1", name="东区台账", region="east"))
+        runtime.put_object(Ledger(ledger_id="L-2", name="西区台账", region="west"))
+    finally:
+        runtime.close()
+    catalog = WorkspaceCatalog(data_dir / MANIFEST_FILENAME)
+    catalog.register(
+        WorkspaceDescriptor(
+            workspace_id=workspace_id,
+            model_id=model_id,
+            runtime_id=f"rt-{workspace_id}",
+            db_path="ledger.sqlite3",
+        )
+    )
+    return db_path
+
+
+def _table_names(db_path: Path) -> list[str]:
+    conn = sqlite3.connect(
+        db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0
+    )
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [row[0] for row in rows]
+
+
+def test_takeover_workspace_is_model_agnostic_and_respects_actor_visibility(
+    tmp_path, monkeypatch
+):
+    """通用接管只用可信模型注册表 + 目录清单，绝不 import kanban。
+
+    传入 actor 时聚合根摘要走 ``runtime.query_objects``（RLS / 脱敏照常）；
+    不传 actor 时绝不臆造一个 system 角色。
+    """
+    db_path = _seed_ledger_workspace(tmp_path)
+
+    real_import = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name == "open_ontology.kanban":
+            raise AssertionError(
+                "generic workspace takeover must not import open_ontology.kanban"
+            )
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+
+    taken = takeover_workspace(
+        "ledger-ws",
+        models={"ledger": LEDGER_SPEC},
+        search_root=tmp_path,
+        actor=EAST_READER,
+    )
+    try:
+        assert taken["workspace_id"] == "ledger-ws"
+        assert taken["model_id"] == "ledger"
+        assert taken["runtime_id"] == "rt-ledger-ws"
+        assert taken["db_path"] == str(db_path.resolve())
+        assert taken["model"] is LEDGER_SPEC
+        assert taken["aggregate_root_types"] == ["Ledger"]
+        assert taken["aggregate_roots"] == [
+            {
+                "workspace_id": "ledger-ws",
+                "object_type": "Ledger",
+                "object_id": "L-1",
+                "title": "东区台账",
+            }
+        ]
+    finally:
+        taken["runtime"].close()
+
+    unscoped = takeover_workspace(
+        "ledger-ws", models={"ledger": LEDGER_SPEC}, search_root=tmp_path
+    )
+    try:
+        assert unscoped["aggregate_root_types"] == ["Ledger"]
+        assert unscoped["aggregate_roots"] is None
+    finally:
+        unscoped["runtime"].close()
+
+
+def test_takeover_workspace_missing_workspace_model_and_file_create_nothing(
+    tmp_path,
+):
+    """缺工作空间 / 缺模型 / 缺数据库都明确失败，且不建目录、不建库。"""
+    data_dir = tmp_path / ".instances"
+    data_dir.mkdir()
+    catalog = WorkspaceCatalog(data_dir / MANIFEST_FILENAME)
+    catalog.register(
+        WorkspaceDescriptor(
+            workspace_id="ws-model",
+            model_id="ledger",
+            runtime_id="rt-ws-model",
+            db_path="future.sqlite3",
+        )
+    )
+    before = sorted(path.name for path in data_dir.iterdir())
+
+    with pytest.raises(WorkspaceNotFoundError):
+        takeover_workspace("ghost", models={"ledger": LEDGER_SPEC}, catalog=catalog)
+    with pytest.raises(WorkspaceModelUnavailableError):
+        takeover_workspace(
+            "ws-model", models={"other_model": LEDGER_SPEC}, catalog=catalog
+        )
+    with pytest.raises(WorkspaceDatabaseMissingError):
+        takeover_workspace("ws-model", models={"ledger": LEDGER_SPEC}, catalog=catalog)
+
+    assert sorted(path.name for path in data_dir.iterdir()) == before
+    assert not (data_dir / "future.sqlite3").exists()
+
+    # 默认清单发现同样是纯读的：空目录里不会冒出 .instances / workspaces.json。
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(WorkspaceNotFoundError):
+        takeover_workspace("ghost", models={"ledger": LEDGER_SPEC}, search_root=empty)
+    assert list(empty.iterdir()) == []
+
+
+def test_takeover_workspace_rejects_partial_kernel_database_without_creating_tables(
+    tmp_path,
+):
+    """半成品库在实例化 runtime 之前就被只读预检拒绝，绝不补齐缺失表。"""
+    data_dir = tmp_path / ".instances"
+    data_dir.mkdir()
+    db_path = data_dir / "partial.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE ontology_objects (object_type TEXT, object_id TEXT)")
+    conn.commit()
+    conn.close()
+    before_tables = _table_names(db_path)
+    before_bytes = db_path.read_bytes()
+
+    catalog = WorkspaceCatalog(data_dir / MANIFEST_FILENAME)
+    catalog.register(
+        WorkspaceDescriptor(
+            workspace_id="ws-partial",
+            model_id="ledger",
+            runtime_id="rt-ws-partial",
+            db_path="partial.sqlite3",
+        )
+    )
+
+    with pytest.raises(IncompleteKernelDatabaseError):
+        takeover_workspace(
+            "ws-partial", models={"ledger": LEDGER_SPEC}, catalog=catalog
+        )
+
+    assert _table_names(db_path) == before_tables
+    assert db_path.read_bytes() == before_bytes
+    assert sorted(path.name for path in data_dir.iterdir()) == [
+        "partial.sqlite3",
+        MANIFEST_FILENAME,
+    ]
+
+
+def _seed_board_copy(root: Path) -> Path:
+    root.mkdir(parents=True)
+    db_path = root / "board.sqlite3"
+    _seed_persistent_board(db_path)
+    return db_path
+
+
+def _workspace_catalog(tmp_path: Path, pairs) -> WorkspaceCatalog:
+    catalog = WorkspaceCatalog(tmp_path / ".instances" / MANIFEST_FILENAME)
+    for workspace_id, db_path in pairs:
+        catalog.register(
+            WorkspaceDescriptor(
+                workspace_id=workspace_id,
+                model_id="task_board",
+                runtime_id=f"rt-{workspace_id}",
+                db_path=str(db_path),
+            )
+        )
+    return catalog
+
+
+def test_board_takeover_with_same_board_id_in_two_databases_is_ambiguous(tmp_path):
+    """两个库都有 BD-CC-001：显式列出候选，绝不取第一个。"""
+    db_a = _seed_board_copy(tmp_path / "a")
+    db_b = _seed_board_copy(tmp_path / "b")
+
+    with pytest.raises(AmbiguousTakeoverError) as excinfo:
+        takeover_board_from_db("BD-CC-001", tmp_path)
+
+    candidates = excinfo.value.candidates
+    assert len(candidates) == 2
+    assert {item["db_path"] for item in candidates} == {
+        str(db_a.resolve()),
+        str(db_b.resolve()),
+    }
+    assert {item["board_key"] for item in candidates} == {"BD-CC-001"}
+    assert all(item["workspace_id"] is None for item in candidates)
+    assert "BD-CC-001" in str(excinfo.value)
+
+    # 歧义发现是纯读的：不建库、不建目录。
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["a", "b"]
+
+
+def test_board_takeover_by_workspace_isolates_duplicate_board_ids(tmp_path):
+    """给了 workspace_id 就只在那个工作空间里找；工作空间内可只给工作空间。"""
+    db_a = _seed_board_copy(tmp_path / "a")
+    db_b = _seed_board_copy(tmp_path / "b")
+    catalog = _workspace_catalog(
+        tmp_path, [("ws-a", db_a), ("ws-b", db_b)]
+    )
+
+    taken_a = takeover_board("ws-a", "BD-CC-001", catalog=catalog)
+    try:
+        assert taken_a["workspace_id"] == "ws-a"
+        assert taken_a["db_path"] == str(db_a.resolve())
+        assert taken_a["board_key"] == "BD-CC-001"
+        assert taken_a["overview"]["cards_total"] == 1
+    finally:
+        taken_a["runtime"].close()
+
+    # 只给工作空间：该工作空间里只有一块看板，直接接管它。
+    taken_b = takeover_board("ws-b", catalog=catalog)
+    try:
+        assert taken_b["workspace_id"] == "ws-b"
+        assert taken_b["db_path"] == str(db_b.resolve())
+        assert taken_b["board_key"] == "BD-CC-001"
+    finally:
+        taken_b["runtime"].close()
+
+    # 旧入口保留，并支持显式 workspace_id（清单从 search_root/.instances 发现）。
+    legacy = takeover_board_from_db("BD-CC-001", tmp_path, workspace_id="ws-a")
+    try:
+        assert legacy["workspace_id"] == "ws-a"
+        assert legacy["db_path"] == str(db_a.resolve())
+    finally:
+        legacy["runtime"].close()
+
+
+def test_board_takeover_resolves_card_to_board_inside_workspace(tmp_path):
+    """Board/Card 身份解析落在指定工作空间内：卡片反查所属看板。"""
+    db_a = _seed_board_copy(tmp_path / "a")
+    db_b = _seed_board_copy(tmp_path / "b")
+    catalog = _workspace_catalog(tmp_path, [("ws-a", db_a), ("ws-b", db_b)])
+
+    taken = takeover_board("ws-a", "C-100", catalog=catalog)
+    try:
+        assert taken["workspace_id"] == "ws-a"
+        assert taken["board_key"] == "BD-CC-001"
+        assert taken["match"]["object_type"] == "Card"
+        assert taken["match"]["object_id"] == "C-100"
+        assert taken["overview"]["cards_summary"][0]["card_id"] == "C-100"
+        assert "可认领（ready）：1 张" in taken["context"]
+    finally:
+        taken["runtime"].close()
+
+
+def test_board_takeover_without_target_in_multi_board_workspace_is_ambiguous(
+    tmp_path,
+):
+    """工作空间里有多块看板且没指定 target：显式候选，不猜。"""
+    db_path = _seed_board_copy(tmp_path / "multi")
+    runtime = OntologyRuntime(spec, db_path=db_path)
+    try:
+        act(
+            runtime,
+            "create_board",
+            {
+                "board_key": "BD-CC-002",
+                "title": "第二块看板",
+                "tenant": "acme",
+                "created_by": "board-manager-01",
+                "goal": GOAL_TEXT,
+                "state": STATE_TEXT,
+                "columns": columns(),
+            },
+        )
+    finally:
+        runtime.close()
+
+    catalog = WorkspaceCatalog(tmp_path / "workspaces.json")
+    catalog.register(
+        WorkspaceDescriptor(
+            workspace_id="ws-multi",
+            model_id="task_board",
+            runtime_id="rt-ws-multi",
+            db_path=str(db_path),
+        )
+    )
+
+    with pytest.raises(AmbiguousTakeoverError) as excinfo:
+        takeover_board("ws-multi", catalog=catalog)
+
+    assert {item["board_key"] for item in excinfo.value.candidates} == {
+        "BD-CC-001",
+        "BD-CC-002",
+    }
+    assert all(item["workspace_id"] == "ws-multi" for item in excinfo.value.candidates)
+
+
+def test_board_takeover_missing_workspace_creates_nothing(tmp_path):
+    """工作空间不存在时只抛 LookupError：不建 .instances，也不建库。"""
+    catalog = WorkspaceCatalog(tmp_path / ".instances" / MANIFEST_FILENAME)
+
+    with pytest.raises(WorkspaceNotFoundError):
+        takeover_board("ghost", "BD-CC-001", catalog=catalog)
+
+    assert not (tmp_path / ".instances").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_board_takeover_scan_skips_unrelated_partial_db_and_enriches_catalog_workspace_ids(
+    tmp_path,
+):
+    """扫描目录遇到无关残缺库且无命中时不得中断后续合法看板；有清单时候选应附带 workspace_id。"""
+    broken_dir = tmp_path / "a_broken"
+    broken_dir.mkdir()
+    broken_db = broken_dir / "partial.sqlite3"
+    conn = sqlite3.connect(broken_db)
+    conn.execute(
+        "CREATE TABLE ontology_objects ("
+        "object_type TEXT, object_id TEXT, title TEXT, properties_json TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    valid_db = _seed_board_copy(tmp_path / "b_valid")
+    taken = takeover_board_from_db("BD-CC-001", tmp_path)
+    try:
+        assert taken["db_path"] == str(valid_db.resolve())
+        assert taken["board_key"] == "BD-CC-001"
+    finally:
+        taken["runtime"].close()
+
+    # 再加第二个合法看板库并写入清单：歧义候选应精确带出各自 workspace_id。
+    second_db = _seed_board_copy(tmp_path / "c_valid")
+    _workspace_catalog(tmp_path, [("ws-b", valid_db), ("ws-c", second_db)])
+
+    with pytest.raises(AmbiguousTakeoverError) as excinfo:
+        takeover_board_from_db("BD-CC-001", tmp_path)
+
+    assert {item["workspace_id"] for item in excinfo.value.candidates} == {
+        "ws-b",
+        "ws-c",
+    }
+

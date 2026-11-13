@@ -147,19 +147,9 @@ class SecurityAndAuthorityAspect:
             )
 
     @staticmethod
-    def object_change_side(spec: Any, change: Any) -> str | None:
-        """判断一次对象变更落在 source 侧、ontology 侧，还是混写。"""
-        cls = spec.get_object_type(change.object_type)
-        if cls.is_fully_owned():
-            return "ontology"
-
-        owned_fields = set(cls.owned_field_defaults())
-        if change.kind != "update":
-            # 创建或删除底表行属于 source 侧行为
-            return "source"
-
-        before = change.before or {}
-        after = change.after or {}
+    def _field_side(obj_cls: Any, before: dict[str, Any], after: dict[str, Any]) -> str | None:
+        """同一对象上字段级增量的主权平面：source / ontology / mixed / None。"""
+        owned_fields = set(obj_cls.owned_field_defaults())
         changed = {
             key
             for key in set(before) | set(after)
@@ -174,6 +164,19 @@ class SecurityAndAuthorityAspect:
         if touches_source:
             return "source"
         return None
+
+    @classmethod
+    def object_change_side(cls, spec: Any, change: Any) -> str | None:
+        """判断一次对象变更落在 source 侧、ontology 侧，还是混写。"""
+        cls_ = spec.get_object_type(change.object_type)
+        if cls_.is_fully_owned():
+            return "ontology"
+
+        if change.kind != "update":
+            # 创建或删除底表行属于 source 侧行为
+            return "source"
+
+        return cls._field_side(cls_, change.before or {}, change.after or {})
 
     @classmethod
     def check_authority(cls, spec: Any, action: ActionDef, diff: ObjectDiff) -> None:
@@ -211,6 +214,96 @@ class SecurityAndAuthorityAspect:
                 f"action {action.name!r} is declared affects_source=True but "
                 "its edit plan only writes ontology-owned state",
                 code="MISDECLARED_SOURCE_WRITE",
+            )
+
+    @classmethod
+    def _incremental_side(cls, spec: Any, pre: Any, full: Any) -> str | None:
+        """``post_approval`` 在既有变更之上追加出来的那部分属于哪个平面。"""
+        obj_cls = spec.get_object_type(full.object_type)
+        if obj_cls.is_fully_owned():
+            return "ontology"
+        if full.kind == "delete" or pre.kind == "delete":
+            # 追加阶段删掉 / 重建底表行：结构性变化属于 source 侧行为
+            return "source"
+        return cls._field_side(obj_cls, pre.after or {}, full.after or {})
+
+    @classmethod
+    def check_post_approval_authority(
+        cls,
+        spec: Any,
+        action: ActionDef,
+        pre_diff: ObjectDiff,
+        full_diff: ObjectDiff,
+    ) -> None:
+        """只判定 ``post_approval`` 追加出来的增量是否跨主权平面。
+
+        两相动作的第一阶段（``handler``）与第二阶段（``post_approval``）各自
+        只允许触碰一个主权平面：第二阶段是「另一平面的第二次单相提交」。
+        因此这里既不用合并后的 diff 去比对 ``action.affects_source``，也不把
+        第一阶段已校验过的平面计入判定，只看第二阶段的增量本身。
+        """
+        sides: set[str] = set()
+        pre_objects = {
+            (change.object_type, change.object_id): change
+            for change in pre_diff.object_changes
+        }
+        full_objects = {
+            (change.object_type, change.object_id): change
+            for change in full_diff.object_changes
+        }
+        for key, change in full_objects.items():
+            pre = pre_objects.get(key)
+            side = (
+                cls.object_change_side(spec, change)
+                if pre is None
+                else cls._incremental_side(spec, pre, change)
+            )
+            if side == "mixed":
+                raise InvariantError(
+                    f"action {action.name!r} post_approval touches source and "
+                    f"ontology-owned fields of {change.object_type}:"
+                    f"{change.object_id}",
+                    code="MIXED_AUTHORITY",
+                )
+            if side is not None:
+                sides.add(side)
+        for key, pre in pre_objects.items():
+            if key not in full_objects:
+                side = cls.object_change_side(spec, pre)
+                if side is not None:
+                    sides.add("source" if side == "mixed" else side)
+
+        pre_links = {
+            (
+                change.link_type,
+                change.source_type,
+                change.source_id,
+                change.target_type,
+                change.target_id,
+                change.kind,
+            )
+            for change in pre_diff.link_changes
+        }
+        full_links = {
+            (
+                change.link_type,
+                change.source_type,
+                change.source_id,
+                change.target_type,
+                change.target_id,
+                change.kind,
+            )
+            for change in full_diff.link_changes
+        }
+        for key in full_links ^ pre_links:
+            decl = spec.get_link_type(key[0])
+            sides.add("ontology" if decl.owned else "source")
+
+        if len(sides) > 1:
+            raise InvariantError(
+                f"action {action.name!r} post_approval touches both source and "
+                f"ontology-owned state: {sorted(sides)}",
+                code="MIXED_AUTHORITY",
             )
 
 
@@ -320,7 +413,7 @@ class ApprovalGateAspect:
     ) -> None:
         """把需要审批的动作挂起为 ``PENDING_APPROVAL``，对象保持不动。"""
         dumps = runtime._dumps
-        with runtime._transaction() as conn:
+        with runtime._write_gate() as conn:
             conn.execute(
                 """
                 INSERT INTO ontology_action_runs (
@@ -522,7 +615,7 @@ class RejectionAuditAspect:
         read_versions: dict[str, int],
         error: InvariantError,
     ) -> None:
-        with runtime._transaction() as conn:
+        with runtime._write_gate() as conn:
             insert_action_run(
                 runtime,
                 conn,
