@@ -22,14 +22,16 @@ import pytest
 
 from open_ontology import (
     Actor,
-    CallableHarnessDriver,
-    FactoryOrchestrator,
-    HarnessRateLimitError,
     InvariantError,
     OntologyRuntime,
     start_workshop_server,
 )
 from open_ontology.dev_factory import Deliverable, Engineer, WorkTicket, spec
+from open_ontology.harness_drivers import (
+    CallableHarnessDriver,
+    FactoryOrchestrator,
+    HarnessRateLimitError,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER = Actor(

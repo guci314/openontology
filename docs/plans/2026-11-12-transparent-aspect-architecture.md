@@ -82,6 +82,55 @@ Aspect 的顺序按显式依赖/冲突规则验证。权限不能被缓存绕过
 |---|---|
 | 架构确认与 Git 基线 | 已完成，基线 `2341b04` |
 | 隔离工作树与环境基线 | 已完成，全仓 234 passed |
-| 第一阶段执行边界与观察型 Aspect | 返工 1 终审 PASS：新增专项 25 passed、追加严格 JSON 边界 7 passed、既有专项 71 passed、全仓 259 passed（69.35s、exit 0、零 skip）。既有 51 个源码/测试/视频文件哈希未变，main 干净，8765/8767 仍在运行 |
+| 第一阶段执行边界与观察型 Aspect | 返工 1 终审 PASS：`tests/test_execution_fabric.py` 现有 25 条，main 上本次复跑 25 passed in 0.06s；返工时报告的全仓 259 passed（69.35s、exit 0、零 skip）未在本次评审中复跑 |
 | 架构师独立验证与分支差异审计 | 已完成。严格 JSON 契约经独立复验：元组/整数键/自定义对象/NaN/Infinity/循环均在工具前拒绝且零观察；非 JSON 返回值保留真实结果、仅摘要为空；受保护文件未越界修改 |
-| 是否集成回 main | 待用户决定，不自动合并 |
+| 是否集成回 main | 用户选择集成：`feat/aspect-foundation` 已通过 `3b9ceb1` 合并进 main（非 fast-forward），原主工作目录未被污染 |
+
+**状态说明（2026-11-12 评审）**：表格中的“未合并 main / 待用户决定”已被 `3b9ceb1` 的实现覆盖，故改为事实描述；文档中其余“施工中”的表述按本次评审记为历史记录。评审发现的实现层问题见第 10 节，未在本轮修改源码。
+
+## 10. 评审结论与后续约束（2026-11-12）
+
+评估对象：`open_ontology/execution/fabric.py`（144 行）与 `tests/test_execution_fabric.py`（25 条）相对第 1–8 节的设计约束。
+
+结论：作为“内部受控边界 + 严格值契约”的第一阶段实现，**方向正确、可以保留**；实现与设计文档在若干可检验点上存在**声明强于实现**的差距（10.2 节 A1–A6），其中 A1（实例/身份未绑定）、A2（观察者非干涉不可执行）、A3（边界拒绝零观察）必须在第二阶段接入真实路径前修正，其余按阶段补测。
+
+评审同时验证了这些已成立的部分：工具参数经深拷贝隔离、技术元数据不注入业务参数、真实返回值与真实异常不被观察者替换、可选观察者抛 `Exception` 不影响其余观察者与业务结果、严格 JSON 值契约在工具执行前拒绝且零观察、并发调用各自持有上下文、`invoke` 无隐式重试。这些是真实的阶段性成果，但都不构成“治理审计”“可靠执行”或“溯源”。
+
+### 10.1 设计层面已有的张力
+
+1. **依赖方向自指**。第 1 节要求业务蓝图“不引用 Aspect”，第 3 节又把“能力绑定、Aspect 编排、工具结果归一化”放进同一个织入器。能力契约属于蓝图，绑定属于实例，Aspect 属于执行策略，三者混在一个类里，正是第 1 节自己划出的那条依赖线。建议拆成“契约/绑定解析”“Aspect 链”“结果归一化”三层，让蓝图只依赖契约类型。
+2. **“两个阶段的执行状态与崩溃恢复”依赖一个尚未存在的执行账本**。`schema.sql` 注释写“ontology 唯一可观察输出是业务账本”，而 `ontology_action_runs.params_json` / `object_diff_json` 存的就是业务参数和带 `before/after` 的差异。该表是既定业务事实/审计账本，不承担技术执行账本，执行意图、尝试、回执必须落在独立基础设施存储模块；两者的边界需要在第二阶段以一次表设计评审确认。
+3. **对象版本引用在物理层不可实现**。`ontology_objects` 只有当前行（`version` 整数 + `content_hash`），第 6 节“版本引用能定位历史事实”目前没有存储对象；`ontology_action_runs` 触发器禁止 DELETE 但允许 UPDATE，也不构成不可变历史。
+
+### 10.2 实现与文档声明的差距（按严重度）
+
+| # | 差距 | 证据 | 建议 |
+|---|---|---|---|
+| A1 | 实例与业务能力绑定**没有运行时关联**。`bind` 不带实例，`invoke` 也不校验 `context.instance_id`，所以“实例级能力绑定”目前只是“每个实例各自 new 一个 Fabric”的约定 | `fabric.py:99-113`；不存在 instance→fabric 路由 | 第二阶段由可信运行时持有实例路由，`ExecutionContext` 只允许从路由派生，禁止调用方自填 `instance_id` |
+| A2 | “观察者只能观察”**不可执行**。Python 对象传递，观察者拿不到参数（已由深拷贝 + 摘要隔离），但**能改写返回值本身**；`Observation` 无观察者身份与序号，管理员无法回答“哪个 Aspect 读了哪条记录” | `fabric.py:122-144` 原样返回 `result`；`Observation` 无 `observer_id` / `sequence` | 对必须隔离的返回值提供 `copy_on_observe` 或“仅摘要、字段化返回值”契约；`observation` 增加 `observer_id`、单调 `sequence`、`schema_version` |
+| A3 | 边界本身的失败**零观察**。未知能力、重复绑定、输入非 JSON 都在 `started` 之前抛错，与第 4 节“观察记录覆盖拒绝、失败和成功”冲突 | `test_rejection_happens_before_any_observation` 反面印证 | 明确二分：值契约拒绝 = 调用未成立（沿用零观察），能力不存在 = 治理拒绝（应产生 `rejected` 记录）。两种语义必须分开写进文档与测试 |
+| A4 | 观察者是**同步内联**执行。阻塞观察者直接拖慢业务调用；观察者内重入 `invoke` 会与父调用记录交错；`BaseException`/死循环不受保护 | 实测：两条 50 ms 记录使 invoke ≈ 0.11 s；重入顺序为 `outer.started → inner.started → inner.tool → inner.succeeded → outer.tool → outer.succeeded` | 第二阶段区分“内联记录型”与“有界队列异步型”，并补重入、超时、背压测试 |
+| A5 | 摘要**不提供跨行可比的完整性语义**。`digest` 用 `sort_keys=True`，同一值键序不同得同一摘要，这是有意为之，但 `Observation` 未记录摘要算法/版本，跨版本无法判定可比性 | `test_digest_ignores_key_order` | 记录 `digest_schema`，损坏/缺失单独区分（现在“不可摘要”与“可摘要但为空”都表现为 `None`） |
+| A6 | 真正的**能力契约为空**。`invoke` 是裸下标 `self._tools[capability]`，`KeyError` 无说明；没有输入/输出校验器、副作用声明、`idempotent` / `retryable` 标志，第 4 节“重试服从幂等策略”没有承载位置 | `fabric.py:104-127` | 第二阶段引入能力契约对象（`input/output/side_effect/idempotency_key`），`invoke` 只接受契约已声明且实现已通过契约校验的能力 |
+
+并发与重入的补充证据（本次实测）：同一 Fabric 可从任意线程 `invoke`，`_tools` 字典在 `bind` 之后只读，因此并发正确；但观察者内重入 `invoke` 会使记录序列变为 `outer.started → inner.started → inner.tool → inner.succeeded → outer.tool → outer.succeeded`，`Observation` 缺少 `sequence` / 父调用标识时，下游无法还原因果顺序。
+
+### 10.3 测试断言弱点
+
+1. `test_concurrent_instances_keep_their_own_context` 每个线程**新建** Fabric，因此只证明“并发正确”，不证明“跨实例不串台”；真正的隔离测试应复用同一 Fabric 但刻意传入错误 `instance_id`，当前实现会接受。
+2. `test_business_modules_do_not_import_execution` 是**词汇式**断言，与第 3 节“业务不感知”的目标同构但不同质；依赖方向应由 import 图（`ast` 解析后的集合包含）表达，而非字符串包含。
+3. 缺少对“观察者不得改返回值/不得改异常消息”“观察者触发重入”“`BaseException` 在工具内抛出”“`digest` 版本记录”的用例。
+
+### 10.4 建议补齐的测试（第二阶段入场门槛）
+
+1. 同一 Fabric + 伪造 `instance_id` 的调用被拒绝（对应 A1）。
+2. 观察者并发修改返回值时，调用方拿到的是不可变或拷贝后的结果（对应 A2）。
+3. 能力不存在 → `rejected` 记录；非法 JSON → 无记录、零工具调用（对应 A3）。
+4. 阻塞观察者不改变工具执行次数与耗时量级、重入记录能按 `sequence` 归因（对应 A4）。
+5. 故障注入：观察者成功写最终崩溃，仍不产生“成功”记录；观察者异步失败不改变业务返回值（对应第 5 节强制证据策略）。
+
+### 10.5 文档治理
+
+- 架构入口 `docs/ARCHITECTURE.md` 与本文的“未合并 main / 施工中”表述已与事实不符（`3b9ceb1` 已合并），本次评审已同步修正第 9 节表格，以及架构入口的导语、第 3 节（进程内执行点定义）、第 4 节（`instance_id` 未校验）、第 5 节（历史版本物理约束）、第 7 节（状态映射与复跑结果）、第 8 节（阶段状态）。
+- `SPEC_ASPECT_FOUNDATION.md` 第 2 节写明“仅可更新整体架构文档的执行状态，不改已确认的设计与计划”，而 `d03cd12` 同时修改了本文与 `docs/plans/2026-11-12-aspect-execution-foundation.md`（计划文件另加了“数据库回滚不等于撤销外部付款”的段落）。若这些属于架构师在开工前的授权修改，应在规格中补一句“以上文件由架构师在本工单内一并维护”，否则规格与实际 diff 不一致，后续验收无法依据规格判定越界。
+

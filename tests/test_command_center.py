@@ -58,8 +58,9 @@ def _post(base: str, path: str, body: dict) -> dict:
 
 
 @pytest.fixture()
-def center():
-    registry = build_default_command_center()
+def center(tmp_path):
+    # 每个测试一个独立数据目录：绝不触碰仓库的 .instances 生产库。
+    registry = build_default_command_center(data_dir=tmp_path)
     handle = start_command_center_server(registry, port=0, title="测试指挥中心")
     yield registry, handle
     handle.stop()
@@ -77,14 +78,16 @@ def test_default_command_center_blueprints_and_instances(center):
     registry, _ = center
     assert list(registry.ontologies) == [
         "software_factory",
+        "task_board",
         "coldchain_mcts",
         "crm_saas_unplug",
         "steel_mdm",
         "osv2_governance",
     ]
-    assert len(registry.instances) == 7
+    assert len(registry.instances) == 8
     assert set(registry.instances) == {
         "factory-prod",
+        "board-prod",
         "coldchain-wave3",
         "coldchain-wave3-lab",
         "saas-parasitic",
@@ -105,8 +108,8 @@ def test_default_command_center_blueprints_and_instances(center):
 def test_catalog_payload(base):
     data = _get(base, "/api/catalog")
     assert data["ok"] is True
-    assert len(data["ontologies"]) == 5
-    assert len(data["instances"]) == 7
+    assert len(data["ontologies"]) == 6
+    assert len(data["instances"]) == 8
 
     by_id = {row["instance_id"]: row for row in data["instances"]}
     assert by_id["coldchain-wave3"]["db_uri"] == "sqlite://coldchain_wave3.sqlite3"
@@ -502,3 +505,103 @@ def test_factory_instance_board_data(base):
     deliverables = _get(base, "/api/objects/Deliverable", instance="factory-prod")
     assert deliverables["count"] == 1
     assert deliverables["objects"][0]["verified"] is True
+
+
+# ---------------------------------------------------------------------------
+# 15. 四元模型：Runtime 宿体 + 符号 / 联结双设备注册表
+# ---------------------------------------------------------------------------
+def test_catalog_carries_runtimes_and_dual_device_registry(base):
+    data = _get(base, "/api/catalog")
+
+    runtimes = {row["runtime_id"]: row for row in data["runtimes"]}
+    assert len(data["runtimes"]) == 9  # 1 台预注册内存宿体 + 8 个实例各一台
+    assert "rt-default-memory" in runtimes
+
+    default = runtimes["rt-default-memory"]
+    assert default["storage_kind"] == "memory"
+    assert default["db_uri"] == "sqlite://:memory:"
+    assert len(default["aspects"]) == 7
+    assert "IdleAwareCallbackAspect" in default["aspects"]
+
+    coldchain = runtimes["rt-coldchain-wave3"]
+    assert coldchain["storage_kind"] == "sqlite"
+    assert coldchain["db_uri"] == "sqlite://coldchain_wave3.sqlite3"
+    assert coldchain["instance_ids"] == ["coldchain-wave3"]
+    assert coldchain["ontology_ids"] == ["coldchain_mcts"]
+    assert set(coldchain["adapters"]) == {"WMS 仓储", "TMS 运输", "温控遥测"}
+
+    symbolic = data["devices"]["symbolic"]
+    connectionist = data["devices"]["connectionist"]
+    assert symbolic and connectionist
+
+    wms = next(d for d in symbolic if d["name"] == "WMS 仓储")
+    assert wms["kind"] == "WMS"
+    assert wms["status"] == "CONNECTED"
+    assert wms["openapi_schema"]["openapi"] == "3.1.0"
+    assert {"info", "paths"} <= set(wms["openapi_schema"])
+    assert all(d["kind"] not in {"Harness", "Agent", "LLM"} for d in symbolic)
+
+    card = next(d for d in connectionist if d["name"] == "CodeBuddy CLI")
+    assert card["kind"] == "Harness"
+    assert card["agent_card"]["protocol"] == "A2A/1.0"
+    assert card["agent_card"]["roles"] == ["developer", "tester", "architect"]
+    assert card["agent_card"]["output_contract"] == "HostResult + Numeric Evidence"
+    assert all(d["kind"] in {"Harness", "Agent", "LLM"} for d in connectionist)
+
+
+def test_runtime_and_device_endpoints(base):
+    runtimes = _get(base, "/api/runtimes")
+    assert runtimes["ok"] is True
+    ids = {row["runtime_id"] for row in runtimes["runtimes"]}
+    assert {"rt-default-memory", "rt-factory-prod", "rt-coldchain-wave3"} <= ids
+
+    devices = _get(base, "/api/devices")
+    assert devices["ok"] is True
+    assert {"WMS", "SaaS"} <= {d["kind"] for d in devices["symbolic"]}
+    assert {d["kind"] for d in devices["connectionist"]} == {"Harness"}
+    assert all("openapi_schema" in d for d in devices["symbolic"])
+    assert all("agent_card" in d for d in devices["connectionist"])
+
+
+def test_instance_summary_exposes_runtime_binding(base):
+    data = _get(base, "/api/catalog")
+    by_id = {row["instance_id"]: row for row in data["instances"]}
+
+    coldchain = by_id["coldchain-wave3"]
+    assert coldchain["runtime_id"] == "rt-coldchain-wave3"
+    assert coldchain["formula"] == (
+        "coldchain-wave3 = coldchain_mcts + rt-coldchain-wave3"
+    )
+
+    meta = _get(base, "/api/meta", instance="factory-prod")
+    assert meta["instance"]["runtime_id"] == "rt-factory-prod"
+    assert meta["instance"]["formula"] == (
+        "factory-prod = software_factory + rt-factory-prod"
+    )
+
+
+def test_fork_registers_its_own_runtime_and_devices(base):
+    forked = _post(
+        base,
+        "/api/instance/fork",
+        {"instance": "coldchain-wave3", "label": "设备沙盘分支"},
+    )
+    new_id = forked["instance"]["instance_id"]
+    assert forked["instance"]["runtime_id"] == f"rt-{new_id}"
+    assert forked["instance"]["formula"] == (
+        f"{new_id} = coldchain_mcts + rt-{new_id}"
+    )
+
+    runtimes = {row["runtime_id"]: row for row in _get(base, "/api/runtimes")["runtimes"]}
+    forked_runtime = runtimes[f"rt-{new_id}"]
+    assert forked_runtime["storage_kind"] == "memory"  # 克隆沙盘纯内存
+    assert forked_runtime["instance_ids"] == [new_id]
+    assert len(forked_runtime["aspects"]) == 7
+
+    devices = _get(base, "/api/devices")
+    cloned = [
+        d for d in devices["symbolic"] if d["device_id"].startswith(f"dev-{new_id}-")
+    ]
+    assert len(cloned) == 3
+    assert all(d["openapi_schema"]["openapi"] == "3.1.0" for d in cloned)
+

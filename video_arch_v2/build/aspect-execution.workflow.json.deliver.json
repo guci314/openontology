@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "workflow",
+  "input": "/Users/guci/work/open-ontology/video_arch_v2/specs/aspect-execution.workflow.json",
+  "output": "/Users/guci/work/open-ontology/video_arch_v2/html/aspect-execution.html",
+  "specification": {
+    "sha256": "24e4e569ff6c617985e3894fa8aa2a7ed334187ec302026bc2cb0a10b6059f92",
+    "bytes": 5013
+  },
+  "artifact": {
+    "sha256": "db526890c09eb37a404367140927674e28f05fa549def79e3f2a0d9623c1d2e2",
+    "bytes": 816145
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

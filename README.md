@@ -43,11 +43,15 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 | L2 存储 | `open_ontology/schema.sql` | 5 张纯业务核心表 + 物理写门禁触发器 |
 | L3 声明 | `open_ontology/spec.py` | `Actor` / `ObjectType` / `LinkType` / 函数 / 动作注册器 |
 | L4 沙箱 | `open_ontology/sandbox.py` | `EditBatch` 内存推演、`ObjectDiff` 与逆向补丁 |
-| L4 运行时 | `open_ontology/runtime.py` | put_object / load_snapshot / simulate / submit / approve / revert |
+| L4 运行时（微内核） | `open_ontology/runtime.py` | put_object / simulate / submit 的治理管线；摄入与切面均为薄委托，≤1400 行 |
+| L4 系统调用切面 | `open_ontology/aspects.py` | 脱敏 / 角色与主权门禁 / 幂等与乐观锁 / 审批与回滚 / 被拒入账 / 自动化反射 |
 | L4 查询 | `open_ontology/query.py` | `ObjectSet` 集合代数、`pivot`、`aggregate` |
 | L5 OSDK | `open_ontology/osdk.py` | LLM Tool JSON Schema 导出 + AIP 确定性评测器 |
+| 设备驱动 · 摄入 | `open_ontology/ingestion.py` | 外部快照解析、多源列拼接（MDO）、时间戳冲突裁决、overlay 重放 |
 | HTTP 传输边界 | `open_ontology/http_server.py` | 标准库 `ThreadingHTTPServer` 暴露 health / snapshot / action-runs / objects；不是业务蓝图 |
 | 指挥台展示 | `open_ontology/workshop.py`、`workshop_ui.py` | 本体蓝图与运行实例双视图、中文展示与拓扑大图 |
+| 纯业务任务看板 | `open_ontology/kanban.py` | 看板 / 列语义 / 卡片 / 认领 / 裁决 / 带数字的证据 |
+| 智能体宿主 PSM | `open_ontology/agent_hosts.py` | CodeBuddy CLI 与 OpenCode HTTP 宿主 → 结构化裁决；会话世代轮转与按角色路由 |
 | 内部执行边界（施工中） | `open_ontology/execution/` | 实例级能力绑定与透明可选观察；尚未接入实际治理调用路径 |
 | 纯业务模型 | `examples/odoo_orders_ontology.py` | 双源订单并购场景的 PIM |
 | Odoo PSM | `examples/odoo_dual_erp_demo.py` | 真实 Odoo JSON-RPC 建库、同步、回写桥接 |
@@ -80,6 +84,21 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 13. **时光机回滚**：`revert_action` 取原 diff 的 `inverted()` 逆向恢复对象与关系，原运行标记 `REVERTED`，新增一条回滚运行记录。
 14. **ObjectSet 集合代数**：`search_set` / `union` / `intersect` / `subtract` / `pivot`（正向或反向群跳转，两端 RLS 过滤）/ `aggregate`（分组计数与求和）/ `filter_aggregation`。
 15. **OSDK / AIP**：`export_llm_tools` 导出 OpenAI Tool JSON Schema；`AIPAgentExecutor` 统一分派 `query_objects / call_function / simulate_action / submit_action / pivot / aggregate`；`run_eval_suite` 对模型决策产生的 `ObjectDiff` 做确定性评分。
+
+## 任务看板本体与智能体宿主
+
+`open_ontology/kanban.py` 是一块**纯业务**的任务看板：看板 `Board`、看板列 `BoardColumn`、成员 `Member`、卡片 `Card`、评论 `CardComment`、执行尝试 `CardRun`。
+
+- **列语义进本体**：看板拓扑不是散落在代码里的 if/else，而是 `BoardColumn` 上的数据——用途（待办 / 可认领 / 执行中 / 完成 / 阻塞 / 分诊）、能否认领、是否终态、是否父卡门控、允许哪些角色、允许移动到哪几列、重试几次。建板时一次性校验（用途齐备、不得歧义、完成列必须终态、可认领列必须声明角色、允许移动的目标列必须存在）。
+- **证据必须带数字**：`record_outcome` 收单时强制要求证据，且每条证据的值必须含数字，否则抛 `EVIDENCE_WITHOUT_NUMBER`。「数字必须来自实际运行」从此是机器护栏，不是提示词里的口头要求。
+- **前置未齐不许认领**；父卡完成后子卡自动从初始列提升到可认领列；反复失败进阻塞列，超过上限升级分诊。
+
+`open_ontology/agent_hosts.py` 把卡片交给真实执行宿主，并把结果**结构化**地交回本体：
+
+- `CodeBuddyHost`：命令行宿主，用 `--output-format json --json-schema` 让宿主直接产出 schema 校验过的裁决对象（`structured_output`），裁决不再从散文里 grep。
+- `OpenCodeHost`：本机 OpenCode 服务宿主，走真实端点 `/api/session` → `/move` → `/prompt` → `/wait` → `/message`；也支持 `opencode api` 命令行传输。
+- 两者都返回同一种 `HostResult`，本体不认宿主、不认凭据。
+- `BoardRunner` 是胶水：认领（本体动作）→ 执行（宿主）→ 登记结果（本体动作）。**最后一道关口仍是本体护栏**：宿主给出没有数字的证据，本体拒绝收单，这一轮不会被记成成功。
 
 ## HTTP 传输边界
 

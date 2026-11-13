@@ -1,12 +1,13 @@
 """OpenOntology 统一作战指挥中心 · 全量预装启动器。
 
-一条命令拉起 5 个核心 Ontology 蓝图与 7 个真实数据实例：
+一条命令拉起 6 个核心 Ontology 蓝图与 8 个真实数据实例：
 
 1. ``software_factory``  AI 软件研发工厂（研发成员 / 工单 / 交付物）
-2. ``coldchain_mcts``    冷链医药调度与 MCTS 多步规划
-3. ``crm_saas_unplug``   多云 SaaS 寄居吸纳与脱壳
-4. ``steel_mdm``         钢厂主数据破局与三视角对账
-5. ``osv2_governance``   钢卷资产与 OSv2 四大原语治理
+2. ``task_board``        多智能体任务看板（看板 / 列语义 / 卡片 / 认领 / 裁决）
+3. ``coldchain_mcts``    冷链医药调度与 MCTS 多步规划
+4. ``crm_saas_unplug``   多云 SaaS 寄居吸纳与脱壳
+5. ``steel_mdm``         钢厂主数据破局与三视角对账
+6. ``osv2_governance``   钢卷资产与 OSv2 四大原语治理
 
 运行::
 
@@ -16,7 +17,9 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Sequence
 
 from pydantic import BaseModel
@@ -32,6 +35,8 @@ from open_ontology import (
 )
 from open_ontology.dev_factory import FACTORY_MANAGER
 from open_ontology.dev_factory import spec as factory_spec
+from open_ontology.kanban import BOARD_MANAGER
+from open_ontology.kanban import spec as board_spec
 from open_ontology.workshop import (
     CommandCenterRegistry,
     ConnectorMount,
@@ -57,11 +62,119 @@ from .steel_mdm_demo import (
 )
 
 __all__ = [
+    "BOARD_KEY",
+    "IncompatibleBoardDatabaseError",
     "build_default_command_center",
     "build_osv2_governance",
     "coldchain_mcts_config",
     "main",
 ]
+
+#: 仓库根目录：``docs/ARCHITECTURE.md`` 与 ``_state.md`` 都从这里取全文。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: 默认持久化目录：实例库真实落盘，供新会话按对象 ID 直接从 SQLite 接管。
+_DEFAULT_DATA_DIR = _REPO_ROOT / ".instances"
+
+#: 演示看板的对象 ID。
+BOARD_KEY = "BD-CC-001"
+
+#: 可复用的看板库必须**完整**具备当前内核 schema；缺任何一张即视为半成品 /
+#: 外来库。``OntologyRuntime`` 打开时会 ``executescript(schema.sql)``，漏检的表
+#: 会被静默补建——预检必须把六张核心表一次性收齐，才能保证「要么无损打开，
+#: 要么明确失败且不改动文件」。
+_REQUIRED_TABLES = frozenset(
+    {
+        "ontology_registry",
+        "ontology_objects",
+        "ontology_links",
+        "ontology_overlay",
+        "ontology_action_runs",
+        "ontology_write_gate",
+    }
+)
+
+
+class IncompatibleBoardDatabaseError(ValueError):
+    """指定路径上的数据库不是可安全复用的看板库（外来 / 半成品 / 损坏）。"""
+
+
+def _reset_sqlite_file(db_path: str | Path) -> None:
+    """删除**这一个**库文件及其 WAL/SHM 旁文件。
+
+    只作用于调用方明确指定的数据库，绝不删除所在目录——同目录的其它文件
+    （配置、备份、其它实例库）必须原样保留。
+    """
+    base = Path(db_path)
+    for suffix in ("", "-wal", "-shm"):
+        stale = Path(f"{base}{suffix}")
+        if stale.exists():
+            stale.unlink()
+
+
+def _board_database_state(db_path: str | Path, board_key: str) -> str:
+    """判断指定库该「新建」还是「直接打开」。
+
+    返回 ``"missing"``（文件不存在，可以首次播种）或 ``"ready"``（已含目标
+    看板，必须非破坏性打开）。其它情况——外来 SQLite 文件、缺内核表的半成品、
+    损坏文件、没有该看板的库——一律抛 :class:`IncompatibleBoardDatabaseError`：
+    宁可明确失败，也不覆盖别人的库或在上面静默补种演示数据。
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return "missing"
+    # 必须用标准 ``file://`` URI 编码：路径里的 ``#`` / ``?`` / ``%`` / 空格
+    # 直接拼进 ``file:{path}?mode=ro`` 会被当作片段 / 查询串 / 百分号转义，
+    # 从而打开（甚至创建）一个被截断的旁路文件，违背只读预检的无副作用约定。
+    readonly_uri = path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(readonly_uri, uri=True, timeout=2.0)
+    except sqlite3.Error as exc:
+        raise IncompatibleBoardDatabaseError(
+            f"{path} 无法以只读方式打开，拒绝覆盖：{exc}"
+        ) from exc
+    try:
+        conn.row_factory = sqlite3.Row
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if not _REQUIRED_TABLES <= tables:
+            missing = ", ".join(sorted(_REQUIRED_TABLES - tables))
+            raise IncompatibleBoardDatabaseError(
+                f"{path} 不是可复用的看板库：缺少内核表 {missing}。"
+                f"需要重建请显式传 reset=True（只重建该库，不删目录）。"
+            )
+        found = conn.execute(
+            "SELECT 1 FROM ontology_objects "
+            "WHERE object_type = 'Board' AND object_id = ? LIMIT 1",
+            (board_key,),
+        ).fetchone()
+        if found is None:
+            raise IncompatibleBoardDatabaseError(
+                f"{path} 中没有看板 {board_key}（半成品或别的实例库）。"
+                f"需要重建请显式传 reset=True（只重建该库，不删目录）。"
+            )
+    except sqlite3.Error as exc:
+        raise IncompatibleBoardDatabaseError(
+            f"{path} 不是可复用的看板库：无法读取内核表（{exc}）。"
+            f"需要重建请显式传 reset=True（只重建该库，不删目录）。"
+        ) from exc
+    finally:
+        conn.close()
+    return "ready"
+
+
+
+def _read_repo_doc(relpath: str) -> str:
+    """读取仓库根目录下的文档全文；缺失时返回空串，由调用方回退。"""
+    path = _REPO_ROOT / relpath
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
 
 
 def _submit(runtime: OntologyRuntime, run_id: str, action: str, params: dict[str, Any], actor: Actor) -> dict[str, Any]:
@@ -208,7 +321,276 @@ def _build_software_factory(registry: CommandCenterRegistry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. coldchain_mcts
+# 2. task_board
+# ---------------------------------------------------------------------------
+BOARD_COLUMNS: list[dict[str, Any]] = [
+    {
+        "key": "todo",
+        "label": "待办",
+        "purpose": "initial",
+        "order": 0,
+        "allowed_targets": ("ready", "blocked"),
+    },
+    {
+        "key": "ready",
+        "label": "可认领",
+        "purpose": "ready",
+        "order": 1,
+        "claimable": True,
+        "allowed_roles": ("developer", "tester"),
+        "allowed_targets": ("todo", "blocked"),
+        "on_claimed": "doing",
+    },
+    {
+        "key": "doing",
+        "label": "执行中",
+        "purpose": "working",
+        "order": 2,
+        "on_completed": "done",
+        "on_failed": "ready",
+        "on_exhausted": "blocked",
+        "on_blocked": "blocked",
+        "on_abandoned": "triage",
+    },
+    {
+        "key": "done",
+        "label": "已完成",
+        "purpose": "completion",
+        "order": 3,
+        "is_terminal": True,
+        "allowed_targets": ("todo",),
+    },
+    {
+        "key": "blocked",
+        "label": "阻塞",
+        "purpose": "failure",
+        "order": 4,
+        "max_retries": 2,
+        "allowed_targets": ("ready", "todo"),
+        "on_unblocked": "ready",
+    },
+    {
+        "key": "triage",
+        "label": "分诊",
+        "purpose": "escalation",
+        "order": 5,
+        "allowed_targets": ("todo",),
+    },
+]
+
+
+def _seed_task_board(runtime: OntologyRuntime) -> None:
+    """首次创建时播种演示数据：成员、四张卡、认领、裁决、阻塞。
+
+    只在「库不存在」或「显式 reset」时调用；重复打开时一行都不执行，
+    因此种子动作（``CC-BOARD-001``…）绝不会重放。
+    """
+    run = 0
+
+    # Board.goal / Board.state 直接承载完整文档全文，指挥台与换代供血都不再缺上下文。
+    arch_doc = _read_repo_doc("docs/ARCHITECTURE.md")
+    state_doc = _read_repo_doc("_state.md")
+
+    def act(action: str, params: dict[str, Any]) -> None:
+        nonlocal run
+        run += 1
+        _submit(runtime, f"CC-BOARD-{run:03d}", action, params, BOARD_MANAGER)
+
+    act(
+        "create_board",
+        {
+            "board_key": BOARD_KEY,
+            "title": "多智能体任务看板",
+            "tenant": "acme",
+            "created_by": "board-manager-01",
+            "description": "列拓扑即数据：谁可认领、哪列是终态、失败回哪列，全部声明式。",
+            "goal": arch_doc
+            or "四层元模型（M2→M1→PSM→M0）单向依赖，M2 内核零业务污染，脑手分离协同。",
+            # 建板只是初始化；首个完工才会把完整基线真值表折叠进 Board.state。
+            "state": "初始化：看板已建立，等待首个完工基线。",
+            "columns": BOARD_COLUMNS,
+        },
+    )
+
+    for member_id, name, role in (
+        ("M-DEV-01", "开发者 A", "developer"),
+        ("M-DEV-02", "开发者 B", "developer"),
+        ("M-TEST-01", "测试员", "tester"),
+        ("M-REV-01", "评审员", "reviewer"),
+    ):
+        act(
+            "add_member",
+            {"member_id": member_id, "name": name, "role": role},
+        )
+
+    act(
+        "create_card",
+        {
+            "card_id": "C-100",
+            "board_key": "BD-CC-001",
+            "title": "任务看板本体与宿主胶水",
+            "body": "本体负责认领与裁决，宿主负责执行。",
+        },
+    )
+    act(
+        "create_card",
+        {
+            "card_id": "C-101",
+            "board_key": "BD-CC-001",
+            "title": "PSM 接入 CodeBuddy 与 OpenCode",
+            "body": "两个宿主统一返回结构化裁决。",
+        },
+    )
+    act(
+        "create_card",
+        {
+            "card_id": "C-102",
+            "board_key": "BD-CC-001",
+            "title": "编排器认领超时回收",
+            "body": "技术执行账本的后续能力。",
+        },
+    )
+    act(
+        "create_card",
+        {
+            "card_id": "C-103",
+            "board_key": "BD-CC-001",
+            "title": "看板流程视图",
+            "body": "把列拓扑画成可读的流程图。",
+            "waits_for": ("C-101",),
+        },
+    )
+
+    # 一张已完成的卡（带数字证据）、一张在途卡、一张阻塞卡。
+    act("claim_card", {"card_id": "C-100", "member_id": "M-DEV-01"})
+    act(
+        "record_outcome",
+        {
+            "card_id": "C-100",
+            "member_id": "M-DEV-01",
+            "outcome": "completed",
+            "summary": "本体与宿主胶水跑通",
+            "evidence": [
+                {"metric": "测试条数", "value": "17 passed", "detail": ""},
+                {"metric": "新模块行数", "value": "627 行", "detail": ""},
+            ],
+            "artifact_uri": "open_ontology/agent_hosts.py",
+            # 首个完工把完整基线真值表作为新 state 折叠进来（与初始化占位不同）。
+            "board_state": state_doc
+            or "微内核 1,400 行 + 7 大系统调用切面，全仓测试 430+ passed，看板流自举就绪。",
+            "goal_changed": False,
+            "goal_review_reason": "完工未改变架构目标，沿用建板时的架构宪法。",
+        },
+    )
+    act("claim_card", {"card_id": "C-102", "member_id": "M-DEV-02"})
+    act(
+        "add_comment",
+        {
+            "card_id": "C-102",
+            "author": "M-REV-01",
+            "body": "先做技术执行账本，别塞进业务对象。",
+        },
+    )
+    act("claim_card", {"card_id": "C-101", "member_id": "M-DEV-01"})
+    act(
+        "record_outcome",
+        {
+            "card_id": "C-101",
+            "member_id": "M-DEV-01",
+            "outcome": "blocked",
+            "summary": "等宿主额度窗口",
+            "block_kind": "awaiting_review",
+            "evidence": [
+                {"metric": "已接通宿主数", "value": "2 个", "detail": ""}
+            ],
+        },
+    )
+
+
+def _build_task_board(
+    registry: CommandCenterRegistry,
+    db_path: str | Path = ":memory:",
+    *,
+    reset: bool = False,
+) -> None:
+    """任务看板：列拓扑是数据，卡片靠带数字的证据收单。
+
+    ``db_path`` 传文件路径时实例真实落盘（默认演示走
+    ``.instances/board_prod.sqlite3``），空会话可直接从 SQLite 接管。
+
+    打开语义：
+
+    * 文件不存在 → 首次创建并播种演示数据；
+    * 文件已存在且含目标看板 → **非破坏性打开**，对象值 / 版本 / 关系 /
+      动作账本原样保留，不重放任何种子动作；
+    * ``reset=True`` → 只删除并重建这一个库文件（及其 WAL/SHM），
+      绝不删除所在目录；
+    * 外来 / 半成品 / 损坏库 → 抛 :class:`IncompatibleBoardDatabaseError`。
+    """
+    if str(db_path) == ":memory:":
+        runtime = OntologyRuntime(board_spec)
+        _seed_task_board(runtime)
+    else:
+        path = Path(db_path)
+        if reset:
+            _reset_sqlite_file(path)
+        if _board_database_state(path, BOARD_KEY) == "missing":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            runtime = OntologyRuntime(board_spec, db_path=path)
+            _seed_task_board(runtime)
+        else:
+            runtime = OntologyRuntime(board_spec, db_path=path)
+
+    registry.register_ontology(
+        "task_board",
+        "多智能体任务看板",
+        board_spec,
+        category="Agentic Delivery",
+        description="看板列拓扑即数据；认领、裁决、带数字的证据全部由本体判定。",
+    )
+    registry.register_instance(
+        "board-prod",
+        "task_board",
+        "任务看板 · 生产实例",
+        runtime,
+        db_uri="sqlite://board_prod.sqlite3",
+        description="4 名成员 + 4 张卡（已完成 / 执行中 / 阻塞 / 待前置）。",
+        connectors=[
+            ConnectorMount("CodeBuddy CLI", "Harness", "cli://codebuddy", "CONNECTED"),
+            ConnectorMount("OpenCode HTTP", "Harness", "http://localhost:4096", "CONNECTED"),
+        ],
+        default_actor=BOARD_MANAGER,
+        sample_action_params={
+            "claim_card": {"card_id": "C-102", "member_id": "M-DEV-02"},
+            "record_outcome": {
+                "card_id": "C-102",
+                "member_id": "M-DEV-02",
+                "outcome": "completed",
+                "summary": "回收策略已实现",
+                "evidence": [
+                    {"metric": "测试条数", "value": "9 passed", "detail": ""}
+                ],
+                "board_state": "新基线：回收策略已实现，9 passed。",
+                "goal_changed": False,
+                "goal_review_reason": "回收策略不改变架构目标。",
+            },
+            "create_card": {
+                "card_id": "C-104",
+                "board_key": "BD-CC-001",
+                "title": "新卡片",
+                "body": "在这里写任务说明。",
+            },
+            "add_comment": {
+                "card_id": "C-102",
+                "author": "M-REV-01",
+                "body": "补一条评论。",
+            },
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. coldchain_mcts
 # ---------------------------------------------------------------------------
 def coldchain_mcts_config(
     runtime: OntologyRuntime, actor: Actor = DISPATCHER
@@ -659,10 +1041,27 @@ def build_osv2_governance(registry: CommandCenterRegistry | None = None) -> Comm
 # ---------------------------------------------------------------------------
 # 组装
 # ---------------------------------------------------------------------------
-def build_default_command_center() -> CommandCenterRegistry:
-    """预装 5 个 Ontology 蓝图 + 7 个真实数据 Instance。"""
+def build_default_command_center(
+    data_dir: str | Path | None = None,
+    *,
+    reset: bool = False,
+) -> CommandCenterRegistry:
+    """预装 5 个 Ontology 蓝图 + 7 个真实数据 Instance。
+
+    默认把 ``board-prod`` 的 SQLite 库落在 ``.instances/board_prod.sqlite3``，
+    使实例真实落盘可被新会话按对象 ID 检索。
+
+    **默认非破坏性**：库已存在且含看板时直接打开，原有对象值、版本、关系与
+    动作账本全部保留。只有显式 ``reset=True`` 才会重建**指定的这一个库**
+    （绝不删除目录）；传入不兼容 / 半成品 / 损坏的库会明确报错。
+    """
     registry = CommandCenterRegistry()
     _build_software_factory(registry)
+    _build_task_board(
+        registry,
+        db_path=Path(data_dir or _DEFAULT_DATA_DIR) / "board_prod.sqlite3",
+        reset=reset,
+    )
     _build_coldchain(registry)
     _build_saas(registry)
     _build_steel(registry)
@@ -681,9 +1080,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--title", default="OpenOntology 统一作战指挥中心")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="显式重建演示看板库（只重建 .instances/board_prod.sqlite3，不删目录）",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    registry = build_default_command_center()
+    registry = build_default_command_center(reset=args.reset)
     handle = start_command_center_server(
         registry, args.host, args.port, title=args.title
     )

@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Action 治理生命周期：有治理的自由",
+    "output": "action-lifecycle.html",
+    "viewBox": [1080, 780],
+    "locale": "zh-CN",
+    "animation": "trace",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "sandbox", "label": "零写入沙箱", "focus": ["request", "snapshot", "simulate", "batch"], "note": "先在内存里推演" },
+      { "id": "governance", "label": "治理闸门", "focus": ["checks", "authority", "submit", "rejected"], "note": "违规与被拒都留痕" },
+      { "id": "reversible", "label": "可逆执行", "focus": ["submit", "committed", "pending", "revert", "approver"], "note": "审批、提交与时光机" }
+    ]
+  },
+  "stages": [
+    { "label": "请求" },
+    { "label": "沙箱" },
+    { "label": "治理" },
+    { "label": "提交" },
+    { "label": "回执" }
+  ],
+  "nodes": [
+    { "id": "request", "type": "frontend", "label": "Agent 请求", "sublabel": "query / action", "stage": 0, "row": 0, "tag": "只读或动作" },
+    { "id": "snapshot", "type": "backend", "label": "外部快照", "sublabel": "load_snapshot", "stage": 0, "row": 2, "tag": "底表重刷" },
+    { "id": "simulate", "type": "messagebus", "label": "simulate", "sublabel": "零写入", "stage": 1, "row": 0, "tag": "valid / diff" },
+    { "id": "batch", "type": "messagebus", "label": "EditBatch", "sublabel": "RYOW", "stage": 1, "row": 2, "tag": "内存暂存" },
+    { "id": "checks", "type": "backend", "label": "前置校验", "sublabel": "业务不变量", "stage": 2, "row": 0, "tag": "硬护栏" },
+    { "id": "authority", "type": "backend", "label": "主权边界", "sublabel": "affects_source", "stage": 2, "row": 2, "tag": "MIXED_AUTHORITY" },
+    { "id": "submit", "type": "database", "label": "submit", "sublabel": "原子 + 乐观锁", "stage": 3, "row": 1, "tag": "read_versions" },
+    { "id": "rejected", "type": "messagebus", "label": "REJECTED", "sublabel": "被拒企图", "stage": 3, "row": 4, "tag": "仍入账" },
+    { "id": "committed", "type": "backend", "label": "COMMITTED", "sublabel": "写回适配", "stage": 4, "row": 0, "tag": "幂等 run_id" },
+    { "id": "pending", "type": "database", "label": "PENDING", "sublabel": "审批挂起", "stage": 4, "row": 2, "tag": "role gate" },
+    { "id": "revert", "type": "security", "label": "revert", "sublabel": "diff.inverted", "stage": 4, "row": 4, "tag": "时光机" },
+    { "id": "approver", "type": "external", "label": "审批人", "sublabel": "approve_action", "stage": 4, "row": 3, "yOffset": -18, "tag": "人在环" }
+  ],
+  "flows": [
+    { "from": "request", "to": "simulate", "label": "提出动作", "classification": "入口", "variant": "emphasis", "route": "straight" },
+    { "from": "snapshot", "to": "batch", "label": "重索引", "classification": "overlay 存活", "variant": "emphasis", "route": "straight" },
+    { "from": "simulate", "to": "checks", "label": "产出 diff", "classification": "ObjectDiff", "variant": "emphasis", "route": "straight" },
+    { "from": "batch", "to": "authority", "label": "编辑计划", "classification": "可读性", "variant": "emphasis", "route": "straight" },
+    { "from": "checks", "to": "submit", "label": "校验通过", "classification": "单事务", "variant": "emphasis", "route": "vertical-channel" },
+    { "from": "authority", "to": "submit", "label": "主权合法", "classification": "强校验", "variant": "default", "route": "vertical-channel" },
+    { "from": "submit", "to": "committed", "label": "落业务账", "classification": "append-only", "variant": "emphasis", "route": "vertical-channel" },
+    { "from": "submit", "to": "pending", "label": "命中规则", "classification": "对象不动", "variant": "default", "route": "vertical-channel" },
+    { "from": "checks", "to": "rejected", "label": "违规拦截", "classification": "REJECTED 审计", "variant": "security", "fromSide": "top", "toSide": "top", "via": [[530, 80], [20, 80], [20, 550], [745, 550]], "labelAt": [300, 550] },
+    { "from": "authority", "to": "rejected", "label": "越界", "classification": "未遂留痕", "variant": "security", "route": "bottom-channel", "labelDy": 30 },
+    { "from": "rejected", "to": "approver", "label": "人工复核", "classification": "受控", "variant": "security", "route": "vertical-channel" },
+    { "from": "rejected", "to": "revert", "label": "可逆回滚", "classification": "逆向补丁", "variant": "dashed", "route": "straight", "labelDy": 30 }
+  ],
+  "cards": [
+    { "dot": "amber", "title": "零副作用推演", "items": ["Action 永不直接写库", "EditBatch 内存暂存 + 读己所写", "simulate 返回 diff，库里行数不变"] },
+    { "dot": "emerald", "title": "有治理的自由", "items": ["业务不变量 / 主权边界硬校验", "超阈值挂起等待人工审批", "被拒的未遂企图也必须入账"] },
+    { "dot": "rose", "title": "可逆", "items": ["diff.inverted() 一键回滚", "content_hash 幂等不增版本", "RLS 行级安全贯穿查询"] }
+  ]
+}

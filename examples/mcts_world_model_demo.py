@@ -274,6 +274,12 @@ def dispatch_order(ctx: Any, params: DispatchParams) -> None:
     ctx.link(truck, SERVES, order)
 
 
+#: 本蓝图自己的展示词条：展示层动态合并，内核字典保持 0 行改动。
+spec.display = {
+    "roles": {"ops_manager": "运营主管"},
+}
+
+
 # ---------------------------------------------------------------------------
 # Actors + seed
 # ---------------------------------------------------------------------------

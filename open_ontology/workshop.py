@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 from .runtime import OntologyRuntime
 from .spec import Actor, ObjectType, OntologySpec, OpenOntologyError
 from .workshop_ui import (
+    DISPLAY,
     DISPLAY_JS,
     TOPOLOGY_JS,
     TOPOLOGY_PAGE_HTML,
@@ -41,12 +42,32 @@ __all__ = [
     "ConnectorMount",
     "OntologyCatalogEntry",
     "OntologyInstanceEntry",
+    "SymbolicDeviceEntry",
+    "AgentCardDeviceEntry",
+    "RuntimeCatalogEntry",
     "CommandCenterRegistry",
     "WorkshopServer",
     "WorkshopHandle",
     "start_workshop_server",
     "start_command_center_server",
 ]
+
+#: 默认纯内存宿体编号：无外设的沙盘实例共用同一台宿主。
+DEFAULT_RUNTIME_ID = "rt-default-memory"
+
+#: 七大全景治理切面（Core 之上的系统调用切面层）。
+RUNTIME_ASPECTS = [
+    "ColumnMaskingAspect",
+    "SecurityAndAuthorityAspect",
+    "IdempotencyAndOCCAspect",
+    "ApprovalGateAspect",
+    "RejectionAuditAspect",
+    "AutomationReflexAspect",
+    "IdleAwareCallbackAspect",
+]
+
+#: 联结主义设备（智能体）的连接器类型；其余一律视为符号主义设备。
+CONNECTIONIST_KINDS = ("Harness", "Agent", "LLM")
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +104,95 @@ class OntologyInstanceEntry:
     description: str
     db_uri: str
     runtime: OntologyRuntime
+    runtime_id: str = DEFAULT_RUNTIME_ID
     connectors: list[ConnectorMount] = field(default_factory=list)
     default_actor: Actor | None = None
     sample_action_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     mcts_config: dict[str, Any] | None = None
     unplug_fn: Callable[[], dict[str, Any]] | None = None
+
+
+@dataclass
+class SymbolicDeviceEntry:
+    """符号主义设备：带 OpenAPI 契约的外部系统（仓储 / 物流 / 软件服务 / 数据库…）。"""
+
+    device_id: str
+    name: str
+    kind: str
+    endpoint: str
+    status: str = "CONNECTED"
+    openapi_schema: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AgentCardDeviceEntry:
+    """联结主义设备：以 A2A Agent Card 描述能力的智能体 / 宿主驱动。"""
+
+    device_id: str
+    name: str
+    kind: str
+    endpoint: str
+    status: str = "CONNECTED"
+    agent_card: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RuntimeCatalogEntry:
+    """Runtime 宿体：Core 微内核 + Aspect 切面 + DeviceAdapter 设备驱动。"""
+
+    runtime_id: str
+    label: str
+    storage_kind: str
+    db_uri: str
+    description: str = ""
+    aspects: list[str] = field(default_factory=list)
+    adapters: list[str] = field(default_factory=list)
+    ontology_ids: list[str] = field(default_factory=list)
+    instance_ids: list[str] = field(default_factory=list)
+
+
+def _openapi_schema(connector: ConnectorMount) -> dict[str, Any]:
+    """把符号主义连接器投影成最小可用的 OpenAPI 3.1 契约。"""
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": f"{connector.name} ({connector.kind})",
+            "version": "1.0.0",
+            "description": f"{connector.kind} 外部系统的符号主义设备契约。",
+        },
+        "servers": [{"url": connector.endpoint}],
+        "paths": {
+            "/": {
+                "get": {
+                    "operationId": "describe",
+                    "summary": f"读取 {connector.name} 的可用资源",
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+
+
+def _agent_card(connector: ConnectorMount) -> dict[str, Any]:
+    """把联结主义连接器投影成 A2A Agent Card。"""
+    return {
+        "protocol": "A2A/1.0",
+        "name": connector.name,
+        "endpoint": connector.endpoint,
+        "roles": ["developer", "tester", "architect"],
+        "skills": [
+            {"id": "execute", "name": "任务执行", "input": "text", "output": "text"},
+            {"id": "report", "name": "结果回报", "input": "text", "output": "text"},
+        ],
+        "output_contract": "HostResult + Numeric Evidence",
+    }
+
+
+class _WorkspaceUnavailableError(Exception):
+    """工作空间不可读的内部信号。
+
+    消息只能是可信固定字面量：公开清单绝不回传可能夹带明文取值的异常消息。
+    """
 
 
 class CommandCenterRegistry:
@@ -96,7 +201,155 @@ class CommandCenterRegistry:
     def __init__(self) -> None:
         self.ontologies: dict[str, OntologyCatalogEntry] = {}
         self.instances: dict[str, OntologyInstanceEntry] = {}
+        self.runtimes: dict[str, RuntimeCatalogEntry] = {}
+        self.symbolic_devices: dict[str, SymbolicDeviceEntry] = {}
+        self.connectionist_devices: dict[str, AgentCardDeviceEntry] = {}
         self.lock = threading.RLock()
+        self.register_runtime(
+            DEFAULT_RUNTIME_ID,
+            "默认内存 Runtime (In-Memory)",
+            "memory",
+            "sqlite://:memory:",
+            description="纯内存零外设沙盘宿体，用于验证 Ontology 与虚拟现实推演",
+            aspects=list(RUNTIME_ASPECTS),
+        )
+
+    # -- runtime / device registration -------------------------------------
+    def register_runtime(
+        self,
+        runtime_id: str,
+        label: str,
+        storage_kind: str,
+        db_uri: str,
+        description: str = "",
+        aspects: Iterable[str] | None = None,
+        adapters: Iterable[str] | None = None,
+        ontology_ids: Iterable[str] | None = None,
+        instance_ids: Iterable[str] | None = None,
+    ) -> RuntimeCatalogEntry:
+        entry = RuntimeCatalogEntry(
+            runtime_id=runtime_id,
+            label=label,
+            storage_kind=storage_kind,
+            db_uri=db_uri,
+            description=description,
+            aspects=list(aspects or []),
+            adapters=list(adapters or []),
+            ontology_ids=list(ontology_ids or []),
+            instance_ids=list(instance_ids or []),
+        )
+        self.runtimes[runtime_id] = entry
+        return entry
+
+    def register_symbolic_device(
+        self,
+        device_id: str,
+        name: str,
+        kind: str,
+        endpoint: str,
+        status: str = "CONNECTED",
+        openapi_schema: dict[str, Any] | None = None,
+    ) -> SymbolicDeviceEntry:
+        entry = SymbolicDeviceEntry(
+            device_id=device_id,
+            name=name,
+            kind=kind,
+            endpoint=endpoint,
+            status=status,
+            openapi_schema=dict(openapi_schema or {}),
+        )
+        self.symbolic_devices[device_id] = entry
+        return entry
+
+    def register_agent_device(
+        self,
+        device_id: str,
+        name: str,
+        kind: str,
+        endpoint: str,
+        status: str = "CONNECTED",
+        agent_card: dict[str, Any] | None = None,
+    ) -> AgentCardDeviceEntry:
+        entry = AgentCardDeviceEntry(
+            device_id=device_id,
+            name=name,
+            kind=kind,
+            endpoint=endpoint,
+            status=status,
+            agent_card=dict(agent_card or {}),
+        )
+        self.connectionist_devices[device_id] = entry
+        return entry
+
+    def _sync_devices(self, entry: OntologyInstanceEntry) -> None:
+        """按连接器类型把外部世界拆成符号主义 / 联结主义两类设备。"""
+        symbolic = 0
+        agentic = 0
+        for connector in entry.connectors:
+            if connector.kind in CONNECTIONIST_KINDS:
+                agentic += 1
+                self.register_agent_device(
+                    f"dev-{entry.instance_id}-a2a-{agentic}",
+                    connector.name,
+                    connector.kind,
+                    connector.endpoint,
+                    connector.status,
+                    _agent_card(connector),
+                )
+            else:
+                symbolic += 1
+                self.register_symbolic_device(
+                    f"dev-{entry.instance_id}-openapi-{symbolic}",
+                    connector.name,
+                    connector.kind,
+                    connector.endpoint,
+                    connector.status,
+                    _openapi_schema(connector),
+                )
+        entry.runtime_id = self._bind_runtime(entry, has_peripherals=symbolic > 0)
+
+    def _bind_runtime(
+        self, entry: OntologyInstanceEntry, has_peripherals: bool
+    ) -> str:
+        """为实例绑定宿体：零外设内存沙盘共用默认宿体，其余各建一台。"""
+        storage_kind = "memory" if ":memory:" in entry.db_uri else "sqlite"
+        adapters = [connector.name for connector in entry.connectors]
+        if storage_kind == "memory" and not has_peripherals:
+            runtime_id = DEFAULT_RUNTIME_ID
+            runtime = self.runtimes.get(runtime_id)
+            if runtime is None:
+                runtime = self.register_runtime(
+                    runtime_id,
+                    "默认内存 Runtime (In-Memory)",
+                    "memory",
+                    "sqlite://:memory:",
+                    description="纯内存零外设沙盘宿体，用于验证 Ontology 与虚拟现实推演",
+                    aspects=list(RUNTIME_ASPECTS),
+                )
+        else:
+            runtime_id = f"rt-{entry.instance_id}"
+            runtime = self.register_runtime(
+                runtime_id,
+                f"{entry.label} · {storage_kind.upper()} Runtime",
+                storage_kind,
+                entry.db_uri,
+                description=(
+                    f"承载 {entry.label} 的治理宿体：{storage_kind} 存储 + "
+                    f"{len(RUNTIME_ASPECTS)} 大切面 + {len(adapters)} 个设备驱动。"
+                ),
+                aspects=list(RUNTIME_ASPECTS),
+                adapters=adapters,
+                ontology_ids=[entry.ontology_id],
+                instance_ids=[entry.instance_id],
+            )
+        if entry.ontology_id not in runtime.ontology_ids:
+            runtime.ontology_ids.append(entry.ontology_id)
+        if entry.instance_id not in runtime.instance_ids:
+            runtime.instance_ids.append(entry.instance_id)
+        for name in adapters:
+            if name not in runtime.adapters:
+                runtime.adapters.append(name)
+        return runtime_id
 
     # -- registration ------------------------------------------------------
     def register_ontology(
@@ -147,6 +400,7 @@ class CommandCenterRegistry:
             unplug_fn=unplug_fn,
         )
         self.instances[instance_id] = entry
+        self._sync_devices(entry)
         return entry
 
     # -- lookup ------------------------------------------------------------
@@ -174,6 +428,77 @@ class CommandCenterRegistry:
 
     def default_instance_id(self) -> str:
         return self.default_instance().instance_id
+
+    # -- workspace listing (read-only) -------------------------------------
+    def list_workspaces(self, actor: Actor) -> list[dict[str, Any]]:
+        """列出全部工作空间及其聚合根对象（纯读投影）。
+
+        每个工作空间一行，身份为 ``workspace_id``（当前与 ``instance_id``
+        同源），根对象的完整身份是 工作空间 + 类型 + 对象 ID。根对象一律经
+        ``runtime.query_objects`` 读取，因此行级安全与列级脱敏照常生效。
+        不可读工作空间的 ``aggregate_roots`` 是 ``None``（不是空列表），并给出
+        只含可信固定字面量或异常类型的 ``reason``。
+        """
+        with self.lock:
+            entries = [self.instances[key] for key in sorted(self.instances)]
+        return [self._workspace_record(entry, actor) for entry in entries]
+
+    def _workspace_record(
+        self, entry: OntologyInstanceEntry, actor: Actor
+    ) -> dict[str, Any]:
+        runtime = entry.runtime
+        spec = (
+            runtime.spec
+            if runtime is not None
+            else self.ontologies[entry.ontology_id].spec
+        )
+        root_types = sorted(
+            name for name, cls in spec.object_types.items() if cls.is_aggregate_root()
+        )
+        roots: list[dict[str, Any]] | None = []
+        availability = "available"
+        reason: str | None = None
+        try:
+            if runtime is None:
+                raise _WorkspaceUnavailableError("runtime_missing")
+            if not runtime.is_open:
+                raise _WorkspaceUnavailableError("runtime_closed")
+            for type_name in root_types:
+                cls = spec.object_types[type_name]
+                for obj in runtime.query_objects(cls, actor):
+                    roots.append(
+                        {
+                            "workspace_id": entry.instance_id,
+                            "object_type": type_name,
+                            "object_id": obj.primary_key_value(),
+                            "title": obj.title_value(),
+                        }
+                    )
+            roots.sort(key=lambda root: (root["object_type"], root["object_id"]))
+        except _WorkspaceUnavailableError as exc:
+            availability, reason, roots = "unavailable", str(exc), None
+        except Exception as exc:  # 单个工作空间不可读，不得拖垮整张清单
+            # 只暴露异常类型：校验/查询消息里可能带未脱敏的原始取值。
+            availability, reason, roots = "unavailable", type(exc).__name__, None
+
+        if availability == "unavailable":
+            root_status = "unavailable"
+        elif not root_types:
+            root_status = "no_declared_roots"
+        elif roots:
+            root_status = "roots"
+        else:
+            root_status = "empty"
+        return {
+            "workspace_id": entry.instance_id,
+            "model_id": entry.ontology_id,
+            "runtime_id": entry.runtime_id,
+            "availability": availability,
+            "root_status": root_status,
+            "reason": reason,
+            "aggregate_root_types": root_types,
+            "aggregate_roots": roots,
+        }
 
     # -- fork --------------------------------------------------------------
     def fork_instance(
@@ -215,6 +540,7 @@ class CommandCenterRegistry:
             unplug_fn=None,
         )
         self.instances[candidate] = entry
+        self._sync_devices(entry)
         return entry
 
     # -- compatibility -----------------------------------------------------
@@ -274,7 +600,47 @@ def _type_name(annotation: Any) -> str:
     return str(name) if name else str(annotation).replace("typing.", "")
 
 
-def _spec_meta(spec: OntologySpec) -> dict[str, Any]:
+def _ontology_roles(
+    spec: OntologySpec,
+    instances: Iterable[OntologyInstanceEntry] = (),
+) -> list[str]:
+    """按首次出现顺序去重提取某个 Ontology 专属的角色体系。
+
+    角色来源（全部来自该蓝图自己的声明，不读任何全局角色表）：
+
+    1. 该蓝图下各实例的 ``default_actor.role``；
+    2. ``spec.actions`` 中每个动作的 ``allowed_roles`` 与 ``approver_roles``；
+    3. ``spec.object_types`` 中各对象类型的 ``__masked_fields__`` 白名单角色。
+
+    三者都为空时回退 ``["admin"]``，保证前端下拉框永远有可选项。
+    """
+    roles: list[str] = []
+
+    def add(role: str | None) -> None:
+        if role and role not in roles:
+            roles.append(role)
+
+    for entry in instances:
+        actor = getattr(entry, "default_actor", None)
+        if actor is not None:
+            add(actor.role)
+    for action in spec.actions.values():
+        for role in action.allowed_roles:
+            add(role)
+        for role in action.approver_roles:
+            add(role)
+    for cls in spec.object_types.values():
+        masked = getattr(cls, "__masked_fields__", {}) or {}
+        for allowed_roles in masked.values():
+            for role in allowed_roles or ():
+                add(role)
+    return roles or ["admin"]
+
+
+def _spec_meta(
+    spec: OntologySpec,
+    instances: Iterable[OntologyInstanceEntry] = (),
+) -> dict[str, Any]:
     """把一个 OntologySpec 投影成前端可渲染的完整元模型。"""
     object_types = []
     for name, cls in spec.object_types.items():  # declaration order
@@ -316,6 +682,7 @@ def _spec_meta(spec: OntologySpec) -> dict[str, Any]:
     ]
     return {
         "spec": spec.summary(),
+        "roles": _ontology_roles(spec, instances),
         "object_types": object_types,
         "interfaces": interfaces,
         "link_types": [
@@ -362,6 +729,8 @@ def _instance_summary(entry: OntologyInstanceEntry, registry: CommandCenterRegis
         "instance_id": entry.instance_id,
         "ontology_id": entry.ontology_id,
         "ontology_name": ontology.name if ontology else entry.ontology_id,
+        "runtime_id": entry.runtime_id,
+        "formula": f"{entry.instance_id} = {entry.ontology_id} + {entry.runtime_id}",
         "label": entry.label,
         "description": entry.description,
         "db_uri": entry.db_uri,
@@ -407,7 +776,7 @@ body{background:
   linear-gradient(#05080f,#02040a);
   color:var(--txt);font-family:"PingFang SC","Hiragino Sans GB","Heiti SC",sans-serif;
   font-feature-settings:"tnum";overflow:hidden}
-.shell{display:grid;grid-template-rows:auto 1fr;height:100vh}
+.shell{display:grid;grid-template-rows:auto auto 1fr;height:100vh}
 header{display:flex;align-items:center;gap:16px;padding:11px 18px;
   border-bottom:1px solid var(--line);background:rgba(8,14,22,.86)}
 .mark{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;font-size:19px;
@@ -423,6 +792,8 @@ header{display:flex;align-items:center;gap:16px;padding:11px 18px;
 .role select{background:#0d1725;color:var(--txt);border:1px solid var(--line);
   border-radius:8px;padding:6px 9px;font-size:12px;outline:none}
 main{display:grid;grid-template-columns:330px 1fr;gap:10px;padding:10px;min-height:0}
+main.full{grid-template-columns:1fr}
+[hidden]{display:none !important}
 .side{display:flex;flex-direction:column;gap:10px;min-height:0}
 .stage{min-height:0;display:flex;flex-direction:column;gap:10px;overflow:auto}
 .stage > *{flex-shrink:0}
@@ -478,6 +849,16 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .tab{font-size:11px;padding:4px 9px;border-radius:7px;border:1px solid var(--line);
   background:rgba(255,255,255,.02);color:#b9cbe0;cursor:pointer;white-space:nowrap}
 .tab.on{background:rgba(56,189,248,.16);border-color:rgba(56,189,248,.55);color:#d6f2ff}
+.pillarnav{display:flex;gap:6px;flex-wrap:wrap;padding:0 18px 9px;
+  border-bottom:1px solid var(--line);background:rgba(8,14,22,.86)}
+.pillar-tab{font-size:12px;font-weight:600;padding:7px 14px;border-radius:9px;letter-spacing:.2px;
+  border:1px solid var(--line);background:rgba(255,255,255,.03);color:#b9cbe0;cursor:pointer;
+  white-space:nowrap;transition:.15s}
+.pillar-tab:hover{background:rgba(56,189,248,.12);color:#d6f2ff}
+.pillar-tab.on{color:#eaf8ff;border-color:rgba(56,189,248,.62);
+  background:linear-gradient(135deg,rgba(56,189,248,.28),rgba(129,140,248,.22));
+  box-shadow:0 0 0 1px rgba(56,189,248,.25) inset}
+.devcols{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}
 .obj{border:1px solid var(--line);border-left:3px solid rgba(120,160,210,.4);
   border-radius:10px;padding:7px 10px;margin-bottom:7px;background:rgba(255,255,255,.025)}
 .obj:hover{border-left-color:var(--cy);background:rgba(56,189,248,.05)}
@@ -563,13 +944,19 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
     <button class="v" onclick="runAutomations()">⚡ 运行自动化规则</button>
   </div>
 </header>
+<nav class="pillarnav" id="pillarTabs">
+  <button class="pillar-tab on" id="tab-ontology" onclick="switchPillar('ontology')">📐 Ontology · 未激活的知识</button>
+  <button class="pillar-tab" id="tab-runtime" onclick="switchPillar('runtime')">⚙️ Runtime · 算力与治理宿体</button>
+  <button class="pillar-tab" id="tab-instance" onclick="switchPillar('instance')">🌍 Instance · 激活的知识与沙盘</button>
+  <button class="pillar-tab" id="tab-device" onclick="switchPillar('device')">🔌 Device · 外部世界(符号+联结)</button>
+</nav>
 <main>
-  <aside class="side">
-    <section class="panel" style="flex:1.02">
+  <aside class="side" id="side">
+    <section class="panel" id="ontologiesPanel" style="flex:1">
       <div class="ph"><span><i>▍</i>📐 本体蓝图列表</span><small>ONTOLOGY BLUEPRINTS</small></div>
       <div class="list" id="ontologies"></div>
     </section>
-    <section class="panel" style="flex:1.25">
+    <section class="panel" id="instancesPanel" style="flex:1" hidden>
       <div class="ph"><span><i>▍</i>🌍 运行实例列表</span><small>RUNTIME INSTANCES</small></div>
       <div class="list" id="instances"></div>
       <div style="padding:8px 10px;border-top:1px dashed var(--line)">
@@ -588,7 +975,7 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
 __UI_BUNDLE__
 __TOPOLOGY_JS__
 const S = {catalog:null, ont:null, inst:null, meta:null, objects:{}, type:null,
-           ontoDetail:{}, mcts:null, result:null};
+           ontoDetail:{}, mcts:null, result:null, pillar:'ontology'};
 const $ = (id) => document.getElementById(id);
 const role = () => $('role').value;
 function setRole(value) {
@@ -600,6 +987,26 @@ function setRole(value) {
     sel.appendChild(opt);
   }
   sel.value = value;
+}
+
+/* 把 #role 下拉选项收敛为当前 Ontology 的专属角色（文案一律中文）。 */
+function syncRoleOptions(roles, preferredRole) {
+  const sel = $('role');
+  if (!sel || !roles || !roles.length) return;
+  const current = sel.value;
+  sel.innerHTML = roles.map(r =>
+    '<option value="' + esc(r) + '">' + esc(zhRole(r)) + '</option>').join('');
+  let wanted = null;
+  if (preferredRole && roles.indexOf(preferredRole) >= 0) wanted = preferredRole;
+  else if (roles.indexOf(current) >= 0) wanted = current;
+  if (!wanted) {
+    const first = (S.catalog && S.ont)
+      ? S.catalog.instances.find(i => i.ontology_id === S.ont.ontology_id && i.default_actor_role)
+      : null;
+    const fallback = (first && first.default_actor_role) || roles[0];
+    wanted = roles.indexOf(fallback) >= 0 ? fallback : roles[0];
+  }
+  setRole(wanted);
 }
 
 function toast(msg, bad) {
@@ -631,11 +1038,60 @@ function chips() {
   const parts = [
     ['本体蓝图', c.ontologies.length],
     ['运行实例', c.instances.length],
+    ['Runtime 宿体', (c.runtimes || []).length],
+    ['外部设备', ((c.devices && c.devices.symbolic) || []).length +
+      ((c.devices && c.devices.connectionist) || []).length],
     ['对象总数', c.instances.reduce((n, i) => n + i.counts.objects, 0)],
     ['动作执行记录', c.instances.reduce((n, i) => n + i.counts.runs, 0)]
   ];
   $('chips').innerHTML = parts.map(([k, n]) =>
     '<span class="chip">' + k + ' <b>' + n + '</b></span>').join('');
+}
+
+/* ------------------------- 四标签页（四大原语） ------------------------- */
+function setPillar(name) {
+  S.pillar = name;
+  document.querySelectorAll('.pillar-tab').forEach(el => el.classList.remove('on'));
+  const tab = $('tab-' + name);
+  if (tab) tab.classList.add('on');
+  // 侧栏与主舞台严格隔离：Runtime / Device 独占整幅舞台，无侧栏。
+  const full = (name === 'runtime' || name === 'device');
+  const main = document.querySelector('main');
+  if (main) main.classList.toggle('full', full);
+  const side = $('side');
+  if (side) side.hidden = full;
+  const ontoPanel = $('ontologiesPanel');
+  if (ontoPanel) ontoPanel.hidden = (name !== 'ontology');
+  const instPanel = $('instancesPanel');
+  if (instPanel) instPanel.hidden = (name !== 'instance');
+}
+
+async function switchPillar(name) {
+  if (!S.catalog) return;
+  setPillar(name);
+  try {
+    if (name === 'runtime') { renderRuntimeView(); return; }
+    if (name === 'device') { renderDeviceView(); return; }
+    if (name === 'ontology') {
+      if (!S.ont && S.catalog.ontologies.length) {
+        await selectOntology(S.catalog.ontologies[0].ontology_id);
+        return;
+      }
+      if (!S.ont) { $('stage').innerHTML = '<div class="hint">暂无本体蓝图。</div>'; return; }
+      if (!S.ontoDetail[S.ont.ontology_id]) {
+        S.ontoDetail[S.ont.ontology_id] = await api('/api/ontology/' + encodeURIComponent(S.ont.ontology_id));
+      }
+      renderOntologyView(S.ontoDetail[S.ont.ontology_id]);
+      return;
+    }
+    if (name === 'instance') {
+      if (S.inst) { await loadInstanceData(); return; }
+      const first = S.catalog.instances.find(i => !S.ont || i.ontology_id === S.ont.ontology_id) ||
+        S.catalog.instances[0];
+      if (first) await selectInstance(first.instance_id);
+      else $('stage').innerHTML = '<div class="hint">暂无运行实例。</div>';
+    }
+  } catch (e) { toast('切换失败：' + e.message, true); }
 }
 
 function renderLists() {
@@ -673,8 +1129,11 @@ async function selectOntology(id) {
   S.ont = S.catalog.ontologies.find(o => o.ontology_id === id) || null;
   S.inst = null;
   S.meta = null;
+  setPillar('ontology');
+  // 默认展示全部实例；勾选「仅显示当前蓝图的实例」时才按 S.ont 过滤。
   renderLists();
   if (!S.ont) return;
+  syncRoleOptions(S.ont.roles || []);
   if (!S.ontoDetail[id]) {
     S.ontoDetail[id] = await api('/api/ontology/' + encodeURIComponent(id));
   }
@@ -690,7 +1149,8 @@ async function selectInstance(id) {
   S.objects = {};
   S.type = null;
   S.mcts = null;
-  if (summary.default_actor_role) setRole(summary.default_actor_role);
+  setPillar('instance');
+  syncRoleOptions((S.ont && S.ont.roles) || [], summary.default_actor_role);
   renderLists();
   await loadInstanceData();
 }
@@ -704,9 +1164,20 @@ async function loadAll() {
       if (fresh) S.inst = fresh;
     }
     renderLists();
-    if (S.inst) await loadInstanceData();
-    else if (S.ont) await selectOntology(S.ont.ontology_id);
+    setPillar(S.pillar);
+    if (S.pillar === 'runtime') { renderRuntimeView(); return; }
+    if (S.pillar === 'device') { renderDeviceView(); return; }
+    if (S.pillar === 'instance') {
+      if (S.inst) { await loadInstanceData(); return; }
+      const first = S.catalog.instances.find(i => !S.ont || i.ontology_id === S.ont.ontology_id) ||
+        S.catalog.instances[0];
+      if (first) await selectInstance(first.instance_id);
+      else $('stage').innerHTML = '<div class="hint">暂无运行实例。</div>';
+      return;
+    }
+    if (S.ont) await selectOntology(S.ont.ontology_id);
     else if (S.catalog.ontologies.length) await selectOntology(S.catalog.ontologies[0].ontology_id);
+    else $('stage').innerHTML = '<div class="hint">暂无本体蓝图。</div>';
   } catch (e) { toast('加载失败：' + e.message, true); }
 }
 
@@ -722,7 +1193,7 @@ function renderOntologyView(detail) {
       const tags = [];
       if (f.name === t.primary_key) tags.push('<span class="badge c">主键</span>');
       if (f.owned) tags.push('<span class="badge a">本体自有</span>');
-      if (f.masked) tags.push('<span class="badge r">🔒 不可见：' + esc((f.masked_roles||[]).map(zhRole).join(' / ')) + '</span>');
+      if (f.masked) tags.push('<span class="badge r">🔒 仅可见：' + esc((f.masked_roles||[]).map(zhRole).join(' / ')) + '</span>');
       return '<tr><td><b>' + esc(zhField(t.name, f.name)) + '</b> <span class="en">' + esc(f.name) +
         '</span></td><td>' + esc(f.type) + '</td><td>' + tags.join(' ') + '</td></tr>';
     }).join('');
@@ -830,7 +1301,8 @@ function renderInstanceView(meta, fp, runs, links) {
     '<div class="hero"><h2>🌍 ' + esc(i.label) + ' <span class="badge c">' +
     esc(zh('ontologies', i.ontology_id, i.ontology_name)) + '</span></h2>' +
     '<p>' + esc(i.description || '') + ' · <b style="color:#a5e4ff">数据源 ' + esc(i.db_uri) + '</b></p>' +
-    '<div class="acts">' + connectorChips(i.connectors) + '</div></div>' +
+    '<div class="acts"><span class="badge v" id="formula" title="Instance = Ontology + Runtime">🧬 认知降维：' +
+    esc(i.formula || '') + '</span>' + connectorChips(i.connectors) + '</div></div>' +
     '<section class="panel"><div class="mount"><b>实例环境与后台挂载栏</b>' +
     '<span class="badge">' + esc(i.instance_id) + '</span><span class="sp"></span>' +
     '<small style="color:#8ea3bd;font-size:9.5px;letter-spacing:1px">当前状态指纹</small>' +
@@ -845,7 +1317,7 @@ function renderInstanceView(meta, fp, runs, links) {
     '<div class="body"><div class="row"><select id="action" onchange="fillParams()"></select>' +
     '<span class="badge" id="actmeta"></span></div><div id="form" class="row"></div>' +
     '<div class="row"><button id="simBtn" onclick="simulate()">🔍 沙盘预演</button>' +
-    '<button class="v" onclick="runMcts()">🌳 多步智能推演</button>' +
+    (i.supports_mcts ? '<button class="v" onclick="runMcts()">🌳 多步智能推演</button>' : '') +
     '<button class="g" id="submitBtn" onclick="submitAction()">⚡ 正式执行</button></div>' +
     '<pre id="result" class="hint">沙盘预演或正式执行后，这里显示对象变更 / 错误码。</pre>' +
     '<div id="mcts" class="hint" style="margin-top:8px"></div>' +
@@ -864,6 +1336,74 @@ function renderInstanceView(meta, fp, runs, links) {
   renderLinks(links);
   renderRuns(runs);
   fillParams();
+}
+
+/* ------------------------- Runtime 宿体视图 ------------------------- */
+function renderRuntimeView() {
+  const list = (S.catalog && S.catalog.runtimes) || [];
+  const cards = list.map(r => {
+    const aspects = (r.aspects || []).map(a =>
+      '<span class="badge v">' + esc(a) + '</span>').join('') ||
+      '<span class="badge">未挂载切面</span>';
+    const adapters = (r.adapters || []).map(a =>
+      '<span class="badge c">' + esc(a) + '</span>').join('') ||
+      '<span class="badge">零外设驱动</span>';
+    const onto = (r.ontology_ids || []).map(o =>
+      '<span class="badge a">' + esc(zh('ontologies', o, o)) + '</span>').join('') ||
+      '<span class="badge">—</span>';
+    const inst = (r.instance_ids || []).map(i =>
+      '<button onclick="selectInstance(\'' + esc(i) + '\')">' + esc(i) + '</button>').join('') ||
+      '<span class="badge">—</span>';
+    return '<section class="panel flat"><div class="ph"><span><i>▍</i>⚙️ ' + esc(r.label) +
+      '</span><small>' + esc(r.runtime_id) + '</small></div><div class="body">' +
+      '<div class="kv"><span>Core</span><b>' + esc(r.storage_kind) + '</b>' +
+      '<b>' + esc(r.db_uri) + '</b></div>' +
+      '<div class="hint" style="margin:5px 0 8px">' + esc(r.description || '') + '</div>' +
+      '<div class="sect">Aspect · 治理切面</div><div class="badges">' + aspects + '</div>' +
+      '<div class="sect">DeviceAdapter · 设备驱动</div><div class="badges">' + adapters + '</div>' +
+      '<div class="sect">关联 Ontology</div><div class="badges">' + onto + '</div>' +
+      '<div class="sect">关联 Instance</div><div class="badges">' + inst + '</div>' +
+      '</div></section>';
+  }).join('') || '<div class="hint">暂无 Runtime 宿体。</div>';
+
+  $('stage').innerHTML = '<div class="hero"><h2>⚙️ Runtime · 算力与治理宿体</h2>' +
+    '<p>Runtime = Core 微内核 + Aspect 系统调用切面 + DeviceAdapter 设备驱动。' +
+    '同一套微内核在不同宿体上承载不同的 Ontology 与 Instance：知识因此被激活。</p>' +
+    '<div class="acts"><span class="badge c">' + list.length + ' 台宿体</span>' +
+    '<span class="badge v">' + list.reduce((n, r) => n + (r.aspects || []).length, 0) +
+    ' 个切面挂载</span><span class="badge a">' +
+    list.reduce((n, r) => n + (r.adapters || []).length, 0) + ' 个设备驱动</span></div></div>' +
+    '<div class="grid2">' + cards + '</div>';
+}
+
+/* ------------------------- Device 外部世界视图 ------------------------- */
+function deviceCard(d, schema) {
+  return '<div class="obj"><h4>' + esc(d.name) + ' <span>' + esc(d.kind) + '</span></h4>' +
+    '<div class="kv"><span>设备编号 <b>' + esc(d.device_id) + '</b></span>' +
+    '<span>端点 <b>' + esc(d.endpoint) + '</b></span>' +
+    '<span class="badge ' + (d.status === 'CONNECTED' ? 'g' : 'v') + '">' +
+    esc(zhStatus(d.status)) + '</span></div>' +
+    '<pre style="margin-top:6px">' + esc(JSON.stringify(schema || {}, null, 2)) + '</pre></div>';
+}
+
+function renderDeviceView() {
+  const devices = (S.catalog && S.catalog.devices) || {};
+  const symbolic = (devices.symbolic || []).map(d => deviceCard(d, d.openapi_schema));
+  const connectionist = (devices.connectionist || []).map(d => deviceCard(d, d.agent_card));
+  $('stage').innerHTML = '<div class="hero"><h2>🔌 Device · 外部世界(符号+联结)</h2>' +
+    '<p>外部世界是高维混沌的：符号主义设备以 OpenAPI 契约暴露结构化接口，' +
+    '联结主义设备以 A2A Agent Card 声明能力、角色与产出契约。' +
+    'Instance 通过 Runtime 的设备驱动把它们认知降维成受约束的对象图。</p>' +
+    '<div class="acts"><span class="badge c">符号主义 ' + symbolic.length + ' 台</span>' +
+    '<span class="badge v">联结主义 ' + connectionist.length + ' 台</span></div></div>' +
+    '<div class="devcols">' +
+    '<section class="panel flat"><div class="ph"><span><i>▍</i>🔗 符号主义设备 · OpenAPI Schema</span>' +
+    '<small>SYMBOLIC DEVICES</small></div><div class="body" id="symbolicDevices">' +
+    (symbolic.join('') || '<div class="hint">暂无符号主义设备。</div>') + '</div></section>' +
+    '<section class="panel flat"><div class="ph"><span><i>▍</i>🤝 联结主义设备 · A2A Agent Card</span>' +
+    '<small>CONNECTIONIST DEVICES</small></div><div class="body" id="connectionistDevices">' +
+    (connectionist.join('') || '<div class="hint">暂无联结主义设备。</div>') + '</div></section>' +
+    '</div>';
 }
 
 function renderFingerprint(fp) {
@@ -887,12 +1427,36 @@ function pickType(name) {
 async function pickInterface(name) {
   try {
     const data = await api('/api/interface?interface=' + encodeURIComponent(name));
-    const rows = (data.objects || []).map(o => '<div class="obj"><h4>◇ ' + esc(name) +
-      '<span>' + esc(o[Object.keys(o)[0]]) + '</span></h4><div class="kv">' +
-      Object.keys(o).map(k => '<span>' + esc(k) + ' <b>' + esc(typeof o[k] === 'object' ? JSON.stringify(o[k]) : o[k]) + '</b></span>').join('') +
-      '</div></div>').join('');
-    $('objects').innerHTML = '<div class="hint" style="margin-bottom:7px">Interface 多态视图：' + esc(name) + '</div>' +
+    const title = zh('interfaces', name, name);
+    const decl = ((S.meta && S.meta.interfaces) || []).find(i => i.name === name);
+    const types = ((S.meta && S.meta.object_types) || []).filter(t =>
+      !decl || (decl.implementations || []).indexOf(t.name) >= 0);
+    const fieldMeta = {};
+    types.forEach(t => (t.fields || []).forEach(f => {
+      if (!fieldMeta[f.name]) fieldMeta[f.name] = f;
+    }));
+    const rows = (data.objects || []).map(o => {
+      const keys = Object.keys(o);
+      const pk = keys.length ? o[keys[0]] : '';
+      return '<div class="obj"><h4>◇ ' + esc(title) + '<span>' + esc(pk) + '</span></h4><div class="kv">' +
+        keys.map(k => {
+          const meta = fieldMeta[k];
+          const isRoleMasked = !!(meta && meta.masked) && role() !== 'system' &&
+            !((meta.masked_roles || []).indexOf(role()) >= 0);
+          const v = o[k];
+          const masked = isRoleMasked || v === '***MASKED***' || v === 'REDACTED';
+          const text = masked ? '不可见'
+            : ((v === null || v === undefined) ? '—'
+              : (typeof v === 'object' ? JSON.stringify(v) : String(v)));
+          return '<span title="' + esc(k) + '">' + esc(zhField(null, k)) +
+            ' <b class="' + (masked ? 'masked' : '') + '">' + esc(text) + '</b></span>';
+        }).join('') + '</div></div>';
+    }).join('');
+    $('objects').innerHTML = '<div class="hint" style="margin-bottom:7px">Interface 多态视图：' + esc(title) + '</div>' +
       (rows || '<div class="hint">该接口暂无对象。</div>');
+    document.querySelectorAll('.tab').forEach(el => el.classList.remove('on'));
+    const target = document.querySelector('.tab[data-name="' + name + '"]');
+    if (target) target.classList.add('on');
   } catch (e) { toast(e.message, true); }
 }
 
@@ -905,7 +1469,11 @@ function renderObjects() {
   box.innerHTML = list.map((o, idx) => {
     const fields = typeMeta.fields.map(f => {
       const v = o[f.name];
-      const masked = v === '***MASKED***' || v === 'REDACTED';
+      // __masked_fields__ 是「可明文查看」的白名单：当前角色不在白名单内即为脱敏。
+      // 数值型会被掩成 0、可空型会被掩成 null，因此不能只认 ***MASKED***。
+      const isRoleMasked = f.masked && role() !== 'system' &&
+        !((f.masked_roles || []).indexOf(role()) >= 0);
+      const masked = isRoleMasked || v === '***MASKED***' || v === 'REDACTED';
       const cls = masked ? 'masked' : (f.owned ? 'owned' : '');
       let text = (v === null || v === undefined) ? '—'
         : (typeof v === 'object' ? JSON.stringify(v) : String(v));
@@ -986,6 +1554,8 @@ function smartPrefill(actionName) {
 }
 
 function fillParams() {
+  const box = $('result');
+  if (box) box.textContent = '沙盘预演或正式执行后，这里显示对象变更 / 错误码。';
   const act = currentAction();
   if (!act) { $('form').innerHTML = ''; $('actmeta').textContent = ''; return; }
   S.lastAction = act.name;
@@ -1146,6 +1716,7 @@ async function revertRun(runId) {
 }
 
 async function runAutomations() {
+  if (!S.inst) { toast('请先选择一个运行实例', true); return; }
   try {
     const data = await api('/api/automations/run', {});
     toast(data.fired.length ? ('自动化规则触发 ' + data.fired.length + ' 次') : '没有新的可触发对象');
@@ -1194,13 +1765,45 @@ loadAll();
 """
 
 
-def _render_ui_page(template: str, title: str) -> str:
+def merged_display(registry: CommandCenterRegistry | None = None) -> dict[str, Any]:
+    """基础展示词条 + 每个蓝图自己声明的 ``spec.display``。
+
+    内核的 ``ui_display.json`` 只保存跨蓝图通用的词条；
+    任何业务本体自己的中文名都写在它自己的 ``spec.display`` 里，
+    因此新增业务本体**不需要修改内核文件**。
+    """
+    merged = copy.deepcopy(DISPLAY)
+    if registry is None:
+        return merged
+    for entry in registry.ontologies.values():
+        overlay = getattr(entry.spec, "display", None) or {}
+        for group, table in overlay.items():
+            if not isinstance(table, dict):
+                continue
+            target = merged.setdefault(group, {})
+            if not isinstance(target, dict):
+                continue
+            for key, value in table.items():
+                # 内核通用词条优先，蓝图只补充缺口，避免互相覆盖。
+                target.setdefault(key, value)
+    return merged
+
+
+def _render_ui_page(
+    template: str,
+    title: str,
+    registry: CommandCenterRegistry | None = None,
+) -> str:
     """注入共享中文展示助手、拓扑渲染器与页面标题。
 
     展示映射与渲染脚本都是**纯展示层**资源，不会改写任何 API 标识、
-    角色 value 或动作参数。
+    角色 value 或动作参数。展示词条来自「内核通用词条 + 各蓝图
+    ``spec.display``」的动态合并结果。
     """
-    bundle = DISPLAY_JS.replace("__DISPLAY_JSON__", display_json())
+    bundle = DISPLAY_JS.replace(
+        "__DISPLAY_JSON__",
+        json.dumps(merged_display(registry), ensure_ascii=False),
+    )
     return (
         template.replace("__UI_BUNDLE__", bundle)
         .replace("__TOPOLOGY_JS__", TOPOLOGY_JS)
@@ -1283,7 +1886,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
 
     # -- meta / catalog ----------------------------------------------------
     def _meta(self, actor: Actor, runtime: OntologyRuntime, entry: OntologyInstanceEntry) -> dict[str, Any]:
-        payload = _spec_meta(runtime.spec)
+        payload = _spec_meta(runtime.spec, [entry])
         payload.update(
             {
                 "ok": True,
@@ -1300,16 +1903,16 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
     def _catalog(self) -> dict[str, Any]:
         ontologies = []
         for entry in self._registry.ontologies.values():
-            meta = _spec_meta(entry.spec)
-            instances = [
-                item.instance_id for item in self._registry.instances_for(entry.ontology_id)
-            ]
+            instances = self._registry.instances_for(entry.ontology_id)
+            meta = _spec_meta(entry.spec, instances)
+            instance_ids = [item.instance_id for item in instances]
             ontologies.append(
                 {
                     "ontology_id": entry.ontology_id,
                     "name": entry.name,
                     "category": entry.category,
                     "description": entry.description,
+                    "roles": meta["roles"],
                     "counts": {
                         "object_types": len(meta["object_types"]),
                         "interfaces": len(meta["interfaces"]),
@@ -1317,20 +1920,36 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                         "functions": len(meta["functions"]),
                         "actions": len(meta["actions"]),
                         "automations": len(meta["automations"]),
-                        "instances": len(instances),
+                        "instances": len(instance_ids),
                     },
-                    "instances": instances,
+                    "instances": instance_ids,
                 }
             )
         instances = [
             _instance_summary(entry, self._registry)
             for entry in self._registry.instances.values()
         ]
-        return {"ok": True, "ontologies": ontologies, "instances": instances}
+        return {
+            "ok": True,
+            "ontologies": ontologies,
+            "instances": instances,
+            "runtimes": [asdict(item) for item in self._registry.runtimes.values()],
+            "devices": {
+                "symbolic": [
+                    asdict(item) for item in self._registry.symbolic_devices.values()
+                ],
+                "connectionist": [
+                    asdict(item)
+                    for item in self._registry.connectionist_devices.values()
+                ],
+            },
+        }
 
     def _ontology_detail(self, ontology_id: str) -> dict[str, Any]:
         entry = self._registry.get_ontology(ontology_id)
-        payload = _spec_meta(entry.spec)
+        payload = _spec_meta(
+            entry.spec, self._registry.instances_for(entry.ontology_id)
+        )
         payload.update(
             {
                 "ok": True,
@@ -1367,7 +1986,9 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(
                 200,
-                _render_ui_page(_WORKSHOP_HTML, self._title).encode("utf-8"),
+                _render_ui_page(
+                    _WORKSHOP_HTML, self._title, self._registry
+                ).encode("utf-8"),
                 "text/html; charset=utf-8",
             )
             return
@@ -1377,7 +1998,9 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             # 前端再按 ?ontology=<编号> 请求 /api/ontology/<编号>。
             self._send(
                 200,
-                _render_ui_page(TOPOLOGY_PAGE_HTML, self._title).encode("utf-8"),
+                _render_ui_page(
+                    TOPOLOGY_PAGE_HTML, self._title, self._registry
+                ).encode("utf-8"),
                 "text/html; charset=utf-8",
             )
             return
@@ -1389,6 +2012,34 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/catalog":
                     self._send_json(200, self._catalog())
+                    return
+                if path == "/api/runtimes":
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "runtimes": [
+                                asdict(item)
+                                for item in self._registry.runtimes.values()
+                            ],
+                        },
+                    )
+                    return
+                if path == "/api/devices":
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "symbolic": [
+                                asdict(item)
+                                for item in self._registry.symbolic_devices.values()
+                            ],
+                            "connectionist": [
+                                asdict(item)
+                                for item in self._registry.connectionist_devices.values()
+                            ],
+                        },
+                    )
                     return
 
                 if path.startswith("/api/ontology/"):

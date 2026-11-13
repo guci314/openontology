@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "dataflow",
+  "input": "/Users/guci/work/open-ontology/video_arch_v2/specs/action-lifecycle.dataflow.json",
+  "output": "/Users/guci/work/open-ontology/video_arch_v2/html/action-lifecycle.html",
+  "specification": {
+    "sha256": "1fba1fc17dde8212b943328b5c56cafc7d478f481ef9ec7234f2dfa11ae85115",
+    "bytes": 5123
+  },
+  "artifact": {
+    "sha256": "ee41752ac7bbf5288ed61e660f100a60f136e5b9fe4089ba5590caf71204c76c",
+    "bytes": 820193
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

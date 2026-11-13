@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenOntology 架构与原理 · 播放</title>
+<style>
+  :root{--ink:#13233b;--muted:#62748e;--accent:#2563eb;--line:#e1e8f2;--bg:#f6f9fd}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1500px;margin:0 auto;padding:28px 32px 48px}
+  header{display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin-bottom:18px}
+  h1{font-size:26px;margin:0;letter-spacing:-.01em}
+  .meta{font-size:14px;color:var(--muted)}
+  .badge{font-size:12px;color:var(--accent);background:#eaf1ff;border:1px solid #cadcff;
+    padding:4px 10px;border-radius:999px}
+  .stage{background:#0e192c;border-radius:14px;overflow:hidden;box-shadow:0 12px 34px rgba(16,34,64,.18)}
+  video{display:block;width:100%;aspect-ratio:16/9;background:#000}
+  #hint{padding:14px 18px;color:#ffd48a;font-size:14px;display:none;background:#1b2740}
+  h2{font-size:16px;margin:26px 0 12px;color:var(--muted);font-weight:600;letter-spacing:.04em}
+  .chapters{display:flex;flex-wrap:wrap;gap:8px}
+  button{font:inherit;font-size:13px;color:var(--ink);background:#fff;border:1px solid var(--line);
+    border-radius:9px;padding:9px 13px;cursor:pointer;transition:.15s}
+  button:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+  button b{color:var(--accent);margin-right:7px;font-variant-numeric:tabular-nums}
+  .note{margin-top:22px;font-size:13px;line-height:1.8;color:var(--muted)}
+  code{background:#eaf0f8;padding:2px 6px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>OpenOntology · 架构与原理</h1>
+    <span class="badge">archify 动画</span>
+    <span class="meta">1920×1080 · 中文配音 · 逐段标注既有实现 / 目标设计 / 未实现</span>
+  </header>
+
+  <div class="stage">
+    <video id="v" controls autoplay playsinline preload="auto">
+      <source src="open-ontology-architecture-v2.mp4" type="video/mp4">
+      浏览器不支持视频播放。
+    </video>
+    <div id="hint">浏览器拦截了自动播放，点一下视频上的播放键即可（声音已开启）。</div>
+  </div>
+
+  <h2>章节跳转</h2>
+  <div class="chapters" id="chapters"></div>
+
+  <p class="note">
+    内容依据 2026-11-12 的 <code>README.md</code>、<code>docs/ARCHITECTURE.md</code>、
+    透明 Aspect 目标设计与评审结论、<code>schema.sql</code>、<code>execution/fabric.py</code>。
+    三张图由 archify v2.17 生成，全部通过 showcase 校验（9/9、0 警告）。
+    项目里另有 11-11 的旧版架构视频 <code>video_arch/open_ontology_architecture.mp4</code>，本片未覆盖它。
+  </p>
+</div>
+<script>
+  const v = document.getElementById('v');
+  const box = document.getElementById('chapters');
+  Promise.all([
+    fetch('script.json').then(r => r.json()),
+    fetch('build/timeline.json').then(r => r.json())
+  ]).then(([script, tl]) => {
+    tl.timeline.forEach((seg, i) => {
+      const meta = script.segments[i] || {};
+      const b = document.createElement('button');
+      const label = (meta.chapter || seg.id).replace(/^\d+\s*\/\s*/, '');
+      b.innerHTML = '<b>' + seg.id.replace('s', '') + '</b>' + label;
+      b.title = seg.start.toFixed(1) + ' 秒 · ' + (meta.caption || '');
+      b.onclick = () => { v.currentTime = seg.start; v.play().catch(() => {}); v.scrollIntoView({behavior:'smooth',block:'center'}); };
+      box.appendChild(b);
+    });
+  }).catch(() => { box.textContent = '章节数据加载中，可直接拖动进度条。'; });
+  v.addEventListener('loadedmetadata', () => {
+    v.play().catch(() => { document.getElementById('hint').style.display = 'block'; });
+  });
+  v.addEventListener('error', () => {
+    document.getElementById('hint').textContent = '视频文件未能加载，请改用系统播放器打开 MP4。';
+    document.getElementById('hint').style.display = 'block';
+  });
+</script>
+</body>
+</html>

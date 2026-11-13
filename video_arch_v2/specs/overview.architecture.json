@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "OpenOntology 架构主干：Agent → Ontology → Tool",
+    "output": "overview.html",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "backbone", "label": "主干", "focus": ["agent", "osdk", "spec", "runtime", "storage"], "note": "请求经声明与运行时落到存储" },
+      { "id": "kinetic", "label": "动力学", "focus": ["runtime", "sandbox", "ledger", "fabric"], "note": "沙箱、审计与执行连线" },
+      { "id": "boundary", "label": "依赖边界", "focus": ["spec", "runtime", "fabric", "adapter"], "note": "蓝图不依赖协议与工具" }
+    ]
+  },
+  "components": [
+    { "id": "agent", "type": "external", "label": "Agent", "sublabel": "策略提案", "pos": [40, 300], "size": [120, 60] },
+    { "id": "identity", "type": "security", "label": "身份 / RLS", "sublabel": "Actor + tags", "pos": [40, 110], "size": [120, 64], "tag": "行级安全" },
+    { "id": "osdk", "type": "cloud", "label": "OSDK", "sublabel": "Tool Schema", "pos": [250, 300], "size": [130, 60] },
+    { "id": "spec", "type": "cloud", "label": "声明层", "sublabel": "spec.py", "pos": [460, 300], "size": [130, 60] },
+    { "id": "runtime", "type": "backend", "label": "运行时", "sublabel": "runtime.py", "pos": [670, 300], "size": [130, 60] },
+    { "id": "sandbox", "type": "database", "label": "沙箱", "sublabel": "EditBatch", "pos": [670, 150], "size": [130, 60] },
+    { "id": "storage", "type": "database", "label": "存储层", "sublabel": "schema.sql", "pos": [880, 300], "size": [130, 60] },
+    { "id": "ledger", "type": "cloud", "label": "业务账本", "sublabel": "action_runs", "pos": [250, 440], "size": [130, 60], "tag": "只追加" },
+    { "id": "fabric", "type": "messagebus", "label": "执行连线", "sublabel": "Fabric + Aspect", "pos": [670, 440], "size": [130, 60] },
+    { "id": "adapter", "type": "backend", "label": "Tool 适配器", "sublabel": "Camel / Odoo", "pos": [880, 440], "size": [130, 60] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "OpenOntology 内核边界", "wraps": ["osdk", "spec", "runtime", "sandbox", "storage", "ledger", "fabric", "adapter"] },
+    { "kind": "security-group", "label": "物理写门禁", "wraps": ["spec", "runtime"] }
+  ],
+  "connections": [
+    { "id": "request", "from": "agent", "to": "osdk", "label": "业务请求", "variant": "emphasis" },
+    { "id": "identity-check", "from": "identity", "to": "runtime", "label": "身份校验", "variant": "security", "fromSide": "right", "toSide": "top", "via": [[620, 142], [620, 246], [735, 246]] },
+    { "id": "to-spec", "from": "osdk", "to": "spec" },
+    { "id": "to-ledger", "from": "osdk", "to": "ledger", "label": "评测", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelDy": 58 },
+    { "id": "to-runtime", "from": "spec", "to": "runtime" },
+    { "id": "to-sandbox", "from": "runtime", "to": "sandbox", "label": "推演", "fromSide": "top", "toSide": "bottom", "labelDy": -68 },
+    { "id": "to-storage", "from": "runtime", "to": "storage", "label": "版本" },
+    { "id": "to-fabric", "from": "runtime", "to": "fabric", "label": "织入", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelDy": 58 },
+    { "id": "to-adapter", "from": "fabric", "to": "adapter" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "语义与声明", "items": ["ObjectType / LinkType / Actor", "5 张纯业务表 + write_gate", "业务蓝图不依赖 ERP / 协议"] },
+    { "dot": "emerald", "title": "动力学与治理", "items": ["Action 只改 EditBatch → ObjectDiff", "simulate / submit / approve / revert", "10 个物理写门禁触发器"] },
+    { "dot": "rose", "title": "依赖边界", "items": ["纯洁性是依赖边界，不是词汇禁令", "HTTP 只是传输边界", "工具实现可替换"] }
+  ]
+}

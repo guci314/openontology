@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "透明 Aspect 执行边界与三份账",
+    "output": "aspect-execution.html",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "boundary", "label": "执行边界", "focus": ["request", "contract", "fabric", "context"], "note": "能力绑定与不可变上下文" },
+      { "id": "observe", "label": "观察型 Aspect", "focus": ["context", "observer", "tool", "business"], "note": "透明不等于不可观测" },
+      { "id": "ledgers", "label": "三份账", "focus": ["business", "execution", "evidence", "unknown"], "note": "后两本尚未实现" }
+    ]
+  },
+  "lanes": [
+    { "id": "agent", "label": "Agent / 请求" },
+    { "id": "blueprint", "label": "业务蓝图与契约" },
+    { "id": "weave", "label": "执行连线（织入器）" },
+    { "id": "execution", "label": "工具与业务状态" },
+    { "id": "ledger", "label": "账本" },
+    { "id": "gaps", "label": "目标设计 / 尚未实现", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "contract", "label": "契约", "fromCol": 0, "toCol": 1 },
+    { "id": "invoke", "label": "调用与观察", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "evidence", "label": "回执与证据", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "groups": [
+    { "id": "fabric-group", "label": "内部执行边界", "lane": "blueprint", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "not-built", "label": "设计已确认，代码未落地", "lane": "gaps", "fromCol": 3, "toCol": 5, "variant": "security" }
+  ],
+  "mainPath": ["request", "contract", "fabric", "context", "observer", "tool", "business", "execution"],
+  "nodes": [
+    { "id": "request", "lane": "agent", "col": 0, "type": "frontend", "label": "业务请求", "sublabel": "不填技术字段" },
+    { "id": "contract", "lane": "agent", "col": 1, "type": "frontend", "label": "能力契约", "sublabel": "input / output" },
+    { "id": "fabric", "lane": "blueprint", "col": 2, "type": "backend", "label": "Fabric", "sublabel": "bind + invoke", "tag": "已实现" },
+    { "id": "context", "lane": "blueprint", "col": 3, "type": "security", "label": "CallContext", "sublabel": "不可变摘要", "tag": "已实现" },
+    { "id": "observer", "lane": "weave", "col": 4, "type": "security", "label": "观察型 Aspect", "sublabel": "started / succeeded", "tag": "只观察" },
+    { "id": "tool", "lane": "execution", "col": 4, "type": "cloud", "label": "Tool 调用", "sublabel": "深拷贝隔离", "tag": "无隐式重试" },
+    { "id": "business", "lane": "execution", "col": 5, "type": "backend", "label": "业务状态账", "sublabel": "action_runs", "tag": "已实现" },
+    { "id": "execution", "lane": "ledger", "col": 5, "type": "external", "label": "技术执行账", "sublabel": "意图 / 尝试", "tag": "未实现" },
+    { "id": "evidence", "lane": "gaps", "col": 2, "type": "security", "label": "证据与溯源", "sublabel": "历史版本定位", "tag": "未实现" },
+    { "id": "unknown", "lane": "gaps", "col": 4, "width": 64, "type": "messagebus", "label": "未知状态", "sublabel": "超时 ≠ 无副作用", "tag": "目标设计" }
+  ],
+  "edges": [
+    { "from": "request", "to": "contract" },
+    { "from": "contract", "to": "fabric", "label": "绑定", "variant": "emphasis", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "fabric", "to": "context" },
+    { "from": "context", "to": "observer", "variant": "emphasis", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "observer", "to": "tool", "variant": "security", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "tool", "to": "business" },
+    { "from": "business", "to": "execution", "label": "分离", "variant": "emphasis", "route": "drop", "fromSide": "bottom", "toSide": "top", "labelDy": 11 },
+    { "from": "context", "to": "evidence", "label": "目标", "variant": "security", "role": "error", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "business", "to": "unknown", "variant": "security", "role": "error", "route": "outside-right", "fromSide": "right", "toSide": "right" },
+    { "from": "unknown", "to": "tool", "label": "核实", "variant": "dashed", "role": "return", "route": "return-left", "fromSide": "left", "toSide": "left" }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "第一阶段已实现", "items": ["能力绑定 + 严格 JSON 值契约", "参数深拷贝，技术字段不注入", "观察者失败不改业务结果"] },
+    { "dot": "rose", "title": "诚实边界", "items": ["未接入真实 Ontology→Tool 路径", "同进程插件不是安全沙箱", "无持久化证据 / 无控制型 Aspect"] },
+    { "dot": "cyan", "title": "三份账", "items": ["业务状态：什么事实成立", "技术执行：请求到哪一步", "证据库：依据与版本从哪来"] }
+  ]
+}

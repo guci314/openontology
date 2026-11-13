@@ -1,0 +1,105 @@
+{
+  "fps": 20,
+  "voice": "zh-CN-XiaoxiaoNeural",
+  "rate": "+5%",
+  "gap": 0.45,
+  "segments": [
+    {
+      "id": "s0",
+      "kind": "title",
+      "card": "intro",
+      "chapter": "00 / 引子",
+      "tag": "基于 2026-11-12 代码与文档",
+      "caption": "OpenOntology｜架构与原理",
+      "narration": "OpenOntology，一个受 Palantir Ontology 启发的轻量业务本体运行时，核心只用 Python 标准库 sqlite3 加 pydantic。这一期讲它的架构和原理，并且严格区分哪些是已经跑通的代码，哪些只是已确认的目标设计。"
+    },
+    {
+      "id": "s1",
+      "kind": "diagram",
+      "html": "overview.html",
+      "chapter": "01 / 架构主干",
+      "tag": "既有实现 + 已确认设计",
+      "caption": "主干：Agent → Ontology → Tool",
+      "narration": "架构主干是 Agent 到 Ontology 到 Tool。Agent 提出业务请求，Ontology 决定业务合法性和状态转换，Tool 负责能力实现。这里有一处重要修订：业务纯洁性现在被定义为依赖边界，不是词汇禁令——业务蓝图不引用 ERP 表名、传输协议、宿主会话或 Aspect，但溯源能力要保留并分层，不能为了纯洁性把它全部删掉。",
+      "shot": { "zoom": [1.0, 1.08], "focus": [], "anim": 1.0 }
+    },
+    {
+      "id": "s2",
+      "kind": "diagram",
+      "html": "overview.html",
+      "chapter": "02 / 分层与代码映射",
+      "tag": "既有实现",
+      "caption": "五张纯业务表 · L2→L5 · 传输边界在外",
+      "narration": "落到代码。L2 是 schema.sql：五张纯业务表，加一张物理写门禁表，十个触发器锁死对象、关系和 overlay 的增删改。L3 是 spec.py 的声明式原语。L4 是沙箱、运行时与 ObjectSet 查询。L5 是 OSDK，导出大模型工具 Schema 和确定性评测。HTTP 服务只是传输边界，不属于业务蓝图；外部系统的脏活放在 Camel 总线和适配器里。",
+      "shot": { "zoom": [1.06, 1.18], "focus": ["spec", "runtime", "sandbox", "storage"], "anim": 1.1 }
+    },
+    {
+      "id": "s3",
+      "kind": "diagram",
+      "html": "action-lifecycle.html",
+      "chapter": "03 / 动力学原理",
+      "tag": "既有实现",
+      "caption": "Action 永不直接写库：EditBatch → ObjectDiff",
+      "narration": "动力学层最核心的一条：Action 永远不直接写数据库。它只在 EditBatch 内存沙箱里暂存修改，读得到自己刚写的内容，结束后编译成可序列化、可逆转的 ObjectDiff。simulate 是零写入干跑，数据库版本和行数完全不变。提交时先过业务不变量和主权边界强校验，再用读取版本做乐观锁，在单个事务里落库。",
+      "shot": { "zoom": [1.0, 1.10], "focus": ["request", "simulate", "batch", "submit"], "anim": 1.15 }
+    },
+    {
+      "id": "s4",
+      "kind": "diagram",
+      "html": "action-lifecycle.html",
+      "chapter": "04 / 有治理的自由",
+      "tag": "既有实现",
+      "caption": "被拒的未遂企图，也必须入账",
+      "narration": "治理上，违规不是悄悄失败：对象零改动，但必须持久化一条 REJECTED 审计，带上错误码。审批规则命中时，只落待审批状态和差异，对象不动；批准时再次比对读取版本，等待期间有对象变了就抛并发冲突。还有时光机，用差异的逆向补丁整体撤回。内容指纹相同的写入静默跳过，不递增版本号。",
+      "shot": { "zoom": [1.12, 1.04], "focus": ["checks", "authority", "rejected", "pending", "revert"], "anim": 1.0 }
+    },
+    {
+      "id": "s5",
+      "kind": "diagram",
+      "html": "action-lifecycle.html",
+      "chapter": "05 / 属性主权与高维图",
+      "tag": "既有实现",
+      "caption": "source-backed × __owned__ × overlay 补丁表",
+      "narration": "语义层用字段级主权解决老系统替换：一个对象既能映射外部源系统字段，也能通过双下划线 owned 声明本体自有字段，改动落在 overlay 补丁表。外部底表全量重刷时，单事务替换后再按 overlay 覆盖，自有状态存活；如果重刷会让 overlay 失去基础对象，就抛冲突完整回滚，防止孤儿。ObjectSet 的集合代数和 pivot 群跳转，能从品牌批次直接跳到规格和散码，做三视角无损对账。",
+      "shot": { "zoom": [1.10, 1.16], "focus": ["snapshot", "batch", "authority"], "anim": 1.0 }
+    },
+    {
+      "id": "s6",
+      "kind": "diagram",
+      "html": "aspect-execution.html",
+      "chapter": "06 / 透明 Aspect（新架构）",
+      "tag": "第一阶段已合并 · 未接入真实路径",
+      "caption": "业务不感知 Aspect，但执行行为必须可查",
+      "narration": "今天刚合并的透明 Aspect 是架构上的一次大改。执行连线上织入能力绑定、调用上下文和观察型 Aspect；业务不调用追踪接口，不填溯源字段，也不感知是否安装。CallContext 不可变，参数深拷贝，观察者只拿摘要记录，观察者失败不改业务结果，也没有隐式重试。但必须说清楚：ExecutionFabric 目前只是内部基础设施，没有接入真实的 Ontology 到 Tool 调用路径，同进程 Python 插件也不是安全沙箱。",
+      "shot": { "zoom": [1.02, 1.10], "focus": ["fabric", "context", "observer", "tool"], "anim": 1.2, "vertical_pan": true }
+    },
+    {
+      "id": "s7",
+      "kind": "diagram",
+      "html": "aspect-execution.html",
+      "chapter": "07 / 三份账与边界",
+      "tag": "设计已确认 · 后两本未实现",
+      "caption": "请求发出 ≠ 业务完成；超时 ≠ 没有副作用",
+      "narration": "设计上要三份账：业务状态账回答什么事实成立，技术执行账回答请求执行到哪一步，证据库回答依据和版本从哪来。目前只有第一本。评审还指出一个物理约束：对象表现在只存当前行，版本号是整数计数，被覆盖的历史内容没有留存，所以版本引用暂时无法定位历史事实。文档反复强调两句话：请求发出不等于业务完成，超时不等于没有副作用；回滚本地对象，也不等于撤销外部付款。",
+      "shot": { "zoom": [1.08, 1.02], "focus": ["business", "execution", "evidence", "unknown"], "anim": 1.0, "vertical_pan": true }
+    },
+    {
+      "id": "s8",
+      "kind": "title",
+      "card": "verdict",
+      "chapter": "08 / 现状与分阶段交付",
+      "tag": "结论 · 已跑通的 vs 图纸上的",
+      "caption": "别把设计文档当成已实现能力",
+      "narration": "最后把状态摊开。已经跑通的是纯业务内核、写门禁、沙箱与时光机、属性主权，以及双 Odoo 加真 Camel、钢厂主数据三本账、订单到收款全流程这些实证。第一阶段执行边界随合并提交进入主干，二十五条专项测试通过，但没有接入真实治理路径。评审列出的实例绑定未校验、观察者可改返回值、治理拒绝零观察这三项，要在第二阶段接入前修掉。后面还有可靠执行与证据、受约束的控制型 Aspect 两个阶段。"
+    },
+    {
+      "id": "s9",
+      "kind": "title",
+      "card": "sources",
+      "chapter": "09 / 资料",
+      "tag": "来源",
+      "caption": "依据：项目文档与源码，非二手材料",
+      "narration": "依据的是项目里的 README、整体架构文档、透明 Aspect 目标设计与评审结论、schema.sql 以及 execution 下的 fabric.py。三张图由 archify 生成，动画与视频在本机合成。"
+    }
+  ]
+}

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -71,8 +72,9 @@ def _html(url: str) -> str:
 
 
 @pytest.fixture()
-def live():
-    registry = build_default_command_center()
+def live(tmp_path):
+    # 每个测试一个独立数据目录：绝不触碰仓库的 .instances 生产库。
+    registry = build_default_command_center(data_dir=tmp_path)
     handle = start_command_center_server(
         registry, port=0, title="OpenOntology 统一作战指挥中心"
     )
@@ -152,24 +154,38 @@ def test_empty_ontology_topology_page():
 # 2. 展示映射与 API 标识分离
 # ---------------------------------------------------------------------------
 def test_display_mapping_covers_default_blueprints(live):
-    from open_ontology.workshop_ui import DISPLAY, label
+    """每个蓝图的对象 / 关系 / 动作 / 函数 / 字段都必须有中文展示名。
+
+    词条来源分两处：内核 ``ui_display.json`` 保存跨蓝图通用词条，
+    业务本体把自己的词条声明在 ``spec.display`` 上。展示层把两者
+    动态合并，所以本测试验证的是**合并结果**——这也是浏览器真正看到的。
+    """
+    from open_ontology.workshop import merged_display
 
     registry, _ = live
+    merged = merged_display(registry)
+
+    def show(group: str, key: str) -> str:
+        table = merged.get(group) or {}
+        return str(table.get(key) or key)
+
     for entry in registry.ontologies.values():
         spec = entry.spec
         for name in spec.object_types:
-            assert DISPLAY["objects"].get(name), f"missing object label: {name}"
+            assert show("objects", name) != name, f"missing object label: {name}"
         for name in spec.link_types:
-            assert DISPLAY["links"].get(name), f"missing link label: {name}"
+            assert show("links", name) != name, f"missing link label: {name}"
         for name in spec.actions:
-            assert DISPLAY["actions"].get(name), f"missing action label: {name}"
+            assert show("actions", name) != name, f"missing action label: {name}"
         for name in spec.functions:
-            assert DISPLAY["functions"].get(name), f"missing function label: {name}"
+            assert show("functions", name) != name, f"missing function label: {name}"
         for name in spec.automations:
-            assert DISPLAY["automations"].get(name), f"missing automation label: {name}"
+            assert show("automations", name) != name, (
+                f"missing automation label: {name}"
+            )
         for cls in spec.object_types.values():
             for field_name in cls.model_fields:
-                assert label("fields", field_name) != field_name or field_name in {
+                assert show("fields", field_name) != field_name or field_name in {
                     "name",
                     "status",
                     "role",
@@ -178,13 +194,32 @@ def test_display_mapping_covers_default_blueprints(live):
                     "verified",
                 }, f"missing field label: {field_name}"
 
-    assert label("objects", "Engineer") == "研发成员"
-    assert label("objects", "EmergencyOrder") == "急救订单"
-    assert label("objects", "ColdTruck") == "冷链车辆"
-    assert label("actions", "dispatch_order") == "分配配送车辆"
-    assert label("roles", "admin") == "管理员"
-    assert label("cardinalities", "many-to-many") == "多对多"
-    assert label("objects", "UnknownThing") == "UnknownThing"
+    assert show("objects", "Engineer") == "研发成员"
+    assert show("objects", "EmergencyOrder") == "急救订单"
+    assert show("objects", "ColdTruck") == "冷链车辆"
+    assert show("actions", "dispatch_order") == "分配配送车辆"
+    assert show("roles", "admin") == "管理员"
+    assert show("cardinalities", "many-to-many") == "多对多"
+    assert show("objects", "UnknownThing") == "UnknownThing"
+
+
+def test_business_display_terms_live_in_their_own_spec(live):
+    """业务词条必须住在业务本体自己的 spec.display 里，不进内核字典。"""
+    from open_ontology.workshop_ui import DISPLAY
+
+    registry, _ = live
+    board = registry.get_ontology("task_board")
+    assert board.spec.display, "task_board 必须在自己的 spec.display 声明词条"
+    assert board.spec.display["objects"]["Card"] == "任务卡片"
+
+    # 内核字典里不许出现看板专属词条。
+    for group in ("objects", "links", "actions", "functions"):
+        table = DISPLAY.get(group) or {}
+        assert "Card" not in table, f"看板词条泄漏进内核 {group}"
+        assert "claim_card" not in table, f"看板词条泄漏进内核 {group}"
+
+    # 其它蓝图不受影响：内核通用词条仍然生效。
+    assert DISPLAY["objects"]["Engineer"] == "研发成员"
 
 
 def test_main_page_chinese_primary_copy(base):
@@ -318,6 +353,8 @@ def _open_coldchain(page, base_url: str) -> None:
     page.get_by_text("冷链医药调度与 MCTS 规划").first.click()
     # 蓝图视图渲染完成（拓扑预览可点）后再点实例，避免点空。
     page.locator(".topo-link").first.wait_for(state="visible")
+    # 运行实例列表只在 Instance 页出现，先切页再点实例。
+    page.locator("#tab-instance").click()
     page.get_by_text("冷链第三波 · 急救调度").first.click()
     # 实例作战室真正挂载完成：动作下拉可见 + 世界状态出现对象卡片。
     page.locator("#action").wait_for(state="visible")
@@ -446,6 +483,52 @@ def test_browser_topology_link_keyboard(live, browser):
     context.close()
 
 
+def test_browser_topology_shows_objects_links_actions_and_functions(live, browser):
+    """全景拓扑：同一张 #scene 里同时呈现 Object / Link / Action / Function。"""
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    page.goto(
+        base_url + "/topology?ontology=task_board", wait_until="networkidle"
+    )
+    page.wait_for_selector("#scene rect.node")
+
+    # 数据层：6 个对象类型仍走 class="node"，不被新增语义层污染。
+    assert page.locator("#scene rect.node").count() == 6
+    # 语义层：10 个受控业务动作 + 3 个只读查询函数各自独立成卡。
+    assert page.locator("#scene rect.action-node").count() == 10
+    assert page.locator("#scene rect.fn-node").count() == 3
+
+    scene_text = page.evaluate(
+        "() => document.getElementById('scene').textContent || ''"
+    )
+    for marker in ("认领任务卡片", "登记执行结果", "创建任务卡片"):
+        assert marker in scene_text, marker
+    for marker in ("看板总览", "看板流程图", "生成任务简报"):
+        assert marker in scene_text, marker
+
+    subtitle = page.inner_text("#subtitle")
+    for marker in ("6 个对象类型", "4 条关系", "10 个业务动作", "3 个查询函数"):
+        assert marker in subtitle, marker
+
+    page.locator("#fitBtn").click()
+    page.wait_for_timeout(150)
+    fits = page.evaluate(
+        """() => {
+            const r = document.getElementById('scene').getBoundingClientRect();
+            const c = document.getElementById('canvas').getBoundingClientRect();
+            return {left:r.left - c.left, top:r.top - c.top, right:r.right - c.left, bottom:r.bottom - c.top,
+                    w:c.width,
+                    h:c.height};
+        }"""
+    )
+    assert fits["left"] >= -2 and fits["top"] >= -2
+    assert fits["right"] <= fits["w"] + 2 and fits["bottom"] <= fits["h"] + 2
+    assert errors == []
+    context.close()
+
+
 def test_browser_chinese_action_form_and_submit(live, browser):
     base_url = live[1].base_url
     context = browser.new_context(viewport={"width": 1440, "height": 900})
@@ -492,6 +575,17 @@ def test_browser_three_blueprints_and_two_instances_no_mixed_names(live, browser
     assert "研发成员" in stage and "研发工单" in stage and "交付物" in stage
     assert "急救订单" not in stage
 
+    # 左侧实例列表只在 Instance 页展示，切实例前先切页。
+    page.locator("#tab-instance").click()
+    page.get_by_text("研发工厂 · 生产实例").first.click()
+    page.wait_for_function(
+        "() => document.getElementById('stage').innerText.includes('研发成员')"
+    )
+    assert "研发成员" in page.inner_text(".tabs")
+    assert "急救订单" not in page.inner_text(".tabs")
+
+    # 蓝图列表只在 Ontology 页展示，切蓝图前先切回。
+    page.locator("#tab-ontology").click()
     page.get_by_text("冷链医药调度与 MCTS 规划").first.click()
     page.wait_for_function(
         "() => document.getElementById('stage').innerText.includes('急救订单')"
@@ -500,21 +594,7 @@ def test_browser_three_blueprints_and_two_instances_no_mixed_names(live, browser
     assert "急救订单" in stage and "冷链车辆" in stage
     assert "研发成员" not in stage
 
-    page.get_by_text("钢厂主数据破局与三视角对账").first.click()
-    page.wait_for_function(
-        "() => document.getElementById('stage').innerText.includes('物料规格')"
-    )
-    stage = page.inner_text("#stage")
-    assert "物料规格" in stage and "合同物料编码" in stage and "进厂批次" in stage
-    assert "急救订单" not in stage and "研发成员" not in stage
-
-    page.get_by_text("研发工厂 · 生产实例").first.click()
-    page.wait_for_function(
-        "() => document.getElementById('stage').innerText.includes('研发成员')"
-    )
-    assert "研发成员" in page.inner_text(".tabs")
-    assert "急救订单" not in page.inner_text(".tabs")
-
+    page.locator("#tab-instance").click()
     page.get_by_text("冷链第三波 · 急救调度").first.click()
     page.wait_for_function(
         "() => document.getElementById('stage').innerText.includes('急救订单')"
@@ -522,8 +602,182 @@ def test_browser_three_blueprints_and_two_instances_no_mixed_names(live, browser
     tabs = page.inner_text(".tabs")
     assert "急救订单" in tabs and "冷链车辆" in tabs
     assert "研发成员" not in tabs
+
+    page.locator("#tab-ontology").click()
+    page.get_by_text("钢厂主数据破局与三视角对账").first.click()
+    page.wait_for_function(
+        "() => document.getElementById('stage').innerText.includes('物料规格')"
+    )
+    stage = page.inner_text("#stage")
+    assert "物料规格" in stage and "合同物料编码" in stage and "进厂批次" in stage
+    assert "急救订单" not in stage and "研发成员" not in stage
     assert errors == []
     context.close()
+
+
+def _role_option_pairs(page) -> list[list[str]]:
+    return page.eval_on_selector_all(
+        "#role option", "els => els.map(el => [el.value, el.textContent.trim()])"
+    )
+
+
+def test_browser_all_ontologies_instance_and_role_isolation_and_demo_flows(live, browser):
+    """6 蓝图 × 8 实例全量界面巡检。
+
+    断言：
+    (a) 点击每个蓝图后 ``#instances .card`` 仅含该蓝图实例；
+    (b) ``#role option`` 仅含该蓝图专属角色，且文案 100% 为中文；
+    (c) ``osv2-coil-prod`` 列级脱敏随角色动态生效，接口 Tab 高亮与汉化正常；
+    (d) 非 MCTS 实例不渲染「多步智能推演」按钮；
+    (e) 全程 0 console error / 0 pageerror。
+    """
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 1000})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    try:
+        page.goto(base_url, wait_until="networkidle")
+        catalog = _get_json(base_url, "/api/catalog")
+        ontologies = catalog["ontologies"]
+        instances = catalog["instances"]
+        assert len(ontologies) == 6, len(ontologies)
+        assert len(instances) == 8, len(instances)
+
+        labels = {row["instance_id"]: row["label"] for row in instances}
+        mcts = {row["instance_id"]: row["supports_mcts"] for row in instances}
+        by_ontology = {row["ontology_id"]: row for row in ontologies}
+
+        def open_ontology(ontology: dict) -> None:
+            # Ontology 页才显示本体蓝图列表，跨标签跳转必须先切回该页。
+            page.locator("#tab-ontology").click()
+            page.locator("#ontologies .card", has_text=ontology["name"]).first.click()
+            page.wait_for_function(
+                "(name) => {const h = document.querySelector('#stage .hero h2');"
+                " return h && h.innerText.includes(name);}",
+                arg=ontology["name"],
+            )
+
+        def open_instance(instance_id: str) -> None:
+            # Instance 页才显示运行实例列表，跨标签跳转必须先切到该页。
+            page.locator("#tab-instance").click()
+            label = labels[instance_id]
+            page.locator("#instances .card", has_text=label).first.click()
+            page.wait_for_function(
+                "(label) => {const h = document.querySelector('#stage .hero h2');"
+                " return h && h.innerText.includes(label);}",
+                arg=label,
+            )
+            page.locator("#action").wait_for(state="visible")
+            page.wait_for_selector("#objects .obj")
+
+        for ontology in ontologies:
+            oid = ontology["ontology_id"]
+            open_ontology(ontology)
+
+            # 侧栏隔离：Ontology 页只显示本体蓝图列表，实例列表必须隐藏。
+            assert page.locator("#ontologiesPanel").is_visible(), oid
+            assert not page.locator("#instancesPanel").is_visible(), oid
+            # 实例过滤默认关闭，直接展示全部实例。
+            assert not page.locator("#filterToggle").is_checked(), oid
+
+            # (b) 角色下拉隔离 + 全中文。
+            options = _role_option_pairs(page)
+            assert [value for value, _ in options] == ontology["roles"], oid
+            for value, text in options:
+                assert text and text != value, (oid, value, text)
+                assert not re.search(r"[A-Za-z_]", text), (oid, value, text)
+
+            expected = [labels[iid] for iid in ontology["instances"]]
+            if expected:
+                # Instance 页：本体蓝图列表消失，实例列表出现。
+                page.locator("#tab-instance").click()
+                page.locator("#instancesPanel").wait_for(state="visible")
+                assert not page.locator("#ontologiesPanel").is_visible(), oid
+                assert not page.locator("#filterToggle").is_checked(), oid
+                # 默认不勾选：全部 8 个实例都在。
+                assert page.locator("#instances .card").count() == len(instances), oid
+
+                # 勾选过滤：仅展示当前蓝图的实例，杜绝跨蓝图串台。
+                page.locator("#filterToggle").check()
+                page.wait_for_function(
+                    "(n) => document.querySelectorAll('#instances .card').length === n",
+                    arg=len(expected),
+                )
+                instance_text = page.inner_text("#instances")
+                for label in expected:
+                    assert label in instance_text, (oid, label)
+                for row in instances:
+                    if row["ontology_id"] != oid:
+                        assert row["label"] not in instance_text, (oid, row["label"])
+
+                # 取消勾选：恢复全部 8 个实例。
+                page.locator("#filterToggle").uncheck()
+                page.wait_for_function(
+                    "(n) => document.querySelectorAll('#instances .card').length === n",
+                    arg=len(instances),
+                )
+
+            # (d) 遍历该蓝图下每个实例：能正常进入，按钮按能力显隐。
+            for iid in ontology["instances"]:
+                open_instance(iid)
+                stage = page.inner_text("#stage")
+                if mcts[iid]:
+                    assert "多步智能推演" in stage, iid
+                else:
+                    assert "多步智能推演" not in stage, iid
+                # 实例视图下实例列表可见、蓝图列表隐藏，角色列表仍属于当前蓝图。
+                assert page.locator("#instancesPanel").is_visible(), iid
+                assert not page.locator("#ontologiesPanel").is_visible(), iid
+                assert [
+                    value for value, _ in _role_option_pairs(page)
+                ] == ontology["roles"], iid
+
+        # (c) 列级脱敏：ops 看不到吨价 / 成本备注 / 内部编码，finance 全部可见。
+        open_ontology(by_ontology["osv2_governance"])
+        open_instance("osv2-coil-prod")
+        assert page.locator("#role").input_value() == "ops"
+
+        objects = page.inner_text("#objects")
+        assert "不可见" in objects
+        for hidden in ("18000", "主力现货", "NC-304"):
+            assert hidden not in objects, hidden
+
+        page.locator(".tab", has_text="可计价资产").click()
+        page.wait_for_function(
+            "() => {const el = document.querySelector('.tab[data-name=\"PricedAsset\"]');"
+            " return el && el.classList.contains('on');}"
+        )
+        assert page.locator(".tab.on").count() == 1
+        iface = page.inner_text("#objects")
+        assert "可计价资产" in iface and "PricedAsset" not in iface
+        for field_label in ("吨价", "成本备注", "内部编码"):
+            assert field_label in iface, field_label
+        assert "不可见" in iface
+
+        page.select_option("#role", "finance")
+        sync_api.expect(page.locator("#objects")).to_contain_text(
+            "18000", timeout=10_000
+        )
+        sync_api.expect(page.locator("#objects")).to_contain_text(
+            "主力现货", timeout=10_000
+        )
+        objects = page.inner_text("#objects")
+        assert "不可见" not in objects
+
+        page.locator(".tab", has_text="可计价资产").click()
+        sync_api.expect(page.locator("#objects")).to_contain_text("吨价", timeout=10_000)
+        sync_api.expect(page.locator("#objects")).to_contain_text(
+            "18000", timeout=10_000
+        )
+        iface = page.inner_text("#objects")
+        assert "不可见" not in iface
+        assert "可计价资产" in iface
+        assert page.locator(".tab.on").count() == 1
+
+        # (e) 全程零报错。
+        assert errors == [], errors
+    finally:
+        context.close()
 
 
 def test_browser_empty_graph_and_unknown_ontology(browser):
@@ -589,6 +843,7 @@ def test_browser_screenshots_two_viewports(live, browser):
         )
         topo.close()
 
+        page.locator("#tab-instance").click()
         page.get_by_text("冷链第三波 · 急救调度").first.click()
         page.wait_for_selector("#objects .obj")
         page.screenshot(path=str(EVIDENCE_DIR / f"instance_{width}x{height}.png"))
@@ -606,3 +861,397 @@ def test_browser_screenshots_two_viewports(live, browser):
     ):
         path = EVIDENCE_DIR / name
         assert path.exists() and path.stat().st_size > 10_000, name
+
+
+# ---------------------------------------------------------------------------
+# 3. 架构分层红线（M2 内核不得承载 M1 业务词汇）
+# ---------------------------------------------------------------------------
+KERNEL_FILES = ("workshop.py", "workshop_ui.py")
+
+#: 看板领域的私有标识与中文词，一个都不许出现在通用 UI 内核里。
+BOARD_LEAKS = (
+    "board_key",
+    "claimable",
+    "is_terminal",
+    "可认领",
+    "终态",
+    ".cards",
+    ".purpose",
+)
+
+
+def test_ui_kernel_has_no_board_domain_fields():
+    """通用 UI 内核只认领域无关的视觉协议，不许出现任何看板私有字段。"""
+    root = Path(__file__).resolve().parents[1] / "open_ontology"
+    for name in KERNEL_FILES:
+        text = (root / name).read_text(encoding="utf-8")
+        for token in BOARD_LEAKS:
+            assert token not in text, f"{token!r} 泄漏进内核 {name}"
+
+
+def test_spec_carries_its_own_display_terms():
+    """OntologySpec 自带 display，新增业务本体不必改内核字典。"""
+    from open_ontology.kanban import spec as board_spec
+    from open_ontology.workshop_ui import DISPLAY
+
+    assert hasattr(board_spec, "display")
+    assert board_spec.display["objects"]["BoardColumn"] == "看板列"
+    # 内核字典保持 0 污染。
+    assert "BoardColumn" not in DISPLAY.get("objects", {})
+
+
+# ---------------------------------------------------------------------------
+# 3b. 看板实例承载完整架构宪法与基线真值表（TK-ONTO-BOARD-FULL-DOCS）
+# ---------------------------------------------------------------------------
+def test_task_board_instance_carries_full_architecture_and_state_docs(base):
+    payload = _get_json(base, "/api/objects/Board", instance="board-prod")
+    boards = {item["board_key"]: item for item in payload["objects"]}
+    board = boards["BD-CC-001"]
+
+    assert "# OpenOntology 架构设计规范" in board["goal"]
+    assert len(board["goal"]) > 1000
+    assert "# OpenOntology 当前状态真值表" in board["state"]
+    assert len(board["state"]) > 1000
+
+
+# ---------------------------------------------------------------------------
+# 4. M2 零流程图污染护栏（静态源码 + HTTP 404）
+# ---------------------------------------------------------------------------
+#: M1「业务流程图」遗留物，一个都不许再出现在 M2 指挥台里。
+FLOW_POLLUTION_TOKENS = (
+    "flow_function",
+    "FLOW_JS",
+    "FLOW_PAGE_HTML",
+    "业务流程图",
+    "PROCESS FLOW",
+    "/flow",
+)
+
+
+def test_m2_workshop_has_no_process_flow_pollution(base):
+    """M2 指挥台只认四大通用原语，不得承载任何流程图专属协议。"""
+    root = Path(__file__).resolve().parents[1] / "open_ontology"
+    for name in KERNEL_FILES:
+        text = (root / name).read_text(encoding="utf-8")
+        for token in FLOW_POLLUTION_TOKENS:
+            assert token not in text, f"{token!r} 泄漏进内核 {name}"
+
+    payload = _get_json(base, "/api/meta", instance="board-prod")
+    assert "flow_function" not in payload["instance"]
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _request(base + "/flow?instance=board-prod")
+    assert exc.value.code == 404
+
+
+def test_meta_unknown_instance_has_chinese_error(base):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get_json(base, "/api/meta", instance="no-such-instance")
+    assert exc.value.code == 404
+
+
+# ---------------------------------------------------------------------------
+# 5. 真实浏览器：任务看板实例无流程图面板，四大通用 M2 面板完整
+# ---------------------------------------------------------------------------
+def test_browser_task_board_instance_has_no_flow_panel(live, browser):
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    try:
+        page.goto(base_url, wait_until="networkidle")
+        page.get_by_text("多智能体任务看板").first.click()
+        page.locator("#tab-instance").click()
+        page.get_by_text("任务看板 · 生产实例").first.click()
+        page.locator("#action").wait_for(state="visible")
+        page.wait_for_selector("#objects .obj")
+
+        # 流程图面板与 #flow 容器彻底消失（正文里的架构文档引述属于数据，不算 UI 面板）
+        assert page.locator("#flow").count() == 0
+        assert (
+            page.locator(
+                "button:has-text('业务流程图'), a:has-text('业务流程图'), "
+                "button:has-text('PROCESS FLOW'), a:has-text('PROCESS FLOW')"
+            ).count()
+            == 0
+        )
+        body = page.inner_text("body")
+
+        # 四大通用 M2 面板完整渲染
+        for marker in (
+            "当前业务状态",
+            "业务动作与沙盘推演台",
+            "语义关系与 🧮 查询计算",
+            "动作执行记录",
+        ):
+            assert marker in body, marker
+        assert page.locator("#objects").count() == 1
+        assert page.locator("#links").count() == 1
+        assert page.locator("#runs").count() == 1
+        assert page.locator("#form").count() == 1
+
+        assert errors == [], errors
+    finally:
+        context.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. 微内核顶层命名空间纯洁性（M2 内核不得导出用户态程序与设备驱动）
+# ---------------------------------------------------------------------------
+#: 具体业务本体（用户态程序）与具体 CLI 宿主驱动（设备驱动）都不许出现在内核顶层。
+NON_KERNEL_TOP_LEVEL = (
+    # 业务本体对象
+    "Engineer",
+    "WorkTicket",
+    "Deliverable",
+    "Board",
+    "BoardColumn",
+    "Member",
+    "Card",
+    "CardComment",
+    "CardRun",
+    # 业务查询函数
+    "factory_board_summary",
+    "build_engineer_briefing",
+    "render_briefing",
+    "board_overview",
+    "board_flow",
+    "card_briefing",
+    # CLI / 宿主驱动
+    "CodeBuddyCLIDriver",
+    "HermesCLIDriver",
+    "OpenCodeHTTPDriver",
+    "GenericCLIDriver",
+    "CallableHarnessDriver",
+    "FactoryOrchestrator",
+    "HarnessDriver",
+    "HarnessError",
+    "HarnessRateLimitError",
+    "HarnessUnavailableError",
+    "CodeBuddyHost",
+    "OpenCodeHost",
+    "RoleRoutedHost",
+    "BoardRunner",
+)
+
+
+def test_kernel_top_level_exports_only_kernel_primitives():
+    """``open_ontology.__all__`` 只包含微内核与通用引擎原语。"""
+    import open_ontology
+
+    leaked = [name for name in NON_KERNEL_TOP_LEVEL if name in open_ontology.__all__]
+    assert leaked == [], f"内核顶层泄漏了用户态程序 / 设备驱动：{leaked}"
+
+
+def test_kernel_top_level_has_no_business_or_driver_attributes():
+    """不只是 ``__all__``：属性也不能挂在内核顶层命名空间上。"""
+    import open_ontology
+
+    leaked = [name for name in NON_KERNEL_TOP_LEVEL if hasattr(open_ontology, name)]
+    assert leaked == [], f"内核顶层仍可访问到：{leaked}"
+
+
+def test_business_programs_remain_importable_from_their_own_modules():
+    """清理顶层导出不等于删除能力：业务本体与驱动仍可从各自模块导入。"""
+    from open_ontology.agent_hosts import BoardRunner, CodeBuddyHost, OpenCodeHost
+    from open_ontology.dev_factory import Engineer, WorkTicket
+    from open_ontology.harness_drivers import CodeBuddyCLIDriver
+    from open_ontology.kanban import Board, Card
+
+    assert Engineer.__name__ == "Engineer"
+    assert WorkTicket.__name__ == "WorkTicket"
+    assert Board.__name__ == "Board"
+    assert Card.__name__ == "Card"
+    assert CodeBuddyCLIDriver.__name__ == "CodeBuddyCLIDriver"
+    assert BoardRunner.__name__ == "BoardRunner"
+    assert CodeBuddyHost.__name__ == "CodeBuddyHost"
+    assert OpenCodeHost.__name__ == "OpenCodeHost"
+
+
+def test_ingestion_driver_is_a_device_driver_not_kernel():
+    """数据摄入是设备驱动：内核通过 ``runtime.ingestion`` 委托，自己不实现。"""
+    from open_ontology import Actor, OntologyRuntime, OntologySpec, ObjectType
+    from open_ontology.ingestion import SnapshotIngestionDriver, parse_mdo_rows
+
+    spec = OntologySpec()
+
+    class Item(ObjectType):
+        __primary_key__ = "item_id"
+        __owned__ = {"note": None}
+        item_id: str
+        qty: int = 0
+        label: str = ""
+        note: str = ""
+
+    spec.object_type(Item)
+    runtime = OntologyRuntime(spec)
+    try:
+        assert isinstance(runtime.ingestion, SnapshotIngestionDriver)
+        admin = Actor(actor_id="a", role="admin", clearance_tags={"*"})
+        runtime.load_snapshot({"Item": [{"item_id": "I1", "qty": 5}]}, actor=admin)
+        assert runtime.get_object(Item, "I1", admin).qty == 5
+
+        # 多源列拼接：两个源各贡献一部分列
+        summary = runtime.load_mdo_snapshots(
+            Item,
+            [
+                [{"item_id": "I1", "qty": 9}],
+                [{"item_id": "I1", "label": "from source"}],
+            ],
+            actor=admin,
+        )
+        assert summary["merged_objects"] == 1
+        assert set(summary["merged_columns"]) == {"qty", "label"}
+        item = runtime.get_object(Item, "I1", admin)
+        assert item.qty == 9 and item.label == "from source"
+
+        # 纯函数入口与内核静态方法行为一致
+        assert parse_mdo_rows([{"item_id": "X", "qty": 1}], "item_id", 0) == [
+            ("X", {"item_id": "X", "qty": 1})
+        ]
+        assert OntologyRuntime._mdo_rows({"X": {"qty": 2}}, "item_id", 0) == [
+            ("X", {"qty": 2})
+        ]
+    finally:
+        runtime.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. 指挥台四个一级标签页（Ontology / Runtime / Instance / Device）
+# ---------------------------------------------------------------------------
+PILLAR_TABS = (
+    ("tab-ontology", "Ontology · 未激活的知识"),
+    ("tab-runtime", "Runtime · 算力与治理宿体"),
+    ("tab-instance", "Instance · 激活的知识与沙盘"),
+    ("tab-device", "Device · 外部世界(符号+联结)"),
+)
+
+
+def test_pillar_tabs_markup_and_class_isolation(base):
+    """四个一级标签页必须是 pillar-tab，绝不占用 Instance 页的 .tab 小标签。"""
+    html = _html(base + "/")
+
+    assert 'id="pillarTabs"' in html
+    for tab_id, label in PILLAR_TABS:
+        assert f'id="{tab_id}"' in html, tab_id
+        assert label in html, label
+        assert f"switchPillar('{tab_id[len('tab-'):]}')" in html, tab_id
+    assert 'class="pillar-tab' in html
+    assert 'class="pillar-tab on"' in html  # 默认高亮 Ontology
+    # 侧栏两块面板必须可独立显隐：实例列表默认隐藏，仅在 Instance 页出现。
+    assert 'id="side"' in html
+    assert 'id="ontologiesPanel"' in html
+    assert 'id="instancesPanel"' in html
+    assert 'id="instancesPanel" style="flex:1" hidden' in html
+    assert 'main.full' in html
+    assert '[hidden]{display:none !important}' in html
+    # 一级标签页不得复用 .tab：.tab.on 仍专属于实例页的对象 / 接口小标签。
+    assert '<button class="tab' not in html
+    assert 'class="tab on" id="tab-' not in html
+
+
+def test_browser_pillar_tabs_switch_four_views(live, browser):
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 1000})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    try:
+        page.goto(base_url, wait_until="networkidle")
+        page.wait_for_selector("#pillarTabs .pillar-tab")
+        assert page.locator("#pillarTabs .pillar-tab").count() == 4
+        assert page.locator(".pillar-tab.on").count() == 1
+        assert page.locator("#tab-ontology.on").count() == 1
+
+        # Ontology 页：侧栏可见，只挂本体蓝图列表。
+        assert page.locator("#side").is_visible()
+        assert page.locator("#ontologiesPanel").is_visible()
+        assert not page.locator("#instancesPanel").is_visible()
+
+        # --- Runtime：默认内存宿体 + 各实例专属宿体 -------------------
+        page.locator("#tab-runtime").click()
+        page.wait_for_function(
+            "() => document.getElementById('stage').innerText"
+            ".includes('Runtime · 算力与治理宿体')"
+        )
+        stage = page.inner_text("#stage")
+        assert "默认内存 Runtime (In-Memory)" in stage
+        assert "rt-default-memory" in stage
+        assert "rt-coldchain-wave3" in stage
+        assert "IdleAwareCallbackAspect" in stage
+        assert "DeviceAdapter" in stage
+        assert "WMS 仓储" in stage
+        assert page.locator("#tab-runtime.on").count() == 1
+        assert page.locator("#tab-ontology.on").count() == 0
+        # Runtime 页：侧栏整体隐藏，主舞台独占整幅。
+        assert not page.locator("#side").is_visible()
+        assert not page.locator("#ontologiesPanel").is_visible()
+        assert not page.locator("#instancesPanel").is_visible()
+        assert page.locator("main.full").count() == 1
+
+        # --- Device：符号 / 联结双栏 ---------------------------------
+        page.locator("#tab-device").click()
+        page.wait_for_function(
+            "() => document.getElementById('stage').innerText"
+            ".includes('外部世界(符号+联结)')"
+        )
+        assert page.locator("#symbolicDevices").count() == 1
+        assert page.locator("#connectionistDevices").count() == 1
+        symbolic = page.inner_text("#symbolicDevices")
+        connectionist = page.inner_text("#connectionistDevices")
+        assert '"openapi": "3.1.0"' in symbolic
+        assert "WMS 仓储" in symbolic
+        assert '"protocol": "A2A/1.0"' in connectionist
+        assert "CodeBuddy CLI" in connectionist
+        assert page.locator("#tab-device.on").count() == 1
+        # Device 页：侧栏整体隐藏，主舞台独占整幅。
+        assert not page.locator("#side").is_visible()
+        assert not page.locator("#ontologiesPanel").is_visible()
+        assert not page.locator("#instancesPanel").is_visible()
+        assert page.locator("main.full").count() == 1
+
+        # --- Instance：认知降维公式 + 原有作战室面板 -------------------
+        page.locator("#tab-instance").click()
+        page.locator("#action").wait_for(state="visible")
+        page.wait_for_selector("#objects .obj")
+        assert page.locator("#formula").count() == 1
+        formula = page.inner_text("#formula")
+        assert " + " in formula and "=" in formula
+        assert page.locator("#tab-instance.on").count() == 1
+        assert page.locator(".tab.on").count() == 1  # 小标签语义未被污染
+        for panel in ("当前业务状态", "动作执行记录"):
+            assert panel in page.inner_text("#stage"), panel
+        # Instance 页：侧栏可见，只挂运行实例列表，本体蓝图列表隐藏。
+        assert page.locator("#side").is_visible()
+        assert not page.locator("#ontologiesPanel").is_visible()
+        assert page.locator("#instancesPanel").is_visible()
+        assert page.locator("main.full").count() == 0
+
+        # --- Ontology：拓扑预览与元模型 -------------------------------
+        page.locator("#tab-ontology").click()
+        page.wait_for_selector("#stage .topo-link")
+        assert "本体关系图" in page.inner_text("#stage")
+        assert page.locator("#tab-ontology.on").count() == 1
+        assert page.locator("#side").is_visible()
+        assert page.locator("#ontologiesPanel").is_visible()
+        assert not page.locator("#instancesPanel").is_visible()
+
+        # --- 左侧栏点击同样驱动一级标签页高亮 -------------------------
+        # 实例列表只在 Instance 页出现，点实例前先切到该页。
+        page.locator("#tab-instance").click()
+        page.locator("#instancesPanel").wait_for(state="visible")
+        page.locator("#instances .card").first.click()
+        page.wait_for_function(
+            "() => document.getElementById('tab-instance').classList.contains('on')"
+        )
+        # 本体蓝图列表只在 Ontology 页出现，点蓝图前先切回该页。
+        page.locator("#tab-ontology").click()
+        page.locator("#ontologiesPanel").wait_for(state="visible")
+        page.locator("#ontologies .card").first.click()
+        page.wait_for_function(
+            "() => document.getElementById('tab-ontology').classList.contains('on')"
+        )
+
+        assert errors == [], errors
+    finally:
+        context.close()
+

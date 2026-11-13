@@ -23,11 +23,22 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from types import UnionType
-from typing import Any, Callable, Iterator, Union, get_args, get_origin
+from typing import Any, Callable, Iterator
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
+from .aspects import (
+    ApprovalGateAspect,
+    AutomationReflexAspect,
+    ColumnMaskingAspect,
+    MASKED_STRING as _MASKED_STRING,
+    mask_value as _mask_value,
+    IdempotencyAndOCCAspect,
+    RejectionAuditAspect,
+    SecurityAndAuthorityAspect,
+    insert_action_run,
+)
+from .ingestion import SnapshotIngestionDriver, parse_mdo_rows
 from .query import AggregationResult, AggregationRow, ObjectSet
 from .sandbox import EditBatch, LoadedObject, ObjectDiff
 from .spec import (
@@ -41,63 +52,17 @@ from .spec import (
     ObjectType,
     OntologySpec,
     PermissionDeniedError,
-    ReindexConflictError,
 )
 
 __all__ = ["OntologyRuntime", "SimulationResult", "SCHEMA_PATH"]
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
-_PENDING = "PENDING_APPROVAL"
 _COMMITTED = "COMMITTED"
-_REVERTED = "REVERTED"
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _parse_utc(value: str) -> datetime:
-    """Parse an ISO-8601 timestamp into an aware UTC datetime."""
-    text = str(value).strip().replace("Z", "+00:00")
-    moment = datetime.fromisoformat(text)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
-
-
-_MASKED_STRING = "***MASKED***"
-
-
-def _mask_value(cls: type[Any], field_name: str, current: Any) -> Any:
-    """Pick the mask value for one sensitive column."""
-    defaults = getattr(cls, "__mask_defaults__", None) or {}
-    if field_name in defaults:
-        return defaults[field_name]
-
-    annotation = cls.model_fields[field_name].annotation
-    origin = get_origin(annotation)
-    if origin in (Union, UnionType) and type(None) in get_args(annotation):
-        return None
-    if annotation is bool:
-        return False
-    if annotation is int:
-        return 0
-    if annotation is float:
-        return 0.0
-    if annotation is str:
-        return _MASKED_STRING
-
-    # Fallback: infer from the live value.
-    if isinstance(current, bool):
-        return False
-    if isinstance(current, int):
-        return 0
-    if isinstance(current, float):
-        return 0.0
-    if isinstance(current, str):
-        return _MASKED_STRING
-    return None
 
 
 def _dumps(value: Any) -> str:
@@ -160,13 +125,29 @@ class OntologyRuntime:
         self._closed = False
         # Automation de-duplication ledger: (name, object_id, version) -> record.
         self._automation_fires: dict[tuple[str, str, int], dict[str, Any]] = {}
+        # 数据摄入设备驱动：外部快照解析 / 多源列拼接 / overlay 重放。
+        self.ingestion = SnapshotIngestionDriver(self)
         self._sync_registry()
 
     # -- lifecycle ---------------------------------------------------------
+    # -- kernel primitives exposed to syscall aspects ----------------------
+    @staticmethod
+    def _dumps(value: Any) -> str:
+        return _dumps(value)
+
+    @staticmethod
+    def _utcnow() -> str:
+        return _utcnow()
+
     @property
     def connection(self) -> sqlite3.Connection:
         """Raw handle. Writes are still rejected by the physical gate."""
         return self._conn
+
+    @property
+    def is_open(self) -> bool:
+        """连接是否仍然可用（关闭后的 runtime 不能再被查询）。"""
+        return not self._closed
 
     def close(self) -> None:
         if not self._closed:
@@ -257,21 +238,9 @@ class OntologyRuntime:
     def _sync_registry(self) -> None:
         rows: list[tuple[str, str, dict[str, Any]]] = []
         for name, cls in self.spec.object_types.items():
-            rows.append(
-                (
-                    "object_type",
-                    name,
-                    {
-                        "name": name,
-                        "primary_key": cls.primary_key_name(),
-                        "title": getattr(cls, "__title__", None),
-                        "security_tag_fields": list(
-                            getattr(cls, "__security_tag_fields__", ()) or ()
-                        ),
-                        "schema": cls.model_json_schema(),
-                    },
-                )
-            )
+            meta = cls.type_metadata()
+            meta["schema"] = cls.model_json_schema()
+            rows.append(("object_type", name, meta))
         for name, decl in self.spec.link_types.items():
             rows.append(("link_type", name, decl.model_dump(mode="json")))
         for name, fn in self.spec.functions.items():
@@ -501,10 +470,10 @@ class OntologyRuntime:
         }
 
     def ingest_object(self, obj: ObjectType) -> dict[str, Any]:
-        """Backward-compatible alias for :meth:`put_object`."""
-        return self.put_object(obj)
+        """Backward-compatible alias for :meth:`put_object`（由摄入驱动转发）。"""
+        return self.ingestion.ingest_object(obj)
 
-    # -- snapshot reindex with field-level ownership ----------------------
+    # -- snapshot reindex (delegated to the ingestion device driver) -------
     def load_snapshot(
         self,
         objects: dict[str, list[dict[str, Any]]],
@@ -517,260 +486,24 @@ class OntologyRuntime:
     ) -> dict[str, Any]:
         """Replace source-backed base rows, then re-apply owned overlays.
 
-        Fully ontology-owned types may not be supplied at all.  Source-backed
-        rows may not carry any property declared in ``__owned__``.  If a
-        snapshot would delete an object that still has an ontology-owned
-        patch, the whole operation is rejected and rolled back.
-
-        Conflict strategies (Palantir OSv2):
-
-        * ``"user_edits_win"`` (default, Strategy 1): the ``ontology_overlay``
-          patch always wins over the incoming source row.
-        * ``"most_recent_value"`` (Strategy 2): when ``source_timestamps``
-          carries a UTC timestamp for ``(object_type, object_id)`` that is
-          strictly newer than ``ontology_overlay.updated_at``, the stale patch
-          is dropped so the source value wins; otherwise the patch is kept.
+        快照解析、多源列拼接与时间戳裁决属于**设备驱动层**，
+        实现见 :mod:`open_ontology.ingestion`；内核只做委托。
         """
-        if conflict_strategy not in ("user_edits_win", "most_recent_value"):
-            raise ValueError(
-                "conflict_strategy must be 'user_edits_win' or 'most_recent_value'"
-            )
-        normalized_objects: list[
-            tuple[str, type[ObjectType], ObjectType, dict[str, Any]]
-        ] = []
-        supplied_types_set: set[str] = set()
-        seen: set[tuple[str, str]] = set()
+        return self.ingestion.load_snapshot(
+            objects,
+            links,
+            conflict_strategy=conflict_strategy,
+            source_timestamps=source_timestamps,
+            auto_trigger=auto_trigger,
+            actor=actor,
+        )
 
-        for type_name, rows in objects.items():
-            cls = self.spec.get_object_type(type_name)
-            if cls.is_fully_owned():
-                raise GovernanceViolationError(
-                    f"object type {type_name!r} is fully ontology-owned; "
-                    "a source snapshot may not supply it"
-                )
-            supplied_types_set.add(type_name)
-            owned_fields = set(cls.owned_field_defaults())
-
-            for index, row in enumerate(rows):
-                if not isinstance(row, dict):
-                    raise GovernanceViolationError(
-                        f"snapshot row {type_name}[{index}] must be a dict"
-                    )
-                forbidden = sorted(owned_fields & set(row))
-                if forbidden:
-                    raise GovernanceViolationError(
-                        f"snapshot row {type_name}[{index}] supplies "
-                        f"ontology-owned fields {forbidden}"
-                    )
-                try:
-                    obj = cls(**row)
-                except ValidationError as exc:
-                    raise GovernanceViolationError(
-                        f"snapshot row {type_name}[{index}] does not match "
-                        f"the object type: {exc}"
-                    ) from exc
-                object_id = obj.primary_key_value()
-                key = (type_name, object_id)
-                if key in seen:
-                    raise GovernanceViolationError(
-                        f"duplicate snapshot object {type_name}:{object_id}"
-                    )
-                seen.add(key)
-                normalized_objects.append(
-                    (type_name, cls, obj, obj.to_properties())
-                )
-
-        normalized_links: list[tuple[str, str, str, str, str]] = []
-        supplied_link_types_set: set[str] = set()
-        for link_name, pairs in (links or {}).items():
-            decl = self.spec.get_link_type(link_name)
-            if decl.owned:
-                raise GovernanceViolationError(
-                    f"link type {link_name!r} is ontology-owned; "
-                    "a source snapshot may not supply it"
-                )
-            supplied_link_types_set.add(link_name)
-            for pair in pairs:
-                if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-                    raise GovernanceViolationError(
-                        f"snapshot link {link_name!r} expects (source_id, target_id) pairs"
-                    )
-                normalized_links.append(
-                    (
-                        decl.name,
-                        decl.source,
-                        str(pair[0]),
-                        decl.target,
-                        str(pair[1]),
-                    )
-                )
-
-        supplied_types = sorted(supplied_types_set)
-        supplied_link_types = sorted(supplied_link_types_set)
-
-        with self._write_gate() as conn:
-            existing: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
-            for type_name in supplied_types:
-                rows = conn.execute(
-                    "SELECT object_id, version, properties_json "
-                    "FROM ontology_objects WHERE object_type = ?",
-                    (type_name,),
-                ).fetchall()
-                for row in rows:
-                    existing[(type_name, row["object_id"])] = (
-                        int(row["version"]),
-                        json.loads(row["properties_json"]),
-                    )
-
-            overlay_rows = conn.execute(
-                "SELECT object_type, object_id, patch_json, updated_at "
-                "FROM ontology_overlay"
-            ).fetchall()
-            overlays = {
-                (row["object_type"], row["object_id"]): json.loads(row["patch_json"])
-                for row in overlay_rows
-            }
-            overlay_updated = {
-                (row["object_type"], row["object_id"]): row["updated_at"]
-                for row in overlay_rows
-            }
-            overlays_dropped: list[str] = []
-            overlays_kept: list[str] = []
-
-            if conflict_strategy == "most_recent_value":
-                stamps = source_timestamps or {}
-                for key in list(overlays):
-                    source_ts = stamps.get(key)
-                    if source_ts is None:
-                        source_ts = stamps.get(f"{key[0]}:{key[1]}")  # type: ignore[arg-type]
-                    if source_ts is None:
-                        continue
-                    label = f"{key[0]}:{key[1]}"
-                    if _parse_utc(source_ts) > _parse_utc(overlay_updated[key]):
-                        overlays.pop(key)
-                        conn.execute(
-                            "DELETE FROM ontology_overlay "
-                            "WHERE object_type = ? AND object_id = ?",
-                            key,
-                        )
-                        overlays_dropped.append(label)
-                    else:
-                        overlays_kept.append(label)
-
-            for link_name in supplied_link_types:
-                conn.execute(
-                    "DELETE FROM ontology_links WHERE link_type = ?",
-                    (link_name,),
-                )
-            for type_name in supplied_types:
-                conn.execute(
-                    "DELETE FROM ontology_objects WHERE object_type = ?",
-                    (type_name,),
-                )
-
-            now = _utcnow()
-            for type_name, cls, obj, base_properties in normalized_objects:
-                object_id = obj.primary_key_value()
-                patch = overlays.get((type_name, object_id), {})
-                merged = {**base_properties, **patch}
-                try:
-                    merged_obj = cls(**merged)
-                except ValidationError as exc:
-                    raise ReindexConflictError(
-                        f"owned patch for {type_name}:{object_id} no longer "
-                        f"fits the object type: {exc}"
-                    ) from exc
-                properties = merged_obj.to_properties()
-                old = existing.get((type_name, object_id))
-                if old is None:
-                    version = 1
-                elif old[1] == properties:
-                    version = old[0]
-                else:
-                    version = old[0] + 1
-
-                conn.execute(
-                    """
-                    INSERT INTO ontology_objects (
-                        object_type, object_id, title, properties_json, version,
-                        security_tags_json, content_hash, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        type_name,
-                        object_id,
-                        merged_obj.title_value(),
-                        _dumps(properties),
-                        version,
-                        _dumps(merged_obj.security_tags()),
-                        _content_hash(properties),
-                        now,
-                    ),
-                )
-
-            for link in normalized_links:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO ontology_links (
-                        link_type, source_type, source_id, target_type, target_id
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    link,
-                )
-
-            # Orphaned-overlay refusal: every owned patch must still have a
-            # base object after the snapshot has been applied.
-            for object_type, object_id in overlays:
-                row = conn.execute(
-                    "SELECT 1 FROM ontology_objects "
-                    "WHERE object_type = ? AND object_id = ?",
-                    (object_type, object_id),
-                ).fetchone()
-                if row is None:
-                    raise ReindexConflictError(
-                        "snapshot would orphan the ontology-owned patch for "
-                        f"{object_type}:{object_id}"
-                    )
-
-        if auto_trigger:
-            self.evaluate_automations(actor)
-        return {
-            "object_types": supplied_types,
-            "objects": len(normalized_objects),
-            "link_types": supplied_link_types,
-            "links": len(normalized_links),
-            "overlays_reapplied": sum(
-                1 for object_type, _ in overlays if object_type in supplied_types
-            ),
-            "conflict_strategy": conflict_strategy,
-            "overlays_dropped": overlays_dropped,
-            "overlays_kept": overlays_kept,
-        }
-
-    # -- column level security / masking ----------------------------------
+    # -- column level security / masking (ColumnMaskingAspect) -------------
     def _apply_masking(self, obj: ObjectType, actor: Actor) -> ObjectType:
-        """Return a masked copy of ``obj`` when ``actor`` may not see a column.
+        """读出口脱敏：委托给 :class:`ColumnMaskingAspect`。"""
+        return ColumnMaskingAspect.apply_masking(obj, actor)
 
-        The stored row is never touched: masking is a read-time projection.
-        ``role == "system"`` bypasses masking (kernel-internal reads).
-        """
-        masked = getattr(type(obj), "__masked_fields__", None) or {}
-        if not masked or actor.role == "system":
-            return obj
-        updates: dict[str, Any] = {}
-        for field_name, allowed_roles in masked.items():
-            if field_name not in type(obj).model_fields:
-                continue
-            if actor.role in allowed_roles:
-                continue
-            updates[field_name] = _mask_value(
-                type(obj), field_name, getattr(obj, field_name, None)
-            )
-        if not updates:
-            return obj
-        return obj.model_copy(update=updates)
-
-    # -- automations -------------------------------------------------------
+    # -- automations (AutomationReflexAspect) ------------------------------
     def evaluate_automations(
         self,
         actor: Actor | None = None,
@@ -778,76 +511,22 @@ class OntologyRuntime:
         object_type: type[ObjectType] | str | None = None,
         automation: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Run every armed automation over the watched objects.
-
-        A trigger fires at most once per ``(automation, object_id, version)``;
-        the version guard is what prevents condition/action feedback loops.
-        """
-        actor = actor or Actor(actor_id="system", role="system")
-        wanted_type = (
-            self.spec.get_object_type(object_type).__name__
-            if object_type is not None
-            else None
+        """跑一遍已武装的自动化规则：委托给 :class:`AutomationReflexAspect`。"""
+        return AutomationReflexAspect.evaluate_automations(
+            self, actor, object_type=object_type, automation=automation
         )
-        fired: list[dict[str, Any]] = []
-
-        for name, decl in sorted(self.spec.automations.items()):
-            if automation is not None and name != automation:
-                continue
-            cls = self.spec.get_object_type(decl.watch_object_type)
-            if wanted_type is not None and cls.__name__ != wanted_type:
-                continue
-            for row in self.load_all(cls.__name__):
-                obj = cls(**row.data)
-                if not decl.condition(obj):
-                    continue
-                key = (name, row.object_id, row.version)
-                if key in self._automation_fires:
-                    continue
-                result = decl.handler(self, obj, actor)
-                record = {
-                    "automation": name,
-                    "object_type": cls.__name__,
-                    "object_id": row.object_id,
-                    "version": row.version,
-                    "actor": actor.actor_id,
-                    "result": result,
-                }
-                self._automation_fires[key] = record
-                fired.append(record)
-        return fired
 
     def automation_history(self) -> list[dict[str, Any]]:
-        """Every automation trigger recorded so far, in fire order."""
-        return list(self._automation_fires.values())
+        """按触发顺序返回全部自动化记录。"""
+        return AutomationReflexAspect.automation_history(self)
 
-    # -- column-wise MDO ---------------------------------------------------
+    # -- column-wise MDO (delegated to the ingestion device driver) --------
     @staticmethod
     def _mdo_rows(
         source: Any, primary_key: str, index: int
     ) -> list[tuple[str, dict[str, Any]]]:
-        if isinstance(source, dict):
-            if source and all(isinstance(v, dict) for v in source.values()):
-                return [(str(key), dict(cols)) for key, cols in source.items()]
-            if primary_key not in source:
-                raise GovernanceViolationError(
-                    f"MDO source {index} is a flat row without primary key "
-                    f"{primary_key!r}"
-                )
-            return [(str(source[primary_key]), dict(source))]
-        if isinstance(source, (list, tuple)):
-            rows: list[tuple[str, dict[str, Any]]] = []
-            for row_index, row in enumerate(source):
-                if not isinstance(row, dict) or primary_key not in row:
-                    raise GovernanceViolationError(
-                        f"MDO source {index} row {row_index} must be a dict "
-                        f"carrying {primary_key!r}"
-                    )
-                rows.append((str(row[primary_key]), dict(row)))
-            return rows
-        raise GovernanceViolationError(
-            f"MDO source {index} must be a dict or a list of dicts"
-        )
+        """兼容入口：真正的实现在 :mod:`open_ontology.ingestion`。"""
+        return parse_mdo_rows(source, primary_key, index)
 
     def load_mdo_snapshots(
         self,
@@ -862,54 +541,17 @@ class OntologyRuntime:
     ) -> dict[str, Any]:
         """Column-wise MDO: stitch partial column sets from many sources.
 
-        Each source contributes a subset of columns for the same primary keys;
-        they are merged per column (later sources win on overlap) and then
-        written through :meth:`load_snapshot`, so ontology-owned overlays are
-        re-applied exactly as in a normal reindex.
+        实现见 :mod:`open_ontology.ingestion`；内核只做委托。
         """
-        cls = self.spec.get_object_type(object_type)
-        primary_key = cls.primary_key_name()
-        merged: dict[str, dict[str, Any]] = {}
-        stats: list[dict[str, Any]] = []
-
-        for index, source in enumerate(sources):
-            columns_seen: set[str] = set()
-            rows = self._mdo_rows(source, primary_key, index)
-            for object_id, columns in rows:
-                bucket = merged.setdefault(object_id, {})
-                for column, value in columns.items():
-                    if column == primary_key:
-                        continue
-                    bucket[column] = value
-                    columns_seen.add(column)
-            stats.append(
-                {
-                    "source": index,
-                    "rows": len(rows),
-                    "columns": sorted(columns_seen),
-                }
-            )
-
-        rows_out = [
-            {primary_key: object_id, **columns}
-            for object_id, columns in merged.items()
-        ]
-        summary = self.load_snapshot(
-            {cls.__name__: rows_out},
+        return self.ingestion.load_mdo_snapshots(
+            object_type,
+            sources,
             links=links,
             conflict_strategy=conflict_strategy,
             source_timestamps=source_timestamps,
             auto_trigger=auto_trigger,
             actor=actor,
         )
-        return {
-            **summary,
-            "mdo_sources": stats,
-            "merged_objects": len(rows_out),
-            "merged_columns": sorted(
-                {column for columns in merged.values() for column in columns}
-            ),
-        }
 
     # -- governed queries --------------------------------------------------
     def get_object(
@@ -1297,6 +939,21 @@ class OntologyRuntime:
         return result
 
     # -- simulate ----------------------------------------------------------
+    def _run_handler(
+        self,
+        action: ActionDef,
+        model: BaseModel,
+        actor: Actor,
+        *,
+        batch: EditBatch | None = None,
+    ) -> ObjectDiff:
+        """跑一次动作 handler 并产出已通过主权校验的 diff。"""
+        batch = batch or EditBatch(self.spec, self, actor)
+        action.handler(batch, model)
+        self._check_authority(action, batch.build_diff())
+        if action.post_approval is not None:
+            action.post_approval(batch, model)
+        return batch.build_diff()
     def simulate_action(
         self,
         action_name: str,
@@ -1307,14 +964,9 @@ class OntologyRuntime:
         self._check_role(action, actor)
         model = self._build_params(action.params, params)
 
-        batch = EditBatch(self.spec, self, actor)
         try:
-            action.handler(batch, model)
-            main_diff = batch.build_diff()
-            self._check_authority(action, main_diff)
-            if action.post_approval is not None:
-                action.post_approval(batch, model)
-            diff = batch.build_diff()
+            batch = EditBatch(self.spec, self, actor)
+            diff = self._run_handler(action, model, actor, batch=batch)
         except InvariantError as exc:
             return SimulationResult(
                 valid=False,
@@ -1348,7 +1000,7 @@ class OntologyRuntime:
         * approval required    -> diff stored, status PENDING_APPROVAL,
           objects untouched until :meth:`approve_action`
         """
-        existing = self.get_action_run(run_id)
+        existing = IdempotencyAndOCCAspect.check_idempotent_run(self, run_id)
         if existing is not None:
             return existing
 
@@ -1359,12 +1011,7 @@ class OntologyRuntime:
 
         batch = EditBatch(self.spec, self, actor)
         try:
-            action.handler(batch, model)
-            main_diff = batch.build_diff()
-            self._check_authority(action, main_diff)
-            if action.post_approval is not None:
-                action.post_approval(batch, model)
-            diff = batch.build_diff()
+            diff = self._run_handler(action, model, actor, batch=batch)
         except InvariantError as exc:
             # Refusal auditing: persist the failed attempt, then re-raise.
             self._record_rejection(
@@ -1382,28 +1029,15 @@ class OntologyRuntime:
         diff_json = diff.to_dict()
 
         if requires_approval:
-            with self._transaction() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO ontology_action_runs (
-                        run_id, action_type, actor_id, actor_role, params_json,
-                        status, read_versions_json, object_diff_json,
-                        approved_by, reverted_by_run_id, executed_at,
-                        error_code, error_message
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL)
-                    """,
-                    (
-                        run_id,
-                        action.name,
-                        actor.actor_id,
-                        actor.role,
-                        _dumps(params_json),
-                        _PENDING,
-                        _dumps(read_versions),
-                        _dumps(diff_json),
-                        _utcnow(),
-                    ),
-                )
+            ApprovalGateAspect.stage_pending_approval(
+                self,
+                run_id=run_id,
+                action=action,
+                actor=actor,
+                params_json=params_json,
+                read_versions=read_versions,
+                diff=diff,
+            )
             if auto_trigger:
                 self.evaluate_automations(actor)
             return self.get_action_run(run_id)  # type: ignore[return-value]
@@ -1428,36 +1062,8 @@ class OntologyRuntime:
 
     # -- approve -----------------------------------------------------------
     def approve_action(self, run_id: str, approver: Actor) -> dict[str, Any]:
-        run = self.get_action_run(run_id)
-        if run is None:
-            raise ObjectNotFoundError(f"action run {run_id!r} not found")
-        if run["status"] != _PENDING:
-            raise GovernanceViolationError(
-                f"action run {run_id!r} is {run['status']}, not PENDING_APPROVAL"
-            )
-
-        action = self.spec.get_action(run["action_type"])
-        if approver.role not in action.approver_roles:
-            raise PermissionDeniedError(
-                f"actor {approver.actor_id!r} role {approver.role!r} may not approve "
-                f"{action.name!r}; required one of {list(action.approver_roles)}"
-            )
-
-        read_versions = dict(run["read_versions"])
-        diff = ObjectDiff.from_dict(run["object_diff"])
-
-        with self._write_gate() as conn:
-            self._verify_read_versions(conn, read_versions)
-            self._apply_diff(conn, diff)
-            conn.execute(
-                """
-                UPDATE ontology_action_runs
-                SET status = ?, approved_by = ?, executed_at = ?
-                WHERE run_id = ? AND status = ?
-                """,
-                (_COMMITTED, approver.actor_id, _utcnow(), run_id, _PENDING),
-            )
-        return self.get_action_run(run_id)  # type: ignore[return-value]
+        """批准挂起单：委托给 :class:`ApprovalGateAspect`。"""
+        return ApprovalGateAspect.approve_action(self, run_id, approver)
 
     # -- revert (time machine) --------------------------------------------
     def revert_action(
@@ -1466,68 +1072,8 @@ class OntologyRuntime:
         revert_run_id: str,
         actor: Actor,
     ) -> dict[str, Any]:
-        existing = self.get_action_run(revert_run_id)
-        if existing is not None:
-            return existing
-
-        run = self.get_action_run(run_id)
-        if run is None:
-            raise ObjectNotFoundError(f"action run {run_id!r} not found")
-
-        action = self.spec.get_action(run["action_type"])
-        if actor.role not in set(action.allowed_roles) | set(action.approver_roles):
-            raise PermissionDeniedError(
-                f"actor {actor.actor_id!r} role {actor.role!r} may not revert "
-                f"{action.name!r}"
-            )
-
-        if run["status"] == _REVERTED:
-            raise GovernanceViolationError(f"action run {run_id!r} was already reverted")
-        if run["status"] != _COMMITTED:
-            raise GovernanceViolationError(
-                f"action run {run_id!r} is {run['status']}; only COMMITTED runs can revert"
-            )
-
-        original_diff = ObjectDiff.from_dict(run["object_diff"])
-        inverted = original_diff.inverted()
-
-        # Capture current versions of every object the revert will touch.
-        revert_read_versions: dict[str, int] = {}
-        for change in inverted.object_changes:
-            row = self._conn.execute(
-                """
-                SELECT version FROM ontology_objects
-                WHERE object_type = ? AND object_id = ?
-                """,
-                (change.object_type, change.object_id),
-            ).fetchone()
-            if row is not None:
-                revert_read_versions[
-                    f"{change.object_type}:{change.object_id}"
-                ] = int(row["version"])
-
-        with self._write_gate() as conn:
-            self._apply_diff(conn, inverted)
-            conn.execute(
-                """
-                UPDATE ontology_action_runs
-                SET status = ?, reverted_by_run_id = ?
-                WHERE run_id = ? AND status = ?
-                """,
-                (_REVERTED, revert_run_id, run_id, _COMMITTED),
-            )
-            self._insert_run(
-                conn,
-                run_id=revert_run_id,
-                action=action,
-                actor=actor,
-                params_json=run["params"],
-                status=_COMMITTED,
-                read_versions=revert_read_versions,
-                diff=inverted,
-                approved_by=None,
-            )
-        return self.get_action_run(revert_run_id)  # type: ignore[return-value]
+        """时光机回滚：委托给 :class:`ApprovalGateAspect`。"""
+        return ApprovalGateAspect.revert_action(self, run_id, revert_run_id, actor)
 
     # -- apply diff --------------------------------------------------------
     def _apply_diff(self, conn: sqlite3.Connection, diff: ObjectDiff) -> None:
@@ -1537,14 +1083,9 @@ class OntologyRuntime:
         for change in diff.object_changes:
             if change.kind == "create":
                 assert change.after is not None
-                exists = conn.execute(
-                    """
-                    SELECT 1 FROM ontology_objects
-                    WHERE object_type = ? AND object_id = ?
-                    """,
-                    (change.object_type, change.object_id),
-                ).fetchone()
-                if exists is not None:
+                if IdempotencyAndOCCAspect.current_version(
+                    conn, change.object_type, change.object_id
+                ) is not None:
                     raise ConcurrencyConflictError(
                         f"cannot create {change.object_type}:{change.object_id}: "
                         "object already exists"
@@ -1568,28 +1109,18 @@ class OntologyRuntime:
                         now,
                     ),
                 )
-                self._sync_overlay(
-                    conn,
-                    change.object_type,
-                    change.object_id,
-                    change.after,
-                )
+                self._sync_overlay(conn, change.object_type, change.object_id, change.after)
 
             elif change.kind == "update":
                 assert change.after is not None
-                row = conn.execute(
-                    """
-                    SELECT version FROM ontology_objects
-                    WHERE object_type = ? AND object_id = ?
-                    """,
-                    (change.object_type, change.object_id),
-                ).fetchone()
-                if row is None:
+                current_version = IdempotencyAndOCCAspect.current_version(
+                    conn, change.object_type, change.object_id
+                )
+                if current_version is None:
                     raise ConcurrencyConflictError(
                         f"cannot update {change.object_type}:{change.object_id}: "
                         "object vanished"
                     )
-                current_version = int(row["version"])
                 if (
                     change.before_version is not None
                     and current_version != change.before_version
@@ -1617,24 +1148,14 @@ class OntologyRuntime:
                         change.object_id,
                     ),
                 )
-                self._sync_overlay(
-                    conn,
-                    change.object_type,
-                    change.object_id,
-                    change.after,
-                )
+                self._sync_overlay(conn, change.object_type, change.object_id, change.after)
 
             elif change.kind == "delete":
-                row = conn.execute(
-                    """
-                    SELECT version FROM ontology_objects
-                    WHERE object_type = ? AND object_id = ?
-                    """,
-                    (change.object_type, change.object_id),
-                ).fetchone()
-                if row is None:
+                current_version = IdempotencyAndOCCAspect.current_version(
+                    conn, change.object_type, change.object_id
+                )
+                if current_version is None:
                     continue
-                current_version = int(row["version"])
                 if (
                     change.before_version is not None
                     and current_version != change.before_version
@@ -1707,17 +1228,10 @@ class OntologyRuntime:
 
     @staticmethod
     def _check_role(action: ActionDef, actor: Actor) -> None:
-        if actor.role not in action.allowed_roles:
-            raise PermissionDeniedError(
-                f"actor {actor.actor_id!r} role {actor.role!r} may not execute "
-                f"{action.name!r}; allowed roles: {list(action.allowed_roles)}"
-            )
+        """动作级 RBAC：委托给 :class:`SecurityAndAuthorityAspect`。"""
+        SecurityAndAuthorityAspect.check_role(action, actor)
 
     # -- field-level ownership / authority --------------------------------
-    def _owned_defaults(self, object_type: str) -> dict[str, Any]:
-        cls = self.spec.get_object_type(object_type)
-        return cls.owned_field_defaults()
-
     def _sync_overlay(
         self,
         conn: sqlite3.Connection,
@@ -1725,29 +1239,10 @@ class OntologyRuntime:
         object_id: str,
         properties: dict[str, Any],
     ) -> None:
-        defaults = self._owned_defaults(object_type)
-        if not defaults:
-            return
-        patch = {
-            key: properties.get(key, default)
-            for key, default in defaults.items()
-            if properties.get(key, default) != default
-        }
-        now = _utcnow()
-        if patch:
-            conn.execute(
-                """
-                INSERT INTO ontology_overlay (
-                    object_type, object_id, patch_json, updated_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(object_type, object_id) DO UPDATE SET
-                    patch_json = excluded.patch_json,
-                    updated_at = excluded.updated_at
-                """,
-                (object_type, object_id, _dumps(patch), now),
-            )
-        else:
-            self._delete_overlay(conn, object_type, object_id)
+        """自有字段持久化：委托给 :class:`SecurityAndAuthorityAspect`。"""
+        SecurityAndAuthorityAspect.sync_overlay(
+            self, conn, object_type, object_id, properties
+        )
 
     def _delete_overlay(
         self,
@@ -1755,93 +1250,21 @@ class OntologyRuntime:
         object_type: str,
         object_id: str,
     ) -> None:
-        conn.execute(
-            "DELETE FROM ontology_overlay "
-            "WHERE object_type = ? AND object_id = ?",
-            (object_type, object_id),
-        )
+        SecurityAndAuthorityAspect.delete_overlay(conn, object_type, object_id)
 
     def _object_change_side(self, change: Any) -> str | None:
-        cls = self.spec.get_object_type(change.object_type)
-        if cls.is_fully_owned():
-            return "ontology"
-
-        owned_fields = set(cls.owned_field_defaults())
-        if change.kind != "update":
-            # creating or deleting the base row is a source-owned act
-            return "source"
-
-        before = change.before or {}
-        after = change.after or {}
-        changed = {
-            key
-            for key in set(before) | set(after)
-            if before.get(key) != after.get(key)
-        }
-        touches_source = any(key not in owned_fields for key in changed)
-        touches_owned = any(key in owned_fields for key in changed)
-        if touches_source and touches_owned:
-            return "mixed"
-        if touches_owned:
-            return "ontology"
-        if touches_source:
-            return "source"
-        return None
+        """判断变更落在 source / ontology / mixed 侧：委托给切面。"""
+        return SecurityAndAuthorityAspect.object_change_side(self.spec, change)
 
     def _check_authority(self, action: ActionDef, diff: ObjectDiff) -> None:
-        sides: set[str] = set()
-        for change in diff.object_changes:
-            side = self._object_change_side(change)
-            if side == "mixed":
-                raise InvariantError(
-                    f"action {action.name!r} touches source and ontology-owned "
-                    f"fields of {change.object_type}:{change.object_id} in one change",
-                    code="MIXED_AUTHORITY",
-                )
-            if side is not None:
-                sides.add(side)
-
-        for link_change in diff.link_changes:
-            decl = self.spec.get_link_type(link_change.link_type)
-            sides.add("ontology" if decl.owned else "source")
-
-        if len(sides) > 1:
-            raise InvariantError(
-                f"action {action.name!r} touches both source and ontology-owned "
-                f"state: {sorted(sides)}",
-                code="MIXED_AUTHORITY",
-            )
-        if sides == {"source"} and not action.affects_source:
-            raise InvariantError(
-                f"action {action.name!r} is declared affects_source=False but "
-                "its edit plan writes source-backed state",
-                code="UNDECLARED_SOURCE_WRITE",
-            )
-        if sides == {"ontology"} and action.affects_source:
-            raise InvariantError(
-                f"action {action.name!r} is declared affects_source=True but "
-                "its edit plan only writes ontology-owned state",
-                code="MISDECLARED_SOURCE_WRITE",
-            )
+        """主权边界强校验：委托给 :class:`SecurityAndAuthorityAspect`。"""
+        SecurityAndAuthorityAspect.check_authority(self.spec, action, diff)
 
     def _verify_read_versions(
         self, conn: sqlite3.Connection, read_versions: dict[str, int]
     ) -> None:
-        for key, expected_version in read_versions.items():
-            object_type, _, object_id = key.partition(":")
-            row = conn.execute(
-                """
-                SELECT version FROM ontology_objects
-                WHERE object_type = ? AND object_id = ?
-                """,
-                (object_type, object_id),
-            ).fetchone()
-            if row is None or int(row["version"]) != int(expected_version):
-                actual = None if row is None else int(row["version"])
-                raise ConcurrencyConflictError(
-                    f"stale read on {key}: proposal read version "
-                    f"{expected_version}, current version {actual}"
-                )
+        """MVCC 乐观锁：委托给 :class:`IdempotencyAndOCCAspect`。"""
+        IdempotencyAndOCCAspect.verify_read_versions(conn, read_versions)
 
     def _insert_run(
         self,
@@ -1858,28 +1281,20 @@ class OntologyRuntime:
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> None:
-        conn.execute(
-            """
-            INSERT INTO ontology_action_runs (
-                run_id, action_type, actor_id, actor_role, params_json, status,
-                read_versions_json, object_diff_json, approved_by,
-                reverted_by_run_id, executed_at, error_code, error_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-            """,
-            (
-                run_id,
-                action.name,
-                actor.actor_id,
-                actor.role,
-                _dumps(params_json),
-                status,
-                _dumps(read_versions),
-                _dumps(diff.to_dict()),
-                approved_by,
-                _utcnow(),
-                error_code,
-                error_message,
-            ),
+        """审计账本写入：委托给 :func:`open_ontology.aspects.insert_action_run`。"""
+        insert_action_run(
+            self,
+            conn,
+            run_id=run_id,
+            action=action,
+            actor=actor,
+            params_json=params_json,
+            status=status,
+            read_versions=read_versions,
+            diff=diff,
+            approved_by=approved_by,
+            error_code=error_code,
+            error_message=error_message,
         )
 
     def _record_rejection(
@@ -1892,20 +1307,16 @@ class OntologyRuntime:
         read_versions: dict[str, int],
         error: InvariantError,
     ) -> None:
-        with self._transaction() as conn:
-            self._insert_run(
-                conn,
-                run_id=run_id,
-                action=action,
-                actor=actor,
-                params_json=params_json,
-                status="REJECTED",
-                read_versions=read_versions,
-                diff=ObjectDiff(),
-                approved_by=None,
-                error_code=error.code or "INVARIANT_ERROR",
-                error_message=str(error),
-            )
+        """被拒企图入账：委托给 :class:`RejectionAuditAspect`。"""
+        RejectionAuditAspect.record_rejection(
+            self,
+            run_id=run_id,
+            action=action,
+            actor=actor,
+            params_json=params_json,
+            read_versions=read_versions,
+            error=error,
+        )
 
     # -- pure-business audit readers --------------------------------------
     def get_action_run(self, run_id: str) -> dict[str, Any] | None:

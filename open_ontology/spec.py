@@ -172,6 +172,9 @@ class ObjectType(BaseModel):
     __masked_fields__: ClassVar[dict[str, tuple[str, ...]]] = {}
     #: 可选的显式掩码值：``{字段名: 掩码值}``。
     __mask_defaults__: ClassVar[dict[str, Any]] = {}
+    #: 是否为聚合根：纯声明式导航元数据，由模型作者显式声明，
+    #: 不从图拓扑 / 归属 / 主键 / 类型名 / 连边情况推断。
+    __aggregate_root__: ClassVar[bool] = False
 
     # -- identity ----------------------------------------------------------
     @classmethod
@@ -197,6 +200,24 @@ class ObjectType(BaseModel):
         if isinstance(owned, dict):
             return dict(owned)
         return {}
+
+    @classmethod
+    def is_aggregate_root(cls) -> bool:
+        """聚合根是**声明**出来的，不是从图结构推断出来的。"""
+        return bool(getattr(cls, "__aggregate_root__", False))
+
+    @classmethod
+    def type_metadata(cls) -> dict[str, Any]:
+        """``ontology_registry`` 持久化的 TYPE 元数据（JSON 安全，不含实例值）。"""
+        return {
+            "name": cls.__name__,
+            "primary_key": cls.primary_key_name(),
+            "title": getattr(cls, "__title__", None),
+            "security_tag_fields": list(
+                getattr(cls, "__security_tag_fields__", ()) or ()
+            ),
+            "aggregate_root": cls.is_aggregate_root(),
+        }
 
     def primary_key_value(self) -> str:
         value = getattr(self, self.primary_key_name(), None)
@@ -336,6 +357,10 @@ class OntologySpec:
         self.functions: dict[str, FunctionDef] = {}
         self.actions: dict[str, ActionDef] = {}
         self.automations: dict[str, AutomationDef] = {}
+        #: 本蓝图自己的展示词条（中文名等）。展示层会把这些词条动态合并，
+        #: 因此新增一个业务本体不需要修改任何内核文件。
+        #: 结构：``{"objects": {...}, "links": {...}, "fields": {...}, ...}``
+        self.display: dict[str, dict[str, str]] = {}
 
     # -- object types ------------------------------------------------------
     def object_type(self, cls: type[ObjectType]) -> type[ObjectType]:

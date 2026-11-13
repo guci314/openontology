@@ -185,11 +185,195 @@ function topologyScene(m, W, H, fs) {
   if (!types.length) {
     return {inner: '', bbox: {minX: 0, minY: 0, maxX: 1, maxY: 1}};
   }
+
+  /* ------------------------------------------------------------------
+     动态语义层：在对象关系环下方同图展示 Action / Function / Automation。
+     全部坐标统一走 grow(...)，让 fit() 与 topologySvg() 的 viewBox 完整包裹。
+     ------------------------------------------------------------------ */
+  const actions = (m && m.actions) || [];
+  const funcs = (m && m.functions) || [];
+  const autos = (m && m.automations) || [];
+  const pkToType = {};
+  ((m && m.object_types) || []).forEach(t => {
+    if (t && t.primary_key) pkToType[t.primary_key] = t.name;
+  });
+  /* 动作参数里若出现某个对象类型的主键，就说明该动作受控改写这个对象。 */
+  function targetOf(action) {
+    const props = (action && action.params && action.params.properties) || {};
+    const keys = Object.keys(props);
+    for (let i = 0; i < keys.length; i++) {
+      if (pkToType[keys[i]]) return pkToType[keys[i]];
+    }
+    return '';
+  }
+  function glyphWidth(ch) { return ch.charCodeAt(0) > 255 ? 1 : 0.56; }
+  function textWidth(text, size) {
+    const s = String(text === null || text === undefined ? '' : text);
+    const chars = Array.from(s);
+    let w = 0;
+    chars.forEach(ch => { w += glyphWidth(ch) * size; });
+    return w;
+  }
+  function clipText(text, size, maxWidth) {
+    const s = String(text === null || text === undefined ? '' : text);
+    if (textWidth(s, size) <= maxWidth) return s;
+    const chars = Array.from(s);
+    let out = '';
+    for (let i = 0; i < chars.length; i++) {
+      if (textWidth(out + chars[i] + '…', size) > maxWidth) break;
+      out += chars[i];
+    }
+    return out + '…';
+  }
+  function roleLine(action) {
+    const roles = ((action && action.allowed_roles) || []).map(zhRole);
+    const approvers = ((action && action.approver_roles) || []).map(zhRole);
+    let text = roles.length ? roles.slice(0, 2).join(' / ') : '—';
+    if (roles.length > 2) text += ' +' + (roles.length - 2);
+    if (approvers.length) {
+      text += ' · 审批 ' + approvers.slice(0, 1).join('');
+      if (approvers.length > 1) text += '+' + (approvers.length - 1);
+    }
+    return text;
+  }
+
+  let layerParts = '';
+  if (actions.length || funcs.length || autos.length) {
+    const layerTop = maxY + 52 * fs;
+    const panelW = Math.max(maxX - minX, 880 * fs);
+    const panelLeft = cx - panelW / 2;
+    const panelGap = 26 * fs;
+    const actionsW = Math.round(panelW * 0.62);
+    const funcsW = panelW - actionsW - panelGap;
+    const panelPad = 16 * fs;
+    const headH = 34 * fs;
+    const gap = 14 * fs;
+
+    const actionCols = Math.min(3, Math.max(1, actions.length));
+    const actionRows = Math.max(1, Math.ceil(actions.length / actionCols));
+    const actionCardW = (actionsW - panelPad * 2 - gap * (actionCols - 1)) / actionCols;
+    const actionCardH = 92 * fs;
+    const actionsBodyH = actions.length
+      ? actionRows * actionCardH + (actionRows - 1) * gap : 0;
+
+    const funcCols = funcs.length > 2 ? 2 : 1;
+    const funcRows = Math.max(1, Math.ceil(funcs.length / funcCols));
+    const funcCardW = (funcsW - panelPad * 2 - gap * (funcCols - 1)) / funcCols;
+    const funcCardH = 62 * fs;
+    const funcsBodyH = funcs.length
+      ? funcRows * funcCardH + (funcRows - 1) * gap : 0;
+
+    const autoCols = autos.length > 2 ? 2 : 1;
+    const autoRows = Math.max(1, Math.ceil(autos.length / autoCols));
+    const autoCardW = (funcsW - panelPad * 2 - gap * (autoCols - 1)) / autoCols;
+    const autoCardH = 52 * fs;
+    const autosBodyH = autos.length
+      ? autoRows * autoCardH + (autoRows - 1) * gap : 0;
+
+    const actionsH = panelPad * 2 + headH + (actions.length ? gap + actionsBodyH : 0);
+    const funcsH = panelPad * 2 + headH +
+      (funcs.length ? gap + funcsBodyH : 0) + (autos.length ? gap + autosBodyH : 0);
+    const panelH = Math.max(actionsH, funcsH, 110 * fs);
+
+    const headBase = layerTop + panelPad + 21 * fs;
+    const bodyTop = layerTop + panelPad + headH + gap;
+    const funcLeft = panelLeft + actionsW + panelGap;
+    const autoBodyTop = bodyTop + funcsBodyH + (funcs.length ? gap : 0);
+
+    function panelBox(x, y, w, h, tint) {
+      return '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h +
+        '" rx="' + (14 * fs) + '" fill="rgba(8,14,22,.72)" stroke="' + tint + '"/>';
+    }
+    function panelHead(x, y, text, color) {
+      return '<text x="' + (x + panelPad) + '" y="' + y + '" fill="' + color +
+        '" font-size="' + (11.5 * fs) + '" font-weight="700" letter-spacing=".6">' +
+        esc(text) + '</text>';
+    }
+
+    layerParts += panelBox(panelLeft, layerTop, actionsW, panelH, 'rgba(245,165,36,.30)') +
+      panelHead(panelLeft, headBase,
+        '🎯 业务动作层 · GOVERNED ACTIONS · ' + actions.length, '#ffd79a');
+
+    actions.forEach((action, index) => {
+      const col = index % actionCols;
+      const row = Math.floor(index / actionCols);
+      const x = panelLeft + panelPad + col * (actionCardW + gap);
+      const y = bodyTop + row * (actionCardH + gap);
+      const innerW = actionCardW - 20 * fs;
+      const tx = x + 10 * fs;
+      const target = targetOf(action);
+      layerParts += '<g>' +
+        '<rect class="action-node" x="' + x + '" y="' + y + '" width="' + actionCardW +
+        '" height="' + actionCardH + '" rx="' + (10 * fs) +
+        '" fill="rgba(245,165,36,.10)" stroke="rgba(245,165,36,.65)"/>' +
+        '<text x="' + tx + '" y="' + (y + 26 * fs) + '" fill="#ffe3b0" font-size="' +
+        (11.5 * fs) + '" font-weight="700">' +
+        esc(clipText('🎯 ' + zhAction(action.name), 11.5 * fs, innerW)) + '</text>' +
+        '<text x="' + tx + '" y="' + (y + 45 * fs) + '" fill="#c9a06a" font-size="' +
+        (8.5 * fs) + '">' + esc(clipText(action.name, 8.5 * fs, innerW)) + '</text>' +
+        '<text x="' + tx + '" y="' + (y + 63 * fs) + '" fill="#a98b5f" font-size="' +
+        (8 * fs) + '">' +
+        esc(clipText('角色 ' + roleLine(action), 8 * fs, innerW)) + '</text>' +
+        (target
+          ? '<text x="' + tx + '" y="' + (y + 81 * fs) +
+            '" fill="#7fd6c0" font-size="' + (8 * fs) + '">' +
+            esc(clipText('作用于 ' + zhObject(target), 8 * fs, innerW)) + '</text>'
+          : '') +
+        '</g>';
+    });
+
+    layerParts += panelBox(funcLeft, layerTop, funcsW, panelH, 'rgba(167,139,250,.30)') +
+      panelHead(funcLeft, headBase,
+        '🧮 查询与计算函数层 · SEMANTIC FUNCTIONS · ' + funcs.length, '#d8ccff');
+
+    funcs.forEach((fn, index) => {
+      const col = index % funcCols;
+      const row = Math.floor(index / funcCols);
+      const x = funcLeft + panelPad + col * (funcCardW + gap);
+      const y = bodyTop + row * (funcCardH + gap);
+      const innerW = funcCardW - 20 * fs;
+      const tx = x + 10 * fs;
+      const sub = fn.description ? fn.name + ' · ' + fn.description : fn.name;
+      layerParts += '<g>' +
+        '<rect class="fn-node" x="' + x + '" y="' + y + '" width="' + funcCardW +
+        '" height="' + funcCardH + '" rx="' + (10 * fs) +
+        '" fill="rgba(167,139,250,.10)" stroke="rgba(167,139,250,.65)"/>' +
+        '<text x="' + tx + '" y="' + (y + 25 * fs) + '" fill="#e3dbff" font-size="' +
+        (11 * fs) + '" font-weight="700">' +
+        esc(clipText('🧮 ' + zh('functions', fn.name, fn.name), 11 * fs, innerW)) + '</text>' +
+        '<text x="' + tx + '" y="' + (y + 44 * fs) + '" fill="#9c8fd6" font-size="' +
+        (8.5 * fs) + '">' + esc(clipText(sub, 8.5 * fs, innerW)) + '</text>' +
+        '</g>';
+    });
+
+    autos.forEach((auto, index) => {
+      const col = index % autoCols;
+      const row = Math.floor(index / autoCols);
+      const x = funcLeft + panelPad + col * (autoCardW + gap);
+      const y = autoBodyTop + row * (autoCardH + gap);
+      const innerW = autoCardW - 20 * fs;
+      const tx = x + 10 * fs;
+      layerParts += '<g>' +
+        '<rect class="auto-node" x="' + x + '" y="' + y + '" width="' + autoCardW +
+        '" height="' + autoCardH + '" rx="' + (10 * fs) +
+        '" fill="rgba(56,189,248,.08)" stroke="rgba(56,189,248,.55)"/>' +
+        '<text x="' + tx + '" y="' + (y + 23 * fs) + '" fill="#bfe9ff" font-size="' +
+        (10.5 * fs) + '" font-weight="700">' +
+        esc(clipText('⚡ ' + zh('automations', auto.name, auto.name), 10.5 * fs, innerW)) +
+        '</text>' +
+        '<text x="' + tx + '" y="' + (y + 41 * fs) + '" fill="#7f93ab" font-size="' +
+        (8 * fs) + '">' + esc(clipText(auto.name, 8 * fs, innerW)) + '</text>' +
+        '</g>';
+    });
+
+    grow(panelLeft, layerTop, panelLeft + panelW, layerTop + panelH);
+  }
+
   return {
     inner: '<defs><marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" ' +
       'markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
       '<path d="M0,0 L10,5 L0,10 z" fill="#38bdf8"/></marker></defs>' +
-      lineParts + labelParts + nodes,
+      lineParts + labelParts + nodes + layerParts,
     bbox: {
       minX: minX - pad, minY: minY - pad,
       maxX: maxX + pad, maxY: maxY + pad
@@ -206,6 +390,7 @@ function topologySvg(m) {
     '" preserveAspectRatio="xMidYMid meet">' + scene.inner + '</svg>';
 }
 """
+
 
 
 TOPOLOGY_PAGE_HTML = r"""<!doctype html>
@@ -426,7 +611,9 @@ async function load() {
     document.title = '本体关系图 · ' + name;
     document.getElementById('subtitle').textContent =
       category + ' · ' + (data.object_types || []).length + ' 个对象类型 · ' +
-      (data.link_types || []).length + ' 条关系';
+      (data.link_types || []).length + ' 条关系 · ' +
+      (data.actions || []).length + ' 个业务动作 · ' +
+      (data.functions || []).length + ' 个查询函数';
     scene = topologyScene(data, 1200, 700, 1.5);
     sceneG.innerHTML = scene.inner;
     if (!(data.object_types || []).length) {

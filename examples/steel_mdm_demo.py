@@ -525,6 +525,17 @@ def consume_by_brand_fifo(ctx: Any, params: ConsumeBrandParams) -> None:
         remaining -= take
 
 
+#: 本蓝图自己的展示词条：展示层动态合并，内核字典保持 0 行改动。
+spec.display = {
+    "roles": {
+        "ops_manager": "运营主管",
+        "warehouse": "库管员",
+        "mes": "制造执行系统",
+        "production": "生产主管",
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Demo seed
 # ---------------------------------------------------------------------------

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/Users/guci/work/open-ontology/video_arch_v2/specs/overview.architecture.json",
+  "output": "/Users/guci/work/open-ontology/video_arch_v2/html/overview.html",
+  "specification": {
+    "sha256": "963836650b3836c97734fd0557a78927002d977592a69c74eb5d3d62b448398c",
+    "bytes": 3929
+  },
+  "artifact": {
+    "sha256": "1231da90a04f762c90b253c44663d8c9f1c992500e4a38eee609210611413da0",
+    "bytes": 812548
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

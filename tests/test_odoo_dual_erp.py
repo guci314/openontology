@@ -387,7 +387,14 @@ def test_pim_psm_separation():
         )
         # The pure HTTP boundaries are allowed to use the stdlib transport;
         # every other kernel module must stay fully transport-agnostic.
-        if path.name not in ("http_server.py", "workshop.py", "harness_drivers.py"):
+        # ``agent_hosts.py`` is the智能体宿主 PSM 边界（与 harness_drivers.py 同层），
+        # 它按定义负责把任务交给真实宿主，因此允许使用标准库传输。
+        if path.name not in (
+            "http_server.py",
+            "workshop.py",
+            "harness_drivers.py",
+            "agent_hosts.py",
+        ):
             for forbidden in ("urllib", "http://", "https://", "http.server"):
                 assert forbidden not in text, f"{forbidden!r} leaked into {path.name}"
 
