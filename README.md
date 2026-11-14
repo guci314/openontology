@@ -51,7 +51,7 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 | HTTP 传输边界 | `open_ontology/http_server.py` | 标准库 `ThreadingHTTPServer` 暴露 health / snapshot / action-runs / objects；不是业务蓝图 |
 | 工作空间目录 | `open_ontology/workspaces.py` | `WorkspaceDescriptor` + `workspaces.json` 清单、可信模型解析、`takeover_workspace`；不建业务表 |
 | 模型只读投影 | `open_ontology/model_views.py` | `describe_tbox(spec)` / `describe_behavior(spec)`：结构 TBox 与行为契约的纯 JSON 视图 |
-| 指挥台展示 | `open_ontology/workshop.py`、`workshop_ui.py` | `Model · 领域模型` / `Workspace · 工作空间` / Runtime / Device 四视角、中文展示与拓扑大图 |
+| 指挥台展示 | `open_ontology/workshop.py`、`workshop_ui.py` | `Model · 领域模型` / `World · 业务世界`（`Workspace`） / Runtime / Device 四视角、中文展示与拓扑大图 |
 | 纯业务任务看板 | `open_ontology/kanban.py` | 看板 / 列语义 / 卡片 / 认领 / 裁决 / 带数字的证据 |
 | 智能体宿主 PSM | `open_ontology/agent_hosts.py` | CodeBuddy CLI 与 OpenCode HTTP 宿主 → 结构化裁决；会话世代轮转与按角色路由 |
 | 内部执行边界 | `open_ontology/execution/` | 实例级能力绑定与透明可选观察；已落盘并有测试，未宣称接入全部外部工具路径 |
@@ -66,13 +66,13 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 
 `ontology_registry`、`ontology_objects`、`ontology_links`、`ontology_action_runs`、`ontology_overlay`，外加物理门禁表 `ontology_write_gate`。
 
-## Model / Workspace 术语
+## Model / World（Workspace）术语
 
 | 概念 | 说明 |
 |---|---|
 | **Model · 领域模型** | 可复用的 `model_id` 定义包：TBox（类型/字段/关系/约束）+ Behavior（动作/函数/自动化契约） |
-| **Workspace · 工作空间** | 绑定模型引用、ABox 事实、Runtime 与执行历史的隔离运行范围，以 `workspace_id` 标识 |
-| **业务对象地址** | `workspace_id / object_type / object_id`；聚合根对象 ID 不等于工作空间 ID |
+| **World · 业务世界**（代码兼容别名 `Workspace · 工作空间`） | 绑定模型引用、ABox 事实、Runtime 与演化历史的隔离业务世界实例（含持久化主世界与 `fork()` 平行沙盘），代码以 `workspace_id` 标识 |
+| **业务对象地址** | `workspace_id / object_type / object_id`；聚合根对象 ID 不等于业务世界（工作空间）ID |
 
 `instance_id` / `?instance=` / `register_instance` 等旧拼写与 `workspace_id` / `?workspace=` 双栈兼容，指向同一份底层条目。完整词汇与身份边界见 [GLOSSARY.md](GLOSSARY.md)。
 

@@ -23,8 +23,19 @@ def _doc(relpath: str) -> str:
 
 def test_glossary_defines_core_terms_and_identity_boundary():
     text = _doc("GLOSSARY.md")
-    for term in ("Model", "Workspace", "TBox", "ABox", "Behavior", "Runtime", "Device"):
+    for term in (
+        "Symbolic World Model",
+        "Model",
+        "World",
+        "Workspace",
+        "TBox",
+        "ABox",
+        "Behavior",
+        "Runtime",
+        "Device",
+    ):
         assert term in text, f"术语表缺少 {term}"
+    assert "World · 业务世界" in text
     assert "workspace_id / object_type / object_id" in text
     assert "工作空间身份" in text and "业务对象身份" in text
     assert "聚合根" in text
@@ -40,7 +51,8 @@ def test_architecture_doc_stays_m2_and_rejects_old_framing():
     assert "BD-CC-001" not in text
     assert "docs/TASK_BOARD.md" in text
     # 迁移后的展示词汇与兼容映射必须写进宪法，而不是留在旧标签里。
-    assert "Model · 领域模型" in text and "Workspace · 工作空间" in text
+    assert "Model · 领域模型" in text and "World · 业务世界" in text
+    assert "Workspace · 工作空间" in text
 
 
 def test_task_board_doc_keeps_m1_m0_contract_and_links_m2():
@@ -54,7 +66,8 @@ def test_task_board_doc_keeps_m1_m0_contract_and_links_m2():
 def test_readme_and_state_docs_describe_current_implementation():
     readme = _doc("README.md")
     assert "GLOSSARY.md" in readme
-    assert "Model · 领域模型" in readme and "Workspace · 工作空间" in readme
+    assert "Model · 领域模型" in readme and "World · 业务世界" in readme
+    assert "Workspace · 工作空间" in readme
     assert "workspaces.py" in readme and "model_views.py" in readme
     # 旧「施工中 / 尚未验收」的状态声明不得继续冒充当前实现状态。
     assert "尚未验收、未合并 main" not in readme

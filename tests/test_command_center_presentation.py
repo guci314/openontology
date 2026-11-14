@@ -1122,7 +1122,7 @@ def test_ingestion_driver_is_a_device_driver_not_kernel():
 PILLAR_TABS = (
     ("tab-ontology", "Model · 领域模型"),
     ("tab-runtime", "Runtime · 算力与治理宿体"),
-    ("tab-instance", "Workspace · 工作空间"),
+    ("tab-instance", "World · 业务世界"),
     ("tab-device", "Device · 外部世界(符号+联结)"),
 )
 
@@ -1262,7 +1262,7 @@ def test_browser_pillar_tabs_switch_four_views(live, browser):
 MODEL_WORKSPACE_PILLARS = (
     ("tab-ontology", "Model · 领域模型"),
     ("tab-runtime", "Runtime · 算力与治理宿体"),
-    ("tab-instance", "Workspace · 工作空间"),
+    ("tab-instance", "World · 业务世界"),
     ("tab-device", "Device · 外部世界(符号+联结)"),
 )
 
@@ -1514,7 +1514,7 @@ def test_browser_model_and_workspace_views_label_tbox_behavior_abox(live, browse
         page.wait_for_selector("#pillarTabs .pillar-tab")
         pillars = page.inner_text("#pillarTabs")
         assert "Model · 领域模型" in pillars
-        assert "Workspace · 工作空间" in pillars
+        assert "World · 业务世界" in pillars
 
         page.locator("#ontologies .card").first.click()
         page.wait_for_selector("#stage .topo-link")
@@ -1529,7 +1529,7 @@ def test_browser_model_and_workspace_views_label_tbox_behavior_abox(live, browse
         page.wait_for_selector("#objects .obj")
         workspace_stage = page.inner_text("#stage")
         assert "ABox" in workspace_stage, workspace_stage
-        assert "Workspace · 工作空间" in workspace_stage
+        assert "World · 业务世界" in workspace_stage
 
         assert errors == [], errors
     finally:

@@ -81,7 +81,7 @@ OpenOntology 完整继承了 Palantir Foundry/AIP 的核心原理，并将其精
 
 | 哲学维度 | Palantir Foundry / AIP 原语 | OpenOntology 对应实现 | 所在模块 |
 |---|---|---|---|
-| **领域模型与元注册表** | Ontology Metadata / Workspace | `OntologySpec`（M1 可复用模型容器）+ 隔离 `Workspace` | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py)、[workspaces.py](file:///Users/guci/work/open-ontology/open_ontology/workspaces.py) |
+| **领域模型与业务世界** | Ontology Metadata / Workspace | `OntologySpec`（M1 世界法则容器）+ 隔离 `World / 业务世界`（代码兼容别名 `Workspace`） | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py)、[workspaces.py](file:///Users/guci/work/open-ontology/open_ontology/workspaces.py) |
 | **语义层（TBox）** | Object Type / Link Type / Interface | `ObjectType`（Pydantic 基类）、`LinkType`、`InterfaceType` | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py) |
 | **动力学层（Behavior）** | Function / Action / Automation | `FunctionDef`（只读）、`ActionDef`（受控写）、`AutomationDef`（条件反射） | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py) |
 | **集合代数与遍历** | ObjectSet / SearchAround / Aggregate | `ObjectSet`（去重保序集合代数）、`pivot`、`aggregate` | [query.py](file:///Users/guci/work/open-ontology/open_ontology/query.py) |

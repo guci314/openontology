@@ -6,38 +6,40 @@
 
 ---
 
-## 1. 领域模型、工作空间、执行引擎与外部设备
+## 1. 领域模型、业务世界、执行引擎与外部设备
+
+> **符号世界模型三元组**：`Model`（领域模型 / 世界法则） + `Runtime`（执行引擎 / 模拟器） + `World`（业务世界 / 世界状态实例，代码兼容别名 `Workspace`）共同构成完整的 **Symbolic World Model（符号世界模型）**。
 
 | 概念 | 职责（M2 语义） | 不是什么 |
 |---|---|---|
-| **Model / 领域模型** | 定义类型（TBox）、关系、声明式约束与受控行为（Behavior），可被多个工作空间复用 | 不是具体对象数据，也不因启动执行而变成事实 |
-| **Workspace / 工作空间** | 绑定模型引用、事实状态（ABox）、Runtime 与审计历史，提供隔离的业务运行范围 | 不是单个业务对象，也不是源代码工作目录 |
-| **Runtime / 执行引擎** | 执行模型定义的查询、动作、治理切面、持久化和沙盘推演 | 不是额外一份业务事实 |
+| **Model / 领域模型** | 定义世界结构（TBox）、关系、声明式约束与状态转移法则（Behavior），可被多个业务世界复用 | 不是具体对象数据，也不因启动执行而变成事实 |
+| **World / 业务世界**<br>（代码兼容别名 `Workspace`） | 绑定模型引用、事实状态（ABox）、Runtime 与演化审计历史，提供隔离的业务世界实例（含主世界与 `fork()` 平行沙盘世界） | 不是单个业务对象，也不是源代码工作目录 |
+| **Runtime / 执行引擎** | 执行模型定义的查询、动作、治理切面、持久化和平行沙盘推演 | 不是额外一份业务事实 |
 | **Device / 外部设备** | 登记与适配外部系统（OpenAPI）、工具和智能体（A2A Agent） | 不是未经校验即可进入事实图的可信数据 |
 
 四种职责不意味着四个完全正交、必须各自独立管理生命周期的业务资源。指挥台界面可以按这四种视角组织展示，但不能由四个标签页反推出四套割裂的资源账本。
 
 ```mermaid
 flowchart TB
-    subgraph MODEL["1. Model / 领域模型（M1 可复用领域定义）"]
+    subgraph MODEL["1. Model / 领域模型（M1 世界法则与结构定义）"]
         direction LR
         TBOX["TBox 结构定义｜ObjectType / InterfaceType / LinkType · 主键 / __aggregate_root__ / 脱敏与安全标签"]
         BEHAVIOR["Behavior 受控行为｜ActionDef / FunctionDef / AutomationDef · RBAC 授权 / InvariantError 不变量"]
         DISPLAY["spec.display｜领域自治中文词条"]
     end
 
-    subgraph WORKSPACE["2. Workspace / 工作空间（M0 隔离业务运行范围）"]
+    subgraph WORLD["2. World / 业务世界（Workspace · M0 隔离世界状态实例）"]
         direction TB
         MODEL_REF["模型引用：model_id"]
         ABOX["ABox 事实状态｜ontology_objects / ontology_links / ontology_overlay · 三级寻址 workspace_id / object_type / object_id"]
         ROOT["聚合根入口｜RootObjectType / object_id"]
-        HISTORY["执行与审计历史｜ontology_action_runs（追加式因果账本）"]
+        HISTORY["演化与审计历史｜ontology_action_runs（追加式因果账本）"]
         ABOX --> ROOT
     end
 
-    subgraph RUNTIME["3. Runtime / 执行引擎（确定性算力与治理宿体）"]
+    subgraph RUNTIME["3. Runtime / 执行引擎（世界模拟器与治理宿体）"]
         direction TB
-        CORE["① Runtime.Core 微内核｜EditBatch 内存沙箱 · ObjectDiff · fork() 平行推演 · ontology_write_gate 写门禁"]
+        CORE["① Runtime.Core 微内核｜EditBatch 内存沙箱 · ObjectDiff · fork() 平行世界推演 · ontology_write_gate 写门禁"]
         ASPECT["② Runtime.Aspect 七大系统调用切面｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 审批 / 时光机 · 被拒审计 · 反射 · 忙闲回调"]
         ADAPTER["③ Runtime.DeviceAdapter 设备驱动｜SnapshotIngestionDriver · agent_hosts · harness_drivers"]
         CORE <--> ASPECT
@@ -50,9 +52,9 @@ flowchart TB
         CONNECTIONIST["联结主义设备｜A2A Agent Card（CodeBuddy / OpenCode 等外部智能体）"]
     end
 
-    MODEL ==>|"1 对 N 复用装载（定义结构与操作契约）"| WORKSPACE
+    MODEL ==>|"1 对 N 复用装载（定义结构与转移法则）"| WORLD
     MODEL -.->|"注入 TBox 与 Behavior 规则"| CORE
-    RUNTIME ==>|"绑定并驱动受控读写（沙箱先行 · 禁止裸 CRUD）"| WORKSPACE
+    RUNTIME ==>|"绑定并驱动受控读写（沙箱先行 · 禁止裸 CRUD）"| WORLD
     SYMBOLIC ==>|"快照同步刷新（Source-Backed 字段）"| ADAPTER
     CONNECTIONIST ==>|"ExecutionFabric 调用回执（须经 ActionDef 不变量门禁验收）"| ADAPTER
 ```
@@ -60,22 +62,22 @@ flowchart TB
 ### 1.1 定义、事实与行为（TBox · Behavior · ABox）
 
 ```text
-Model <model_id>（M1 可复用领域定义）
+Model <model_id>（M1 可复用领域定义 / 世界法则）
 ├─ TBox：ObjectType、字段、InterfaceType、LinkType、声明式约束与类型元数据
 └─ Behavior：ActionDef、FunctionDef、AutomationDef、角色授权与操作契约
 
-Workspace <workspace_id>（M0 隔离业务运行空间）
+World <world_id / workspace_id>（M0 隔离业务世界）
 ├─ 模型引用：<model_id>
 ├─ ABox：具体对象实例、属性值、关系断言事实
-│  └─ <RootObjectType> / <object_id>（空间内的聚合根对象）
+│  └─ <RootObjectType> / <object_id>（世界内的聚合根对象）
 ├─ Runtime 绑定：Core + Aspect + DeviceAdapter
-└─ 执行与审计历史（ontology_action_runs）
+└─ 演化与审计历史（ontology_action_runs）
 ```
 
 * **TBox** 描述类型与关系结构定义，**ABox** 描述个体与事实断言；两者是元层次区分，不是知识激活流程的两个阶段。
 * **Behavior** 决定事实如何受控变化，不能全部硬塞入静态结构 TBox。此处借用 TBox/ABox 做逻辑投影，不承诺 OWL 推理机或任意 Python 校验函数的逻辑序列化。
-* 工作空间本质上是 `模型引用 + ABox + Runtime 绑定 + 执行历史`，不是把同一份模型或数据库换名复制两遍。
-* 当前 `OntologyRuntime(spec, db_path)` 绑定单个模型与单个存储。同一模型复用于多个工作空间是核心能力；单个引擎同时装载多个不同模型不属于现阶段承诺。
+* 业务世界（代码标识符 `Workspace`）本质上是 `模型引用 + ABox + Runtime 绑定 + 执行历史`，不是把同一份模型或数据库换名复制两遍。
+* 当前 `OntologyRuntime(spec, db_path)` 绑定单个模型与单个存储。同一模型复用于多个业务世界（工作空间）是核心能力；单个引擎同时装载多个不同模型不属于现阶段承诺。
 * 模型随 Python 代码模块发布即可；现阶段不建设独立模型发布服务、不引入外部 RDF/OWL 存储，也不因逻辑分层拆分底层业务表。
 
 #### 1.1.1 Ontology 核心原语规范（ObjectType · LinkType · InterfaceType · FunctionDef · ActionDef · AutomationDef）
@@ -136,28 +138,28 @@ flowchart LR
 
 ### 1.2 身份寻址与聚合根元数据
 
-业务对象的完整三级地址为 **`workspace_id / object_type / object_id`**：
+业务对象的完整三级地址在代码与存储契约中为 **`workspace_id / object_type / object_id`**（其中 `workspace_id` 即业务世界身份 `world_id`）：
 
-* `workspace_id` 标识隔离工作空间；`object_type / object_id` 标识该空间内的具体业务对象，严禁将聚合根对象 ID 混同为工作空间 ID。
-* 不同工作空间允许存在相同的 `object_id`；跨工作空间按对象寻址出现多命中歧义时，必须显式返回候选并拒绝盲取第一个命中。
-* 代码中的文件系统路径参数（如 `workdir` 或历史命名的 `workspace_root`）仅表示本地代码工作目录，不等于业务 `workspace_id`。
+* `workspace_id` 标识隔离业务世界（工作空间）；`object_type / object_id` 标识该世界内的具体业务对象，严禁将聚合根对象 ID 混同为业务世界 / 工作空间 ID。
+* 不同业务世界允许存在相同的 `object_id`；跨世界按对象寻址出现多命中歧义时，必须显式返回候选并拒绝盲取第一个命中。
+* 代码中的文件系统路径参数（如 `workdir` 或历史命名的 `workspace_root`）仅表示本地代码工作目录，不等于业务世界身份 `workspace_id`（`world_id`）。
 
 `ObjectType.__aggregate_root__` 是默认 `False` 的显式**类型级元数据**，由各 M1 模型作者按领域语义显式声明：
 * 严禁按图入度、类型名称、主键命名或是否存在连边自动猜测聚合根；
-* 该标记用于空间导航与入口暴露，不因此自动改变或扩张动作级事务边界。
+* 该标记用于世界导航与入口暴露，不因此自动改变或扩张动作级事务边界。
 
-“列出所有工作空间”必须同时按调用方 `Actor` 列出每个空间内有权可见的聚合根对象（`object_type`、`object_id`、脱敏后的 `title`）：
+“列出所有业务世界 / 工作空间”必须同时按调用方 `Actor` 列出每个世界内有权可见的聚合根对象（`object_type`、`object_id`、脱敏后的 `title`）：
 * 必须严格区分 **“模型未声明根类型”**、**“已声明根类型但当前无可见根对象”**、**“仅在目录登记尚未加载（`not_loaded`）”** 与 **“存储不可读/损坏（`unavailable`）”** 四种状态；不可读根集绝不能伪装成空列表。
 * 根对象枚举必须走既有受控查询路径（遵守 RLS 行级过滤与列级脱敏），严禁裸 SQL 旁路读取，也不得通过异常消息回显原始敏感值或静默截断结果集。
 
 ### 1.3 标准三步工作流与只读探测铁律
 
-1. **定义 Model，建立内存验证空间**：声明对象、关系、动作与不变量，在 `:memory:` Runtime 上验证状态转移与沙盘推演。
+1. **定义 Model，建立内存验证世界**：声明对象、关系、动作与不变量，在 `:memory:` Runtime 上验证状态转移与沙盘推演。
 2. **登记 Device，装配 Runtime**：登记外部符号系统（OpenAPI）与联结设备（A2A Agent），装配存储、治理切面与适配器。
-3. **打开或创建 Workspace**：将模型绑定至持久化存储形成生产工作空间。
+3. **打开或创建 World（Workspace）**：将模型绑定至持久化存储形成生产业务世界。
    * **默认无损打开**：已有合法数据库默认原样重开，绝不重跑建表播种；只有显式指定单库作用域的 `reset` 才允许清库重建；半成品或外来异构库必须在预检阶段报错拒绝，禁止静默修补覆盖。
    * **跨库探测零副作用**：按目录或对象 ID 扫描 SQLite 文件必须使用经 RFC 3986 标准转义的只读文件 URI（`Path.resolve().as_uri() + "?mode=ro"`），防止路径中的 `#`、`?`、`%` 等保留字符截断只读参数或在旁路误建空文件；查找失败只抛异常，绝不自动建目录、建库或写入种子数据。
-   * 纯内存工作空间仅在进程生命周期内有效，不得伪装为跨重启可恢复的持久空间。
+   * 纯内存业务世界仅在进程生命周期内有效，不得伪装为跨重启可恢复的持久世界。
 
 ```mermaid
 sequenceDiagram
@@ -166,15 +168,15 @@ sequenceDiagram
     participant M as Model（M1 领域模型）
     participant D as Device（OpenAPI / A2A Agent）
     participant R as Runtime（Core + Aspect + Adapter）
-    participant W as Workspace（ABox + 审计账本）
+    participant W as World / 业务世界（Workspace · ABox + 审计账本）
 
-    Note over M,R: 第一步：定义 Model，建立 :memory: 验证空间
+    Note over M,R: 第一步：定义 Model，建立 :memory: 验证世界
     M->>R: 装载 TBox 结构与 Behavior 契约（simulate_action / fork 推演）
 
     Note over D,R: 第二步：登记 Device，装配 Runtime
     D->>R: 登记符号设备（OpenAPI）与联结设备（A2A Agent Card）
 
-    Note over R,W: 第三步：打开或创建持久化 Workspace（默认无损打开 / 只读探测 ?mode=ro）
+    Note over R,W: 第三步：打开或创建持久化 World（默认无损打开 / 只读探测 ?mode=ro）
     D->>R: 外部快照摄入（load_snapshot）
     R->>W: 刷新 Source-Backed 字段（保留 __owned__ 自有覆盖层）
 
@@ -279,15 +281,15 @@ sequenceDiagram
 * **读出口脱敏的作用面**：`EditBatch` 可注入读脱敏回调，但只有**只读** `FunctionDef` 批处理会注入；动作批处理永不脱敏，确保暂存 diff 只会写入真实值，绝不会把 `***MASKED***` 落库。
 
 ### 3.3 虚拟现实沙盘推演与时光机（Simulation & Time-Travel）
-* **隔离分叉（`runtime.fork()`）**：复用同一 `OntologySpec`，通过 SQLite backup 将当前工作空间事实与历史克隆至独立 `:memory:` 实例形成平行沙盘（非操作系统页级零拷贝，但与原空间物理隔离）。
-* **蒙特卡洛树搜索（`OntologyMCTSPlanner`）**：在 `fork()` 沙盘上枚举候选动作序列并自动剪枝违反 `InvariantError` 的分支，择优后再受控提交回主工作空间。
+* **隔离分叉（`runtime.fork()`）**：复用同一 `OntologySpec`，通过 SQLite backup 将当前业务世界事实与历史克隆至独立 `:memory:` 实例形成平行沙盘世界（非操作系统页级零拷贝，但与原世界物理隔离）。
+* **蒙特卡洛树搜索（`OntologyMCTSPlanner`）**：在 `fork()` 平行世界沙盘上枚举候选动作序列并自动剪枝违反 `InvariantError` 的分支，择优后再受控提交回主业务世界。
 * **因果账本与逆向冲正（`runtime.approve_action` / `runtime.revert_action`，委托 `aspects.ApprovalGateAspect`）**：基于持久化 `ObjectDiff` 与版本号执行带冲突检测的精确逆向回滚，并支持提交后 `evaluate_automations` 条件反射与版本级去重。
 
 ### 3.4 指挥台四展示视角与领域无关图形协议（4-View Command Center）
-* **指挥台展示视角**（一级标签与路由已按 Model / Workspace 完成迁移，兼容映射见第 6 节）：
+* **指挥台展示视角**（一级标签升级为 `Model / Runtime / World / Device`，代码与 HTTP 兼容映射见第 6 节）：
   1. **Model / 领域模型视角**（`Model · 领域模型`）：查看结构 TBox、Behavior 操作契约及 `/topology` 全景矢量图（对象、关系、动作、函数及可选自动化规则）；
   2. **Runtime / 执行引擎视角**（`Runtime · 算力与治理宿体`）：查看运行宿体配置（`:memory:` / `.sqlite3`、已挂载的七大 `Aspect` 与适配器）；
-  3. **Workspace / 工作空间视角**（`Workspace · 工作空间`）：选择工作空间及聚合根入口，查看 ABox 事实，执行干跑、正式提交、`fork()` / MCTS 推演、审批与时光机回滚；
+  3. **World / 业务世界视角**（`World · 业务世界`，代码兼容别名 `Workspace`）：选择业务世界及聚合根入口，查看 ABox 事实，执行干跑、正式提交、`fork()` / MCTS 推演、审批与时光机回滚；
   4. **Device / 外部设备视角**（`Device · 外部世界(符号+联结)`）：分栏检视 **符号主义设备（OpenAPI Schema）** 与 **联结主义设备（A2A Agent Card）**。
 * **展示词条自治（`OntologySpec.display`）**：内核 `ui_display.json` 仅保留跨领域通用界面词汇；各 M1 模型必须在自身 `spec.display` 中自带中文词条。TBox/ABox 为逻辑投影，不拆成两个一级标签页。
 
@@ -295,11 +297,11 @@ sequenceDiagram
 
 ## 4. 外部世界双标准设备与三层职责分离 (Device & Tri-Layer Separation)
 
-工作空间与外部世界交互时，在 M2 层严格分离以下三类职责：
+业务世界与外部世界交互时，在 M2 层严格分离以下三类职责：
 
 | 层次 | 载体 / 模块 | 回答的 M2 核心问题 |
 | :--- | :--- | :--- |
-| **1. 工作空间的事实与历史** | `ontology_objects`、`ontology_links`、`ontology_overlay`、`ontology_action_runs` | 当前空间内哪些对象与关系事实成立？哪一次受控动作在何时由谁改变了它们？事实与审计逻辑分离，不复制两套业务库。 |
+| **1. 业务世界的事实与历史** | `ontology_objects`、`ontology_links`、`ontology_overlay`、`ontology_action_runs` | 当前业务世界内哪些对象与关系事实成立？哪一次受控动作在何时由谁改变了它们？事实与审计逻辑分离，不复制两套业务库。 |
 | **2. 外部设备契约与调用织入** | • **符号主义设备**：`OpenAPI Schema`（当前目录项 `SymbolicDeviceEntry`）<br>• **联结主义设备**：`A2A Agent Card`（当前目录项 `AgentCardDeviceEntry`）<br>• **调用织入与宿主适配**：`ExecutionFabric`、`agent_hosts.py` | 外部确定性系统暴露什么 RPC/快照契约？外部智能体具备什么角色与技能 Card？调用输入输出摘要与结构化回执（如 `HostResult`）是什么？ |
 | **3. M1 领域动作验收门禁** | 各 M1 Model 在 `ActionDef` 中声明的强类型契约与 `InvariantError` 不变量 | 外部设备（尤其是概率性的联结主义 Agent）返回的建议或回执，是否满足该业务模型要求的确定性准入条件？（未通过门禁一律拒绝写入事实表并记入被拒审计。） |
 
@@ -320,16 +322,17 @@ sequenceDiagram
 
 ## 6. 旧代码拼写的兼容范围
 
-架构正文统一使用 **Model / Workspace**。下列现有代码标识符仅说明向后兼容映射，不代表另一套并列概念：
+架构正文统一使用 **Model / World**（业务世界，作为符号世界模型中的 M0 世界状态实例）。下列现有代码标识符仅说明向后兼容映射，不代表另一套并列概念：
 
 | 现有代码拼写 | 架构含义 / 渐进迁移方向 |
 |---|---|
+| `Workspace`、`workspace_id`、`workspaces.py` | 业务世界（`World`）在代码、HTTP 路由（`?workspace=`）与目录清单（`workspaces.json`）中的现行兼容标识符；与界面 `World · 业务世界` 指向同一实体 |
 | `OntologySpec`、`ontology_id` | M1 领域模型定义容器与模型身份；保留代码兼容，目标别名 `model_id` |
 | `OntologyRuntime` | 绑定单个模型与存储的 M2 执行引擎，不因术语收敛推倒重写 |
-| `instance_id`、`?instance=` | 旧工作空间身份与 HTTP 查询参数；与 `workspace_id` / `?workspace=` 双栈兼容（冲突参数显式报错） |
-| `register_instance`、`get_instance` | `CommandCenterRegistry` 上的旧工作空间登记/查找方法；与 `register_workspace` / `get_workspace` 指向同一份底层条目 |
-| `#tab-ontology`、`#tab-instance` | 兼容期保留的 DOM ID；界面展示目标为 `Model · 领域模型` 与 `Workspace · 工作空间` |
-| `CommandCenterRegistry` | 当前同时承载模型目录、工作空间目录与符号/联结双设备表的内存注册中心；持久化工作空间清单由独立目录描述子承接 |
-| `takeover_board_from_db` | M1 `task_board` 模型的按对象 ID 接管兼容入口；通用工作空间寻址由模型无关的 `takeover_workspace` 承接，见 [docs/TASK_BOARD.md](TASK_BOARD.md) |
+| `instance_id`、`?instance=` | 早期工作空间 / 业务世界身份与 HTTP 查询参数；与 `workspace_id` / `?workspace=` 双栈兼容（冲突参数显式报错） |
+| `register_instance`、`get_instance` | `CommandCenterRegistry` 上的早期登记/查找方法；与 `register_workspace` / `get_workspace` 指向同一份底层条目 |
+| `#tab-ontology`、`#tab-instance` | 兼容期保留的 DOM ID；界面展示已由早期的 `Workspace · 工作空间` 升级为 `World · 业务世界`（与 `Model · 领域模型` 对应） |
+| `CommandCenterRegistry` | 当前同时承载模型目录、业务世界（工作空间）目录与符号/联结双设备表的内存注册中心；持久化清单由独立目录描述子承接 |
+| `takeover_board_from_db` | M1 `task_board` 模型的按对象 ID 接管兼容入口；通用业务世界寻址由模型无关的 `takeover_workspace` 承接，见 [docs/TASK_BOARD.md](TASK_BOARD.md) |
 
 架构演进直接原地修订对应层次的规范正文，严禁以“上文新口径、下文旧定义”的追加补丁方式制造阅读歧义。

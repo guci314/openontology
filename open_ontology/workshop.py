@@ -1026,7 +1026,7 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
 <nav class="pillarnav" id="pillarTabs">
   <button class="pillar-tab on" id="tab-ontology" onclick="switchPillar('ontology')">📐 Model · 领域模型</button>
   <button class="pillar-tab" id="tab-runtime" onclick="switchPillar('runtime')">⚙️ Runtime · 算力与治理宿体</button>
-  <button class="pillar-tab" id="tab-instance" onclick="switchPillar('instance')">🌍 Workspace · 工作空间</button>
+  <button class="pillar-tab" id="tab-instance" onclick="switchPillar('instance')">🌍 World · 业务世界</button>
   <button class="pillar-tab" id="tab-device" onclick="switchPillar('device')">🔌 Device · 外部世界(符号+联结)</button>
 </nav>
 <main>
@@ -1380,10 +1380,10 @@ function renderInstanceView(meta, fp, runs, links) {
     esc(zh('interfaces', f.name, f.name)) + '</span>').join('');
 
   $('stage').innerHTML =
-    '<div class="hero"><h2>🌍 ' + esc(i.label) + ' <span class="badge c">Workspace · 工作空间</span>' +
+    '<div class="hero"><h2>🌍 ' + esc(i.label) + ' <span class="badge c">World · 业务世界</span>' +
     ' <span class="badge">' + esc(zh('ontologies', i.ontology_id, i.ontology_name)) + '</span></h2>' +
     '<p>' + esc(i.description || '') + ' · <b style="color:#a5e4ff">数据源 ' + esc(i.db_uri) + '</b></p>' +
-    '<div class="acts"><span class="badge v" id="formula" title="Workspace = Model + Runtime">🧬 认知降维：' +
+    '<div class="acts"><span class="badge v" id="formula" title="World = Model + Runtime">🧬 认知降维：' +
     esc(i.formula || '') + '</span><span class="badge">ABox · 事实状态</span>' + connectorChips(i.connectors) + '</div></div>' +
     '<section class="panel"><div class="mount"><b>实例环境与后台挂载栏</b>' +
     '<span class="badge">' + esc(i.instance_id) + '</span><span class="sp"></span>' +
