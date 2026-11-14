@@ -1551,3 +1551,129 @@ def test_browser_topology_model_alias_renders_same_scene(live, browser):
     finally:
         context.close()
 
+
+def test_docs_page_and_api_docs_served(base):
+    """首页提供架构文档入口，/docs 与 /api/docs 返回 4 份真实文档且无外链脚本。"""
+    index_html = _html(base + "/")
+    assert 'id="btnArchDoc"' in index_html
+    assert 'href="/docs?doc=architecture"' in index_html
+    assert 'id="btnPalantirDoc"' in index_html
+    assert 'href="/docs?doc=palantir"' in index_html
+
+    for suffix in ("/docs", "/docs?doc=architecture", "/docs?doc=palantir"):
+        doc_html = _html(base + suffix)
+        assert "<script src" not in doc_html
+        assert "docArticle" in doc_html
+
+    repo_root = Path(__file__).resolve().parents[1]
+    expected_paths = {
+        "palantir": repo_root / "docs" / "PALANTIR_AND_OPEN_ONTOLOGY.md",
+        "architecture": repo_root / "docs" / "ARCHITECTURE.md",
+        "task_board": repo_root / "docs" / "TASK_BOARD.md",
+        "glossary": repo_root / "GLOSSARY.md",
+    }
+    for key, path in expected_paths.items():
+        payload = _get_json(base, "/api/docs", doc=key)
+        assert payload["ok"] is True
+        assert payload["doc"] == key
+        assert payload["content"] == path.read_text(encoding="utf-8")
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _request(base + "/api/docs?doc=unknown_doc_key")
+    assert exc.value.code == 404
+
+
+def test_browser_docs_page_switches_and_renders_content(live, browser):
+    """点击首页架构文档按钮可跳转 /docs，切换文档标签并渲染正文与 Mermaid 架构块。"""
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    try:
+        page.goto(base_url, wait_until="networkidle")
+        page.locator("#btnArchDoc").click()
+        page.wait_for_url("**/docs?doc=architecture")
+        page.wait_for_selector("#docArticle h1")
+        assert "OpenOntology" in page.inner_text("#docArticle")
+        assert page.locator("#docArticle .mermaid-card").count() >= 1
+
+        page.locator('.doc-tab[data-doc="palantir"]').click()
+        page.wait_for_selector("#docArticle h1")
+        assert "Palantir" in page.inner_text("#docArticle")
+        assert "Overlay" in page.inner_text("#docArticle")
+        assert errors == [], errors
+    finally:
+        context.close()
+
+
+def test_storage_planes_separates_overlay_and_enforces_masking(base):
+    """OSv2 /api/storage-planes 严格分离 Backing Dataset 与 Overlay，并执行列级脱敏。"""
+    saas_ws = _get_json(
+        base,
+        "/api/storage-planes",
+        workspace="saas-parasitic",
+        object_type="SupportTicket",
+    )
+    saas_inst = _get_json(
+        base,
+        "/api/storage-planes",
+        instance="saas-parasitic",
+        object_type="SupportTicket",
+    )
+    assert saas_ws["workspace"] == "saas-parasitic"
+    assert saas_ws["planes"] == saas_inst["planes"]
+
+    by_id = {row["object_id"]: row for row in saas_ws["planes"]}
+    tkt_triaged = by_id["TKT-3004"]
+    assert tkt_triaged["owned_mode"] == "hybrid"
+    assert tkt_triaged["has_overlay"] is True
+    assert "ticket_id" in tkt_triaged["source"]
+    assert "ai_triage_note" not in tkt_triaged["source"]
+    assert (
+        tkt_triaged["overlay"]["ai_triage_note"]
+        == tkt_triaged["merged"]["ai_triage_note"]
+    )
+
+    tkt_untriaged = by_id["TKT-3001"]
+    assert tkt_untriaged["has_overlay"] is False
+    assert tkt_untriaged["overlay"] == {}
+
+    cust_planes = _get_json(
+        base,
+        "/api/storage-planes",
+        workspace="saas-parasitic",
+        object_type="Customer",
+    )
+    cust_map = {row["object_id"]: row for row in cust_planes["planes"]}
+    cust_triaged = cust_map["CUST-1004"]
+    assert cust_triaged["has_overlay"] is True
+    assert "fraud_score" not in cust_triaged["source"]
+    assert cust_triaged["overlay"]["fraud_score"] == cust_triaged["merged"]["fraud_score"]
+    assert cust_triaged["overlay"]["vip_tier"] == "GOLD"
+
+    ops_planes = _get_json(
+        base,
+        "/api/storage-planes",
+        workspace="osv2-coil-prod",
+        object_type="SteelCoil",
+        role="ops",
+    )
+    ops_c1 = next(row for row in ops_planes["planes"] if row["object_id"] == "C-1")
+    assert ops_c1["source"]["unit_price_ton"] == 0.0
+    assert ops_c1["source"]["cost_note"] is None
+    assert ops_c1["source"]["internal_code"] == "REDACTED"
+    assert ops_c1["merged"]["internal_code"] == "REDACTED"
+
+    fin_planes = _get_json(
+        base,
+        "/api/storage-planes",
+        workspace="osv2-coil-prod",
+        object_type="SteelCoil",
+        role="finance",
+    )
+    fin_c1 = next(row for row in fin_planes["planes"] if row["object_id"] == "C-1")
+    assert fin_c1["source"]["unit_price_ton"] == 18000.0
+    assert fin_c1["source"]["cost_note"] == "主力现货"
+    assert fin_c1["source"]["internal_code"] == "NC-304"
+
+

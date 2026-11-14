@@ -1386,3 +1386,11 @@ class OntologyRuntime:
             }
             for row in rows
         ]
+
+    def inspect_storage_planes(
+        self, actor: Actor, object_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        """返回 Backing Dataset 与 Ontology Overlay 双平面读视图：委托切面。"""
+        return SecurityAndAuthorityAspect.inspect_storage_planes(
+            self, actor, object_type=object_type
+        )

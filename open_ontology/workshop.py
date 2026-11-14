@@ -34,6 +34,7 @@ from .spec import Actor, ObjectType, OntologySpec, OpenOntologyError
 from .workshop_ui import (
     DISPLAY,
     DISPLAY_JS,
+    DOCS_PAGE_HTML,
     TOPOLOGY_JS,
     TOPOLOGY_PAGE_HTML,
     display_json,
@@ -60,6 +61,27 @@ __all__ = [
 
 #: 默认纯内存宿体编号：无外设的沙盘实例共用同一台宿主。
 DEFAULT_RUNTIME_ID = "rt-default-memory"
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+_DOC_FILES: dict[str, tuple[str, str]] = {
+    "palantir": (
+        "Palantir Foundry / AIP vs OpenOntology 对标与协同指南",
+        "docs/PALANTIR_AND_OPEN_ONTOLOGY.md",
+    ),
+    "architecture": (
+        "OpenOntology 架构设计规范",
+        "docs/ARCHITECTURE.md",
+    ),
+    "task_board": (
+        "架构演进与当前状态真值表",
+        "docs/TASK_BOARD.md",
+    ),
+    "glossary": (
+        "OpenOntology 概念词典",
+        "GLOSSARY.md",
+    ),
+}
 
 #: 七大全景治理切面（Core 之上的系统调用切面层）。
 RUNTIME_ASPECTS = [
@@ -1021,6 +1043,8 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
       <option value="mdm_steward">主数据管理员</option>
     </select>
     <button class="v" onclick="runAutomations()">⚡ 运行自动化规则</button>
+    <a class="ph-more" id="btnArchDoc" href="/docs?doc=architecture" target="_self" rel="noopener">🏛 架构规范</a>
+    <a class="ph-more" id="btnPalantirDoc" href="/docs?doc=palantir" target="_self" rel="noopener">📖 Palantir 对比</a>
   </div>
 </header>
 <nav class="pillarnav" id="pillarTabs">
@@ -2145,10 +2169,48 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/docs":
+            self._send(
+                200,
+                _render_ui_page(
+                    DOCS_PAGE_HTML, self._title, self._registry
+                ).encode("utf-8"),
+                "text/html; charset=utf-8",
+            )
+            return
+
         with self._lock:
             try:
                 if path == "/api/health":
                     self._send_json(200, {"ok": True})
+                    return
+                if path == "/api/docs":
+                    doc_key = (
+                        query.get("doc", ["architecture"])[0] or "architecture"
+                    ).strip()
+                    doc_entry = _DOC_FILES.get(doc_key)
+                    if doc_entry is None:
+                        self._error(404, f"unknown doc '{doc_key}'")
+                        return
+                    title, rel_path = doc_entry
+                    doc_path = _REPO_ROOT / rel_path
+                    if not doc_path.is_file():
+                        self._error(404, f"doc file missing: {rel_path}")
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "doc": doc_key,
+                            "title": title,
+                            "path": rel_path,
+                            "content": doc_path.read_text(encoding="utf-8"),
+                            "docs": [
+                                {"key": k, "title": t, "path": p}
+                                for k, (t, p) in _DOC_FILES.items()
+                            ],
+                        },
+                    )
                     return
                 if path == "/api/catalog":
                     self._send_json(200, self._catalog())
@@ -2279,6 +2341,24 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                             "interface": name,
                             "count": len(objects),
                             "objects": [o.model_dump(mode="json") for o in objects],
+                        },
+                    )
+                    return
+
+                if path == "/api/storage-planes":
+                    object_type = query.get("object_type", [None])[0]
+                    planes = runtime.inspect_storage_planes(
+                        actor, object_type=object_type
+                    )
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "instance": entry.instance_id,
+                            "workspace": entry.instance_id,
+                            "actor": {"actor_id": actor.actor_id, "role": actor.role},
+                            "count": len(planes),
+                            "planes": planes,
                         },
                     )
                     return

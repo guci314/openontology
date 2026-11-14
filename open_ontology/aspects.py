@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from types import UnionType
 from typing import Any, Callable, Union, get_args, get_origin
 
@@ -348,6 +349,74 @@ class SecurityAndAuthorityAspect:
             "WHERE object_type = ? AND object_id = ?",
             (object_type, object_id),
         )
+
+    @staticmethod
+    def inspect_storage_planes(
+        runtime: Any,
+        actor: Actor,
+        object_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按行级 RLS 与列级脱敏投影 Backing Dataset 与 Overlay 双平面。"""
+        if object_type is not None:
+            resolved_type = runtime.spec.get_object_type(object_type).__name__
+            obj_rows = runtime._conn.execute(
+                "SELECT * FROM ontology_objects WHERE object_type = ? ORDER BY object_id",
+                (resolved_type,),
+            ).fetchall()
+            ov_rows = runtime._conn.execute(
+                "SELECT object_type, object_id, patch_json FROM ontology_overlay "
+                "WHERE object_type = ?",
+                (resolved_type,),
+            ).fetchall()
+        else:
+            obj_rows = runtime._conn.execute(
+                "SELECT * FROM ontology_objects ORDER BY object_type, object_id"
+            ).fetchall()
+            ov_rows = runtime._conn.execute(
+                "SELECT object_type, object_id, patch_json FROM ontology_overlay"
+            ).fetchall()
+
+        overlays: dict[tuple[str, str], dict[str, Any]] = {
+            (str(r["object_type"]), str(r["object_id"])): json.loads(r["patch_json"])
+            for r in ov_rows
+        }
+        entries: list[dict[str, Any]] = []
+        for row in obj_rows:
+            type_name = str(row["object_type"])
+            obj_id = str(row["object_id"])
+            security_tags = list(json.loads(row["security_tags_json"]))
+            if not actor.has_access(security_tags):
+                continue
+            cls = runtime.spec.get_object_type(type_name)
+            raw_props = json.loads(row["properties_json"])
+            masked_obj = runtime._apply_masking(cls(**raw_props), actor)
+            merged_props = masked_obj.to_properties()
+            patch_raw = overlays.get((type_name, obj_id), {})
+            if cls.is_fully_owned():
+                source_plane: dict[str, Any] = {}
+                overlay_plane: dict[str, Any] = dict(merged_props)
+                has_overlay = True
+                owned_mode = "fully_owned"
+            else:
+                source_plane = masked_obj.source_properties()
+                overlay_plane = {
+                    k: merged_props.get(k, v) for k, v in patch_raw.items()
+                }
+                has_overlay = bool(overlay_plane)
+                owned_mode = "hybrid" if cls.owned_field_defaults() else "source_only"
+            entries.append(
+                {
+                    "object_type": type_name,
+                    "object_id": obj_id,
+                    "version": int(row["version"]),
+                    "owned_mode": owned_mode,
+                    "has_overlay": has_overlay,
+                    "source": source_plane,
+                    "overlay": overlay_plane,
+                    "merged": merged_props,
+                }
+            )
+        return entries
 
 # ---------------------------------------------------------------------------
 # 3. IdempotencyAndOCCAspect —— 幂等短路与 MVCC 乐观锁
