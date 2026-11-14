@@ -38,7 +38,7 @@ flowchart TB
 
     subgraph STORAGE["OSv2 双平面存储模型"]
         BACK["Backing Dataset（外部管线同步底表）"]
-        EDITS["User Edits Overlay（受控动作编辑覆盖层）"]
+        EDITS["Action / Ontology Edits Overlay（受控动作叠加层）｜Agent · Automation · Human"]
     end
 
     subgraph CALLERS["上层应用与智能体"]
@@ -59,10 +59,11 @@ flowchart TB
 * **Kinetic Layer（动力学层）**：彻底废除裸 CRUD，一切状态变更必须封装为 **Action（具名业务动作）**。Action 内置 **Submission Criteria（准入/不变量条件）**、只读推演 **Function** 与 **Action Log（因果账本）**，保证每一次变化都知道“谁、何时、基于什么前提、改了哪些对象”。
 * **Dynamic Layer（动态决策层）**：在确定性的对象与动作之上，允许人类或 AI 启动 **Scenario（平行沙盘推演）**、配置事件驱动的 **Automation（自动化条件反射）**，并通过 **OSDK（Ontology SDK）** 让大模型安全参与决策。
 
-### 1.2 OSv2 双平面存储模型（Backing Dataset + User Edits）
-Palantir Object Storage v2 最核心的工程设计之一，是将 **外部数据源同步层（Backing Dataset）** 与 **Ontology 动作编辑层（User Edits）** 分离：
+### 1.2 OSv2 双平面存储模型（Backing Dataset + Action / Ontology Edits）
+Palantir Object Storage v2 最核心的工程设计之一，是将 **外部数据源同步层（Backing Dataset）** 与 **Ontology 受控动作叠加层（Action / Ontology Edits）** 分离：
+> **术语演进注记**：Palantir 在早期面向人工分析师的文档中将该层称为 `User Edits`；但在 AI 原生场景（AIP / OpenOntology）下，该层的高频写入主力实为 **Agent Edits（智能体决策写入）**，辅以确定性自动化规则（Automation）与人类兜底裁决（Human）。三者在内核中统一抽象为 `Actor`，其核心边界不在于“人还是机器”，而在于**“必须经由受控 Action 写入、主权归属本体的决策叠加态”**（即 OpenOntology 的 `ontology_overlay`）。
 * 外部 ERP/CRM 数据更新时，同步管线重刷 Backing Dataset；
-* 通过 Action 修改的业务属性或自有对象保存在 Edit 覆盖层中，查询时自动合并投影，从而保证“外部快照重刷不冲掉本体决策状态”，并支持在冲突时进行精细化裁决（Reindexing / Conflict Resolution）。
+* 经受控 Action 修改的业务属性（涵盖 Agent 推演提交、自动化条件反射与人工审批）或本体自有对象保存在叠加层中，查询时自动合并投影，从而保证“外部快照重刷不冲掉本体决策状态”，并支持在冲突时进行精细化裁决（Reindexing / Conflict Resolution）。
 
 ### 1.3 安全与因果治理（Markings + RBAC + Action Log）
 * **行级安全标签（Markings / Classification）**：权限不只管“能不能进菜单”，而是跟随对象实例的字段标签走（例如 `region:north`、`clearance:secret`），调用方不具备对应标签则对象在查询中不可见。
@@ -85,7 +86,7 @@ OpenOntology 完整继承了 Palantir Foundry/AIP 的核心原理，并将其精
 | **语义层（TBox）** | Object Type / Link Type / Interface | `ObjectType`（Pydantic 基类）、`LinkType`、`InterfaceType` | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py) |
 | **动力学层（Behavior）** | Function / Action / Automation | `FunctionDef`（只读）、`ActionDef`（受控写）、`AutomationDef`（条件反射） | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py) |
 | **集合代数与遍历** | ObjectSet / SearchAround / Aggregate | `ObjectSet`（去重保序集合代数）、`pivot`、`aggregate` | [query.py](file:///Users/guci/work/open-ontology/open_ontology/query.py) |
-| **OSv2 双平面与摄入** | Backing Dataset + User Edits + Reindex | `SnapshotIngestionDriver`（`load_snapshot` / `load_mdo_snapshots`）+ `ontology_objects` + `ontology_overlay` | [ingestion.py](file:///Users/guci/work/open-ontology/open_ontology/ingestion.py)、[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql) |
+| **OSv2 双平面与摄入** | Backing Dataset + Action / Ontology Edits（原称 User Edits）+ Reindex | `SnapshotIngestionDriver`（`load_snapshot` / `load_mdo_snapshots`）+ `ontology_objects` + `ontology_overlay` | [ingestion.py](file:///Users/guci/work/open-ontology/open_ontology/ingestion.py)、[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql) |
 | **沙盘先行与变更集** | Scenarios / Edits | `EditBatch` 内存沙箱 + 可逆 `ObjectDiff`（`simulate_action` 与 `submit_action` 同路径） | [sandbox.py](file:///Users/guci/work/open-ontology/open_ontology/sandbox.py) |
 | **安全、并发与审批铁笼** | Markings / RBAC / Column Masking / OCC / Approvals | 七大系统调用切面：`ColumnMaskingAspect`、`SecurityAndAuthorityAspect`、`IdempotencyAndOCCAspect`、`ApprovalGateAspect`、`RejectionAuditAspect`、`AutomationReflexAspect`、`IdleAwareCallbackAspect` | [aspects.py](file:///Users/guci/work/open-ontology/open_ontology/aspects.py) |
 | **写防线与因果账本** | No-CRUD Guardrail + Action Log | `ontology_write_gate` 触发器（5 张业务表 + 1 张门禁表）+ `ontology_action_runs` 追加式账本 | [schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql) |
