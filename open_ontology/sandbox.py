@@ -12,14 +12,16 @@ tracking (for optimistic locking) and lossless diff inversion.
 from __future__ import annotations
 
 import copy
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from .spec import (
     Actor,
+    GovernanceViolationError,
     InvariantError,
-    LinkType,
     ObjectNotFoundError,
+    ObjectProperty,
     ObjectType,
     OntologySpec,
 )
@@ -31,6 +33,7 @@ __all__ = [
     "LinkChange",
     "ObjectDiff",
     "EditBatch",
+    "InvariantView",
 ]
 
 
@@ -280,20 +283,20 @@ class EditBatch:
 
     def _link_key(
         self,
-        link: str | LinkType,
+        link: str | ObjectProperty,
         src: ObjectType,
         dst: ObjectType,
     ) -> tuple[str, str, str, str, str]:
-        decl = self.spec.get_link_type(link)
         src_type = type(src).__name__
         dst_type = type(dst).__name__
-        if src_type != decl.source:
+        decl = self.spec.get_object_property(link, domain=src_type)
+        if src_type != decl.domain:
             raise ValueError(
-                f"link {decl.name!r} expects source {decl.source!r}, got {src_type!r}"
+                f"object property {decl.name!r} expects domain {decl.domain!r}, got {src_type!r}"
             )
-        if dst_type != decl.target:
+        if dst_type != decl.range:
             raise ValueError(
-                f"link {decl.name!r} expects target {decl.target!r}, got {dst_type!r}"
+                f"object property {decl.name!r} expects range {decl.range!r}, got {dst_type!r}"
             )
         return (
             decl.name,
@@ -302,6 +305,70 @@ class EditBatch:
             dst_type,
             dst.primary_key_value(),
         )
+
+    @staticmethod
+    def _extract_field_targets(raw_val: Any) -> list[str]:
+        if raw_val is None or raw_val == "":
+            return []
+        if isinstance(raw_val, (list, tuple, set)):
+            return [str(x) for x in raw_val if x is not None and str(x) != ""]
+        return [str(raw_val)]
+
+    def _sync_object_properties(
+        self,
+        cls: type[ObjectType],
+        obj_id: str,
+        before_props: dict[str, Any] | None,
+        after_props: dict[str, Any] | None,
+    ) -> None:
+        prop_map = getattr(cls, "__object_properties__", None) or {}
+        if not prop_map:
+            return
+        src_type = cls.__name__
+        for field_name, decl in prop_map.items():
+            old_targets = (
+                set(self._extract_field_targets(before_props.get(field_name)))
+                if before_props is not None
+                else set()
+            )
+            new_targets = (
+                set(self._extract_field_targets(after_props.get(field_name)))
+                if after_props is not None
+                else set()
+            )
+            for tid in sorted(old_targets - new_targets):
+                self._link_state[(decl.name, src_type, obj_id, decl.range, tid)] = False
+            for tid in sorted(new_targets - old_targets):
+                self._link_state[(decl.name, src_type, obj_id, decl.range, tid)] = True
+
+    def validate_object_properties(self) -> None:
+        """Enforce referential integrity for every created/modified ObjectProperty."""
+        for key, data in self._objects.items():
+            kind = self._kinds.get(key)
+            if kind not in ("create", "update"):
+                continue
+            obj_type, obj_id = self._split_key(key)
+            cls = self.spec.get_object_type(obj_type)
+            prop_map = getattr(cls, "__object_properties__", None) or {}
+            for field_name, decl in prop_map.items():
+                if decl.range not in self.spec.object_types:
+                    continue
+                for tid in self._extract_field_targets(data.get(field_name)):
+                    tkey = self._key(decl.range, tid)
+                    if tkey in self._objects:
+                        if self._kinds.get(tkey) == "delete":
+                            raise InvariantError(
+                                f"{obj_type}:{obj_id}.{field_name} references deleted "
+                                f"{decl.range}:{tid}",
+                                code="TARGET_NOT_FOUND",
+                            )
+                        continue
+                    if self.loader.load_object(decl.range, tid) is None:
+                        raise InvariantError(
+                            f"{obj_type}:{obj_id}.{field_name} references missing "
+                            f"{decl.range}:{tid}",
+                            code="TARGET_NOT_FOUND",
+                        )
 
     def _original_link_state(self, key: tuple[str, str, str, str, str]) -> bool:
         if key not in self._link_original:
@@ -336,7 +403,16 @@ class EditBatch:
         return self._project(self._model_for(cls, row.data))
 
     def query(self, cls: type[ObjectType]) -> list[ObjectType]:
-        """List every visible instance of ``cls`` (RLS filtered)."""
+        """List every visible instance of ``cls`` (polymorphic for abstract supertypes)."""
+        if (
+            isinstance(cls, type)
+            and issubclass(cls, ObjectType)
+            and (cls is ObjectType or cls.is_abstract())
+        ):
+            combined: list[ObjectType] = []
+            for sub_cls in self.spec.subtypes_of(cls):
+                combined.extend(self.query(sub_cls))
+            return combined
         object_type = self.spec.get_object_type(cls).__name__
         results: dict[str, ObjectType] = {}
         for row in self.loader.load_all(object_type):
@@ -350,25 +426,30 @@ class EditBatch:
         # overlay staged objects
         for key, data in self._objects.items():
             otype, oid = self._split_key(key)
-            if otype != object_type or self._kinds.get(key) == "delete":
+            if otype != object_type:
+                continue
+            if self._kinds.get(key) == "delete":
+                results.pop(key, None)
                 continue
             if self.actor.has_access(self._meta(otype, data)[1]):
                 results[key] = self._project(self._model_for(cls, data))
+            else:
+                results.pop(key, None)
         return list(results.values())
 
     def query_linked(
         self,
         source_obj: ObjectType,
-        link: str | LinkType,
+        link: str | ObjectProperty,
         target_cls: type[ObjectType],
     ) -> list[ObjectType]:
         """Traverse ``link`` from ``source_obj`` to ``target_cls`` targets."""
-        decl = self.spec.get_link_type(link)
         src_type = type(source_obj).__name__
         tgt_type = self.spec.get_object_type(target_cls).__name__
-        if src_type != decl.source or tgt_type != decl.target:
+        decl = self.spec.get_object_property(link, domain=src_type)
+        if src_type != decl.domain or tgt_type != decl.range:
             raise ValueError(
-                f"link {decl.name!r} spans {decl.source}->{decl.target}, "
+                f"object property {decl.name!r} spans {decl.domain}->{decl.range}, "
                 f"got {src_type}->{tgt_type}"
             )
 
@@ -395,7 +476,8 @@ class EditBatch:
 
     # -- writes ------------------------------------------------------------
     def create(self, obj: ObjectType) -> ObjectType:
-        object_type = self.spec.get_object_type(type(obj)).__name__
+        cls = self.spec.get_object_type(type(obj))
+        object_type = cls.__name__
         object_id = obj.primary_key_value()
         key = self._key(object_type, object_id)
 
@@ -405,8 +487,10 @@ class EditBatch:
             # delete + recreate in one batch == a full update of the existing row
             tags = obj.security_tags()
             self.actor.can_access(tags)
-            self._objects[key] = copy.deepcopy(obj.to_properties())
+            after_props = copy.deepcopy(obj.to_properties())
+            self._objects[key] = after_props
             self._kinds[key] = "update"
+            self._sync_object_properties(cls, object_id, None, after_props)
             return obj
         if self.loader.load_object(object_type, object_id) is not None:
             raise ValueError(f"{key} already exists in the database")
@@ -414,13 +498,16 @@ class EditBatch:
         tags = obj.security_tags()
         self.actor.can_access(tags)
 
-        self._objects[key] = copy.deepcopy(obj.to_properties())
+        after_props = copy.deepcopy(obj.to_properties())
+        self._objects[key] = after_props
         self._original[key] = None
         self._kinds[key] = "create"
+        self._sync_object_properties(cls, object_id, None, after_props)
         return obj
 
     def modify(self, obj: ObjectType, **updates: Any) -> ObjectType:
-        object_type = self.spec.get_object_type(type(obj)).__name__
+        cls = self.spec.get_object_type(type(obj))
+        object_type = cls.__name__
         object_id = obj.primary_key_value()
         key = self._ensure_loaded(object_type, object_id)
         if key is None:
@@ -428,17 +515,21 @@ class EditBatch:
         if self._kinds.get(key) == "delete":
             raise ObjectNotFoundError(f"{object_type}:{object_id} was deleted")
 
-        merged = {**self._objects[key], **updates}
+        before_props = self._objects[key]
+        merged = {**before_props, **updates}
         validated = type(obj)(**merged)
         self.actor.can_access(validated.security_tags())
 
-        self._objects[key] = validated.to_properties()
+        after_props = validated.to_properties()
+        self._objects[key] = after_props
         if self._kinds.get(key) is None:
             self._kinds[key] = "update"
+        self._sync_object_properties(cls, object_id, before_props, after_props)
         return validated
 
     def delete(self, obj: ObjectType) -> None:
-        object_type = self.spec.get_object_type(type(obj)).__name__
+        cls = self.spec.get_object_type(type(obj))
+        object_type = cls.__name__
         object_id = obj.primary_key_value()
         key = self._ensure_loaded(object_type, object_id)
         if key is None:
@@ -446,32 +537,35 @@ class EditBatch:
 
         if self._kinds.get(key) == "create":
             # created and deleted inside the same batch == no-op
+            self._sync_object_properties(cls, object_id, self._objects.get(key), None)
             self._objects.pop(key, None)
             self._original.pop(key, None)
             self._kinds.pop(key, None)
             self._versions.pop(key, None)
             return
 
-        self.actor.can_access(self._meta(object_type, self._objects[key])[1])
+        before_props = self._objects[key]
+        self.actor.can_access(self._meta(object_type, before_props)[1])
+        self._sync_object_properties(cls, object_id, before_props, None)
         self._kinds[key] = "delete"
 
-    def link(self, src: ObjectType, link: str | LinkType, dst: ObjectType) -> None:
+    def link(self, src: ObjectType, link: str | ObjectProperty, dst: ObjectType) -> None:
         key = self._link_key(link, src, dst)
         self._link_state[key] = True
 
-    def unlink(self, src: ObjectType, link: str | LinkType, dst: ObjectType) -> None:
+    def unlink(self, src: ObjectType, link: str | ObjectProperty, dst: ObjectType) -> None:
         key = self._link_key(link, src, dst)
         self._link_state[key] = False
 
     def unlink_all_to(
-        self, link: str | LinkType, dst: ObjectType
+        self, link: str | ObjectProperty, dst: ObjectType
     ) -> int:
         """Remove every incoming ``link`` edge that points at ``dst``."""
-        decl = self.spec.get_link_type(link)
+        decl = self.spec.get_object_property(link)
         dst_type = type(dst).__name__
-        if dst_type != decl.target:
+        if dst_type != decl.range:
             raise ValueError(
-                f"link {decl.name!r} points at {decl.target!r}, got {dst_type!r}"
+                f"object property {decl.name!r} points at {decl.range!r}, got {dst_type!r}"
             )
         dst_id = dst.primary_key_value()
 
@@ -489,7 +583,7 @@ class EditBatch:
 
         removed = 0
         for source_type, source_id in sorted(sources):
-            if source_type != decl.source:
+            if source_type != decl.domain:
                 continue
             key = (decl.name, source_type, source_id, dst_type, dst_id)
             self._link_state[key] = False
@@ -597,3 +691,137 @@ class EditBatch:
     def invalidate(self, message: str, code: str | None = None) -> None:
         """Small helper for action handlers."""
         raise InvariantError(message, code=code)
+
+    def invariant_view(self) -> "InvariantView":
+        """Build a read-only, full-visibility snapshot of staged post-state."""
+        view = InvariantView(
+            self.spec,
+            self.loader,
+            Actor(actor_id="__invariant__", role="system", clearance_tags={"*"}),
+        )
+        view._objects = {k: copy.deepcopy(v) for k, v in self._objects.items()}
+        view._original = {
+            k: copy.deepcopy(v) if v is not None else None
+            for k, v in self._original.items()
+        }
+        view._kinds = dict(self._kinds)
+        view._versions = dict(self._versions)
+        view._link_state = dict(self._link_state)
+        view._link_original = dict(self._link_original)
+        return view
+
+    @staticmethod
+    def _run_invariant_callable(
+        entry: Any,
+        invoke: Callable[[], Any],
+        *,
+        default_prefix: str,
+        label: str,
+    ) -> None:
+        default_code = entry.code or f"{default_prefix}_{entry.name.upper()}"
+        try:
+            outcome = invoke()
+        except InvariantError as exc:
+            if exc.code is None:
+                exc.code = default_code
+            raise
+        except AssertionError as exc:
+            msg = (
+                str(exc).strip()
+                or entry.description
+                or f"{label} {entry.name!r} failed"
+            )
+            raise InvariantError(msg, code=default_code) from exc
+        if outcome is False:
+            msg = (
+                entry.description
+                or f"{label} {entry.name!r} returned False"
+            )
+            raise InvariantError(msg, code=default_code)
+
+    def validate_invariants(self) -> None:
+        """Evaluate every registered ``@spec.invariant`` against staged post-state."""
+        if not self.spec.invariants:
+            return
+        view = self.invariant_view()
+        for inv in self.spec.invariants.values():
+            self._run_invariant_callable(
+                inv,
+                lambda inv=inv: inv.handler(view),
+                default_prefix="INVARIANT",
+                label="post-state invariant",
+            )
+
+    def validate_transition_invariants(
+        self, diff: ObjectDiff | None = None
+    ) -> None:
+        """Evaluate every ``@spec.transition_invariant`` against ``diff`` and post-state."""
+        if not getattr(self.spec, "transition_invariants", None):
+            return
+        active_diff = diff if diff is not None else self.build_diff()
+        view = self.invariant_view()
+        for tinv in self.spec.transition_invariants.values():
+            sig = inspect.signature(tinv.handler)
+            pos_params = [
+                p
+                for p in sig.parameters.values()
+                if p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+            has_varargs = any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL
+                for p in sig.parameters.values()
+            )
+            if len(pos_params) == 1 and not has_varargs:
+                invoke = lambda h=tinv.handler: h(active_diff)
+            else:
+                invoke = lambda h=tinv.handler: h(active_diff, view)
+            self._run_invariant_callable(
+                tinv,
+                invoke,
+                default_prefix="TRANSITION",
+                label="transition invariant",
+            )
+
+
+class InvariantView(EditBatch):
+    """Read-only, RLS-unrestricted post-state view for ``@spec.invariant`` handlers."""
+
+    def create(self, obj: ObjectType) -> ObjectType:
+        raise GovernanceViolationError(
+            "invariant handlers are read-only and may not mutate world state"
+        )
+
+    def modify(self, obj: ObjectType, **updates: Any) -> ObjectType:
+        raise GovernanceViolationError(
+            "invariant handlers are read-only and may not mutate world state"
+        )
+
+    def delete(self, obj: ObjectType) -> None:
+        raise GovernanceViolationError(
+            "invariant handlers are read-only and may not mutate world state"
+        )
+
+    def link(
+        self, src: ObjectType, link: str | ObjectProperty, dst: ObjectType
+    ) -> None:
+        raise GovernanceViolationError(
+            "invariant handlers are read-only and may not mutate world state"
+        )
+
+    def unlink(
+        self, src: ObjectType, link: str | ObjectProperty, dst: ObjectType
+    ) -> None:
+        raise GovernanceViolationError(
+            "invariant handlers are read-only and may not mutate world state"
+        )
+
+    def unlink_all_to(
+        self, link: str | ObjectProperty, dst: ObjectType
+    ) -> int:
+        raise GovernanceViolationError(
+            "invariant handlers are read-only and may not mutate world state"
+        )

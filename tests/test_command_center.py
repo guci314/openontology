@@ -23,7 +23,7 @@ import pytest
 from open_ontology import (
     Actor,
     CommandCenterRegistry,
-    LinkType,
+    ObjectProperty,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
@@ -89,8 +89,9 @@ def test_default_command_center_blueprints_and_instances(center):
         "crm_saas_unplug",
         "steel_mdm",
         "osv2_governance",
+        "o2c_order_to_cash",
     ]
-    assert len(registry.instances) == 8
+    assert len(registry.instances) == 9
     assert set(registry.instances) == {
         "factory-prod",
         "board-prod",
@@ -100,6 +101,7 @@ def test_default_command_center_blueprints_and_instances(center):
         "saas-standalone",
         "steel-mill-north",
         "osv2-coil-prod",
+        "o2c-erp-north",
     }
     coldchain = registry.get_instance("coldchain-wave3")
     assert coldchain.mcts_config is not None
@@ -114,8 +116,8 @@ def test_default_command_center_blueprints_and_instances(center):
 def test_catalog_payload(base):
     data = _get(base, "/api/catalog")
     assert data["ok"] is True
-    assert len(data["ontologies"]) == 6
-    assert len(data["instances"]) == 8
+    assert len(data["ontologies"]) == 7
+    assert len(data["instances"]) == 9
 
     by_id = {row["instance_id"]: row for row in data["instances"]}
     assert by_id["coldchain-wave3"]["db_uri"] == "sqlite://coldchain_wave3.sqlite3"
@@ -145,10 +147,12 @@ def test_ontology_detail_metamodel(base):
         "WorkTicket",
         "Deliverable",
     }
-    assert {l["name"] for l in data["link_types"]} == {
-        "ticket_assigned_to",
-        "ticket_reviewed_by",
-        "ticket_deliverables",
+    assert {l["name"] for l in data["object_properties"]} == {
+        "Engineer.active_ticket",
+        "WorkTicket.assignee",
+        "WorkTicket.reviewer",
+        "Deliverable.ticket",
+        "Deliverable.engineer",
     }
     assert {"recruit_engineer", "dispatch_ticket"} <= {
         a["name"] for a in data["actions"]
@@ -365,7 +369,7 @@ def test_command_center_html_markers(base):
         "action runs",
         "当前状态指纹",
         "本体蓝图列表",
-        "运行实例列表",
+        "世界状态列表",
         "/api/catalog",
         "/api/instance/mcts",
         "/api/instance/fork",
@@ -514,29 +518,14 @@ def test_factory_instance_board_data(base):
     assert deliverables["objects"][0]["verified"] is True
 
 
-def test_seeded_board_goal_combines_architecture_and_task_board_docs(base):
-    """预装看板的 goal 同时承载 M2 宪法与 M1/M0 看板规范（单文件目录仍兼容）。"""
-    repo_root = Path(__file__).resolve().parent.parent
-    architecture = (repo_root / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8").strip()
-    task_board = (repo_root / "docs" / "TASK_BOARD.md").read_text(encoding="utf-8").strip()
-
-    payload = _get(base, "/api/objects/Board", instance="board-prod")
-    boards = {item["board_key"]: item for item in payload["objects"]}
-    goal = boards["BD-CC-001"]["goal"]
-
-    assert goal == architecture + "\n\n---\n\n" + task_board
-    assert goal.startswith("# OpenOntology 架构设计规范")
-    assert goal.endswith(task_board[-40:])
-
-
 # ---------------------------------------------------------------------------
-# 15. 四元模型：Runtime 宿体 + 符号 / 联结双设备注册表
+# 15. 四元模型：Runtime 宿体 + 外部设备（OpenAPI）注册表
 # ---------------------------------------------------------------------------
 def test_catalog_carries_runtimes_and_dual_device_registry(base):
     data = _get(base, "/api/catalog")
 
     runtimes = {row["runtime_id"]: row for row in data["runtimes"]}
-    assert len(data["runtimes"]) == 9  # 1 台预注册内存宿体 + 8 个实例各一台
+    assert len(data["runtimes"]) == 10  # 1 台预注册内存宿体 + 9 个实例各一台
     assert "rt-default-memory" in runtimes
 
     default = runtimes["rt-default-memory"]
@@ -553,22 +542,14 @@ def test_catalog_carries_runtimes_and_dual_device_registry(base):
     assert set(coldchain["adapters"]) == {"WMS 仓储", "TMS 运输", "温控遥测"}
 
     symbolic = data["devices"]["symbolic"]
-    connectionist = data["devices"]["connectionist"]
-    assert symbolic and connectionist
+    assert symbolic
+    assert "connectionist" not in data["devices"]
 
     wms = next(d for d in symbolic if d["name"] == "WMS 仓储")
     assert wms["kind"] == "WMS"
     assert wms["status"] == "CONNECTED"
     assert wms["openapi_schema"]["openapi"] == "3.1.0"
     assert {"info", "paths"} <= set(wms["openapi_schema"])
-    assert all(d["kind"] not in {"Harness", "Agent", "LLM"} for d in symbolic)
-
-    card = next(d for d in connectionist if d["name"] == "CodeBuddy CLI")
-    assert card["kind"] == "Harness"
-    assert card["agent_card"]["protocol"] == "A2A/1.0"
-    assert card["agent_card"]["roles"] == ["developer", "tester", "architect"]
-    assert card["agent_card"]["output_contract"] == "HostResult + Numeric Evidence"
-    assert all(d["kind"] in {"Harness", "Agent", "LLM"} for d in connectionist)
 
 
 def test_runtime_and_device_endpoints(base):
@@ -580,9 +561,8 @@ def test_runtime_and_device_endpoints(base):
     devices = _get(base, "/api/devices")
     assert devices["ok"] is True
     assert {"WMS", "SaaS"} <= {d["kind"] for d in devices["symbolic"]}
-    assert {d["kind"] for d in devices["connectionist"]} == {"Harness"}
+    assert "connectionist" not in devices
     assert all("openapi_schema" in d for d in devices["symbolic"])
-    assert all("agent_card" in d for d in devices["connectionist"])
 
 
 def test_instance_summary_exposes_runtime_binding(base):
@@ -677,11 +657,11 @@ def test_links_endpoint_hides_rows_the_actor_cannot_see():
         region: str = "north"
 
     spec.object_type(Node)
-    spec.add_link_type(
-        LinkType(
+    spec.add_object_property(
+        ObjectProperty(
             name="node_links",
-            source="Node",
-            target="Node",
+            domain="Node",
+            range="Node",
             cardinality="many-to-many",
             owned=False,
         )
@@ -753,11 +733,11 @@ def test_http_boundary_enumeration_honours_explicit_actor():
         secret: str = "s3cr3t"
 
     spec.object_type(Node)
-    spec.add_link_type(
-        LinkType(
+    spec.add_object_property(
+        ObjectProperty(
             name="node_links",
-            source="Node",
-            target="Node",
+            domain="Node",
+            range="Node",
             cardinality="many-to-many",
         )
     )
@@ -781,3 +761,632 @@ def test_http_boundary_enumeration_honours_explicit_actor():
 
     assert [row["object_id"] for row in rows] == ["N-1"]
     assert rows[0]["properties"]["secret"] == "s3cr3t"  # auditor 在白名单内
+
+
+def test_simulation_preview_ui_hooks_and_zero_write_diff(base):
+    """沙盘预演不正式执行时，前端应具备左侧世界状态预览渲染钩子且主库零写入。"""
+    import urllib.request
+
+    with urllib.request.urlopen(base + "/", timeout=5) as resp:
+        html = resp.read().decode("utf-8")
+
+    for marker in (
+        "stateTabs",
+        "renderStateTabs",
+        "pickStateTab",
+        "当前业务状态",
+        "沙盘推演状态",
+        "applySimPreview",
+        "clearSimPreview",
+        "mergeObjectChanges",
+        "mergeLinkChanges",
+        "sim-banner",
+        "sim-create",
+        "sim-update",
+        "sim-delete",
+        "sim-link-create",
+        "sim-link-delete",
+        "renderObjectTabs",
+    ):
+        assert marker in html
+
+    before_fp = _get(base, "/api/fingerprint", instance="coldchain-wave3")
+    sim = _post(
+        base,
+        "/api/simulate?instance=coldchain-wave3",
+        {
+            "instance": "coldchain-wave3",
+            "action": "dispatch_order",
+            "params": {"order_id": "ORD-1", "truck_id": "TRK-HEAVY"},
+        },
+    )
+    assert sim["ok"] is True
+    assert sim["valid"] is True
+    assert sim["diff"]["object_changes"]
+    assert sim["diff"]["link_changes"]
+    after_fp = _get(base, "/api/fingerprint", instance="coldchain-wave3")
+    assert after_fp == before_fp
+
+
+def test_sequential_sandbox_simulate_add_comment_creates_distinct_ids(base):
+    """连续多次沙盘推演追加卡片评论时，应基于前序沙盘状态生成递增的评论 ID 且主库零写入。"""
+    before_fp = _get(base, "/api/fingerprint", instance="board-prod")
+    cards = _get(base, "/api/objects/Card", instance="board-prod")["objects"]
+    card_id = cards[0]["card_id"]
+
+    step1_params = {"card": card_id, "author": "alice", "body": "沙盘评论 1"}
+    sim1 = _post(
+        base,
+        "/api/simulate?instance=board-prod",
+        {"instance": "board-prod", "action": "add_comment", "params": step1_params},
+    )
+    assert sim1["valid"] is True
+    id1 = sim1["diff"]["object_changes"][0]["object_id"]
+
+    step2_params = {"card": card_id, "author": "bob", "body": "沙盘评论 2"}
+    sim2 = _post(
+        base,
+        "/api/simulate?instance=board-prod",
+        {
+            "instance": "board-prod",
+            "action": "add_comment",
+            "params": step2_params,
+            "prior_steps": [{"action": "add_comment", "params": step1_params}],
+        },
+    )
+    assert sim2["valid"] is True
+    id2 = sim2["diff"]["object_changes"][0]["object_id"]
+
+    assert id1 != id2
+    assert _get(base, "/api/fingerprint", instance="board-prod") == before_fp
+
+    # 正式执行全部沙盘步骤：3 条评论应全部落库（而非只提交最后 1 条）
+    step3_params = {"card": card_id, "author": "carol", "body": "沙盘评论 3"}
+    submitted = _post(
+        base,
+        "/api/submit?instance=board-prod",
+        {
+            "instance": "board-prod",
+            "steps": [
+                {"action": "add_comment", "params": step1_params},
+                {"action": "add_comment", "params": step2_params},
+                {"action": "add_comment", "params": step3_params},
+            ],
+        },
+    )
+    assert submitted["ok"] is True
+    assert len(submitted["runs"]) == 3
+    comments = _get(base, "/api/objects/CardComment", instance="board-prod")["objects"]
+    bodies = {c["body"] for c in comments}
+    assert {"沙盘评论 1", "沙盘评论 2", "沙盘评论 3"} <= bodies
+
+
+# ---------------------------------------------------------------------------
+# 19. /api/worlds/{world}/openapi.json + REST 展开路由 + Actor Token 身份绑定
+# ---------------------------------------------------------------------------
+def test_world_openapi_role_scoping_and_actor_token_binding(center):
+    registry, handle = center
+    base = handle.base_url
+    registry.register_actor_token(
+        "tok-dev-01",
+        Actor(actor_id="M-DEV-01", role="developer", clearance_tags={"tenant:acme"}),
+        workspace_id="board-prod",
+    )
+
+    def _req(
+        path: str,
+        *,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        req = urllib.request.Request(
+            f"{base}{path}",
+            data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+            headers={
+                **({"Content-Type": "application/json"} if payload is not None else {}),
+                **(headers or {}),
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    # 1) Token 强制锁定 role=developer：即使 query 尝试伪造 board_manager 也被忽略
+    oa_dev = _req(
+        "/api/worlds/board-prod/openapi.json?role=board_manager",
+        headers={"Authorization": "Bearer tok-dev-01"},
+    )
+    assert oa_dev["openapi"] == "3.1.0"
+    assert oa_dev["x-actor-role"] == "developer"
+    assert "/api/worlds/board-prod/actions/claim_card" in oa_dev["paths"]
+    assert "/api/worlds/board-prod/actions/record_outcome" in oa_dev["paths"]
+    assert "/api/worlds/board-prod/actions/create_board" not in oa_dev["paths"]
+    assert "/api/worlds/board-prod/functions/eligible_cards" in oa_dev["paths"]
+
+    # 2) 无效 Token -> 401；跨工作空间 Token -> 403
+    with pytest.raises(urllib.error.HTTPError) as exc401:
+        _req("/api/worlds/board-prod", headers={"Authorization": "Bearer bogus"})
+    assert exc401.value.code == 401
+    exc401.value.close()
+
+    with pytest.raises(urllib.error.HTTPError) as exc403:
+        _req("/api/worlds/factory-prod", headers={"Authorization": "Bearer tok-dev-01"})
+    assert exc403.value.code == 403
+    exc403.value.close()
+
+    # 3) 用管理员造一张 ready 卡片，然后让 M-DEV-01 通过 Bearer Token 查卡→dry_run→正式认领→汇报完成
+    created = _req(
+        "/api/worlds/board-prod/actions/create_card",
+        method="POST",
+        payload={"board": "BD-CC-001", "title": "OpenAPI 直连验证卡"},
+        headers={"X-Actor-Id": "board-manager-01", "X-Actor-Role": "board_manager"},
+    )
+    assert created["run"]["status"] == "COMMITTED"
+    card_id = created["run"]["object_diff"]["object_changes"][0]["object_id"]
+
+    # 不可冒名认领他人席位 (ACTOR_MEMBER_MISMATCH)
+    with pytest.raises(urllib.error.HTTPError) as exc_mismatch:
+        _req(
+            "/api/worlds/board-prod/actions/claim_card",
+            method="POST",
+            payload={"card": card_id, "member": "M-DEV-02"},
+            headers={"Authorization": "Bearer tok-dev-01"},
+        )
+    assert exc_mismatch.value.code == 400
+    assert "不能冒名操作成员" in exc_mismatch.value.read().decode("utf-8")
+    exc_mismatch.value.close()
+
+    # dry_run 预演
+    dry = _req(
+        "/api/worlds/board-prod/actions/claim_card?dry_run=true",
+        method="POST",
+        payload={"card": card_id, "member": "M-DEV-01"},
+        headers={"Authorization": "Bearer tok-dev-01"},
+    )
+    assert dry["dry_run"] is True and dry["valid"] is True
+
+    # 通过 OpenAPI 路径正式认领并读取单卡，然后 record_outcome 交付
+    eligible = _req(
+        "/api/worlds/board-prod/functions/eligible_cards",
+        method="POST",
+        payload={"board": "BD-CC-001", "role": "developer"},
+        headers={"Authorization": "Bearer tok-dev-01"},
+    )
+    assert any(c["card_id"] == card_id for c in eligible["result"]["cards"])
+
+    claimed = _req(
+        "/api/worlds/board-prod/actions/claim_card",
+        method="POST",
+        payload={"card": card_id, "member": "M-DEV-01"},
+        headers={"Authorization": "Bearer tok-dev-01"},
+    )
+    assert claimed["actor"] == {"actor_id": "M-DEV-01", "role": "developer"}
+    assert claimed["run"]["status"] == "COMMITTED"
+
+    card_row = _req(
+        f"/api/worlds/board-prod/objects/Card/{card_id}",
+        headers={"Authorization": "Bearer tok-dev-01"},
+    )
+    assert card_row["object"]["status"] == "doing"
+
+    done_run = _req(
+        "/api/worlds/board-prod/actions/record_outcome",
+        method="POST",
+        payload={
+            "card": card_id,
+            "member": "M-DEV-01",
+            "outcome": "completed",
+            "summary": "通过 OpenAPI 完成交付",
+        },
+        headers={"Authorization": "Bearer tok-dev-01"},
+    )
+    assert done_run["run"]["status"] == "COMMITTED"
+    assert (
+        _req(
+            f"/api/worlds/board-prod/objects/Card/{card_id}",
+            headers={"Authorization": "Bearer tok-dev-01"},
+        )["object"]["status"]
+        == "done"
+    )
+
+
+def test_kanban_end_to_end_lifecycle_updates_overview_and_promotes_children(center):
+    """端到端覆盖：建板开卡（含 waits_for 父子依赖）→ 查可领卡 → 认领 → 交付 →
+    验证 Card.status、Member.completed_cards/WIP、子卡自动解锁及 board_overview 汇总同步更新。
+    """
+    registry, handle = center
+    base = handle.base_url
+    registry.register_actor_token(
+        "tok-mgr-e2e",
+        Actor(actor_id="board-manager-01", role="board_manager", clearance_tags={"*"}),
+        workspace_id="board-prod",
+    )
+    registry.register_actor_token(
+        "tok-dev-e2e",
+        Actor(actor_id="M-DEV-01", role="developer", clearance_tags={"tenant:acme"}),
+        workspace_id="board-prod",
+    )
+
+    def _call(
+        path: str,
+        *,
+        method: str = "GET",
+        payload: dict | None = None,
+        token: str,
+    ) -> dict:
+        req = urllib.request.Request(
+            f"{base}{path}",
+            data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+            headers={
+                "Authorization": f"Bearer {token}",
+                **({"Content-Type": "application/json"} if payload is not None else {}),
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _overview(board_key: str) -> dict:
+        res = _call(
+            "/api/worlds/board-prod/functions/board_overview",
+            method="POST",
+            payload={"board": board_key},
+            token="tok-mgr-e2e",
+        )["result"]
+        return {
+            **res,
+            "counts": {row["key"]: row["cards"] for row in res["statuses"]},
+            "member_map": {m["member_id"]: m for m in res["members"]},
+        }
+
+    # 1. 记录成员初始已完成计数与 WIP
+    initial_dev = _call(
+        "/api/worlds/board-prod/objects/Member/M-DEV-01", token="tok-mgr-e2e"
+    )["object"]
+    initial_completed = initial_dev["completed_cards"]
+
+    # 2. 管理员建看板并开立父卡 + 依赖子卡
+    _call(
+        "/api/worlds/board-prod/actions/create_board",
+        method="POST",
+        payload={
+            "board_key": "BD-E2E",
+            "title": "端到端验收看板",
+            "tenant": "acme",
+            "created_by": "board-manager-01",
+            "description": "验证从开卡到完成的状态联动与实时聚合",
+        },
+        token="tok-mgr-e2e",
+    )
+    parent_res = _call(
+        "/api/worlds/board-prod/actions/create_card",
+        method="POST",
+        payload={"board": "BD-E2E", "title": "父任务", "priority": 10},
+        token="tok-mgr-e2e",
+    )
+    parent_id = parent_res["run"]["object_diff"]["object_changes"][0]["object_id"]
+
+    child_res = _call(
+        "/api/worlds/board-prod/actions/create_card",
+        method="POST",
+        payload={
+            "board": "BD-E2E",
+            "title": "子任务",
+            "priority": 5,
+            "waits_for": [parent_id],
+        },
+        token="tok-mgr-e2e",
+    )
+    child_id = child_res["run"]["object_diff"]["object_changes"][0]["object_id"]
+
+    ov0 = _overview("BD-E2E")
+    assert ov0["cards_total"] == 2
+    assert ov0["counts"] == {
+        "todo": 1,
+        "ready": 1,
+        "doing": 0,
+        "done": 0,
+        "blocked": 0,
+        "triage": 0,
+    }
+
+    # 3. 开发者仅能看到 ready 父卡，认领后进入 doing 且 active_wip=+1
+    elig1 = _call(
+        "/api/worlds/board-prod/functions/eligible_cards",
+        method="POST",
+        payload={"board": "BD-E2E", "role": "developer"},
+        token="tok-dev-e2e",
+    )["result"]
+    assert [c["card_id"] for c in elig1["cards"]] == [parent_id]
+
+    _call(
+        "/api/worlds/board-prod/actions/claim_card",
+        method="POST",
+        payload={"card": parent_id, "member": "M-DEV-01"},
+        token="tok-dev-e2e",
+    )
+    ov1 = _overview("BD-E2E")
+    assert ov1["counts"]["doing"] == 1 and ov1["counts"]["ready"] == 0
+    assert ov1["member_map"]["M-DEV-01"]["active_wip"] == 1
+
+    # 4. 父卡完成：Card->done，Member.completed_cards +1，WIP 归零，子卡自动由 todo->ready
+    _call(
+        "/api/worlds/board-prod/actions/record_outcome",
+        method="POST",
+        payload={
+            "card": parent_id,
+            "member": "M-DEV-01",
+            "outcome": "completed",
+            "summary": "父任务已交付",
+            "artifact_uri": "src/parent.py",
+        },
+        token="tok-dev-e2e",
+    )
+    parent_obj = _call(
+        f"/api/worlds/board-prod/objects/Card/{parent_id}", token="tok-dev-e2e"
+    )["object"]
+    child_obj = _call(
+        f"/api/worlds/board-prod/objects/Card/{child_id}", token="tok-dev-e2e"
+    )["object"]
+    assert parent_obj["status"] == "done"
+    assert parent_obj["assignee"] is None
+    assert parent_obj["result"] == "父任务已交付"
+    assert parent_obj["artifact_uri"] == "src/parent.py"
+    assert child_obj["status"] == "ready"
+
+    ov2 = _overview("BD-E2E")
+    assert ov2["counts"] == {
+        "todo": 0,
+        "ready": 1,
+        "doing": 0,
+        "done": 1,
+        "blocked": 0,
+        "triage": 0,
+    }
+    assert ov2["member_map"]["M-DEV-01"]["active_wip"] == 0
+    assert ov2["member_map"]["M-DEV-01"]["completed_cards"] == initial_completed + 1
+
+    # 5. 开发者认领并完成解锁后的子卡，board_overview 全卡落入 done，Board 无冗余 state 字段
+    elig2 = _call(
+        "/api/worlds/board-prod/functions/eligible_cards",
+        method="POST",
+        payload={"board": "BD-E2E", "role": "developer"},
+        token="tok-dev-e2e",
+    )["result"]
+    assert [c["card_id"] for c in elig2["cards"]] == [child_id]
+
+    _call(
+        "/api/worlds/board-prod/actions/claim_card",
+        method="POST",
+        payload={"card": child_id, "member": "M-DEV-01"},
+        token="tok-dev-e2e",
+    )
+    _call(
+        "/api/worlds/board-prod/actions/record_outcome",
+        method="POST",
+        payload={
+            "card": child_id,
+            "member": "M-DEV-01",
+            "outcome": "completed",
+            "summary": "子任务已交付",
+            "artifact_uri": "src/child.py",
+        },
+        token="tok-dev-e2e",
+    )
+
+    ov3 = _overview("BD-E2E")
+    assert ov3["counts"] == {
+        "todo": 0,
+        "ready": 0,
+        "doing": 0,
+        "done": 2,
+        "blocked": 0,
+        "triage": 0,
+    }
+    assert ov3["member_map"]["M-DEV-01"]["active_wip"] == 0
+    assert ov3["member_map"]["M-DEV-01"]["completed_cards"] == initial_completed + 2
+
+    board_obj = _call(
+        "/api/worlds/board-prod/objects/Board/BD-E2E", token="tok-dev-e2e"
+    )["object"]
+    assert "state" not in board_obj
+    assert board_obj["board_key"] == "BD-E2E"
+
+
+def test_sandbox_dropdown_and_enum_ui_helpers_present(base):
+    html = urllib.request.urlopen(f"{base}/", timeout=10).read().decode("utf-8")
+    for marker in (
+        "effectiveObjects",
+        "enumValuesFor",
+        "enumOptionsFor",
+        "refreshParamOptions",
+        "renderSimulations",
+        "正式执行第 1 步",
+        "[沙盘]",
+    ):
+        assert marker in html
+    assert "{steps: S.simSteps}" not in html
+
+
+def test_simulation_ledger_persists_bugs_to_db_without_polluting_main_world(tmp_path):
+    db_file = tmp_path / "board_ledger_test.sqlite3"
+
+    def _start_server():
+        reg = build_default_command_center(data_dir=tmp_path)
+        from examples.kanban import BOARD_MANAGER, spec as board_spec
+        rt = OntologyRuntime(board_spec, db_path=db_file)
+        rt.submit_action(
+            "INIT-BD",
+            "create_board",
+            {
+                "board_key": "BD-SIM",
+                "title": "沙盘持久化测试",
+                "tenant": "acme",
+                "created_by": "board-manager-01",
+            },
+            BOARD_MANAGER,
+        )
+        reg.register_workspace(
+            "board-sim-persist",
+            "task_board",
+            "沙盘测试世界",
+            rt,
+            db_uri=f"sqlite://{db_file.name}",
+            default_actor=BOARD_MANAGER,
+        )
+        handle = start_command_center_server(reg, port=0, title="Sim Ledger Test")
+        return reg, rt, handle
+
+    _, rt1, h1 = _start_server()
+    try:
+        base1 = h1.base_url
+        before_fp = _get(base1, "/api/fingerprint", instance="board-sim-persist")
+
+        # 1) 第 1 步合法推演：开卡
+        sim_ok = _post(
+            base1,
+            "/api/simulate?instance=board-sim-persist",
+            {
+                "instance": "board-sim-persist",
+                "session_id": "SESS-BUG-1",
+                "action": "create_card",
+                "params": {"board": "BD-SIM", "card_id": "C-SIM-1", "title": "测试卡"},
+            },
+        )
+        assert sim_ok["valid"] is True
+        assert sim_ok["sim_id"].startswith("SIM-")
+
+        # 2) 第 2 步推演触发本体约束拒绝：直接手动移动到 done（用于定位模型规则/Bug）
+        sim_bad = _post(
+            base1,
+            "/api/simulate?instance=board-sim-persist",
+            {
+                "instance": "board-sim-persist",
+                "session_id": "SESS-BUG-1",
+                "prior_steps": [
+                    {
+                        "action": "create_card",
+                        "params": {"board": "BD-SIM", "card_id": "C-SIM-1", "title": "测试卡"},
+                    }
+                ],
+                "action": "move_card",
+                "params": {"card": "C-SIM-1", "target_status": "done"},
+            },
+        )
+        assert sim_bad["valid"] is False
+        assert sim_bad["error_code"] == "COMPLETION_REQUIRES_RECORD_OUTCOME"
+
+        # 主库零写入
+        assert _get(base1, "/api/fingerprint", instance="board-sim-persist") == before_fp
+
+        # 可按 valid=false 过滤出全部异常推演线索
+        bugs = _get(base1, "/api/simulations", instance="board-sim-persist", valid="false")
+        assert bugs["count"] == 1
+        assert bugs["simulations"][0]["error_code"] == "COMPLETION_REQUIRES_RECORD_OUTCOME"
+    finally:
+        h1.stop()
+        rt1.close()
+
+    # 3) 模拟服务重启，从磁盘 SQLite 重开，推演与 Bug 留痕必须仍在
+    assert db_file.with_suffix(".sim_ledger.sqlite3").is_file()
+    _, rt2, h2 = _start_server()
+    try:
+        all_sims = _get(h2.base_url, "/api/simulations", instance="board-sim-persist")
+        assert all_sims["count"] == 2
+        codes = [row["error_code"] for row in all_sims["simulations"]]
+        assert "COMPLETION_REQUIRES_RECORD_OUTCOME" in codes
+    finally:
+        h2.stop()
+        rt2.close()
+
+
+def test_live_fingerprint_revision_tracks_external_writes_and_auto_poll_ui(tmp_path):
+    from examples import o2c_ontology as o2c
+    from examples.command_center_demo import build_o2c_command_center
+
+    db_file = tmp_path / "live_o2c_poll.sqlite3"
+    seed_rt = OntologyRuntime(o2c.spec, db_path=db_file)
+    seed_rt.put_object(
+        o2c.Customer(
+            customer_id="O2C-CUST-001",
+            name="O2C Demo Customer",
+            credit_limit_cents=10_000_000,
+        )
+    )
+    seed_rt.put_object(
+        o2c.ReceivableBalance(
+            ledger_id=o2c.ar_ledger_id("O2C-CUST-001"),
+            customer="O2C-CUST-001",
+            ar_balance_cents=0,
+        )
+    )
+    seed_rt.close()
+
+    reg = build_o2c_command_center(db_path=db_file)
+    handle = start_command_center_server(reg, port=0, title="Live Auto-Refresh Test")
+    try:
+        base = handle.base_url
+        html = urllib.request.urlopen(f"{base}/", timeout=10).read().decode("utf-8")
+        assert "pollLiveFingerprint" in html
+        assert "preserveSim" in html
+
+        fp0 = _get(base, "/api/fingerprint", instance="o2c-erp-north")
+        assert fp0.get("revision")
+
+        ext_rt = OntologyRuntime(o2c.spec, db_path=db_file)
+        try:
+            r_create = ext_rt.submit_action(
+                "EXT-CREATE-001",
+                "create_sales_order",
+                {
+                    "order_id": "O2C-SO-003",
+                    "customer": "O2C-CUST-001",
+                    "product_summary": "O2C Widget",
+                    "quantity": 12,
+                    "unit_price_cents": 1_000_000,
+                },
+                o2c.AI_AGENT,
+            )
+            assert r_create["status"] == "COMMITTED"
+            fp1 = _get(base, "/api/fingerprint", instance="o2c-erp-north")
+            assert fp1["revision"] != fp0["revision"]
+
+            r_note = ext_rt.submit_action(
+                "EXT-NOTE-002",
+                "annotate_o2c_governance",
+                {"order": "O2C-SO-003", "fulfillment_note": "外部进程标注"},
+                o2c.AI_AGENT,
+            )
+            assert r_note["status"] == "COMMITTED"
+            fp2 = _get(base, "/api/fingerprint", instance="o2c-erp-north")
+            assert fp2["revision"] != fp1["revision"]
+
+            r_pending = ext_rt.submit_action(
+                "EXT-CONFIRM-003",
+                "confirm_sales_order",
+                {"order": "O2C-SO-003"},
+                o2c.AI_AGENT,
+            )
+            assert r_pending["status"] == "PENDING_APPROVAL"
+            fp3 = _get(base, "/api/fingerprint", instance="o2c-erp-north")
+            assert fp3["revision"] != fp2["revision"]
+
+            r_rejected = ext_rt.reject_action(
+                "EXT-CONFIRM-003",
+                o2c.FINANCE_DIRECTOR,
+                reason="演练驳回测试",
+            )
+            assert r_rejected["status"] == "REJECTED"
+            fp4 = _get(base, "/api/fingerprint", instance="o2c-erp-north")
+            assert fp4["revision"] != fp3["revision"]
+        finally:
+            ext_rt.close()
+    finally:
+        handle.stop()
+
+
+
+
+
+

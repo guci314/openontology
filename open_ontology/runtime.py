@@ -47,8 +47,8 @@ from .spec import (
     ConcurrencyConflictError,
     GovernanceViolationError,
     InvariantError,
-    LinkType,
     ObjectNotFoundError,
+    ObjectProperty,
     ObjectType,
     OntologySpec,
     PermissionDeniedError,
@@ -57,6 +57,16 @@ from .spec import (
 __all__ = ["OntologyRuntime", "SimulationResult", "SCHEMA_PATH"]
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+_CORE_SCHEMA_TABLES = frozenset(
+    {
+        "ontology_write_gate",
+        "ontology_registry",
+        "ontology_objects",
+        "ontology_links",
+        "ontology_action_runs",
+        "ontology_overlay",
+    }
+)
 
 _COMMITTED = "COMMITTED"
 
@@ -121,10 +131,19 @@ class OntologyRuntime:
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        existing_tables = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if not _CORE_SCHEMA_TABLES <= existing_tables:
+            self._conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         self._closed = False
         # Automation de-duplication ledger: (name, object_id, version) -> record.
         self._automation_fires: dict[tuple[str, str, int], dict[str, Any]] = {}
+        self._post_commit_hooks: list[Callable[[Actor, dict[str, Any]], None]] = []
+        self._run_event_hooks: list[Callable[[Actor, dict[str, Any]], None]] = []
         # 数据摄入设备驱动：外部快照解析 / 多源列拼接 / overlay 重放。
         self.ingestion = SnapshotIngestionDriver(self)
         self._sync_registry()
@@ -202,6 +221,12 @@ class OntologyRuntime:
         with OntologyMCTSPlanner(self, actor, **kwargs) as planner:
             return planner.search()
 
+    def open_latent_space(self, db_path: str | Path) -> Any:
+        """快捷入口：基于持久化同构 6 表库打开或初始化 ``LatentSpace``。"""
+        from .latent import LatentSpace
+
+        return LatentSpace(self, db_path)
+
     # -- transactions ------------------------------------------------------
     @contextmanager
     def _write_gate(self) -> Iterator[sqlite3.Connection]:
@@ -231,8 +256,8 @@ class OntologyRuntime:
             meta = cls.type_metadata()
             meta["schema"] = cls.model_json_schema()
             rows.append(("object_type", name, meta))
-        for name, decl in self.spec.link_types.items():
-            rows.append(("link_type", name, decl.model_dump(mode="json")))
+        for name, decl in self.spec.object_properties.items():
+            rows.append(("object_property", name, decl.model_dump(mode="json")))
         for name, fn in self.spec.functions.items():
             rows.append(
                 (
@@ -256,6 +281,7 @@ class OntologyRuntime:
                         "allowed_roles": list(action.allowed_roles),
                         "approver_roles": list(action.approver_roles),
                         "affects_source": action.affects_source,
+                        "visibility": action.visibility,
                         "params_schema": action.params.model_json_schema(),
                     },
                 )
@@ -448,6 +474,7 @@ class OntologyRuntime:
                 version = old_version + 1
 
             self._sync_overlay(conn, object_type, object_id, properties)
+            self._sync_object_property_links(conn, cls, object_id, properties)
 
         if auto_trigger:
             self.evaluate_automations(actor)
@@ -458,6 +485,30 @@ class OntologyRuntime:
             "version": version,
             "content_hash": content_hash,
         }
+
+    @staticmethod
+    def _sync_object_property_links(
+        conn: sqlite3.Connection,
+        cls: type[ObjectType],
+        object_id: str,
+        properties: dict[str, Any],
+    ) -> None:
+        prop_map = getattr(cls, "__object_properties__", None) or {}
+        if not prop_map:
+            return
+        source_type = cls.__name__
+        for field_name, decl in prop_map.items():
+            conn.execute(
+                "DELETE FROM ontology_links WHERE link_type = ? AND source_type = ? AND source_id = ?",
+                (decl.name, source_type, str(object_id)),
+            )
+            for target_id in EditBatch._extract_field_targets(properties.get(field_name)):
+                conn.execute(
+                    "INSERT OR IGNORE INTO ontology_links "
+                    "(link_type, source_type, source_id, target_type, target_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (decl.name, source_type, str(object_id), decl.range, target_id),
+                )
 
     def ingest_object(self, obj: ObjectType) -> dict[str, Any]:
         """Backward-compatible alias for :meth:`put_object`（由摄入驱动转发）。"""
@@ -509,6 +560,34 @@ class OntologyRuntime:
     def automation_history(self) -> list[dict[str, Any]]:
         """按触发顺序返回全部自动化记录。"""
         return AutomationReflexAspect.automation_history(self)
+
+    def add_post_commit_hook(self, hook: Any) -> None:
+        """注册动作提交后的适配器回调（与具体业务模块解耦）。"""
+        if hook not in self._post_commit_hooks:
+            self._post_commit_hooks.append(hook)
+
+    def remove_post_commit_hook(self, hook: Any) -> None:
+        """移除已注册的动作提交后适配器回调。"""
+        if hook in self._post_commit_hooks:
+            self._post_commit_hooks.remove(hook)
+
+    def _notify_post_commit(self, actor: Actor, run: dict[str, Any]) -> None:
+        for hook in list(self._post_commit_hooks):
+            hook(actor, run)
+        self._notify_run_event(actor, run)
+
+    def add_run_event_hook(self, hook: Any) -> None:
+        """注册全生命周期动作运行回调（待批/已批/被拒/冲正均触发）。"""
+        if hook not in self._run_event_hooks:
+            self._run_event_hooks.append(hook)
+
+    def remove_run_event_hook(self, hook: Any) -> None:
+        if hook in self._run_event_hooks:
+            self._run_event_hooks.remove(hook)
+
+    def _notify_run_event(self, actor: Actor, run: dict[str, Any]) -> None:
+        for hook in list(self._run_event_hooks):
+            hook(actor, run)
 
     # -- column-wise MDO (delegated to the ingestion device driver) --------
     @staticmethod
@@ -596,16 +675,16 @@ class OntologyRuntime:
     def get_linked(
         self,
         source_obj: ObjectType,
-        link: str | LinkType,
+        link: str | ObjectProperty,
         target_cls: type[ObjectType] | str,
         actor: Actor,
     ) -> list[ObjectType]:
-        decl = self.spec.get_link_type(link)
         source_type = type(source_obj).__name__
         target_type = self.spec.get_object_type(target_cls).__name__
-        if source_type != decl.source or target_type != decl.target:
+        decl = self.spec.get_object_property(link, domain=source_type)
+        if source_type != decl.domain or target_type != decl.range:
             raise ValueError(
-                f"link {decl.name!r} spans {decl.source}->{decl.target}, "
+                f"object property {decl.name!r} spans {decl.domain}->{decl.range}, "
                 f"got {source_type}->{target_type}"
             )
 
@@ -634,17 +713,17 @@ class OntologyRuntime:
     def get_linked_to(
         self,
         target_obj: ObjectType,
-        link: str | LinkType,
+        link: str | ObjectProperty,
         source_cls: type[ObjectType] | str,
         actor: Actor,
     ) -> list[ObjectType]:
         """Reverse traversal: every ``source`` whose ``link`` points at target."""
-        decl = self.spec.get_link_type(link)
         source_type = self.spec.get_object_type(source_cls).__name__
         target_type = type(target_obj).__name__
-        if source_type != decl.source or target_type != decl.target:
+        decl = self.spec.get_object_property(link, domain=source_type)
+        if source_type != decl.domain or target_type != decl.range:
             raise ValueError(
-                f"link {decl.name!r} spans {decl.source}->{decl.target}, "
+                f"object property {decl.name!r} spans {decl.domain}->{decl.range}, "
                 f"got {source_type}->{target_type}"
             )
 
@@ -681,38 +760,40 @@ class OntologyRuntime:
     def pivot(
         self,
         source_set: ObjectSet,
-        link: str | LinkType,
+        link: str | ObjectProperty,
         actor: Actor,
         direction: str | None = None,
     ) -> ObjectSet:
-        decl = self.spec.get_link_type(link)
         set_type = source_set.object_type
+        decl = self.spec.get_object_property(
+            link, domain=set_type if direction != "reverse" else None
+        )
 
         if direction is None:
-            if set_type == decl.source:
+            if set_type == decl.domain:
                 direction = "forward"
-            elif set_type == decl.target:
+            elif set_type == decl.range:
                 direction = "reverse"
             else:
                 raise ValueError(
-                    f"object set type {set_type!r} is not an endpoint of link "
-                    f"{decl.name!r} ({decl.source}->{decl.target})"
+                    f"object set type {set_type!r} is not an endpoint of object property "
+                    f"{decl.name!r} ({decl.domain}->{decl.range})"
                 )
 
         if direction == "forward":
-            if set_type != decl.source:
+            if set_type != decl.domain:
                 raise ValueError(
-                    f"forward pivot of {decl.name!r} requires {decl.source!r}, "
+                    f"forward pivot of {decl.name!r} requires {decl.domain!r}, "
                     f"got {set_type!r}"
                 )
-            target_type = decl.target
+            target_type = decl.range
         elif direction == "reverse":
-            if set_type != decl.target:
+            if set_type != decl.range:
                 raise ValueError(
-                    f"reverse pivot of {decl.name!r} requires {decl.target!r}, "
+                    f"reverse pivot of {decl.name!r} requires {decl.range!r}, "
                     f"got {set_type!r}"
                 )
-            target_type = decl.source
+            target_type = decl.domain
         else:
             raise ValueError("direction must be 'forward', 'reverse' or None")
 
@@ -858,7 +939,7 @@ class OntologyRuntime:
     def link_objects(
         self,
         source_obj: ObjectType,
-        link: str | LinkType,
+        link: str | ObjectProperty,
         target_obj: ObjectType,
     ) -> None:
         """Create one directed edge (governed, gate-protected).
@@ -866,12 +947,12 @@ class OntologyRuntime:
         Useful for initial seeding; runtime actions normally manage links
         through the sandbox diff.
         """
-        decl = self.spec.get_link_type(link)
         source_type = type(source_obj).__name__
         target_type = type(target_obj).__name__
-        if source_type != decl.source or target_type != decl.target:
+        decl = self.spec.get_object_property(link, domain=source_type)
+        if source_type != decl.domain or target_type != decl.range:
             raise ValueError(
-                f"link {decl.name!r} spans {decl.source}->{decl.target}, "
+                f"object property {decl.name!r} spans {decl.domain}->{decl.range}, "
                 f"got {source_type}->{target_type}"
             )
         with self._write_gate() as conn:
@@ -893,11 +974,12 @@ class OntologyRuntime:
     def unlink_objects(
         self,
         source_obj: ObjectType,
-        link: str | LinkType,
+        link: str | ObjectProperty,
         target_obj: ObjectType,
     ) -> None:
         """Delete one directed edge (governed, gate-protected)."""
-        decl = self.spec.get_link_type(link)
+        source_type = type(source_obj).__name__
+        decl = self.spec.get_object_property(link, domain=source_type)
         with self._write_gate() as conn:
             conn.execute(
                 """
@@ -907,7 +989,7 @@ class OntologyRuntime:
                 """,
                 (
                     decl.name,
-                    type(source_obj).__name__,
+                    source_type,
                     source_obj.primary_key_value(),
                     type(target_obj).__name__,
                     target_obj.primary_key_value(),
@@ -947,7 +1029,37 @@ class OntologyRuntime:
             SecurityAndAuthorityAspect.check_post_approval_authority(
                 self.spec, action, pre_diff, batch.build_diff()
             )
-        return batch.build_diff()
+        batch.validate_object_properties()
+        batch.validate_invariants()
+        final_diff = batch.build_diff()
+        batch.validate_transition_invariants(final_diff)
+        return final_diff
+
+    def check_invariants(self) -> None:
+        """在当前持久化世界状态上执行所有已注册的 ``@spec.invariant`` 校验。"""
+        if not self.spec.invariants:
+            return
+        batch = EditBatch(
+            self.spec,
+            self,
+            Actor(actor_id="__invariant__", role="system", clearance_tags={"*"}),
+        )
+        batch.validate_invariants()
+
+    def check_transition_invariants(self, diff: ObjectDiff) -> None:
+        """基于单次 ``ObjectDiff`` 与当前后置状态执行 ``@spec.transition_invariant`` 校验。"""
+        if not self.spec.transition_invariants:
+            return
+        batch = EditBatch(
+            self.spec,
+            self,
+            Actor(actor_id="__invariant__", role="system", clearance_tags={"*"}),
+        )
+        batch.validate_transition_invariants(diff)
+
+    def inspect_health(self) -> dict[str, Any]:
+        """对当前世界状态执行只读全量健康巡检：委托给 :class:`SecurityAndAuthorityAspect`。"""
+        return SecurityAndAuthorityAspect.inspect_health(self)
 
     def simulate_action(
         self,
@@ -1017,6 +1129,9 @@ class OntologyRuntime:
                 read_versions=dict(batch.read_versions),
                 error=exc,
             )
+            rejected_run = self.get_action_run(run_id)
+            if rejected_run is not None:
+                self._notify_run_event(actor, rejected_run)
             raise
 
         read_versions = dict(batch.read_versions)
@@ -1035,11 +1150,16 @@ class OntologyRuntime:
             )
             if auto_trigger:
                 self.evaluate_automations(actor)
-            return self.get_action_run(run_id)  # type: ignore[return-value]
+            pending_run = self.get_action_run(run_id)
+            if pending_run is not None:
+                self._notify_run_event(actor, pending_run)
+            return pending_run  # type: ignore[return-value]
 
         with self._write_gate() as conn:
             self._verify_read_versions(conn, read_versions)
             self._apply_diff(conn, diff)
+            self.check_invariants()
+            self.check_transition_invariants(diff)
             self._insert_run(
                 conn,
                 run_id=run_id,
@@ -1051,14 +1171,23 @@ class OntologyRuntime:
                 diff=diff,
                 approved_by=None,
             )
+        committed_run = self.get_action_run(run_id)
         if auto_trigger:
             self.evaluate_automations(actor)
-        return self.get_action_run(run_id)  # type: ignore[return-value]
+        if committed_run is not None:
+            self._notify_post_commit(actor, committed_run)
+        return committed_run  # type: ignore[return-value]
 
-    # -- approve -----------------------------------------------------------
+    # -- approve & reject --------------------------------------------------
     def approve_action(self, run_id: str, approver: Actor) -> dict[str, Any]:
         """批准挂起单：委托给 :class:`ApprovalGateAspect`。"""
         return ApprovalGateAspect.approve_action(self, run_id, approver)
+
+    def reject_action(
+        self, run_id: str, approver: Actor, reason: str = "rejected by approver"
+    ) -> dict[str, Any]:
+        """驳回挂起单：委托给 :class:`ApprovalGateAspect`。"""
+        return ApprovalGateAspect.reject_action(self, run_id, approver, reason=reason)
 
     # -- revert (time machine) --------------------------------------------
     def revert_action(
@@ -1073,139 +1202,7 @@ class OntologyRuntime:
     # -- apply diff --------------------------------------------------------
     def _apply_diff(self, conn: sqlite3.Connection, diff: ObjectDiff) -> None:
         """Apply a diff. Must run inside ``_write_gate``."""
-        now = _utcnow()
-
-        for change in diff.object_changes:
-            if change.kind == "create":
-                assert change.after is not None
-                if IdempotencyAndOCCAspect.current_version(
-                    conn, change.object_type, change.object_id
-                ) is not None:
-                    raise ConcurrencyConflictError(
-                        f"cannot create {change.object_type}:{change.object_id}: "
-                        "object already exists"
-                    )
-                version = change.after_version or 1
-                conn.execute(
-                    """
-                    INSERT INTO ontology_objects (
-                        object_type, object_id, title, properties_json, version,
-                        security_tags_json, content_hash, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        change.object_type,
-                        change.object_id,
-                        change.after_title,
-                        _dumps(change.after),
-                        version,
-                        _dumps(change.after_security_tags),
-                        _content_hash(change.after),
-                        now,
-                    ),
-                )
-                self._sync_overlay(conn, change.object_type, change.object_id, change.after)
-
-            elif change.kind == "update":
-                assert change.after is not None
-                current_version = IdempotencyAndOCCAspect.current_version(
-                    conn, change.object_type, change.object_id
-                )
-                if current_version is None:
-                    raise ConcurrencyConflictError(
-                        f"cannot update {change.object_type}:{change.object_id}: "
-                        "object vanished"
-                    )
-                if (
-                    change.before_version is not None
-                    and current_version != change.before_version
-                ):
-                    raise ConcurrencyConflictError(
-                        f"stale update on {change.object_type}:{change.object_id}: "
-                        f"expected version {change.before_version}, "
-                        f"found {current_version}"
-                    )
-                conn.execute(
-                    """
-                    UPDATE ontology_objects
-                    SET title = ?, properties_json = ?, version = ?,
-                        security_tags_json = ?, content_hash = ?, updated_at = ?
-                    WHERE object_type = ? AND object_id = ?
-                    """,
-                    (
-                        change.after_title,
-                        _dumps(change.after),
-                        current_version + 1,
-                        _dumps(change.after_security_tags),
-                        _content_hash(change.after),
-                        now,
-                        change.object_type,
-                        change.object_id,
-                    ),
-                )
-                self._sync_overlay(conn, change.object_type, change.object_id, change.after)
-
-            elif change.kind == "delete":
-                current_version = IdempotencyAndOCCAspect.current_version(
-                    conn, change.object_type, change.object_id
-                )
-                if current_version is None:
-                    continue
-                if (
-                    change.before_version is not None
-                    and current_version != change.before_version
-                ):
-                    raise ConcurrencyConflictError(
-                        f"stale delete on {change.object_type}:{change.object_id}: "
-                        f"expected version {change.before_version}, "
-                        f"found {current_version}"
-                    )
-                conn.execute(
-                    """
-                    DELETE FROM ontology_objects
-                    WHERE object_type = ? AND object_id = ?
-                    """,
-                    (change.object_type, change.object_id),
-                )
-                self._delete_overlay(conn, change.object_type, change.object_id)
-            else:  # pragma: no cover - guarded by ObjectChange
-                raise GovernanceViolationError(f"unknown object change kind {change.kind!r}")
-
-        for link_change in diff.link_changes:
-            if link_change.kind == "create":
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO ontology_links (
-                        link_type, source_type, source_id, target_type, target_id
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        link_change.link_type,
-                        link_change.source_type,
-                        link_change.source_id,
-                        link_change.target_type,
-                        link_change.target_id,
-                    ),
-                )
-            elif link_change.kind == "delete":
-                conn.execute(
-                    """
-                    DELETE FROM ontology_links
-                    WHERE link_type = ? AND source_type = ? AND source_id = ?
-                      AND target_type = ? AND target_id = ?
-                    """,
-                    (
-                        link_change.link_type,
-                        link_change.source_type,
-                        link_change.source_id,
-                        link_change.target_type,
-                        link_change.target_id,
-                    ),
-                )
-            else:  # pragma: no cover
-                raise GovernanceViolationError(
-                    f"unknown link change kind {link_change.kind!r}"
-                )
+        IdempotencyAndOCCAspect.apply_diff(self, conn, diff)
 
     # -- internal helpers --------------------------------------------------
     @staticmethod
@@ -1261,57 +1258,13 @@ class OntologyRuntime:
         """MVCC 乐观锁：委托给 :class:`IdempotencyAndOCCAspect`。"""
         IdempotencyAndOCCAspect.verify_read_versions(conn, read_versions)
 
-    def _insert_run(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        run_id: str,
-        action: ActionDef,
-        actor: Actor,
-        params_json: dict[str, Any],
-        status: str,
-        read_versions: dict[str, int],
-        diff: ObjectDiff,
-        approved_by: str | None,
-        error_code: str | None = None,
-        error_message: str | None = None,
-    ) -> None:
+    def _insert_run(self, conn: sqlite3.Connection, **kwargs: Any) -> None:
         """审计账本写入：委托给 :func:`open_ontology.aspects.insert_action_run`。"""
-        insert_action_run(
-            self,
-            conn,
-            run_id=run_id,
-            action=action,
-            actor=actor,
-            params_json=params_json,
-            status=status,
-            read_versions=read_versions,
-            diff=diff,
-            approved_by=approved_by,
-            error_code=error_code,
-            error_message=error_message,
-        )
+        insert_action_run(self, conn, **kwargs)
 
-    def _record_rejection(
-        self,
-        *,
-        run_id: str,
-        action: ActionDef,
-        actor: Actor,
-        params_json: dict[str, Any],
-        read_versions: dict[str, int],
-        error: InvariantError,
-    ) -> None:
+    def _record_rejection(self, **kwargs: Any) -> None:
         """被拒企图入账：委托给 :class:`RejectionAuditAspect`。"""
-        RejectionAuditAspect.record_rejection(
-            self,
-            run_id=run_id,
-            action=action,
-            actor=actor,
-            params_json=params_json,
-            read_versions=read_versions,
-            error=error,
-        )
+        RejectionAuditAspect.record_rejection(self, **kwargs)
 
     # -- pure-business audit readers --------------------------------------
     def get_action_run(self, run_id: str) -> dict[str, Any] | None:

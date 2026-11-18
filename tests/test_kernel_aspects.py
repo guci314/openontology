@@ -26,8 +26,8 @@ from open_ontology import (
     OntologyRuntime,
     OntologySpec,
     PermissionDeniedError,
+    ObjectProperty,
     ObjectType,
-    LinkType,
 )
 from open_ontology.aspects import (
     AUDIT_STATUS_COMMITTED,
@@ -90,11 +90,11 @@ class AutoItem(ObjectType):
 
 spec.object_type(Account)
 spec.object_type(OwnedThing)
-spec.add_link_type(
-    LinkType(
+spec.add_object_property(
+    ObjectProperty(
         name="account_links",
-        source="Account",
-        target="Account",
+        domain="Account",
+        range="Account",
         cardinality="many-to-many",
         owned=False,
     )
@@ -604,7 +604,7 @@ def test_runtime_line_budget():
 # ---------------------------------------------------------------------------
 MICROKERNEL_MODULES = ("spec.py", "sandbox.py", "runtime.py", "query.py")
 ASPECT_MODULES = ("aspects.py",)
-DRIVER_MODULES = ("ingestion.py", "agent_hosts.py", "harness_drivers.py")
+DRIVER_MODULES = ("ingestion.py",)
 
 
 def test_four_module_categories_exist():
@@ -867,11 +867,11 @@ def _phase_write_mixed(ctx, params):
     ctx.modify(obj, name=f"{params.name}!", internal_note=params.note)
 
 
-spec.add_link_type(
-    LinkType(
+spec.add_object_property(
+    ObjectProperty(
         name="account_owned_links",
-        source="Account",
-        target="Account",
+        domain="Account",
+        range="Account",
         cardinality="many-to-many",
         owned=True,
     )
@@ -1256,3 +1256,372 @@ def test_action_batches_never_mask_staged_diffs(runtime):
     assert MASKED_STRING not in json.dumps(run["object_diff"], ensure_ascii=False)
     stored = runtime.load_object("Account", "A1")
     assert stored is not None and stored.data["balance"] == 1234
+
+
+# ---------------------------------------------------------------------------
+# 9. Platform-level read_only_source enforcement (spec + ObjectType + runtime)
+# ---------------------------------------------------------------------------
+class _ExternalCustomer(ObjectType):
+    __primary_key__ = "customer_id"
+    __title__ = "name"
+    __owned__ = {"ops_tag": None}
+    __read_only_source__ = True
+
+    customer_id: str
+    name: str
+    credit_limit: int = 0
+    ops_tag: str | None = None
+
+
+class _MutableOrder(ObjectType):
+    __primary_key__ = "order_id"
+    __title__ = "order_id"
+    __owned__ = {"priority": 0}
+
+    order_id: str
+    amount: int = 0
+    priority: int = 0
+
+
+class _OwnedNote(ObjectType):
+    __primary_key__ = "note_id"
+    __owned__ = True
+
+    note_id: str
+    text: str
+
+
+class _CustomerEditParams(BaseModel):
+    customer_id: str
+    name: str = ""
+    ops_tag: str = ""
+
+
+class _OrderEditParams(BaseModel):
+    order_id: str
+    amount: int = 0
+
+
+class _LinkEditParams(BaseModel):
+    customer_id: str
+    note_id: str = "N1"
+
+
+def test_read_only_source_spec_forbids_affects_source_true_at_registration():
+    """OntologySpec(read_only_source=True) 在注册期即彻底堵死 affects_source=True。"""
+    from open_ontology.spec import GovernanceViolationError
+
+    ro_spec = OntologySpec(read_only_source=True)
+    ro_spec.object_type(_ExternalCustomer)
+
+    with pytest.raises(GovernanceViolationError, match="read_only_source"):
+
+        @ro_spec.action("default_affects_source", _CustomerEditParams, allowed_roles=("admin",))
+        def _bad_default(ctx, params):
+            return None
+
+    with pytest.raises(GovernanceViolationError, match="read_only_source"):
+
+        @ro_spec.action(
+            "explicit_affects_source",
+            _CustomerEditParams,
+            allowed_roles=("admin",),
+            affects_source=True,
+        )
+        def _bad_explicit(ctx, params):
+            return None
+
+    @ro_spec.action(
+        "tag_customer",
+        _CustomerEditParams,
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+    def tag_customer(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        ctx.modify(cust, ops_tag=params.ops_tag)
+
+    assert "tag_customer" in ro_spec.actions
+
+
+def test_read_only_source_object_type_declaration_and_tbox():
+    """__read_only_source__ 是类型元数据，禁止与 __owned__=True 混用，且投射到 TBox。"""
+    from open_ontology.model_views import describe_tbox
+
+    class _ContradictoryOwned(ObjectType):
+        __primary_key__ = "item_id"
+        __owned__ = True
+        __read_only_source__ = True
+        item_id: str
+
+    ro_spec = OntologySpec(read_only_source=True)
+    with pytest.raises(ValueError, match="__read_only_source__"):
+        ro_spec.object_type(_ContradictoryOwned)
+
+    ro_spec.object_type(_ExternalCustomer)
+    ro_spec.object_type(_OwnedNote)
+    assert "__read_only_source__" not in _ExternalCustomer.model_fields
+    assert _ExternalCustomer.is_read_only_source() is True
+    assert _OwnedNote.is_read_only_source() is False
+
+    cust = _ExternalCustomer(customer_id="C1", name="Acme", credit_limit=100)
+    assert "__read_only_source__" not in cust.model_dump()
+    assert "__read_only_source__" not in cust.to_properties()
+
+    tbox = describe_tbox(ro_spec)
+    by_name = {row["name"]: row for row in tbox["object_types"]}
+    assert by_name["_ExternalCustomer"]["read_only_source"] is True
+    assert by_name["_OwnedNote"]["read_only_source"] is False
+
+
+def test_read_only_source_spec_blocks_action_source_writes_but_allows_snapshots_and_overlay(tmp_path):
+    """read_only_source=True 模型下：SnapshotIngestionDriver 可刷新源数据，Action 只能改自有字段。"""
+    from open_ontology.spec import ActionDef
+
+    ro_spec = OntologySpec(read_only_source=True)
+    ro_spec.object_type(_ExternalCustomer)
+    ro_spec.object_type(_OwnedNote)
+    ro_spec.object_property(
+        "customer_src_links",
+        "_ExternalCustomer",
+        "_ExternalCustomer",
+        cardinality="many-to-many",
+        owned=False,
+    )
+    ro_spec.object_property(
+        "customer_owned_notes",
+        "_ExternalCustomer",
+        "_OwnedNote",
+        cardinality="one-to-many",
+        owned=True,
+    )
+
+    @ro_spec.action(
+        "annotate_customer",
+        _CustomerEditParams,
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+    def annotate_customer(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        ctx.modify(cust, ops_tag=params.ops_tag)
+
+    @ro_spec.action(
+        "link_customer_note",
+        _LinkEditParams,
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+    def link_customer_note(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        note = ctx.create(_OwnedNote(note_id=params.note_id, text="note"))
+        ctx.link(cust, "customer_owned_notes", note)
+
+    @ro_spec.action(
+        "illegal_mutate_source",
+        _CustomerEditParams,
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+    def illegal_mutate_source(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        ctx.modify(cust, name=params.name)
+
+    @ro_spec.action(
+        "illegal_create_source",
+        _CustomerEditParams,
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+    def illegal_create_source(ctx, params):
+        ctx.create(_ExternalCustomer(customer_id=params.customer_id, name=params.name))
+
+    @ro_spec.action(
+        "illegal_src_link",
+        _LinkEditParams,
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+    def illegal_src_link(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        ctx.link(cust, "customer_src_links", cust)
+
+    # Bypass decorator registration to test runtime guard defense-in-depth
+    ro_spec.actions["rogue_source_action"] = ActionDef(
+        name="rogue_source_action",
+        params=_CustomerEditParams,
+        handler=lambda ctx, params: None,
+        allowed_roles=("admin",),
+        affects_source=True,
+    )
+
+    rt = OntologyRuntime(ro_spec, tmp_path / "ro_spec.sqlite3")
+    try:
+        # Snapshot ingestion works freely on external source objects
+        rt.ingestion.load_snapshot(
+            {
+                "_ExternalCustomer": [
+                    {"customer_id": "C1", "name": "Acme v1", "credit_limit": 500}
+                ]
+            },
+            actor=ADMIN,
+        )
+
+        # Owned field mutation succeeds
+        sim_ok = rt.simulate_action(
+            "annotate_customer", {"customer_id": "C1", "ops_tag": "vip"}, ADMIN
+        )
+        assert sim_ok.valid is True
+        rt.submit_action("RUN-RO-1", "annotate_customer", {"customer_id": "C1", "ops_tag": "vip"}, ADMIN)
+
+        # Owned link + owned object creation succeeds
+        rt.submit_action("RUN-RO-2", "link_customer_note", {"customer_id": "C1", "note_id": "N1"}, ADMIN)
+
+        # Snapshot refresh updates source fields while preserving __owned__ overlay
+        rt.ingestion.load_snapshot(
+            {
+                "_ExternalCustomer": [
+                    {"customer_id": "C1", "name": "Acme v2", "credit_limit": 800}
+                ]
+            },
+            actor=ADMIN,
+        )
+        refreshed = rt.get_object(_ExternalCustomer, "C1", ADMIN)
+        assert refreshed.name == "Acme v2"
+        assert refreshed.credit_limit == 800
+        assert refreshed.ops_tag == "vip"
+
+        # Any Action source write, source creation, source link, or rogue affects_source=True fails
+        for action_name, payload in (
+            ("illegal_mutate_source", {"customer_id": "C1", "name": "Hacked"}),
+            ("illegal_create_source", {"customer_id": "C2", "name": "Rogue"}),
+            ("illegal_src_link", {"customer_id": "C1"}),
+            ("rogue_source_action", {"customer_id": "C1"}),
+        ):
+            sim = rt.simulate_action(action_name, payload, ADMIN)
+            assert sim.valid is False, action_name
+            assert sim.error_code == "SOURCE_READ_ONLY", action_name
+    finally:
+        rt.close()
+
+
+def test_object_level_read_only_source_protects_external_object_in_mixed_spec(tmp_path):
+    """混合主权模型中：__read_only_source__=True 锁定指定外部对象（含 post_approval 与非自有关系），不影响可写源对象。"""
+    mixed_spec = OntologySpec()  # read_only_source=False
+    mixed_spec.object_type(_ExternalCustomer)
+    mixed_spec.object_type(_MutableOrder)
+    mixed_spec.object_property(
+        "customer_orders",
+        "_ExternalCustomer",
+        "_MutableOrder",
+        cardinality="one-to-many",
+        owned=False,
+    )
+
+    @mixed_spec.action(
+        "update_order_amount",
+        _OrderEditParams,
+        allowed_roles=("admin",),
+        affects_source=True,
+    )
+    def update_order_amount(ctx, params):
+        order = ctx.get(_MutableOrder, params.order_id)
+        ctx.modify(order, amount=params.amount)
+
+    @mixed_spec.action(
+        "rename_customer_with_true",
+        _CustomerEditParams,
+        allowed_roles=("admin",),
+        affects_source=True,
+    )
+    def rename_customer_with_true(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        ctx.modify(cust, name=params.name)
+
+    @mixed_spec.action(
+        "tag_customer_only",
+        _CustomerEditParams,
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+    def tag_customer_only(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        ctx.modify(cust, ops_tag=params.ops_tag)
+
+    def _post_approval_mutate_customer(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        ctx.modify(cust, credit_limit=9999)
+
+    @mixed_spec.action(
+        "two_phase_touches_ro_source",
+        _CustomerEditParams,
+        allowed_roles=("admin",),
+        approver_roles=("admin",),
+        affects_source=False,
+        post_approval=_post_approval_mutate_customer,
+    )
+    def two_phase_touches_ro_source(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        ctx.modify(cust, ops_tag=params.ops_tag)
+
+    @mixed_spec.action(
+        "link_customer_to_order",
+        _LinkEditParams,
+        allowed_roles=("admin",),
+        affects_source=True,
+    )
+    def link_customer_to_order(ctx, params):
+        cust = ctx.get(_ExternalCustomer, params.customer_id)
+        order = ctx.get(_MutableOrder, "O1")
+        ctx.link(cust, "customer_orders", order)
+
+    rt = OntologyRuntime(mixed_spec, tmp_path / "mixed.sqlite3")
+    try:
+        rt.ingestion.load_snapshot(
+            {
+                "_ExternalCustomer": [
+                    {"customer_id": "C1", "name": "Acme", "credit_limit": 100}
+                ],
+                "_MutableOrder": [{"order_id": "O1", "amount": 10}],
+            },
+            actor=ADMIN,
+        )
+
+        # Writable source object still works with affects_source=True
+        rt.submit_action("RUN-ORD-1", "update_order_amount", {"order_id": "O1", "amount": 42}, ADMIN)
+        assert rt.get_object(_MutableOrder, "O1", ADMIN).amount == 42
+
+        # Owned overlay update on read-only source object works with affects_source=False
+        rt.submit_action("RUN-CUST-OWNED", "tag_customer_only", {"customer_id": "C1", "ops_tag": "gold"}, ADMIN)
+        assert rt.get_object(_ExternalCustomer, "C1", ADMIN).ops_tag == "gold"
+
+        # Source writes (even with affects_source=True), post_approval source writes, and source links fail
+        for action_name, payload in (
+            ("rename_customer_with_true", {"customer_id": "C1", "name": "Changed"}),
+            ("two_phase_touches_ro_source", {"customer_id": "C1", "ops_tag": "silver"}),
+            ("link_customer_to_order", {"customer_id": "C1"}),
+        ):
+            sim = rt.simulate_action(action_name, payload, ADMIN)
+            assert sim.valid is False, action_name
+            assert sim.error_code == "SOURCE_READ_ONLY", action_name
+    finally:
+        rt.close()
+
+
+def test_kanban_and_dev_factory_enforce_read_only_source():
+    """kanban.py 与 dev_factory.py 已从平台层锁定 read_only_source=True。"""
+    from examples import kanban
+    from open_ontology import dev_factory
+    from open_ontology.spec import GovernanceViolationError
+
+    assert kanban.spec.read_only_source is True
+    assert dev_factory.spec.read_only_source is True
+
+    for target_spec in (kanban.spec, dev_factory.spec):
+        with pytest.raises(GovernanceViolationError):
+            target_spec.action(
+                "_probe_forbidden_source_action",
+                _CustomerEditParams,
+                allowed_roles=("admin",),
+                affects_source=True,
+            )

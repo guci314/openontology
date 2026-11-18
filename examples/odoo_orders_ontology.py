@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from open_ontology import Actor, InvariantError, LinkType, ObjectType, OntologySpec
+from open_ontology import Actor, InvariantError, ObjectProperty, ObjectType, OntologySpec
 
 # ---------------------------------------------------------------------------
 # Object types
@@ -60,19 +60,19 @@ class OrderNote(ObjectType):
 
 
 # ---------------------------------------------------------------------------
-# Link types
+# Object properties
 # ---------------------------------------------------------------------------
-CUSTOMER_ORDERS = LinkType(
+CUSTOMER_ORDERS = ObjectProperty(
     name="customer_orders",
-    source="Customer",
-    target="Order",
+    domain="Customer",
+    range="Order",
     cardinality="one-to-many",
     owned=False,
 )
-ORDER_NOTES = LinkType(
+ORDER_NOTES = ObjectProperty(
     name="order_notes",
-    source="Order",
-    target="OrderNote",
+    domain="Order",
+    range="OrderNote",
     cardinality="one-to-many",
     owned=True,
 )
@@ -84,8 +84,8 @@ ORDER_NOTES = LinkType(
 spec = OntologySpec()
 for _cls in (Customer, Order, OrderNote):
     spec.object_type(_cls)
-for _link in (CUSTOMER_ORDERS, ORDER_NOTES):
-    spec.add_link_type(_link)
+for _prop in (CUSTOMER_ORDERS, ORDER_NOTES):
+    spec.add_object_property(_prop)
 
 
 # ---------------------------------------------------------------------------

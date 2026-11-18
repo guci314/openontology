@@ -26,6 +26,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .aspects import SecurityAndAuthorityAspect
 from .spec import (
     Actor,
     GovernanceViolationError,
@@ -180,11 +181,12 @@ class SnapshotIngestionDriver:
         # 否则传入 ``{"Shipment": []}``（清空该类型）时类型名会丢失，
         # 既不删旧行，也让孤儿 overlay 保护失效。
         supplied_types = sorted(objects)
-        supplied_link_types = sorted(links or {})
+        supplied_object_properties = sorted(links or {})
 
         with self._write_gate() as conn:
             existing = self._load_existing(conn, supplied_types)
             overlays, overlay_updated = self._load_overlays(conn)
+            now = _utcnow()
 
             overlays_dropped: list[str] = []
             overlays_kept: list[str] = []
@@ -193,8 +195,7 @@ class SnapshotIngestionDriver:
                     conn, overlays, overlay_updated, source_timestamps
                 )
 
-            self._wipe_supplied(conn, supplied_types, supplied_link_types)
-            now = _utcnow()
+            self._wipe_supplied(conn, supplied_types, supplied_object_properties)
             for type_name, cls, obj, base_properties in normalized_objects:
                 self._write_object_row(
                     conn, type_name, cls, obj, base_properties, overlays, existing, now
@@ -216,7 +217,7 @@ class SnapshotIngestionDriver:
         return {
             "object_types": supplied_types,
             "objects": len(normalized_objects),
-            "link_types": supplied_link_types,
+            "object_properties": supplied_object_properties,
             "links": len(normalized_links),
             "overlays_reapplied": sum(
                 1 for object_type, _ in overlays if object_type in supplied_types
@@ -339,25 +340,25 @@ class SnapshotIngestionDriver:
     ) -> list[tuple[str, str, str, str, str]]:
         """校验并归一化快照关系。"""
         normalized: list[tuple[str, str, str, str, str]] = []
-        for link_name, pairs in (links or {}).items():
-            decl = self.spec.get_link_type(link_name)
-            if decl.owned:
+        for prop_name, pairs in (links or {}).items():
+            decl = self.spec.get_object_property(prop_name)
+            if SecurityAndAuthorityAspect._property_is_owned(self.spec, decl):
                 raise GovernanceViolationError(
-                    f"link type {link_name!r} is ontology-owned; "
+                    f"object property {prop_name!r} is ontology-owned; "
                     "a source snapshot may not supply it"
                 )
             for pair in pairs:
                 if not isinstance(pair, (tuple, list)) or len(pair) != 2:
                     raise GovernanceViolationError(
-                        f"snapshot link {link_name!r} expects "
+                        f"snapshot object property {prop_name!r} expects "
                         "(source_id, target_id) pairs"
                     )
                 normalized.append(
                     (
                         decl.name,
-                        decl.source,
+                        decl.domain,
                         str(pair[0]),
-                        decl.target,
+                        decl.range,
                         str(pair[1]),
                     )
                 )
@@ -434,17 +435,23 @@ class SnapshotIngestionDriver:
                 kept.append(label)
         return dropped, kept
 
-    @staticmethod
     def _wipe_supplied(
-        conn: Any, supplied_types: list[str], supplied_link_types: list[str]
+        self, conn: Any, supplied_types: list[str], supplied_object_properties: list[str]
     ) -> None:
-        """清掉即将被快照替换的底表行。"""
-        for link_name in supplied_link_types:
+        """清掉即将被快照替换的底表行及对象属性边。"""
+        for prop_name in supplied_object_properties:
+            decl = self.spec.get_object_property(prop_name)
             conn.execute(
                 "DELETE FROM ontology_links WHERE link_type = ?",
-                (link_name,),
+                (decl.name,),
             )
         for type_name in supplied_types:
+            cls = self.spec.get_object_type(type_name)
+            for decl in (getattr(cls, "__object_properties__", None) or {}).values():
+                conn.execute(
+                    "DELETE FROM ontology_links WHERE link_type = ? AND source_type = ?",
+                    (decl.name, type_name),
+                )
             conn.execute(
                 "DELETE FROM ontology_objects WHERE object_type = ?",
                 (type_name,),
@@ -499,6 +506,7 @@ class SnapshotIngestionDriver:
                 now,
             ),
         )
+        self.runtime._sync_object_property_links(conn, cls, object_id, properties)
 
     @staticmethod
     def _assert_no_orphan_overlay(
@@ -517,21 +525,27 @@ class SnapshotIngestionDriver:
                     f"{object_type}:{object_id}"
                 )
 
-
 # ---------------------------------------------------------------------------
 # 纯函数式入口（与驱动方法一一对应，便于直接调用与测试）
 # ---------------------------------------------------------------------------
+def _driver_for(runtime: Any) -> SnapshotIngestionDriver:
+    existing = getattr(runtime, "ingestion", None)
+    if isinstance(existing, SnapshotIngestionDriver):
+        return existing
+    return SnapshotIngestionDriver(runtime)
+
+
 def ingest_object(runtime: Any, obj: ObjectType) -> dict[str, Any]:
-    return SnapshotIngestionDriver(runtime).ingest_object(obj)
+    return _driver_for(runtime).ingest_object(obj)
 
 
 def load_snapshot(runtime: Any, objects: Any, links: Any = None, **kwargs: Any) -> dict[str, Any]:
-    return SnapshotIngestionDriver(runtime).load_snapshot(objects, links, **kwargs)
+    return _driver_for(runtime).load_snapshot(objects, links, **kwargs)
 
 
 def load_mdo_snapshots(
     runtime: Any, object_type: Any, sources: Any, **kwargs: Any
 ) -> dict[str, Any]:
-    return SnapshotIngestionDriver(runtime).load_mdo_snapshots(
+    return _driver_for(runtime).load_mdo_snapshots(
         object_type, sources, **kwargs
     )

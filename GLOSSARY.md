@@ -19,12 +19,14 @@
 |---|---|---|
 | **Symbolic World Model / 符号世界模型** | `Model`（世界法则） + `Runtime`（世界模拟器） + `World`（世界状态实例）构成的完整受控推演体系 | 并非单一存储或纯静态规则；三者协作完成状态转移与 MCTS 推演 |
 | **Model / 领域模型** | 以 `model_id` 标识的可复用定义包：结构（TBox）+ 行为/转移法则（Behavior） | 不因启动执行而变成事实；不是数据库 |
-| **TBox** | 类型侧结构投影：`ObjectType`、字段、`InterfaceType`、`LinkType`、声明式约束、类型元数据（含 `aggregate_root`） | 不是知识激活流程中的阶段，也不是运行时实例值 |
+| **TBox** | 类型侧结构投影：`ObjectType`、字段（含 `AutoID` 与 `DatatypeProperty`）、`InterfaceType`、`ObjectProperty`、声明式约束、类型元数据（含 `aggregate_root`） | 不是知识激活流程中的阶段，也不是运行时实例值 |
+| **`ObjectProperty` / 对象属性** | OWL 跨对象关系原语：以 `ObjectProperty[Target]` / `ObjectProperty[tuple[Target, ...]]` 或 `spec.object_property(...)` 声明 `domain`、`range`、`cardinality` 与连边主权；写入时自动同步 `ontology_links` 三元组并强制引用完整性（`TARGET_NOT_FOUND`） | 替代关系表外键命名与旧版独立连边原语；不是可任意手填的标量文本字段 |
+| **`AutoID` / 系统自动编号** | 主键/动作编号注解：在 TBox 与 Behavior 契约投影 `auto_generated: True`，用于生成只读系统编号表单控件并由动作自动分配序号 | 不是手填外键，也不跳过唯一性与不变量校验 |
 | **Behavior** | 受控变化契约：`ActionDef`、`FunctionDef`、`AutomationDef`、角色授权、审批与参数 Schema | 不能全部塞进静态结构 TBox，也不是第二套执行引擎 |
 | **ABox** | 事实侧投影：具体对象属性值、关系断言、执行与审计历史 | 不是知识激活流程中的阶段，也不是模型声明 |
-| **World / 业务世界**（代码兼容别名 `Workspace / 工作空间`） | 以 `workspace_id`（`world_id`）标识的隔离业务世界实例：`model_id` 引用 + ABox + Runtime 绑定 + 演化历史（含主世界与 `fork()` 平行沙盘世界） | **不是单个业务对象**，也不是源代码工作目录 |
+| **World / 世界状态**（曾用名 `业务世界`；代码兼容别名 `Workspace / 工作空间`） | 以 `workspace_id`（`world_id`）标识的隔离业务世界实例：`model_id` 引用 + ABox + Runtime 绑定 + 演化历史（含主世界与 `fork()` 平行沙盘世界） | **不是单个业务对象**，也不是源代码工作目录 |
 | **Runtime / 执行引擎** | 执行模型查询、动作、治理切面、持久化与沙盘推演的引擎实例，以 `runtime_id` 标识 | 不是额外一份业务事实 |
-| **Device / 外部设备** | 登记并适配外部系统（OpenAPI）与智能体（A2A Agent Card）的边界 | 不是未经校验即可写入事实图的可信数据 |
+| **Device / 外部设备** | 登记并适配外部确定性工具与数据源（OpenAPI）的边界；外部智能体直接作为 `Actor` 通过 OSDK / `ActionDef` 与世界模型交互 | 不是未经校验即可写入事实图的可信数据 |
 
 ## 3. 身份与寻址
 
@@ -43,11 +45,11 @@ Object     <workspace_id> / <object_type> / <object_id>
 
 | 旧拼写 | 现行含义 | 关系 |
 |---|---|---|
-| `Workspace` / `workspace_id` | 业务世界（`World`）在代码、HTTP 参数与目录清单中的兼容标识 | 与界面 `World · 业务世界` 指向同一实体 |
+| `Workspace` / `workspace_id` | 业务世界（`World`）在代码、HTTP 参数与目录清单中的兼容标识 | 与界面 `World · 世界状态` 指向同一实体 |
 | `OntologySpec` / `ontology_id` | M1 领域模型定义容器 / 模型身份 | `ontology_id` 与 `model_id` 指向同一个值 |
 | `instance_id` / `?instance=` | 早期工作空间 / 业务世界身份 / HTTP 查询参数 | 与 `workspace_id` / `?workspace=` 双栈兼容；冲突参数显式 400 |
 | `register_instance` / `get_instance` | 工作空间 / 业务世界登记 / 查找 | 与 `register_workspace` / `get_workspace` 指向同一份底层条目 |
-| `#tab-ontology` / `#tab-instance` | 兼容期 DOM ID | 界面展示为 `Model · 领域模型` / `World · 业务世界`（兼容旧称 `Workspace · 工作空间`） |
+| `#tab-ontology` / `#tab-instance` | 兼容期 DOM ID | 界面展示为 `Model · 领域模型` / `World · 世界状态`（曾用名 `World · 业务世界`、`Workspace · 工作空间`） |
 | `OntologyRuntime` | 绑定单个模型与单个存储的执行引擎 | 不因术语收敛而重写 |
 
 ## 5. 聚合根与可用性

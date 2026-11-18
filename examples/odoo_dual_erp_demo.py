@@ -122,8 +122,9 @@ def _jsonrpc(service: str, method: str, args: list[Any]) -> Any:
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with opener.open(request, timeout=120) as response:
             body = response.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise OdooRPCError(f"cannot reach {ODOO_URL}: {exc}") from exc

@@ -26,7 +26,7 @@ from open_ontology import (
     Actor,
     InterfaceType,
     InvariantError,
-    LinkType,
+    ObjectProperty,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
@@ -80,8 +80,8 @@ class ScrapLot(ObjectType):
 
 for _cls in (SteelCoil, ScrapLot):
     spec.object_type(_cls)
-spec.add_link_type(
-    LinkType(name="feeds", source="ScrapLot", target="SteelCoil", cardinality="many-to-many")
+spec.add_object_property(
+    ObjectProperty(name="feeds", domain="ScrapLot", range="SteelCoil", cardinality="many-to-many")
 )
 
 

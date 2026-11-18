@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from open_ontology import (
     Actor,
     InvariantError,
-    LinkType,
+    ObjectProperty,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
@@ -111,16 +111,16 @@ class Hospital(ObjectType):
 
 
 # ---------------------------------------------------------------------------
-# Link types
+# Object properties
 # ---------------------------------------------------------------------------
-CARRIES = LinkType(
-    name="carries", source="Truck", target="Shipment", cardinality="one-to-many"
+CARRIES = ObjectProperty(
+    name="carries", domain="Truck", range="Shipment", cardinality="one-to-many"
 )
-SHIPS_FROM = LinkType(
-    name="ships_from", source="Shipment", target="Warehouse", cardinality="many-to-one"
+SHIPS_FROM = ObjectProperty(
+    name="ships_from", domain="Shipment", range="Warehouse", cardinality="many-to-one"
 )
-DELIVERS_TO = LinkType(
-    name="delivers_to", source="Shipment", target="Hospital", cardinality="many-to-one"
+DELIVERS_TO = ObjectProperty(
+    name="delivers_to", domain="Shipment", range="Hospital", cardinality="many-to-one"
 )
 
 
@@ -152,8 +152,8 @@ class AnnotateParams(BaseModel):
 spec = OntologySpec()
 for _cls in (Warehouse, Truck, Shipment, Hospital):
     spec.object_type(_cls)
-for _link in (CARRIES, SHIPS_FROM, DELIVERS_TO):
-    spec.add_link_type(_link)
+for _prop in (CARRIES, SHIPS_FROM, DELIVERS_TO):
+    spec.add_object_property(_prop)
 
 
 @spec.function(

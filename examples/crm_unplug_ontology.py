@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from open_ontology import (
     Actor,
     InvariantError,
-    LinkType,
+    ObjectProperty,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
@@ -124,40 +124,40 @@ class RefundSettlement(ObjectType):
 
 
 # ---------------------------------------------------------------------------
-# Link types
+# Object properties
 # ---------------------------------------------------------------------------
-ACCOUNT_OPPORTUNITIES = LinkType(
+ACCOUNT_OPPORTUNITIES = ObjectProperty(
     name="account_opportunities",
-    source="CustomerAccount",
-    target="SalesOpportunity",
+    domain="CustomerAccount",
+    range="SalesOpportunity",
     cardinality="one-to-many",
     owned=False,
 )
-ACCOUNT_CASES = LinkType(
+ACCOUNT_CASES = ObjectProperty(
     name="account_cases",
-    source="CustomerAccount",
-    target="SupportCase",
+    domain="CustomerAccount",
+    range="SupportCase",
     cardinality="one-to-many",
     owned=False,
 )
-ACCOUNT_ORDERS = LinkType(
+ACCOUNT_ORDERS = ObjectProperty(
     name="account_orders",
-    source="CustomerAccount",
-    target="SalesOrder",
+    domain="CustomerAccount",
+    range="SalesOrder",
     cardinality="one-to-many",
     owned=False,
 )
-CASE_ORDERS = LinkType(
+CASE_ORDERS = ObjectProperty(
     name="case_orders",
-    source="SupportCase",
-    target="SalesOrder",
+    domain="SupportCase",
+    range="SalesOrder",
     cardinality="many-to-one",
     owned=False,
 )
-CASE_REFUNDS = LinkType(
+CASE_REFUNDS = ObjectProperty(
     name="case_refunds",
-    source="SupportCase",
-    target="RefundSettlement",
+    domain="SupportCase",
+    range="RefundSettlement",
     cardinality="one-to-many",
     owned=True,
 )
@@ -175,14 +175,14 @@ for _cls in (
     RefundSettlement,
 ):
     spec.object_type(_cls)
-for _link in (
+for _prop in (
     ACCOUNT_OPPORTUNITIES,
     ACCOUNT_CASES,
     ACCOUNT_ORDERS,
     CASE_ORDERS,
     CASE_REFUNDS,
 ):
-    spec.add_link_type(_link)
+    spec.add_object_property(_prop)
 
 
 # ---------------------------------------------------------------------------

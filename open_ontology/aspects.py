@@ -25,11 +25,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from types import UnionType
 from typing import Any, Callable, Union, get_args, get_origin
 
-from .sandbox import ObjectDiff
+from .sandbox import EditBatch, ObjectDiff
 from .spec import (
     Actor,
     ActionDef,
@@ -179,11 +180,70 @@ class SecurityAndAuthorityAspect:
 
         return cls._field_side(cls_, change.before or {}, change.after or {})
 
+    @staticmethod
+    def _assert_source_object_writable(
+        spec: Any, action: ActionDef, object_type: str, object_id: str
+    ) -> None:
+        """禁止任何动作写入声明为外部只读源的对象或源平面。"""
+        obj_cls = spec.get_object_type(object_type)
+        if getattr(spec, "read_only_source", False) or obj_cls.is_read_only_source():
+            raise InvariantError(
+                f"action {action.name!r} cannot write read-only external source "
+                f"state of {object_type}:{object_id}",
+                code="SOURCE_READ_ONLY",
+            )
+
+    @staticmethod
+    def _assert_append_only_respected(
+        spec: Any, action: ActionDef, change: Any
+    ) -> None:
+        """禁止任何动作修改或删除声明为 ``__append_only__=True`` 的不可变对象。"""
+        obj_cls = spec.get_object_type(change.object_type)
+        if obj_cls.is_append_only() and change.kind in ("update", "delete"):
+            raise InvariantError(
+                f"action {action.name!r} cannot {change.kind} append-only object "
+                f"{change.object_type}:{change.object_id}",
+                code="APPEND_ONLY_VIOLATION",
+            )
+
+    @staticmethod
+    def _assert_source_link_writable(
+        spec: Any,
+        action: ActionDef,
+        decl: Any,
+        source_type: str,
+        target_type: str,
+    ) -> None:
+        """禁止任何动作修改只读外部源关系。"""
+        if getattr(spec, "read_only_source", False):
+            raise InvariantError(
+                f"action {action.name!r} cannot modify read-only external source "
+                f"link {decl.name!r}",
+                code="SOURCE_READ_ONLY",
+            )
+        for type_name in (decl.domain, decl.range, source_type, target_type):
+            if type_name and type_name in spec.object_types:
+                if spec.object_types[type_name].is_read_only_source():
+                    raise InvariantError(
+                        f"action {action.name!r} cannot modify external source "
+                        f"link {decl.name!r} involving read-only source type "
+                        f"{type_name!r}",
+                        code="SOURCE_READ_ONLY",
+                    )
+
     @classmethod
     def check_authority(cls, spec: Any, action: ActionDef, diff: ObjectDiff) -> None:
-        """主权边界强校验：混写、未声明源写入、误声明源写入全部拒绝。"""
+        """主权边界强校验：只读源保护、混写、未声明源写入、误声明源写入全部拒绝。"""
+        if getattr(spec, "read_only_source", False) and action.affects_source:
+            raise InvariantError(
+                f"action {action.name!r} is declared affects_source=True on a "
+                "read_only_source OntologySpec",
+                code="SOURCE_READ_ONLY",
+            )
+
         sides: set[str] = set()
         for change in diff.object_changes:
+            cls._assert_append_only_respected(spec, action, change)
             side = cls.object_change_side(spec, change)
             if side == "mixed":
                 raise InvariantError(
@@ -192,11 +252,24 @@ class SecurityAndAuthorityAspect:
                     code="MIXED_AUTHORITY",
                 )
             if side is not None:
+                if side == "source":
+                    cls._assert_source_object_writable(
+                        spec, action, change.object_type, change.object_id
+                    )
                 sides.add(side)
 
         for link_change in diff.link_changes:
-            decl = spec.get_link_type(link_change.link_type)
-            sides.add("ontology" if decl.owned else "source")
+            decl = spec.get_object_property(link_change.link_type)
+            link_side = "ontology" if cls._property_is_owned(spec, decl) else "source"
+            if link_side == "source":
+                cls._assert_source_link_writable(
+                    spec,
+                    action,
+                    decl,
+                    link_change.source_type,
+                    link_change.target_type,
+                )
+            sides.add(link_side)
 
         if len(sides) > 1:
             raise InvariantError(
@@ -216,6 +289,19 @@ class SecurityAndAuthorityAspect:
                 "its edit plan only writes ontology-owned state",
                 code="MISDECLARED_SOURCE_WRITE",
             )
+
+    @staticmethod
+    def _property_is_owned(spec: Any, decl: Any) -> bool:
+        if decl.owned:
+            return True
+        if decl.field and decl.domain in spec.object_types:
+            dom_cls = spec.object_types[decl.domain]
+            dom_owned = getattr(dom_cls, "__owned__", False)
+            if dom_owned is True:
+                return True
+            if isinstance(dom_owned, dict):
+                return bool(dom_owned.get(decl.field, False))
+        return False
 
     @classmethod
     def _incremental_side(cls, spec: Any, pre: Any, full: Any) -> str | None:
@@ -253,6 +339,7 @@ class SecurityAndAuthorityAspect:
             for change in full_diff.object_changes
         }
         for key, change in full_objects.items():
+            cls._assert_append_only_respected(spec, action, change)
             pre = pre_objects.get(key)
             side = (
                 cls.object_change_side(spec, change)
@@ -267,11 +354,19 @@ class SecurityAndAuthorityAspect:
                     code="MIXED_AUTHORITY",
                 )
             if side is not None:
+                if side == "source":
+                    cls._assert_source_object_writable(
+                        spec, action, change.object_type, change.object_id
+                    )
                 sides.add(side)
         for key, pre in pre_objects.items():
             if key not in full_objects:
                 side = cls.object_change_side(spec, pre)
                 if side is not None:
+                    if side == "source":
+                        cls._assert_source_object_writable(
+                            spec, action, pre.object_type, pre.object_id
+                        )
                     sides.add("source" if side == "mixed" else side)
 
         pre_links = {
@@ -297,8 +392,11 @@ class SecurityAndAuthorityAspect:
             for change in full_diff.link_changes
         }
         for key in full_links ^ pre_links:
-            decl = spec.get_link_type(key[0])
-            sides.add("ontology" if decl.owned else "source")
+            decl = spec.get_object_property(key[0])
+            link_side = "ontology" if cls._property_is_owned(spec, decl) else "source"
+            if link_side == "source":
+                cls._assert_source_link_writable(spec, action, decl, key[1], key[3])
+            sides.add(link_side)
 
         if len(sides) > 1:
             raise InvariantError(
@@ -418,6 +516,183 @@ class SecurityAndAuthorityAspect:
             )
         return entries
 
+    @staticmethod
+    def inspect_health(runtime: Any) -> dict[str, Any]:
+        """对当前世界状态执行只读全量健康巡检（Schema / 引用完整性 / @spec.invariant）。"""
+        rows = runtime._conn.execute(
+            """
+            SELECT object_type, object_id, properties_json
+            FROM ontology_objects
+            ORDER BY object_type, object_id
+            """
+        ).fetchall()
+        objects_checked = len(rows)
+        existing_keys = {
+            (str(r["object_type"]), str(r["object_id"])) for r in rows
+        }
+
+        violations: list[dict[str, str]] = []
+        valid_rows: list[tuple[type[ObjectType], str, dict[str, Any]]] = []
+
+        for r in rows:
+            otype = str(r["object_type"])
+            oid = str(r["object_id"])
+            if otype not in runtime.spec.object_types:
+                violations.append(
+                    {
+                        "kind": "schema",
+                        "code": "UNKNOWN_OBJECT_TYPE",
+                        "subject": f"{otype}:{oid}",
+                        "message": f"未知对象类型 {otype!r}",
+                    }
+                )
+                continue
+            cls = runtime.spec.object_types[otype]
+            try:
+                raw = json.loads(r["properties_json"])
+                cls(**raw)
+            except Exception as exc:
+                violations.append(
+                    {
+                        "kind": "schema",
+                        "code": "SCHEMA_VALIDATION_ERROR",
+                        "subject": f"{otype}:{oid}",
+                        "message": str(exc),
+                    }
+                )
+            else:
+                valid_rows.append((cls, oid, raw))
+
+        reported_dangling_edges: set[tuple[str, str, str, str, str]] = set()
+        for cls, oid, raw in valid_rows:
+            prop_map = getattr(cls, "__object_properties__", None) or {}
+            for field_name, decl in prop_map.items():
+                if decl.range not in runtime.spec.object_types:
+                    continue
+                for tid in EditBatch._extract_field_targets(raw.get(field_name)):
+                    if (decl.range, tid) not in existing_keys:
+                        reported_dangling_edges.add(
+                            (decl.name, cls.__name__, oid, decl.range, tid)
+                        )
+                        violations.append(
+                            {
+                                "kind": "reference",
+                                "code": "DANGLING_OBJECT_PROPERTY",
+                                "subject": f"{cls.__name__}:{oid}.{field_name}",
+                                "message": (
+                                    f"{cls.__name__}:{oid}.{field_name} "
+                                    f"指向不存在的 {decl.range}:{tid}"
+                                ),
+                            }
+                        )
+
+        link_rows = runtime._conn.execute(
+            """
+            SELECT link_type, source_type, source_id, target_type, target_id
+            FROM ontology_links
+            ORDER BY link_type, source_type, source_id, target_type, target_id
+            """
+        ).fetchall()
+        links_checked = len(link_rows)
+        for lr in link_rows:
+            edge = (
+                str(lr["link_type"]),
+                str(lr["source_type"]),
+                str(lr["source_id"]),
+                str(lr["target_type"]),
+                str(lr["target_id"]),
+            )
+            if edge in reported_dangling_edges:
+                continue
+            if (edge[1], edge[2]) not in existing_keys or (
+                edge[3],
+                edge[4],
+            ) not in existing_keys:
+                violations.append(
+                    {
+                        "kind": "reference",
+                        "code": "DANGLING_LINK",
+                        "subject": f"{edge[0]}:{edge[1]}:{edge[2]}->{edge[3]}:{edge[4]}",
+                        "message": (
+                            f"关系边 {edge[0]} 引用了缺失端点 "
+                            f"{edge[1]}:{edge[2]} -> {edge[3]}:{edge[4]}"
+                        ),
+                    }
+                )
+
+        view = EditBatch(
+            runtime.spec,
+            runtime,
+            Actor(actor_id="__invariant__", role="system", clearance_tags={"*"}),
+        ).invariant_view()
+        invariant_results: list[dict[str, Any]] = []
+        for inv in runtime.spec.invariants.values():
+            default_code = inv.code or f"INVARIANT_{inv.name.upper()}"
+            err_code: str | None = None
+            err_msg: str | None = None
+            try:
+                outcome = inv.handler(view)
+            except InvariantError as exc:
+                err_code = exc.code or default_code
+                err_msg = str(exc)
+            except AssertionError as exc:
+                err_code = default_code
+                err_msg = (
+                    str(exc).strip()
+                    or inv.description
+                    or f"post-state invariant {inv.name!r} failed"
+                )
+            except Exception as exc:
+                err_code = "INVARIANT_EXECUTION_ERROR"
+                err_msg = str(exc)
+            else:
+                if outcome is False:
+                    err_code = default_code
+                    err_msg = (
+                        inv.description
+                        or f"post-state invariant {inv.name!r} returned False"
+                    )
+
+            if err_msg is None:
+                invariant_results.append(
+                    {
+                        "name": inv.name,
+                        "code": default_code,
+                        "description": inv.description,
+                        "passed": True,
+                        "error": None,
+                    }
+                )
+            else:
+                assert err_code is not None
+                invariant_results.append(
+                    {
+                        "name": inv.name,
+                        "code": err_code,
+                        "description": inv.description,
+                        "passed": False,
+                        "error": err_msg,
+                    }
+                )
+                violations.append(
+                    {
+                        "kind": "invariant",
+                        "code": err_code,
+                        "subject": inv.name,
+                        "message": err_msg,
+                    }
+                )
+
+        return {
+            "healthy": len(violations) == 0,
+            "objects_checked": objects_checked,
+            "links_checked": links_checked,
+            "invariants_total": len(invariant_results),
+            "invariants_passed": sum(1 for item in invariant_results if item["passed"]),
+            "invariants": invariant_results,
+            "violations": violations,
+        }
+
 # ---------------------------------------------------------------------------
 # 3. IdempotencyAndOCCAspect —— 幂等短路与 MVCC 乐观锁
 # ---------------------------------------------------------------------------
@@ -461,6 +736,173 @@ class IdempotencyAndOCCAspect:
                     f"stale read on {key}: proposal read version "
                     f"{expected_version}, current version {actual}"
                 )
+
+    @staticmethod
+    def propagate_aggregate_root_versions(
+        runtime: Any, conn: Any, diff: ObjectDiff, now: str
+    ) -> None:
+        """聚合根版本号传播：子实体或归属连边变更时，同步递增所属聚合根的 version。"""
+        if not diff.object_changes and not diff.link_changes:
+            return
+        direct_changed = {
+            (change.object_type, change.object_id) for change in diff.object_changes
+        }
+        frontier: list[tuple[str, str]] = list(direct_changed)
+        for lc in diff.link_changes:
+            frontier.append((lc.source_type, lc.source_id))
+            frontier.append((lc.target_type, lc.target_id))
+
+        visited: set[tuple[str, str]] = set()
+        touched_roots: set[tuple[str, str]] = set()
+        while frontier:
+            obj_type, obj_id = frontier.pop()
+            if (obj_type, obj_id) in visited:
+                continue
+            visited.add((obj_type, obj_id))
+            cls = runtime.spec.object_types.get(obj_type)
+            if (
+                cls is not None
+                and cls.is_aggregate_root()
+                and (obj_type, obj_id) not in direct_changed
+            ):
+                touched_roots.add((obj_type, obj_id))
+            rows = conn.execute(
+                "SELECT target_type, target_id FROM ontology_links "
+                "WHERE source_type = ? AND source_id = ?",
+                (obj_type, obj_id),
+            ).fetchall()
+            for row in rows:
+                frontier.append((str(row["target_type"]), str(row["target_id"])))
+
+        for root_type, root_id in sorted(touched_roots):
+            conn.execute(
+                "UPDATE ontology_objects SET version = version + 1, updated_at = ? "
+                "WHERE object_type = ? AND object_id = ?",
+                (now, root_type, root_id),
+            )
+
+    @classmethod
+    def apply_diff(cls, runtime: Any, conn: Any, diff: ObjectDiff) -> None:
+        """在写门禁事务内校验并发版本并原子应用变更集。"""
+        now = runtime._utcnow()
+        dumps = runtime._dumps
+
+        def _hash(props: dict[str, Any]) -> str:
+            return hashlib.sha256(dumps(props).encode("utf-8")).hexdigest()
+
+        for change in diff.object_changes:
+            if change.kind == "create":
+                assert change.after is not None
+                if cls.current_version(conn, change.object_type, change.object_id) is not None:
+                    raise ConcurrencyConflictError(
+                        f"cannot create {change.object_type}:{change.object_id}: "
+                        "object already exists"
+                    )
+                version = change.after_version or 1
+                conn.execute(
+                    "INSERT INTO ontology_objects "
+                    "(object_type, object_id, title, properties_json, version, "
+                    "security_tags_json, content_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        change.object_type,
+                        change.object_id,
+                        change.after_title,
+                        dumps(change.after),
+                        version,
+                        dumps(change.after_security_tags),
+                        _hash(change.after),
+                        now,
+                    ),
+                )
+                runtime._sync_overlay(conn, change.object_type, change.object_id, change.after)
+
+            elif change.kind == "update":
+                assert change.after is not None
+                current_version = cls.current_version(
+                    conn, change.object_type, change.object_id
+                )
+                if current_version is None:
+                    raise ConcurrencyConflictError(
+                        f"cannot update {change.object_type}:{change.object_id}: object vanished"
+                    )
+                if change.before_version is not None and current_version != change.before_version:
+                    raise ConcurrencyConflictError(
+                        f"stale update on {change.object_type}:{change.object_id}: "
+                        f"expected version {change.before_version}, found {current_version}"
+                    )
+                conn.execute(
+                    "UPDATE ontology_objects SET title = ?, properties_json = ?, version = ?, "
+                    "security_tags_json = ?, content_hash = ?, updated_at = ? "
+                    "WHERE object_type = ? AND object_id = ?",
+                    (
+                        change.after_title,
+                        dumps(change.after),
+                        current_version + 1,
+                        dumps(change.after_security_tags),
+                        _hash(change.after),
+                        now,
+                        change.object_type,
+                        change.object_id,
+                    ),
+                )
+                runtime._sync_overlay(conn, change.object_type, change.object_id, change.after)
+
+            elif change.kind == "delete":
+                current_version = cls.current_version(
+                    conn, change.object_type, change.object_id
+                )
+                if current_version is None:
+                    continue
+                if change.before_version is not None and current_version != change.before_version:
+                    raise ConcurrencyConflictError(
+                        f"stale delete on {change.object_type}:{change.object_id}: "
+                        f"expected version {change.before_version}, found {current_version}"
+                    )
+                conn.execute(
+                    "DELETE FROM ontology_objects WHERE object_type = ? AND object_id = ?",
+                    (change.object_type, change.object_id),
+                )
+                runtime._delete_overlay(conn, change.object_type, change.object_id)
+            else:  # pragma: no cover - guarded by ObjectChange
+                raise GovernanceViolationError(f"unknown object change kind {change.kind!r}")
+
+        for link_change in diff.link_changes:
+            if link_change.kind == "create":
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO ontology_links (
+                        link_type, source_type, source_id, target_type, target_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        link_change.link_type,
+                        link_change.source_type,
+                        link_change.source_id,
+                        link_change.target_type,
+                        link_change.target_id,
+                    ),
+                )
+            elif link_change.kind == "delete":
+                conn.execute(
+                    """
+                    DELETE FROM ontology_links
+                    WHERE link_type = ? AND source_type = ? AND source_id = ?
+                      AND target_type = ? AND target_id = ?
+                    """,
+                    (
+                        link_change.link_type,
+                        link_change.source_type,
+                        link_change.source_id,
+                        link_change.target_type,
+                        link_change.target_id,
+                    ),
+                )
+            else:  # pragma: no cover
+                raise GovernanceViolationError(
+                    f"unknown link change kind {link_change.kind!r}"
+                )
+
+        cls.propagate_aggregate_root_versions(runtime, conn, diff, now)
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +971,10 @@ class ApprovalGateAspect:
         with runtime._write_gate() as conn:
             IdempotencyAndOCCAspect.verify_read_versions(conn, read_versions)
             runtime._apply_diff(conn, diff)
+            runtime.check_invariants()
+            check_trans = getattr(runtime, "check_transition_invariants", None)
+            if callable(check_trans):
+                check_trans(diff)
             conn.execute(
                 """
                 UPDATE ontology_action_runs
@@ -543,7 +989,59 @@ class ApprovalGateAspect:
                     AUDIT_STATUS_PENDING,
                 ),
             )
-        return runtime.get_action_run(run_id)  # type: ignore[return-value]
+        committed = runtime.get_action_run(run_id)
+        notify = getattr(runtime, "_notify_post_commit", None)
+        if committed is not None and callable(notify):
+            notify(approver, committed)
+        return committed  # type: ignore[return-value]
+
+    @staticmethod
+    def reject_action(
+        runtime: Any,
+        run_id: str,
+        approver: Actor,
+        *,
+        reason: str = "rejected by approver",
+    ) -> dict[str, Any]:
+        """驳回一张挂起单：校验审批角色并原子更新为 REJECTED，对象零改动。"""
+        run = runtime.get_action_run(run_id)
+        if run is None:
+            raise ObjectNotFoundError(f"action run {run_id!r} not found")
+        if run["status"] != AUDIT_STATUS_PENDING:
+            raise GovernanceViolationError(
+                f"action run {run_id!r} is {run['status']}, not PENDING_APPROVAL"
+            )
+
+        action = runtime.spec.get_action(run["action_type"])
+        if approver.role not in action.approver_roles:
+            raise PermissionDeniedError(
+                f"actor {approver.actor_id!r} role {approver.role!r} may not reject "
+                f"{action.name!r}; required one of {list(action.approver_roles)}"
+            )
+
+        with runtime._write_gate() as conn:
+            conn.execute(
+                """
+                UPDATE ontology_action_runs
+                SET status = ?, approved_by = ?, executed_at = ?,
+                    error_code = ?, error_message = ?
+                WHERE run_id = ? AND status = ?
+                """,
+                (
+                    AUDIT_STATUS_REJECTED,
+                    approver.actor_id,
+                    runtime._utcnow(),
+                    "APPROVAL_REJECTED",
+                    str(reason or "rejected by approver"),
+                    run_id,
+                    AUDIT_STATUS_PENDING,
+                ),
+            )
+        rejected = runtime.get_action_run(run_id)
+        notify = getattr(runtime, "_notify_run_event", None)
+        if rejected is not None and callable(notify):
+            notify(approver, rejected)
+        return rejected  # type: ignore[return-value]
 
     @staticmethod
     def revert_action(
@@ -595,6 +1093,7 @@ class ApprovalGateAspect:
 
         with runtime._write_gate() as conn:
             runtime._apply_diff(conn, inverted)
+            runtime.check_invariants()
             conn.execute(
                 """
                 UPDATE ontology_action_runs
@@ -620,7 +1119,11 @@ class ApprovalGateAspect:
                 diff=inverted,
                 approved_by=None,
             )
-        return runtime.get_action_run(revert_run_id)  # type: ignore[return-value]
+        committed = runtime.get_action_run(revert_run_id)
+        notify = getattr(runtime, "_notify_post_commit", None)
+        if committed is not None and callable(notify):
+            notify(actor, committed)
+        return committed  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------

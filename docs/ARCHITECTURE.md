@@ -13,9 +13,9 @@
 | 概念 | 职责（M2 语义） | 不是什么 |
 |---|---|---|
 | **Model / 领域模型** | 定义世界结构（TBox）、关系、声明式约束与状态转移法则（Behavior），可被多个业务世界复用 | 不是具体对象数据，也不因启动执行而变成事实 |
-| **World / 业务世界**<br>（代码兼容别名 `Workspace`） | 绑定模型引用、事实状态（ABox）、Runtime 与演化审计历史，提供隔离的业务世界实例（含主世界与 `fork()` 平行沙盘世界） | 不是单个业务对象，也不是源代码工作目录 |
+| **World / 世界状态**<br>（代码兼容别名 `Workspace`） | 绑定模型引用、事实状态（ABox）、Runtime 与演化审计历史，提供隔离的业务世界实例（含主世界与 `fork()` 平行沙盘世界） | 不是单个业务对象，也不是源代码工作目录 |
 | **Runtime / 执行引擎** | 执行模型定义的查询、动作、治理切面、持久化和平行沙盘推演 | 不是额外一份业务事实 |
-| **Device / 外部设备** | 登记与适配外部系统（OpenAPI）、工具和智能体（A2A Agent） | 不是未经校验即可进入事实图的可信数据 |
+| **Device / 外部设备** | 登记与适配外部系统（OpenAPI）与外部数据源连接器；外部智能体直接作为 `Actor` 通过 OSDK / `ActionDef` 与世界模型交互 | 不是未经校验即可进入事实图的可信数据 |
 
 四种职责不意味着四个完全正交、必须各自独立管理生命周期的业务资源。指挥台界面可以按这四种视角组织展示，但不能由四个标签页反推出四套割裂的资源账本。
 
@@ -23,12 +23,12 @@
 flowchart TB
     subgraph MODEL["1. Model / 领域模型（M1 世界法则与结构定义）"]
         direction LR
-        TBOX["TBox 结构定义｜ObjectType / InterfaceType / LinkType · 主键 / __aggregate_root__ / 脱敏与安全标签"]
+        TBOX["TBox 结构定义｜ObjectType / InterfaceType / ObjectProperty · AutoID / 主键 / __aggregate_root__ / 脱敏与安全标签"]
         BEHAVIOR["Behavior 受控行为｜ActionDef / FunctionDef / AutomationDef · RBAC 授权 / InvariantError 不变量"]
         DISPLAY["spec.display｜领域自治中文词条"]
     end
 
-    subgraph WORLD["2. World / 业务世界（Workspace · M0 隔离世界状态实例）"]
+    subgraph WORLD["2. World / 世界状态（Workspace · M0 隔离世界状态实例）"]
         direction TB
         MODEL_REF["模型引用：model_id"]
         ABOX["ABox 事实状态｜ontology_objects / ontology_links / ontology_overlay · 三级寻址 workspace_id / object_type / object_id"]
@@ -41,29 +41,27 @@ flowchart TB
         direction TB
         CORE["① Runtime.Core 微内核｜EditBatch 内存沙箱 · ObjectDiff · fork() 平行世界推演 · ontology_write_gate 写门禁"]
         ASPECT["② Runtime.Aspect 七大系统调用切面｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 审批 / 时光机 · 被拒审计 · 反射 · 忙闲回调"]
-        ADAPTER["③ Runtime.DeviceAdapter 设备驱动｜SnapshotIngestionDriver · agent_hosts · harness_drivers"]
+        ADAPTER["③ Runtime.DeviceAdapter 设备驱动｜SnapshotIngestionDriver"]
         CORE <--> ASPECT
         CORE <--> ADAPTER
     end
 
-    subgraph DEVICE["4. Device / 外部设备（外部世界登记与适配）"]
+    subgraph DEVICE["4. Device / 外部设备（外部系统登记与适配）"]
         direction LR
-        SYMBOLIC["符号主义设备｜OpenAPI Schema（ERP / CRM / 外部确定性系统）"]
-        CONNECTIONIST["联结主义设备｜A2A Agent Card（CodeBuddy / OpenCode 等外部智能体）"]
+        SYMBOLIC["外部工具与系统｜OpenAPI Schema（ERP / CRM / 外部确定性系统）"]
     end
 
     MODEL ==>|"1 对 N 复用装载（定义结构与转移法则）"| WORLD
     MODEL -.->|"注入 TBox 与 Behavior 规则"| CORE
     RUNTIME ==>|"绑定并驱动受控读写（沙箱先行 · 禁止裸 CRUD）"| WORLD
     SYMBOLIC ==>|"快照同步刷新（Source-Backed 字段）"| ADAPTER
-    CONNECTIONIST ==>|"ExecutionFabric 调用回执（须经 ActionDef 不变量门禁验收）"| ADAPTER
 ```
 
 ### 1.1 定义、事实与行为（TBox · Behavior · ABox）
 
 ```text
 Model <model_id>（M1 可复用领域定义 / 世界法则）
-├─ TBox：ObjectType、字段、InterfaceType、LinkType、声明式约束与类型元数据
+├─ TBox：ObjectType、DatatypeProperty/AutoID、InterfaceType、ObjectProperty、声明式约束与类型元数据
 └─ Behavior：ActionDef、FunctionDef、AutomationDef、角色授权与操作契约
 
 World <world_id / workspace_id>（M0 隔离业务世界）
@@ -80,25 +78,26 @@ World <world_id / workspace_id>（M0 隔离业务世界）
 * 当前 `OntologyRuntime(spec, db_path)` 绑定单个模型与单个存储。同一模型复用于多个业务世界（工作空间）是核心能力；单个引擎同时装载多个不同模型不属于现阶段承诺。
 * 模型随 Python 代码模块发布即可；现阶段不建设独立模型发布服务、不引入外部 RDF/OWL 存储，也不因逻辑分层拆分底层业务表。
 
-#### 1.1.1 Ontology 核心原语规范（ObjectType · LinkType · InterfaceType · FunctionDef · ActionDef · AutomationDef）
+#### 1.1.1 Ontology 核心原语规范（ObjectType · ObjectProperty · AutoID · InterfaceType · FunctionDef · ActionDef · AutomationDef）
 
 在 OpenOntology（`open_ontology/spec.py`、`sandbox.py`、`query.py`）中，一个领域本体模型由以下 M2 核心原语共同构成：
 
 | 层次分类 | 核心原语 | 声明入口 / 载体 | 核心职责与 M2 治理约束 |
 |---|---|---|---|
-| **模型容器** | **`OntologySpec`** | `spec = OntologySpec()` | 模型定义注册表（目标别名 `model_id`），统一登记对象、关系、接口、函数、动作、自动化规则及自身 `spec.display` 展示词条。 |
-| **TBox 结构** | **`ObjectType`** | 继承 `ObjectType` 并用 `@spec.object_type` 登记 | Pydantic 强类型领域实体基类（`extra="forbid"`），声明业务字段与类型级元数据，实例化后作为带版本号的节点存入工作空间 ABox。 |
+| **模型容器** | **`OntologySpec`** | `spec = OntologySpec(extends=(...))` | 模型定义注册表（目标别名 `model_id`），支持通过 `extends` 导入继承抽象父本体的 `abstract_types`、接口、角色、不变量、跃迁不变量及 `spec.display` 展示词条。 |
+| **TBox 结构** | **`ObjectType`** | 继承 `ObjectType` 并用 `@spec.object_type` 登记 | Pydantic 强类型领域实体基类（`extra="forbid"`），声明业务字段（含 `AutoID` 系统生成主键）与类型级元数据（含 `__abstract__` 抽象基类标记与 `__append_only__` 不可变追加门禁）；具体类型实例化后作为带版本号的节点存入工作空间 ABox。 |
 | **TBox 结构** | **`InterfaceType`** | `spec.interface(name, required_fields=...)` | 跨对象类型的多态接口契约；实现该接口的 `ObjectType` 必须在 `__interfaces__` 中显式声明，并在注册时强校验 `required_fields` 齐全。 |
-| **TBox 结构** | **`LinkType`** | `spec.link_type(name, source, target, ...)` | 有向强类型关系边声明：`source` → `target`、基数 `cardinality`（`one-to-one` / `one-to-many` / `many-to-one` / `many-to-many`）及 `owned` 连边主权标记。 |
+| **TBox 结构** | **`ObjectProperty`** | 字段注解 `ObjectProperty[Target]` / `ObjectProperty[tuple[Target, ...]]` 或 `spec.object_property(...)` | OWL 对象属性：声明有向强类型关系 `domain` → `range`、基数 `cardinality`（`one-to-one` / `one-to-many` / `many-to-one` / `many-to-many`）及 `owned` 连边主权标记；动作提交时自动同步关系三元组并强制引用完整性（`TARGET_NOT_FOUND`）。 |
 | **Behavior 行为** | **`FunctionDef`** | `@spec.function(name, params=...)` | 严格只读计算（`read_only=True`）：接收强类型 Pydantic `params`，在注入列级脱敏的沙箱内执行查询/聚合，任何暂存写变更一律丢弃。 |
 | **Behavior 行为** | **`ActionDef`** | `@spec.action(name, params=..., allowed_roles=...)` | **唯一合法的状态变迁入口**：声明 RBAC 角色授权、条件审批规则（`approval_rule` / `approver_roles`）、`affects_source`、`post_approval` 两段式钩子，并在处理器内以 `InvariantError` 强制业务不变量。 |
+| **Behavior 行为** | **`InvariantDef` / `TransitionInvariantDef`** | `@spec.invariant` / `@spec.transition_invariant` | 声明式公理门禁：前者校验后置快照终态，后者校验单次 `ObjectDiff` 状态跃迁合法性与守恒律；在模拟、提交与审批恢复时统一强制。 |
 | **Behavior 行为** | **`AutomationDef`** | `@spec.automation(name, watch_object_type=..., condition=...)` | 提交后事件驱动条件反射：监听目标 `ObjectType` 变更，满足 `condition(obj)` 时由 `AutomationReflexAspect` 按对象版本号去重触发 `handler(runtime, obj, actor)`。 |
 | **安全与沙箱** | **`Actor`** | `Actor(actor_id, role, clearance_tags)` | 显式零信任调用方身份：`role` 参与 RBAC 与列级脱敏判断，`clearance_tags`（或通配符 `"*"`）驱动 RLS 行级可见性过滤。 |
 | **集合代数** | **`ObjectSet`** | `query.py`（`ObjectSet` / `AggregationResult`） | 按主键去重、保持源顺序的只读对象集合容器，支撑集合检索、链式遍历与聚合计算。 |
 | **内存沙箱** | **`EditBatch` / `ObjectDiff`** | `sandbox.py`（`EditBatch` / `ObjectDiff`） | 动作与函数执行的内存叠加沙箱（支持 read-your-own-writes 与读版本追踪 `read_versions`）；执行后编译生成精确可逆的 `ObjectDiff`（`ObjectChange` + `LinkChange`），支撑预演、原子提交与时光机冲正。 |
 
 **各核心原语的关键契约约束**：
-1. **`ObjectType` 的 7 项类级元数据**：`__primary_key__`（主键字段，默认 `"id"`）、`__title__`（标题字段）、`__aggregate_root__`（显式聚合根标记，默认 `False`）、`__owned__`（字段主权标记：`bool | dict[str, Any]`）、`__interfaces__`（实现的接口名元组）、`__security_tag_fields__`（自动派生 `field:value` 行级安全标签的字段元组）与 `__masked_fields__` / `__mask_defaults__`（列级脱敏白名单 `{字段名: (明文角色, ...)}` 与自定义掩码值）。
+1. **`ObjectType` 的类级元数据**：`__primary_key__`（主键字段，默认 `"id"`）、`__title__`（标题字段）、`__abstract__`（仅看当前类自身 `__dict__` 的抽象基类标记，不沿 MRO 自动传递）、`__append_only__`（只追加不可变事实标记，禁止 `Action` 对存量行执行改/删）、`__aggregate_root__`（显式聚合根标记，默认 `False`）、`__owned__`（字段主权标记：`bool | dict[str, Any]`）、`__interfaces__`（实现的接口名元组）、`__security_tag_fields__`（自动派生 `field:value` 行级安全标签的字段元组）与 `__masked_fields__` / `__mask_defaults__`（列级脱敏白名单 `{字段名: (明文角色, ...)}` 与自定义掩码值）；其中 `__interfaces__`、`__masked_fields__`、`__mask_defaults__` 与 `__owned__` 沿继承链自动合并。
 2. **`FunctionDef` 与 `ActionDef` 的严格隔离**：所有业务查询与计算封装在 `FunctionDef`（读出口脱敏开启、物理表零变更）；所有写入封装在 `ActionDef`（读出口脱敏关闭、先经 `EditBatch` 沙箱与 `InvariantError` 校验再编译 `ObjectDiff`，禁止跳过 `ActionDef` 直接执行裸 CRUD）。
 3. **两段式动作与自动化闭环**：当 `ActionDef` 挂起为 `PENDING_APPROVAL` 并经 `approve_action` 批准后，若声明了 `post_approval(batch, params)` 钩子，仅对其新增增量再做主权校验并合并落库；每次 `COMMITTED` 落库后，内核自动委托 `evaluate_automations` 评估匹配的 `AutomationDef`。
 
@@ -109,9 +108,9 @@ flowchart LR
         subgraph TBOX_BOX["TBox 结构原语"]
             OT["ObjectType｜Pydantic 实体 · 主键 · 聚合根 · 安全标签 · 脱敏 · __owned__"]
             IT["InterfaceType｜required_fields 多态接口契约"]
-            LT["LinkType｜有向关系边 · cardinality · owned 主权"]
+            LT["ObjectProperty｜OWL 对象属性 · domain/range · cardinality · owned 主权"]
             OT -.->|"__interfaces__ 强校验"| IT
-            OT <-->|"source / target 关联"| LT
+            OT <-->|"domain / range 关联"| LT
         end
         subgraph BEHAV_BOX["Behavior 行为原语"]
             FN["FunctionDef｜read_only 只读计算 · 脱敏投影"]
@@ -155,7 +154,7 @@ flowchart LR
 ### 1.3 标准三步工作流与只读探测铁律
 
 1. **定义 Model，建立内存验证世界**：声明对象、关系、动作与不变量，在 `:memory:` Runtime 上验证状态转移与沙盘推演。
-2. **登记 Device，装配 Runtime**：登记外部符号系统（OpenAPI）与联结设备（A2A Agent），装配存储、治理切面与适配器。
+2. **登记 Device，装配 Runtime**：登记外部工具与系统（OpenAPI），装配存储、治理切面与适配器；外部 Agent 以 `Actor` 身份经 OSDK 接入。
 3. **打开或创建 World（Workspace）**：将模型绑定至持久化存储形成生产业务世界。
    * **默认无损打开**：已有合法数据库默认原样重开，绝不重跑建表播种；只有显式指定单库作用域的 `reset` 才允许清库重建；半成品或外来异构库必须在预检阶段报错拒绝，禁止静默修补覆盖。
    * **跨库探测零副作用**：按目录或对象 ID 扫描 SQLite 文件必须使用经 RFC 3986 标准转义的只读文件 URI（`Path.resolve().as_uri() + "?mode=ro"`），防止路径中的 `#`、`?`、`%` 等保留字符截断只读参数或在旁路误建空文件；查找失败只抛异常，绝不自动建目录、建库或写入种子数据。
@@ -166,15 +165,15 @@ sequenceDiagram
     autonumber
     actor User as 调用方（显式 Actor）
     participant M as Model（M1 领域模型）
-    participant D as Device（OpenAPI / A2A Agent）
+    participant D as Device（OpenAPI 外部系统）
     participant R as Runtime（Core + Aspect + Adapter）
-    participant W as World / 业务世界（Workspace · ABox + 审计账本）
+    participant W as World / 世界状态（Workspace · ABox + 审计账本）
 
     Note over M,R: 第一步：定义 Model，建立 :memory: 验证世界
     M->>R: 装载 TBox 结构与 Behavior 契约（simulate_action / fork 推演）
 
     Note over D,R: 第二步：登记 Device，装配 Runtime
-    D->>R: 登记符号设备（OpenAPI）与联结设备（A2A Agent Card）
+    D->>R: 登记外部工具与系统（OpenAPI）
 
     Note over R,W: 第三步：打开或创建持久化 World（默认无损打开 / 只读探测 ?mode=ro）
     D->>R: 外部快照摄入（load_snapshot）
@@ -200,7 +199,7 @@ sequenceDiagram
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │ 用户程序 / Model (User Programs) —— M1 可复用领域定义与纯沙箱行为    │
-│   examples/*_ontology.py · （历史包内 M1 模块：kanban.py / dev_factory.py）│
+│   examples/*_ontology.py · examples/kanban.py（历史包内 M1：dev_factory.py）│
 │   每个业务 Model 自带对象/关系/动作/不变量 + spec.display 中文词条   │
 ├══════════════════════════════════════════════════════════════════════┤
 │ Runtime 核心三层（支撑工作空间确定性执行与外部互联）：               │
@@ -224,12 +223,12 @@ sequenceDiagram
 ├──────────────────────────────────────────────────────────────────────┤
 │ ③ 设备驱动 / Runtime.DeviceAdapter (Device Drivers)                  │
 │   ingestion.py        SnapshotIngestionDriver 快照摄入与多源列拼接   │
-│   agent_hosts.py      CodeBuddy · OpenCode 联结宿主适配与回执解析    │
-│   harness_drivers.py  可插拔机械臂协议与限流故障转移                 │
 │   examples/*adapter.py  Odoo · CRM · SaaS 外部协议桥接               │
 ├══════════════════════════════════════════════════════════════════════┤
 │ 内核外围 M2 通用支撑与传输边界（领域无关，零具体行业语义）：         │
 │   mcts.py              基于 fork() 的蒙特卡洛树搜索规划器            │
+│   latent.py            基于同构 6 表的持久化隐空间与独立回读结算      │
+│   mpc.py               闭环滚动时域控制器 ClosedLoopMPCController    │
 │   osdk.py              受控 LLM 工具 Schema 导出、执行器与评测套件   │
 │   execution/fabric.py  JSON 调用边界与非干涉观察织入 ExecutionFabric │
 │   workspaces.py / model_views.py  工作空间目录与 TBox/Behavior 投影  │
@@ -245,19 +244,22 @@ sequenceDiagram
 | 它描述某个具体业务领域的类型、关系或沙箱内状态转移规则吗？ | **用户程序**（独立 M1 Model 模块） |
 | 它是所有工作空间共享的对象页表、沙箱 `EditBatch`/`ObjectDiff` 或 `fork()` 骨架吗？ | **微内核**（`Runtime.Core`） |
 | 它是对每次读写/提交无条件生效的权限、脱敏、幂等、审批、审计或回调切面吗？ | **系统调用切面**（`Runtime.Aspect`） |
-| 它适配外部 OpenAPI 系统快照、A2A Agent 宿主进程或外部协议通信吗？ | **设备驱动**（`Runtime.DeviceAdapter`） |
+| 它适配外部 OpenAPI 系统快照或外部协议通信吗？ | **设备驱动**（`Runtime.DeviceAdapter`） |
 | 它是领域无关的树搜索规划、工具导出、工作空间目录或 HTTP/UI 通用展示协议吗？ | **内核外围 M2 支撑与传输边界** |
 
 **微内核行数预算与依赖方向约束**：
 * **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1400 行**（`test_runtime_line_budget` 硬门禁）。超出预算时必须审视逻辑是否属于 `aspects.py`、驱动层或外围支撑层，严禁放宽预算阈值。
-* **单向依赖铁律**：切面（`aspects.py`）与设备驱动只能通过微内核既定入口（`spec` / `_write_gate()` / `_apply_diff()` / `get_action_run()` / `load_snapshot` / `submit_action`）工作，严禁反向 `import` `runtime.py`（`test_aspects_module_is_self_contained`），也不得绕过治理管线直改底层表。微内核除保留 `SnapshotIngestionDriver` 快照门面委托外，不得新增对外部协议驱动或 HTTP 传输层的静态依赖；历史位于包内的 `kanban.py`、`dev_factory.py` 严禁进入 `open_ontology/__init__.py` 导出表。
+* **单向依赖铁律**：切面（`aspects.py`）与设备驱动只能通过微内核既定入口（`spec` / `_write_gate()` / `_apply_diff()` / `get_action_run()` / `load_snapshot` / `submit_action`）工作，严禁反向 `import` `runtime.py`（`test_aspects_module_is_self_contained`），也不得绕过治理管线直改底层表。微内核除保留 `SnapshotIngestionDriver` 快照门面委托外，不得新增对外部协议驱动或 HTTP 传输层的静态依赖；`examples/kanban.py` 与历史包内的 `dev_factory.py` 严禁进入 `open_ontology/__init__.py` 导出表。
 
 ---
 
 ## 3. 认知降维与虚拟现实沙盘推演的四大支柱 (Core Pillars)
 
 ### 3.1 语义层（Semantic Layer）：结构化长期记忆与字段主权
-* **对象与多态接口（`ObjectType` & `InterfaceType`）**：基于 Pydantic 声明主键（`__primary_key__`）、标题（`__title__`）、聚合根（`__aggregate_root__`）、安全标签（`__security_tag_fields__`）与列脱敏白名单（`__masked_fields__`）。这些均属模型层 TBox 元数据；实例属性值属于工作空间 ABox。
+* **OWL 三位一体 TBox 原语（`ObjectType`、`DatatypeProperty / AutoID`、`ObjectProperty` & `InterfaceType`）**：
+  * **`ObjectType`**：基于 Pydantic 声明主键（`__primary_key__`）、标题（`__title__`）、聚合根（`__aggregate_root__`）、安全标签（`__security_tag_fields__`）与列脱敏白名单（`__masked_fields__`）；实例属性值属于工作空间 ABox。
+  * **`DatatypeProperty` 与 `AutoID`**：标量值属性与系统自动生成主键注解；`AutoID` 在模型投影（`describe_tbox` / `describe_behavior`）中导出 `auto_generated: True`，驱动界面生成只读系统编号控件，避免人工手填主键。
+  * **`ObjectProperty`**：统一替代关系数据库外键命名（严禁使用跨对象 `_id` / `_key` 外键字段）与早期独立连边类型声明，通过 `ObjectProperty[Target]`、`ObjectProperty[Target] | None`、`ObjectProperty[tuple[Target, ...]]` 或独立 `spec.object_property(...)` 显式声明 `domain` → `range` 与基数；动作提交时，`EditBatch` / `OntologyRuntime` 自动同步 `ontology_links` 中的 `(source_id, property_name, target_id)` 三元组并在 `simulate_action` 与 `submit_action` 两路径强制执行参照完整性校验（目标缺失即抛 `InvariantError(code="TARGET_NOT_FOUND")`），同时在 Schema 投影中导出 `property_kind: "object"`、`range` 与 `multiple`，直接推导出界面单选/多选下拉列表。
 * **属性主权边界（Ownership & Authority Boundary）**：
   * **外部同步属性（Source-Backed Fields）**：由快照摄入驱动从外部 ERP/SaaS 同步刷新（`runtime.load_snapshot` / `runtime.load_mdo_snapshots`，实现在 `ingestion.py`）；外部重索引与本地未决补丁冲突时抛出 `ReindexConflictError` 并原子回滚。
   * **模型自有属性（兼容标记 `__owned__`）**：事实值存储在工作空间受控层（含 `ontology_overlay` 补丁），外部快照重刷时自动重放保留，支撑对遗留 SaaS 的“寄居吸纳 → 平滑接管 → 一键拔除（Unplug）”。
@@ -283,27 +285,29 @@ sequenceDiagram
 ### 3.3 虚拟现实沙盘推演与时光机（Simulation & Time-Travel）
 * **隔离分叉（`runtime.fork()`）**：复用同一 `OntologySpec`，通过 SQLite backup 将当前业务世界事实与历史克隆至独立 `:memory:` 实例形成平行沙盘世界（非操作系统页级零拷贝，但与原世界物理隔离）。
 * **蒙特卡洛树搜索（`OntologyMCTSPlanner`）**：在 `fork()` 平行世界沙盘上枚举候选动作序列并自动剪枝违反 `InvariantError` 的分支，择优后再受控提交回主业务世界。
+* **持久隐空间与回读结算（`LatentSpace`，实现在 `open_ontology/latent.py`）**：复用同构 6 表 SQLite（零新增表、零新账本状态），`stage_move` / `approve_move` 在隐空间内落子推演且记忆世界零写入，重启重开无损保留未结算棋步（`pending_moves`）；`settle_move` 对 `affects_source=False` 自有动作直接校验提升，对外部主权动作以独立 `readback_objects` / `readback_links` 逐项核对预期终态（后台 `load_snapshot` 抢跑收敛至同一终态时不误报冲突），一致则提升入记忆并记 `COMMITTED`，不一致则记忆零改动记 `REJECTED`（`DEVICE_STATE_MISMATCH`）并自动 `rebase()` 重对齐隐空间。
+* **闭环滚动时域控制器（`ClosedLoopMPCController`，实现在 `open_ontology/mpc.py`）**：将多步 MCTS 搜索与 `LatentSpace` 单步落子合龙——每次只在 `:memory:` 分叉上展开多步规划并只把第一步落入持久隐空间；启动/续跑优先排空遗留 `pending_moves()`，遇到 `PENDING_APPROVAL` 干净暂停为 `AWAITING_APPROVAL`；若独立只读传感器 `observe_fn`（与 `act_fn` 严格分离）揭示设备状态不一致导致被拒，必先以最新观察执行 `load_snapshot` 刷新记忆棋盘并 `rebase()` 后再重规划，并受 `max_replans` 与 `max_steps` 护栏封顶。
 * **因果账本与逆向冲正（`runtime.approve_action` / `runtime.revert_action`，委托 `aspects.ApprovalGateAspect`）**：基于持久化 `ObjectDiff` 与版本号执行带冲突检测的精确逆向回滚，并支持提交后 `evaluate_automations` 条件反射与版本级去重。
 
 ### 3.4 指挥台四展示视角与领域无关图形协议（4-View Command Center）
 * **指挥台展示视角**（一级标签升级为 `Model / Runtime / World / Device`，代码与 HTTP 兼容映射见第 6 节）：
   1. **Model / 领域模型视角**（`Model · 领域模型`）：查看结构 TBox、Behavior 操作契约及 `/topology` 全景矢量图（对象、关系、动作、函数及可选自动化规则）；
   2. **Runtime / 执行引擎视角**（`Runtime · 算力与治理宿体`）：查看运行宿体配置（`:memory:` / `.sqlite3`、已挂载的七大 `Aspect` 与适配器）；
-  3. **World / 业务世界视角**（`World · 业务世界`，代码兼容别名 `Workspace`）：选择业务世界及聚合根入口，查看 ABox 事实，执行干跑、正式提交、`fork()` / MCTS 推演、审批与时光机回滚；
-  4. **Device / 外部设备视角**（`Device · 外部世界(符号+联结)`）：分栏检视 **符号主义设备（OpenAPI Schema）** 与 **联结主义设备（A2A Agent Card）**。
+  3. **World / 世界状态视角**（`World · 世界状态`，代码兼容别名 `Workspace`）：选择业务世界及聚合根入口，查看 ABox 事实，执行干跑、正式提交、`fork()` / MCTS 推演、审批与时光机回滚；
+  4. **Device / 外部设备视角**（`Device · 外部工具与设备`）：检视外部系统与工具契约（OpenAPI Schema）。
 * **展示词条自治（`OntologySpec.display`）**：内核 `ui_display.json` 仅保留跨领域通用界面词汇；各 M1 模型必须在自身 `spec.display` 中自带中文词条。TBox/ABox 为逻辑投影，不拆成两个一级标签页。
 
 ---
 
-## 4. 外部世界双标准设备与三层职责分离 (Device & Tri-Layer Separation)
+## 4. 外部工具设备与三层职责分离 (Device & Tri-Layer Separation)
 
-业务世界与外部世界交互时，在 M2 层严格分离以下三类职责：
+业务世界与外部系统及上游 Agent 交互时，在 M2 层严格分离以下三类职责：
 
 | 层次 | 载体 / 模块 | 回答的 M2 核心问题 |
 | :--- | :--- | :--- |
 | **1. 业务世界的事实与历史** | `ontology_objects`、`ontology_links`、`ontology_overlay`、`ontology_action_runs` | 当前业务世界内哪些对象与关系事实成立？哪一次受控动作在何时由谁改变了它们？事实与审计逻辑分离，不复制两套业务库。 |
-| **2. 外部设备契约与调用织入** | • **符号主义设备**：`OpenAPI Schema`（当前目录项 `SymbolicDeviceEntry`）<br>• **联结主义设备**：`A2A Agent Card`（当前目录项 `AgentCardDeviceEntry`）<br>• **调用织入与宿主适配**：`ExecutionFabric`、`agent_hosts.py` | 外部确定性系统暴露什么 RPC/快照契约？外部智能体具备什么角色与技能 Card？调用输入输出摘要与结构化回执（如 `HostResult`）是什么？ |
-| **3. M1 领域动作验收门禁** | 各 M1 Model 在 `ActionDef` 中声明的强类型契约与 `InvariantError` 不变量 | 外部设备（尤其是概率性的联结主义 Agent）返回的建议或回执，是否满足该业务模型要求的确定性准入条件？（未通过门禁一律拒绝写入事实表并记入被拒审计。） |
+| **2. 外部设备契约与调用边界** | • **外部工具与设备**：`OpenAPI Schema`（当前目录项 `SymbolicDeviceEntry`）<br>• **上游 Agent 接入**：`Actor -> OSDK (AIPAgentExecutor) -> ActionDef` | 外部确定性系统暴露什么 RPC/快照契约？上游智能体以什么 `Actor` 身份调用世界模型工具？ |
+| **3. M1 领域动作验收门禁** | 各 M1 Model 在 `ActionDef` 中声明的强类型契约与 `InvariantError` 不变量 | 外部输入（尤其是概率性 Agent 传入的参数）是否满足该业务模型要求的确定性准入条件？（未通过门禁一律拒绝写入事实表并记入被拒审计。） |
 
 ---
 
@@ -326,13 +330,12 @@ sequenceDiagram
 
 | 现有代码拼写 | 架构含义 / 渐进迁移方向 |
 |---|---|
-| `Workspace`、`workspace_id`、`workspaces.py` | 业务世界（`World`）在代码、HTTP 路由（`?workspace=`）与目录清单（`workspaces.json`）中的现行兼容标识符；与界面 `World · 业务世界` 指向同一实体 |
+| `Workspace`、`workspace_id`、`workspaces.py` | 业务世界（`World`）在代码、HTTP 路由（`?workspace=`）与目录清单（`workspaces.json`）中的现行兼容标识符；与界面 `World · 世界状态` 指向同一实体 |
 | `OntologySpec`、`ontology_id` | M1 领域模型定义容器与模型身份；保留代码兼容，目标别名 `model_id` |
 | `OntologyRuntime` | 绑定单个模型与存储的 M2 执行引擎，不因术语收敛推倒重写 |
 | `instance_id`、`?instance=` | 早期工作空间 / 业务世界身份与 HTTP 查询参数；与 `workspace_id` / `?workspace=` 双栈兼容（冲突参数显式报错） |
 | `register_instance`、`get_instance` | `CommandCenterRegistry` 上的早期登记/查找方法；与 `register_workspace` / `get_workspace` 指向同一份底层条目 |
-| `#tab-ontology`、`#tab-instance` | 兼容期保留的 DOM ID；界面展示已由早期的 `Workspace · 工作空间` 升级为 `World · 业务世界`（与 `Model · 领域模型` 对应） |
-| `CommandCenterRegistry` | 当前同时承载模型目录、业务世界（工作空间）目录与符号/联结双设备表的内存注册中心；持久化清单由独立目录描述子承接 |
-| `takeover_board_from_db` | M1 `task_board` 模型的按对象 ID 接管兼容入口；通用业务世界寻址由模型无关的 `takeover_workspace` 承接，见 [docs/TASK_BOARD.md](TASK_BOARD.md) |
+| `#tab-ontology`、`#tab-instance` | 兼容期保留的 DOM ID；界面展示已由早期的 `Workspace · 工作空间` 升级为 `World · 世界状态`（与 `Model · 领域模型` 对应） |
+| `CommandCenterRegistry` | 当前同时承载模型目录、业务世界（工作空间）目录与外部设备表（OpenAPI）的内存注册中心；持久化清单由独立目录描述子承接 |
 
 架构演进直接原地修订对应层次的规范正文，严禁以“上文新口径、下文旧定义”的追加补丁方式制造阅读歧义。

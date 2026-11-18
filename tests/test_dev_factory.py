@@ -27,11 +27,6 @@ from open_ontology import (
     start_workshop_server,
 )
 from open_ontology.dev_factory import Deliverable, Engineer, WorkTicket, spec
-from open_ontology.harness_drivers import (
-    CallableHarnessDriver,
-    FactoryOrchestrator,
-    HarnessRateLimitError,
-)
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER = Actor(
@@ -105,7 +100,7 @@ def dispatch(runtime: OntologyRuntime, ticket_id: str, engineer_id: str) -> None
     act(
         runtime,
         "dispatch_ticket",
-        {"ticket_id": ticket_id, "engineer_id": engineer_id},
+        {"ticket": ticket_id, "engineer": engineer_id},
     )
 
 
@@ -119,8 +114,8 @@ def submit(
         runtime,
         "submit_work",
         {
-            "ticket_id": ticket_id,
-            "engineer_id": engineer_id,
+            "ticket": ticket_id,
+            "engineer": engineer_id,
             "summary": summary,
             "artifact_uri": f"artifacts/{ticket_id}.zip",
         },
@@ -138,8 +133,8 @@ def review(
         runtime,
         "review_ticket",
         {
-            "ticket_id": ticket_id,
-            "reviewer_id": reviewer_id,
+            "ticket": ticket_id,
+            "reviewer": reviewer_id,
             "verdict": verdict,
             "feedback": feedback,
         },
@@ -156,8 +151,8 @@ def reassign(
         runtime,
         "reassign_ticket",
         {
-            "ticket_id": ticket_id,
-            "new_engineer_id": new_engineer_id,
+            "ticket": ticket_id,
+            "new_engineer": new_engineer_id,
             "reason": reason,
         },
     )
@@ -213,7 +208,7 @@ def test_business_purity_static_scan():
 
 def test_business_purity_runtime_surface():
     """本体层的公开动作 / 函数名里也不能混入宿主词汇。"""
-    surface = [*spec.actions, *spec.functions, *spec.link_types]
+    surface = [*spec.actions, *spec.functions, *spec.object_properties]
     lowered = " ".join(surface).lower()
     for token in FORBIDDEN_SUBSTRINGS:
         assert token not in lowered
@@ -291,11 +286,11 @@ def test_dispatch_links_assignee(factory):
     ticket = ticket_of(factory, "TK-1")
     engineer = engineer_of(factory, "ENG-C1")
     assert ticket.stage == "CODING"
-    assert ticket.assignee_id == "ENG-C1"
+    assert ticket.assignee == "ENG-C1"
     assert engineer.availability == "BUSY"
-    assert engineer.active_ticket_id == "TK-1"
+    assert engineer.active_ticket == "TK-1"
 
-    linked = factory.get_linked(ticket, "ticket_assigned_to", Engineer, MANAGER)
+    linked = factory.get_linked(ticket, "WorkTicket.assignee", Engineer, MANAGER)
     assert [row.engineer_id for row in linked] == ["ENG-C1"]
 
 
@@ -325,7 +320,7 @@ def test_full_lifecycle_to_done(factory):
     review(factory, "TK-ONTO-017", "ENG-TEST-01", "PASS", "单测全绿")
     ticket = ticket_of(factory, "TK-ONTO-017")
     assert ticket.stage == "ARCH_REVIEW"
-    assert ticket.reviewer_id == "ENG-TEST-01"
+    assert ticket.reviewer == "ENG-TEST-01"
 
     review(factory, "TK-ONTO-017", "ENG-ARCH-01", "PASS", "架构验收通过")
     ticket = ticket_of(factory, "TK-ONTO-017")
@@ -336,7 +331,7 @@ def test_full_lifecycle_to_done(factory):
     assert len(deliverables) == 1
     assert deliverables[0].verified is True
     assert deliverables[0].round_index == 0
-    assert deliverables[0].engineer_id == "ENG-C1"
+    assert deliverables[0].engineer == "ENG-C1"
 
     assert engineer_of(factory, "ENG-C1").completed_tickets == 1
 
@@ -474,7 +469,7 @@ def test_reassign_preserves_full_context(factory):
 
     ticket = ticket_of(factory, "TK-1")
     assert ticket.stage == "CODING"
-    assert ticket.assignee_id == "ENG-C2"
+    assert ticket.assignee == "ENG-C2"
     assert ticket.rework_round == 1
     assert ticket.latest_submission == "第一版实现"
     assert ticket.latest_feedback == "错误处理不完整"
@@ -482,12 +477,12 @@ def test_reassign_preserves_full_context(factory):
     old = engineer_of(factory, "ENG-C1")
     new = engineer_of(factory, "ENG-C2")
     assert old.availability == "UNAVAILABLE"
-    assert old.active_ticket_id is None
+    assert old.active_ticket is None
     assert new.availability == "BUSY"
-    assert new.active_ticket_id == "TK-1"
+    assert new.active_ticket == "TK-1"
 
     briefing = factory.call_function(
-        "build_engineer_briefing", {"ticket_id": "TK-1"}, MANAGER
+        "build_engineer_briefing", {"ticket": "TK-1"}, MANAGER
     )
     assert briefing["spec_uri"] == "SPEC_TK-1.md"
     assert briefing["isolated_scope"] == "open_ontology/"
@@ -495,7 +490,7 @@ def test_reassign_preserves_full_context(factory):
     assert briefing["previous_submission"] == "第一版实现"
     assert briefing["review_feedback"] == "错误处理不完整"
     assert len(briefing["history"]) == 1
-    assert briefing["history"][0]["engineer_id"] == "ENG-C1"
+    assert briefing["history"][0]["engineer"] == "ENG-C1"
 
     submit(factory, "TK-1", "ENG-C2", "第二版：补齐错误处理")
     review(factory, "TK-1", "ENG-ARCH-01", "PASS", "通过")
@@ -523,7 +518,7 @@ def test_factory_board_summary(factory):
     assert board["tickets"]["by_stage"]["CODING"] == 1
     assert board["tickets"]["by_stage"]["OPEN"] == 2
     assert board["active_workspace_locks"] == [
-        {"ticket_id": "TK-1", "scope": "open_ontology", "engineer_id": "ENG-C1"}
+        {"ticket_id": "TK-1", "scope": "open_ontology", "engineer": "ENG-C1"}
     ]
 
     submit(factory, "TK-1", "ENG-C1", "交卷")
@@ -549,11 +544,11 @@ def test_build_engineer_briefing_includes_history(factory):
     review(factory, "TK-1", "ENG-ARCH-01", "FAIL", "需要补充并发测试")
 
     briefing = factory.call_function(
-        "build_engineer_briefing", {"ticket_id": "TK-1"}, MANAGER
+        "build_engineer_briefing", {"ticket": "TK-1"}, MANAGER
     )
     assert briefing["title"] == "核心 MCTS"
     assert briefing["require_testing"] is True
-    assert briefing["assignee_id"] == "ENG-C1"
+    assert briefing["assignee"] == "ENG-C1"
     assert briefing["assignee_name"] == "核心程序员A"
     assert briefing["history"][0]["summary"] == "MCTS 内核完成"
     assert briefing["history"][0]["artifact_uri"] == "artifacts/TK-1.zip"
@@ -566,52 +561,43 @@ def test_build_engineer_briefing_includes_history(factory):
 
 
 # ---------------------------------------------------------------------------
-# 9. 限流 Failover：自动换人且零失忆
+# 9. 无损换人交接
 # ---------------------------------------------------------------------------
-def test_rate_limit_failover_via_orchestrator(factory, tmp_path):
+def test_reassign_ticket_preserves_history_and_hands_off_cleanly(factory):
     recruit(factory, "ENG-ARCH-01", "首席架构师", "architect")
     recruit(factory, "ENG-C1", "核心程序员A", "coder")
     recruit(factory, "ENG-C2", "核心程序员B", "coder")
     open_ticket(factory, "TK-1", "open_ontology/")
     dispatch(factory, "TK-1", "ENG-C1")
 
-    def limited(engineer_id: str, briefing: str, workspace: str) -> str:
-        raise HarnessRateLimitError("429 too many requests")
-
-    primary = CallableHarnessDriver(fn=limited, name="primary")
-    backup = CallableHarnessDriver(
-        fn=lambda engineer_id, briefing, workspace: f"{engineer_id} 已完成交付",
-        name="backup",
+    factory.submit_action(
+        f"RUN-{next(_RUN_IDS)}",
+        "reassign_ticket",
+        {
+            "ticket": "TK-1",
+            "new_engineer": "ENG-C2",
+            "reason": "ENG-C1 不可用，切换交接",
+            "mark_previous_unavailable": True,
+        },
+        MANAGER,
     )
-
-    orchestrator = FactoryOrchestrator(factory, actor=MANAGER, workspace_root=tmp_path)
-    orchestrator.register(primary)
-    orchestrator.register(backup)
-    orchestrator.bind("ENG-C1", "primary")
-    orchestrator.bind("ENG-C2", "backup")
-
-    result = orchestrator.step_ticket("TK-1", fallback_engineer_id="ENG-C2")
-
-    assert result["engineer_id"] == "ENG-C2"
-    assert result["driver"] == "backup"
-    assert len(result["failovers"]) == 1
-    assert result["failovers"][0]["error"] == "HarnessRateLimitError"
+    submit(factory, "TK-1", "ENG-C2", "ENG-C2 已完成交付")
 
     ticket = ticket_of(factory, "TK-1")
     assert ticket.stage == "ARCH_REVIEW"
-    assert ticket.assignee_id == "ENG-C2"
+    assert ticket.assignee == "ENG-C2"
     assert ticket.latest_submission == "ENG-C2 已完成交付"
 
     assert engineer_of(factory, "ENG-C1").availability == "UNAVAILABLE"
     assert engineer_of(factory, "ENG-C2").availability == "IDLE"
 
     deliverables = factory.query_objects(Deliverable, MANAGER)
-    assert [row.engineer_id for row in deliverables] == ["ENG-C2"]
+    assert [row.engineer for row in deliverables] == ["ENG-C2"]
 
     briefing = factory.call_function(
-        "build_engineer_briefing", {"ticket_id": "TK-1"}, MANAGER
+        "build_engineer_briefing", {"ticket": "TK-1"}, MANAGER
     )
-    assert briefing["assignee_id"] == "ENG-C2"
+    assert briefing["assignee"] == "ENG-C2"
     assert briefing["history"][0]["summary"] == "ENG-C2 已完成交付"
 
     run_types = [run["action_type"] for run in factory.list_action_runs()]
@@ -621,21 +607,6 @@ def test_rate_limit_failover_via_orchestrator(factory, tmp_path):
     review(factory, "TK-1", "ENG-ARCH-01", "PASS", "接力交付通过")
     assert ticket_of(factory, "TK-1").stage == "DONE"
     assert engineer_of(factory, "ENG-C2").completed_tickets == 1
-
-
-def test_orchestrator_refuses_non_coding_ticket(factory, tmp_path):
-    recruit(factory, "ENG-C1", "核心程序员A", "coder")
-    open_ticket(factory, "TK-1", "open_ontology/")
-
-    orchestrator = FactoryOrchestrator(
-        factory,
-        actor=MANAGER,
-        workspace_root=tmp_path,
-        drivers={"only": CallableHarnessDriver(fn=lambda e, b, w: "ok", name="only")},
-    )
-    with pytest.raises(Exception) as exc:
-        orchestrator.step_ticket("TK-1")
-    assert "not CODING" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

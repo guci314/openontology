@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from open_ontology import (
     Actor,
     InvariantError,
-    LinkType,
+    ObjectProperty,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
@@ -85,33 +85,33 @@ class MaterialLot(ObjectType):
 
 
 # ---------------------------------------------------------------------------
-# Link types
+# Object properties
 # ---------------------------------------------------------------------------
-SKU_MAPS_TO_SPEC = LinkType(
+SKU_MAPS_TO_SPEC = ObjectProperty(
     name="sku_maps_to_spec",
-    source="ContractSKU",
-    target="MaterialSpec",
+    domain="ContractSKU",
+    range="MaterialSpec",
     cardinality="many-to-one",
     owned=True,
 )
-LOT_HAS_SPEC = LinkType(
+LOT_HAS_SPEC = ObjectProperty(
     name="lot_has_spec",
-    source="MaterialLot",
-    target="MaterialSpec",
+    domain="MaterialLot",
+    range="MaterialSpec",
     cardinality="many-to-one",
     owned=True,
 )
-LOT_PRODUCED_BY = LinkType(
+LOT_PRODUCED_BY = ObjectProperty(
     name="lot_produced_by",
-    source="MaterialLot",
-    target="Manufacturer",
+    domain="MaterialLot",
+    range="Manufacturer",
     cardinality="many-to-one",
     owned=True,
 )
-LOT_BILLED_AS = LinkType(
+LOT_BILLED_AS = ObjectProperty(
     name="lot_billed_as",
-    source="MaterialLot",
-    target="ContractSKU",
+    domain="MaterialLot",
+    range="ContractSKU",
     cardinality="many-to-one",
     owned=True,
 )
@@ -123,8 +123,8 @@ LOT_BILLED_AS = LinkType(
 spec = OntologySpec()
 for _cls in (MaterialSpec, Manufacturer, ContractSKU, MaterialLot):
     spec.object_type(_cls)
-for _link in (SKU_MAPS_TO_SPEC, LOT_HAS_SPEC, LOT_PRODUCED_BY, LOT_BILLED_AS):
-    spec.add_link_type(_link)
+for _prop in (SKU_MAPS_TO_SPEC, LOT_HAS_SPEC, LOT_PRODUCED_BY, LOT_BILLED_AS):
+    spec.add_object_property(_prop)
 
 
 # ---------------------------------------------------------------------------

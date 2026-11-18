@@ -3,7 +3,7 @@
 Public surface::
 
     from open_ontology import (
-        Actor, ObjectType, LinkType, OntologySpec,
+        Actor, ObjectType, ObjectProperty, AutoID, OntologySpec,
         OntologyRuntime, EditBatch, ObjectDiff,
         export_llm_tools, AIPAgentExecutor, run_eval_suite,
         OntologyMCTSPlanner, CandidateAction, MCTSPlanResult,
@@ -11,6 +11,17 @@ Public surface::
     )
 """
 
+from .latent import DEVICE_STATE_MISMATCH, LatentSpace
+from .mpc import (
+    MPC_AWAITING_APPROVAL,
+    MPC_GOAL_REACHED,
+    MPC_MAX_REPLANS_EXCEEDED,
+    MPC_MAX_STEPS_EXCEEDED,
+    MPC_UNREACHABLE,
+    ClosedLoopMPCController,
+    MPCResult,
+    MPCStepRecord,
+)
 from .mcts import (
     CandidateAction,
     MCTSNode,
@@ -32,6 +43,7 @@ from .query import AggregationResult, AggregationRow, ObjectSet
 from .runtime import OntologyRuntime, SimulationResult
 from .sandbox import (
     EditBatch,
+    InvariantView,
     LinkChange,
     LoadedObject,
     ObjectChange,
@@ -41,6 +53,7 @@ from .spec import (
     ActionDef,
     ActionNotFoundError,
     Actor,
+    AutoID,
     AutomationDef,
     AutomationNotFoundError,
     ConcurrencyConflictError,
@@ -48,17 +61,21 @@ from .spec import (
     FunctionNotFoundError,
     GovernanceViolationError,
     InterfaceType,
+    InvariantDef,
     InvariantError,
-    LinkType,
+    RoleDef,
+    TransitionInvariantDef,
     ObjectNotFoundError,
+    ObjectProperty,
     ObjectType,
     OntologySpec,
     OpenOntologyError,
     OntologyError,
     PermissionDeniedError,
     ReindexConflictError,
-    UnknownLinkTypeError,
+    UnknownObjectPropertyError,
     UnknownObjectTypeError,
+    UnknownRoleError,
 )
 from .workshop import (
     CommandCenterRegistry,
@@ -75,14 +92,16 @@ __version__ = "0.3.0"
 
 __all__ = [
     "Actor",
+    "AutoID",
     "ObjectType",
-    "LinkType",
+    "ObjectProperty",
     "OntologySpec",
     "FunctionDef",
     "ActionDef",
     "OntologyRuntime",
     "SimulationResult",
     "EditBatch",
+    "InvariantView",
     "ObjectDiff",
     "ObjectChange",
     "LinkChange",
@@ -100,11 +119,24 @@ __all__ = [
     "MCTSPlanResult",
     "RootActionStat",
     "OntologyMCTSPlanner",
+    "LatentSpace",
+    "DEVICE_STATE_MISMATCH",
+    "ClosedLoopMPCController",
+    "MPCResult",
+    "MPCStepRecord",
+    "MPC_GOAL_REACHED",
+    "MPC_AWAITING_APPROVAL",
+    "MPC_MAX_REPLANS_EXCEEDED",
+    "MPC_MAX_STEPS_EXCEEDED",
+    "MPC_UNREACHABLE",
     "fork_runtime",
     "state_fingerprint",
     "commit_plan",
     "InterfaceType",
+    "RoleDef",
     "AutomationDef",
+    "InvariantDef",
+    "TransitionInvariantDef",
     "AutomationNotFoundError",
     "WorkshopServer",
     "WorkshopHandle",
@@ -119,7 +151,8 @@ __all__ = [
     "PermissionDeniedError",
     "ObjectNotFoundError",
     "UnknownObjectTypeError",
-    "UnknownLinkTypeError",
+    "UnknownObjectPropertyError",
+    "UnknownRoleError",
     "ActionNotFoundError",
     "FunctionNotFoundError",
     "InvariantError",

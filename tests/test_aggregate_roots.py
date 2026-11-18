@@ -21,12 +21,10 @@ import json
 import pytest
 
 from open_ontology import Actor, OntologyRuntime
-from open_ontology.kanban import (
+from examples.kanban import (
     Board,
-    BoardColumn,
     Card,
     CardComment,
-    CardRun,
     Member,
     spec as kanban_spec,
 )
@@ -209,7 +207,7 @@ def test_registry_type_json_carries_aggregate_root_but_object_values_do_not():
 # ---------------------------------------------------------------------------
 def test_kanban_board_is_aggregate_root_and_card_is_not():
     assert Board.is_aggregate_root() is True
-    for cls in (BoardColumn, Member, Card, CardComment, CardRun):
+    for cls in (Member, Card, CardComment):
         assert cls.is_aggregate_root() is False, f"{cls.__name__} 不应被声明为聚合根"
 
 
@@ -263,10 +261,10 @@ def test_non_root_object_without_incoming_links_is_not_listed():
         runtime.put_object(
             Card(
                 card_id="CD-1",
-                board_key="BD-1",
+                board="BD-1",
                 tenant="acme",
                 title="孤立卡片",
-                column_key="todo",
+                status="todo",
             )
         )
         _add(registry, "ws-1", "task_board", runtime)

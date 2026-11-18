@@ -2,8 +2,8 @@
 
 同一个深色科技风单页应用里，同时管理：
 
-* **Ontology 蓝图（PIM）** —— 纯静态元模型：ObjectTypes / Interfaces /
-  LinkTypes / Functions / Actions / Automations，以及自动排布的内联 SVG 拓扑；
+* **Ontology 蓝图（PIM）** —— 纯静态元模型：ObjectTypes / ObjectProperties /
+  Interfaces / Functions / Actions / Automations，以及自动排布的内联 SVG 拓扑；
 * **Instance 实例（Runtime + PSM）** —— 某个蓝图挂上数据库与外部系统连接器
   后的活体运行环境：实时世界状态、单步干跑、MCTS 多步沙盘、正式执行、
   审计账本、Approve / Revert、Fork 平行沙盘、一键拔除 SaaS。
@@ -19,18 +19,36 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import sqlite3
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from .model_views import describe_behavior, describe_tbox
+from .meta_admin import MetaAdminService
+from .model_views import describe_behavior, describe_openapi, describe_tbox
+from .osdk import AIPAgentExecutor, iter_agent_turn, run_agent_turn
 from .runtime import OntologyRuntime
-from .spec import Actor, ObjectType, OntologySpec, OpenOntologyError
+from .spec import (
+    ActionNotFoundError,
+    Actor,
+    FunctionNotFoundError,
+    ObjectNotFoundError,
+    ObjectType,
+    OntologySpec,
+    OpenOntologyError,
+    PermissionDeniedError,
+    UnknownObjectTypeError,
+)
+from .webhooks import OutboundWebhookDispatcher, WebhookFilter
 from .workshop_ui import (
     DISPLAY,
     DISPLAY_JS,
@@ -50,8 +68,8 @@ __all__ = [
     "OntologyCatalogEntry",
     "OntologyInstanceEntry",
     "SymbolicDeviceEntry",
-    "AgentCardDeviceEntry",
     "RuntimeCatalogEntry",
+    "ActorTokenEntry",
     "CommandCenterRegistry",
     "WorkshopServer",
     "WorkshopHandle",
@@ -61,6 +79,48 @@ __all__ = [
 
 #: 默认纯内存宿体编号：无外设的沙盘实例共用同一台宿主。
 DEFAULT_RUNTIME_ID = "rt-default-memory"
+
+def _compute_live_revision(runtime: Any) -> tuple[dict[str, Any], str]:
+    """Build deterministic state_fingerprint + lightweight content revision digest."""
+    fp = runtime.state_fingerprint()
+    conn = runtime.connection
+    obj_rows = conn.execute(
+        "SELECT object_type, object_id, version, properties_json "
+        "FROM ontology_objects ORDER BY object_type, object_id"
+    ).fetchall()
+    ov_rows = conn.execute(
+        "SELECT object_type, object_id, patch_json "
+        "FROM ontology_overlay ORDER BY object_type, object_id"
+    ).fetchall()
+    link_rows = conn.execute(
+        "SELECT link_type, source_type, source_id, target_type, target_id "
+        "FROM ontology_links ORDER BY link_type, source_type, source_id, target_type, target_id"
+    ).fetchall()
+    run_rows = conn.execute(
+        "SELECT run_id, status, approved_by, reverted_by_run_id "
+        "FROM ontology_action_runs ORDER BY rowid"
+    ).fetchall()
+    db_ino = 0
+    db_p = getattr(runtime, "db_path", None)
+    if db_p and str(db_p) != ":memory:":
+        try:
+            db_ino = Path(db_p).stat().st_ino
+        except OSError:
+            db_ino = 0
+    digest_payload = json.dumps(
+        {
+            "ino": db_ino,
+            "obj": [tuple(r) for r in obj_rows],
+            "ov": [tuple(r) for r in ov_rows],
+            "links": [tuple(r) for r in link_rows],
+            "runs": [tuple(r) for r in run_rows],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    revision = hashlib.sha1(digest_payload).hexdigest()[:16]
+    return fp, revision
+
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -93,9 +153,6 @@ RUNTIME_ASPECTS = [
     "AutomationReflexAspect",
     "IdleAwareCallbackAspect",
 ]
-
-#: 联结主义设备（智能体）的连接器类型；其余一律视为符号主义设备。
-CONNECTIONIST_KINDS = ("Harness", "Agent", "LLM")
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +209,7 @@ class OntologyInstanceEntry:
 
 @dataclass
 class SymbolicDeviceEntry:
-    """符号主义设备：带 OpenAPI 契约的外部系统（仓储 / 物流 / 软件服务 / 数据库…）。"""
+    """外部工具/设备：带 OpenAPI 契约的外部系统（仓储 / 物流 / 软件服务 / 数据库…）。"""
 
     device_id: str
     name: str
@@ -160,18 +217,6 @@ class SymbolicDeviceEntry:
     endpoint: str
     status: str = "CONNECTED"
     openapi_schema: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class AgentCardDeviceEntry:
-    """联结主义设备：以 A2A Agent Card 描述能力的智能体 / 宿主驱动。"""
-
-    device_id: str
-    name: str
-    kind: str
-    endpoint: str
-    status: str = "CONNECTED"
-    agent_card: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -190,13 +235,13 @@ class RuntimeCatalogEntry:
 
 
 def _openapi_schema(connector: ConnectorMount) -> dict[str, Any]:
-    """把符号主义连接器投影成最小可用的 OpenAPI 3.1 契约。"""
+    """把外部连接器投影成最小可用的 OpenAPI 3.1 契约。"""
     return {
         "openapi": "3.1.0",
         "info": {
             "title": f"{connector.name} ({connector.kind})",
             "version": "1.0.0",
-            "description": f"{connector.kind} 外部系统的符号主义设备契约。",
+            "description": f"{connector.kind} 外部工具/系统的 OpenAPI 契约。",
         },
         "servers": [{"url": connector.endpoint}],
         "paths": {
@@ -208,21 +253,6 @@ def _openapi_schema(connector: ConnectorMount) -> dict[str, Any]:
                 }
             }
         },
-    }
-
-
-def _agent_card(connector: ConnectorMount) -> dict[str, Any]:
-    """把联结主义连接器投影成 A2A Agent Card。"""
-    return {
-        "protocol": "A2A/1.0",
-        "name": connector.name,
-        "endpoint": connector.endpoint,
-        "roles": ["developer", "tester", "architect"],
-        "skills": [
-            {"id": "execute", "name": "任务执行", "input": "text", "output": "text"},
-            {"id": "report", "name": "结果回报", "input": "text", "output": "text"},
-        ],
-        "output_contract": "HostResult + Numeric Evidence",
     }
 
 
@@ -240,12 +270,239 @@ def _workspace_runtime_id(
 ) -> str:
     """按存储类型与外设决定宿体编号（注册与清单持久化共用同一规则）。"""
     storage_kind = "memory" if ":memory:" in db_uri else "sqlite"
-    has_peripherals = any(
-        connector.kind not in CONNECTIONIST_KINDS for connector in connectors
-    )
+    has_peripherals = any(True for _ in connectors)
     if storage_kind == "memory" and not has_peripherals:
         return DEFAULT_RUNTIME_ID
     return f"rt-{workspace_id}"
+
+
+class _UnauthorizedError(OpenOntologyError):
+    """Raised when a Bearer token is missing or invalid."""
+
+
+@dataclass(frozen=True)
+class ActorTokenEntry:
+    """绑定凭证与真实 Actor 身份（actor_id / role / clearance_tags / 可选工作空间限制）。"""
+
+    token: str
+    actor: Actor
+    workspace_id: str | None = None
+
+
+def _http_webhook_sender(
+    url: str, headers: dict[str, str], body: bytes, timeout: float
+) -> tuple[int, str]:
+    """HTTP transport sender injected into :class:`OutboundWebhookDispatcher`."""
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return int(resp.status), resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
+        return int(exc.code), detail
+
+
+class _SimulationLedger:
+    """沙盘推演持久化账本（独立于主世界业务库，专用于留痕与本体 Bug 诊断）。
+
+    只记录平行宇宙的推演步骤、校验结果、Diff 与异常原因，绝不触碰主库的
+    ``ontology_objects`` / ``ontology_action_runs`` / ``schema.sql``。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._conns: dict[str, sqlite3.Connection] = {}
+
+    @staticmethod
+    def _utcnow() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _ledger_target(entry: OntologyInstanceEntry | None) -> str:
+        if entry is not None and entry.runtime is not None:
+            db_path = getattr(entry.runtime, "db_path", None)
+            if db_path is not None and str(db_path) != ":memory:":
+                return str(Path(db_path).with_suffix(".sim_ledger.sqlite3"))
+        return ":memory:"
+
+    def _conn_for(
+        self, workspace_id: str, entry: OntologyInstanceEntry | None = None
+    ) -> sqlite3.Connection:
+        target = self._ledger_target(entry)
+        conn = self._conns.get(workspace_id)
+        if conn is not None:
+            return conn
+        if target != ":memory:":
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(target, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sandbox_simulations (
+                sim_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                prior_steps_json TEXT NOT NULL,
+                valid INTEGER NOT NULL,
+                requires_approval INTEGER NOT NULL,
+                error_code TEXT,
+                error_message TEXT,
+                diff_json TEXT NOT NULL,
+                base_fingerprint TEXT NOT NULL,
+                committed_run_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        self._conns[workspace_id] = conn
+        return conn
+
+    def record(
+        self,
+        entry: OntologyInstanceEntry,
+        *,
+        session_id: str,
+        step_index: int,
+        action_name: str,
+        actor: Actor,
+        params: dict[str, Any],
+        prior_steps: list[dict[str, Any]],
+        valid: bool,
+        requires_approval: bool = False,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        diff: dict[str, Any] | None = None,
+        base_fingerprint: str = "",
+    ) -> dict[str, Any]:
+        sim_id = f"SIM-{uuid.uuid4().hex[:12]}"
+        created_at = self._utcnow()
+        with self._lock:
+            conn = self._conn_for(entry.instance_id, entry)
+            conn.execute(
+                """
+                INSERT INTO sandbox_simulations (
+                    sim_id, workspace_id, session_id, step_index, action_type,
+                    actor_id, actor_role, params_json, prior_steps_json,
+                    valid, requires_approval, error_code, error_message,
+                    diff_json, base_fingerprint, committed_run_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    sim_id,
+                    entry.instance_id,
+                    session_id,
+                    int(step_index),
+                    action_name,
+                    actor.actor_id,
+                    actor.role,
+                    json.dumps(params, ensure_ascii=False, default=str),
+                    json.dumps(prior_steps, ensure_ascii=False, default=str),
+                    1 if valid else 0,
+                    1 if requires_approval else 0,
+                    error_code,
+                    error_message,
+                    json.dumps(diff or {"object_changes": [], "link_changes": []}, ensure_ascii=False, default=str),
+                    base_fingerprint,
+                    created_at,
+                ),
+            )
+            conn.commit()
+        return {
+            "sim_id": sim_id,
+            "session_id": session_id,
+            "step_index": int(step_index),
+            "created_at": created_at,
+        }
+
+    def mark_first_step_committed(
+        self,
+        entry: OntologyInstanceEntry,
+        *,
+        session_id: str,
+        run_id: str,
+    ) -> None:
+        if not session_id or not run_id:
+            return
+        with self._lock:
+            conn = self._conn_for(entry.instance_id, entry)
+            conn.execute(
+                """
+                UPDATE sandbox_simulations
+                SET committed_run_id = ?
+                WHERE workspace_id = ? AND session_id = ? AND step_index = 1
+                """,
+                (run_id, entry.instance_id, session_id),
+            )
+            conn.commit()
+
+    def list(
+        self,
+        entry: OntologyInstanceEntry,
+        *,
+        valid: bool | None = None,
+        session_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            conn = self._conn_for(entry.instance_id, entry)
+            clauses = ["workspace_id = ?"]
+            args: list[Any] = [entry.instance_id]
+            if valid is not None:
+                clauses.append("valid = ?")
+                args.append(1 if valid else 0)
+            if session_id:
+                clauses.append("session_id = ?")
+                args.append(session_id)
+            args.append(max(1, min(int(limit), 500)))
+            rows = conn.execute(
+                f"""
+                SELECT * FROM sandbox_simulations
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                args,
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "sim_id": row["sim_id"],
+                    "workspace_id": row["workspace_id"],
+                    "session_id": row["session_id"],
+                    "step_index": int(row["step_index"]),
+                    "action_type": row["action_type"],
+                    "actor_id": row["actor_id"],
+                    "actor_role": row["actor_role"],
+                    "params": json.loads(row["params_json"]),
+                    "prior_steps": json.loads(row["prior_steps_json"]),
+                    "valid": bool(row["valid"]),
+                    "requires_approval": bool(row["requires_approval"]),
+                    "error_code": row["error_code"],
+                    "error_message": row["error_message"],
+                    "diff": json.loads(row["diff_json"]),
+                    "base_fingerprint": row["base_fingerprint"],
+                    "committed_run_id": row["committed_run_id"],
+                    "created_at": row["created_at"],
+                }
+            )
+        return out
+
+    def clear(self, entry: OntologyInstanceEntry) -> int:
+        with self._lock:
+            conn = self._conn_for(entry.instance_id, entry)
+            cur = conn.execute(
+                "DELETE FROM sandbox_simulations WHERE workspace_id = ?",
+                (entry.instance_id,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
 
 
 class CommandCenterRegistry:
@@ -256,7 +513,11 @@ class CommandCenterRegistry:
         self.instances: dict[str, OntologyInstanceEntry] = {}
         self.runtimes: dict[str, RuntimeCatalogEntry] = {}
         self.symbolic_devices: dict[str, SymbolicDeviceEntry] = {}
-        self.connectionist_devices: dict[str, AgentCardDeviceEntry] = {}
+        self.actor_tokens: dict[str, ActorTokenEntry] = {}
+        self.webhooks: OutboundWebhookDispatcher = OutboundWebhookDispatcher(
+            sender=_http_webhook_sender
+        )
+        self.simulation_ledger: _SimulationLedger = _SimulationLedger()
         #: 可选的工作空间身份清单；只有文件落盘的 runtime 会被写入。
         self.catalog = catalog
         self.lock = threading.RLock()
@@ -268,6 +529,45 @@ class CommandCenterRegistry:
             description="纯内存零外设沙盘宿体，用于验证 Ontology 与虚拟现实推演",
             aspects=list(RUNTIME_ASPECTS),
         )
+
+    # -- actor token binding -----------------------------------------------
+    def register_actor_token(
+        self,
+        token: str,
+        actor: Actor,
+        *,
+        workspace_id: str | None = None,
+    ) -> ActorTokenEntry:
+        """Bind a bearer token to an explicit Actor (and optional workspace)."""
+        clean = token.strip()
+        if not clean:
+            raise ValueError("actor token must not be empty")
+        entry = ActorTokenEntry(token=clean, actor=actor, workspace_id=workspace_id)
+        with self.lock:
+            self.actor_tokens[clean] = entry
+        return entry
+
+    def revoke_actor_token(self, token: str) -> None:
+        with self.lock:
+            self.actor_tokens.pop(token, None)
+
+    def resolve_actor_token(
+        self, token: str, *, workspace_id: str | None = None
+    ) -> Actor:
+        with self.lock:
+            binding = self.actor_tokens.get(token)
+        if binding is None:
+            raise _UnauthorizedError("invalid or expired actor bearer token")
+        if (
+            workspace_id is not None
+            and binding.workspace_id is not None
+            and binding.workspace_id != workspace_id
+        ):
+            raise PermissionDeniedError(
+                f"actor token is scoped to workspace {binding.workspace_id!r}, "
+                f"not {workspace_id!r}"
+            )
+        return binding.actor
 
     # -- runtime / device registration -------------------------------------
     def register_runtime(
@@ -316,51 +616,17 @@ class CommandCenterRegistry:
         self.symbolic_devices[device_id] = entry
         return entry
 
-    def register_agent_device(
-        self,
-        device_id: str,
-        name: str,
-        kind: str,
-        endpoint: str,
-        status: str = "CONNECTED",
-        agent_card: dict[str, Any] | None = None,
-    ) -> AgentCardDeviceEntry:
-        entry = AgentCardDeviceEntry(
-            device_id=device_id,
-            name=name,
-            kind=kind,
-            endpoint=endpoint,
-            status=status,
-            agent_card=dict(agent_card or {}),
-        )
-        self.connectionist_devices[device_id] = entry
-        return entry
-
     def _sync_devices(self, entry: OntologyInstanceEntry) -> None:
-        """按连接器类型把外部世界拆成符号主义 / 联结主义两类设备。"""
-        symbolic = 0
-        agentic = 0
-        for connector in entry.connectors:
-            if connector.kind in CONNECTIONIST_KINDS:
-                agentic += 1
-                self.register_agent_device(
-                    f"dev-{entry.instance_id}-a2a-{agentic}",
-                    connector.name,
-                    connector.kind,
-                    connector.endpoint,
-                    connector.status,
-                    _agent_card(connector),
-                )
-            else:
-                symbolic += 1
-                self.register_symbolic_device(
-                    f"dev-{entry.instance_id}-openapi-{symbolic}",
-                    connector.name,
-                    connector.kind,
-                    connector.endpoint,
-                    connector.status,
-                    _openapi_schema(connector),
-                )
+        """将外部连接器统一登记为 OpenAPI 工具/设备契约。"""
+        for idx, connector in enumerate(entry.connectors, start=1):
+            self.register_symbolic_device(
+                f"dev-{entry.instance_id}-openapi-{idx}",
+                connector.name,
+                connector.kind,
+                connector.endpoint,
+                connector.status,
+                _openapi_schema(connector),
+            )
         entry.runtime_id = self._bind_runtime(entry)
 
     def _bind_runtime(self, entry: OntologyInstanceEntry) -> str:
@@ -480,7 +746,16 @@ class CommandCenterRegistry:
 
             self.instances[workspace_id] = entry
             self._sync_devices(entry)
+            self._attach_webhook_hook(workspace_id, runtime)
             return entry
+
+    def _attach_webhook_hook(self, world_id: str, runtime: OntologyRuntime | None) -> None:
+        if runtime is None:
+            return
+        for existing in getattr(runtime, "_post_commit_hooks", ()):
+            if getattr(existing, "_webhook_world_id", None) == world_id:
+                return
+        runtime.add_post_commit_hook(self.webhooks.make_post_commit_hook(world_id))
 
     def register_instance(
         self,
@@ -709,7 +984,7 @@ class CommandCenterRegistry:
             instance_id=candidate,
             ontology_id=source.ontology_id,
             label=label or f"{source.label} · 平行沙盘",
-            description=f"由 {source.instance_id} 毫秒级克隆的独立沙盘实例",
+            description=f"由 {source.instance_id} 毫秒级克隆的独立世界状态",
             db_uri="sqlite://:memory: (fork)",
             runtime=forked,
             connectors=[
@@ -754,7 +1029,7 @@ class CommandCenterRegistry:
             label=label,
             runtime=runtime,
             db_uri=str(runtime.db_path),
-            description="单 runtime 向后兼容实例。",
+            description="单 runtime 向后兼容世界状态。",
             default_actor=actor,
         )
         return registry
@@ -771,11 +1046,12 @@ def _ontology_roles(
 
     角色来源（全部来自该蓝图自己的声明，不读任何全局角色表）：
 
-    1. 该蓝图下各实例的 ``default_actor.role``；
-    2. ``spec.actions`` 中每个动作的 ``allowed_roles`` 与 ``approver_roles``；
-    3. ``spec.object_types`` 中各对象类型的 ``__masked_fields__`` 白名单角色。
+    1. ``spec.roles`` 中显式声明的模型角色（``RoleDef``）；
+    2. 该蓝图下各实例的 ``default_actor.role``；
+    3. ``spec.actions`` 中每个动作的 ``allowed_roles`` 与 ``approver_roles``；
+    4. ``spec.object_types`` 中各对象类型的 ``__masked_fields__`` 白名单角色。
 
-    三者都为空时回退 ``["admin"]``，保证前端下拉框永远有可选项。
+    均为空时回退 ``["admin"]``，保证前端下拉框永远有可选项。
     """
     roles: list[str] = []
 
@@ -783,6 +1059,8 @@ def _ontology_roles(
         if role and role not in roles:
             roles.append(role)
 
+    for role_name in spec.roles:
+        add(role_name)
     for entry in instances:
         actor = getattr(entry, "default_actor", None)
         if actor is not None:
@@ -816,10 +1094,11 @@ def _spec_meta(
         "roles": _ontology_roles(spec, instances),
         "object_types": tbox["object_types"],
         "interfaces": tbox["interfaces"],
-        "link_types": tbox["link_types"],
+        "object_properties": tbox["object_properties"],
         "functions": behavior["functions"],
         "actions": behavior["actions"],
         "automations": behavior["automations"],
+        "role_defs": behavior["roles"],
     }
 
 
@@ -946,10 +1225,10 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .mount .sp{flex:1}
 .fp{display:flex;gap:9px;flex-wrap:wrap}
 .fp span{font-family:"SF Mono",Menlo,monospace;font-size:10.5px;color:#a5e4ff}
-.tabs{display:flex;gap:5px;flex-wrap:wrap;padding:8px 11px;border-bottom:1px solid var(--line)}
-.tab{font-size:11px;padding:4px 9px;border-radius:7px;border:1px solid var(--line);
+.tabs,.state-tabs{display:flex;gap:5px;flex-wrap:wrap;padding:8px 11px;border-bottom:1px solid var(--line)}
+.tab,.state-tab{font-size:11px;padding:4px 9px;border-radius:7px;border:1px solid var(--line);
   background:rgba(255,255,255,.02);color:#b9cbe0;cursor:pointer;white-space:nowrap}
-.tab.on{background:rgba(56,189,248,.16);border-color:rgba(56,189,248,.55);color:#d6f2ff}
+.tab.on,.state-tab.on{background:rgba(56,189,248,.16);border-color:rgba(56,189,248,.55);color:#d6f2ff}
 .pillarnav{display:flex;gap:6px;flex-wrap:wrap;padding:0 18px 9px;
   border-bottom:1px solid var(--line);background:rgba(8,14,22,.86)}
 .pillar-tab{font-size:12px;font-weight:600;padding:7px 14px;border-radius:9px;letter-spacing:.2px;
@@ -963,6 +1242,15 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .obj{border:1px solid var(--line);border-left:3px solid rgba(120,160,210,.4);
   border-radius:10px;padding:7px 10px;margin-bottom:7px;background:rgba(255,255,255,.025)}
 .obj:hover{border-left-color:var(--cy);background:rgba(56,189,248,.05)}
+.obj.sim-create{border-left-color:var(--ok);border-color:rgba(34,197,94,.4);background:rgba(34,197,94,.08)}
+.obj.sim-update{border-left-color:var(--vi);border-color:rgba(167,139,250,.4);background:rgba(167,139,250,.08)}
+.obj.sim-delete{border-left-color:var(--rd);border-color:rgba(239,68,68,.4);background:rgba(239,68,68,.08);opacity:.78}
+.sim-banner{border:1px solid rgba(167,139,250,.45);background:rgba(167,139,250,.12);border-radius:9px;
+  padding:6px 10px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:11px;color:#e9d5ff}
+.sim-old{text-decoration:line-through;color:#fca5a5;font-weight:400;margin-right:4px}
+.sim-new{color:#86efac}
+.sim-link-create{color:#86efac;background:rgba(34,197,94,.08);padding:3px 7px;border-radius:6px;border:1px solid rgba(34,197,94,.28)}
+.sim-link-delete{color:#fca5a5;text-decoration:line-through;background:rgba(239,68,68,.08);padding:3px 7px;border-radius:6px;border:1px solid rgba(239,68,68,.28)}
 .obj h4{font-size:12px;font-weight:700;display:flex;justify-content:space-between;gap:8px}
 .obj h4 span{font-family:"SF Mono",Menlo,monospace;font-size:10.5px;color:#a5e4ff;font-weight:500}
 .kv{display:flex;gap:7px;font-size:10.8px;color:var(--dim);margin-top:3px;flex-wrap:wrap}
@@ -972,9 +1260,25 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .kv .ov{color:#fbbf24}
 .ops{display:flex;gap:5px;margin-top:6px;flex-wrap:wrap}
 .row{display:flex;gap:7px;align-items:center;margin-bottom:7px;flex-wrap:wrap}
-label.f{display:flex;flex-direction:column;gap:3px;font-size:10px;color:var(--dim);flex:1;min-width:120px}
-label.f input,label.f select{background:#0b1522;color:var(--txt);border:1px solid var(--line);
+label.f,div.f{display:flex;flex-direction:column;gap:3px;font-size:10px;color:var(--dim);flex:1;min-width:120px}
+label.f input,label.f select,div.f input,div.f select{background:#0b1522;color:var(--txt);border:1px solid var(--line);
   border-radius:7px;padding:5px 8px;font-size:11px;font-family:"SF Mono",Menlo,monospace;outline:none}
+input.auto-id{opacity:.78;cursor:default;color:#a5e4ff;border-style:dashed}
+.msel{position:relative}
+.msel-btn{width:100%;display:flex;justify-content:space-between;align-items:center;gap:6px;text-align:left;
+  background:#0b1522;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:5px 8px;
+  font-size:11px;font-family:"SF Mono",Menlo,monospace;cursor:pointer}
+.msel-btn:hover{background:#0f1d30;border-color:rgba(56,189,248,.45)}
+.msel-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msel-menu{display:none;position:fixed;z-index:40;max-height:220px;overflow:auto;
+  background:#0b1522;border:1px solid rgba(56,189,248,.45);border-radius:8px;padding:4px;
+  box-shadow:0 12px 28px rgba(0,0,0,.6)}
+.msel.open .msel-menu{display:block}
+.msel-opt{display:flex;align-items:flex-start;gap:7px;padding:5px 7px;border-radius:6px;cursor:pointer;
+  font-size:11px;line-height:1.35;color:var(--txt);font-family:"SF Mono",Menlo,monospace}
+.msel-opt:hover{background:rgba(56,189,248,.14)}
+.msel-opt input[type=checkbox]{margin:2px 0 0;flex-shrink:0;width:13px;height:13px;accent-color:var(--cy)}
+.msel-opt span{min-width:0;word-break:break-word}
 select,input[type=text],textarea{background:#0b1522;color:var(--txt);border:1px solid var(--line);
   border-radius:8px;padding:6px 9px;font-size:11px;font-family:"SF Mono",Menlo,monospace;outline:none}
 pre{margin:0;font-family:"SF Mono",Menlo,monospace;font-size:10.6px;line-height:1.5;
@@ -1022,11 +1326,26 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
 .diff{width:100%;border-collapse:collapse}
 .diff td{vertical-align:top;font-family:"SF Mono",Menlo,monospace;font-size:10px}
 .diff .b{color:#fca5a5}.diff .a{color:#86efac}
+.agent-drawer{position:fixed;top:64px;right:12px;bottom:12px;width:420px;max-width:92vw;
+  background:linear-gradient(170deg,rgba(14,24,40,.98),rgba(6,11,20,.98));
+  border:1px solid rgba(56,189,248,.38);border-radius:14px;display:flex;flex-direction:column;
+  box-shadow:0 20px 56px rgba(0,0,0,.68);z-index:20;overflow:hidden}
+.agent-ctx{padding:6px 11px;font-size:10.5px;color:#8ea3bd;border-bottom:1px dashed var(--line);
+  background:rgba(56,189,248,.05);display:flex;gap:8px;flex-wrap:wrap}
+.agent-msgs{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:9px;min-height:0}
+.amsg{border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:11.5px;line-height:1.55}
+.amsg.user{align-self:flex-end;max-width:86%;background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.35)}
+.amsg.bot{align-self:stretch;background:rgba(255,255,255,.03)}
+.art-card{margin-top:8px;border:1px solid rgba(56,189,248,.32);border-radius:10px;
+  padding:8px 10px;background:rgba(8,15,26,.85)}
+.art-card h5{font-size:11.5px;color:#a5e4ff;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+.agent-foot{padding:9px 10px;border-top:1px solid var(--line);display:flex;gap:7px;background:rgba(8,14,24,.9)}
+.agent-foot input{flex:1;background:#0b1522;color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:11.5px;outline:none}
 </style></head>
 <body><div class="shell">
 <header>
   <div class="mark">◈</div>
-  <div class="brand"><b>__TITLE__</b><span>统一作战指挥中心 · 领域模型 × 工作空间</span></div>
+  <div class="brand"><b>__TITLE__</b><span>统一作战指挥中心 · 领域模型 × 世界状态</span></div>
   <div class="chips" id="chips"></div>
   <div class="role">角色
     <select id="role" onchange="loadAll()">
@@ -1043,15 +1362,15 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
       <option value="mdm_steward">主数据管理员</option>
     </select>
     <button class="v" onclick="runAutomations()">⚡ 运行自动化规则</button>
-    <a class="ph-more" id="btnArchDoc" href="/docs?doc=architecture" target="_self" rel="noopener">🏛 架构规范</a>
-    <a class="ph-more" id="btnPalantirDoc" href="/docs?doc=palantir" target="_self" rel="noopener">📖 Palantir 对比</a>
+    <button class="c" id="btnAgent" onclick="toggleAgentDrawer()">🤖 智能助手</button>
+    <a class="ph-more" id="btnDocs" href="/docs" target="_self" rel="noopener">文档</a>
   </div>
 </header>
 <nav class="pillarnav" id="pillarTabs">
   <button class="pillar-tab on" id="tab-ontology" onclick="switchPillar('ontology')">📐 Model · 领域模型</button>
   <button class="pillar-tab" id="tab-runtime" onclick="switchPillar('runtime')">⚙️ Runtime · 算力与治理宿体</button>
-  <button class="pillar-tab" id="tab-instance" onclick="switchPillar('instance')">🌍 World · 业务世界</button>
-  <button class="pillar-tab" id="tab-device" onclick="switchPillar('device')">🔌 Device · 外部世界(符号+联结)</button>
+  <button class="pillar-tab" id="tab-instance" onclick="switchPillar('instance')">🌍 World · 世界状态</button>
+  <button class="pillar-tab" id="tab-device" onclick="switchPillar('device')">🔌 Device · 外部工具与设备</button>
 </nav>
 <main>
   <aside class="side" id="side">
@@ -1060,12 +1379,12 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
       <div class="list" id="ontologies"></div>
     </section>
     <section class="panel" id="instancesPanel" style="flex:1" hidden>
-      <div class="ph"><span><i>▍</i>🌍 运行实例列表</span><small>RUNTIME INSTANCES</small></div>
+      <div class="ph"><span><i>▍</i>🌍 世界状态列表</span><small>WORLD STATES</small></div>
       <div class="list" id="instances"></div>
       <div style="padding:8px 10px;border-top:1px dashed var(--line)">
-        <button class="v w" onclick="forkInstance()">＋ 克隆沙盘（Fork 当前实例）</button>
+        <button class="v w" onclick="forkInstance()">＋ 克隆沙盘（Fork 当前世界状态）</button>
         <label class="hint" style="display:flex;gap:6px;align-items:center;margin-top:7px">
-          <input type="checkbox" id="filterToggle" onchange="renderLists()"> 仅显示当前蓝图的实例
+          <input type="checkbox" id="filterToggle" onchange="renderLists()"> 仅显示当前蓝图的世界状态
         </label>
       </div>
     </section>
@@ -1073,12 +1392,31 @@ td b{color:#dbe7f5;font-family:"SF Mono",Menlo,monospace;font-size:10.4px}
   <section class="stage" id="stage"></section>
 </main>
 </div>
+<aside class="agent-drawer" id="agentDrawer" hidden>
+  <div class="ph">
+    <span><i>▍</i>🤖 AIP 智能助手</span>
+    <span style="display:flex;gap:6px;align-items:center">
+      <button id="agentScopeBtn" class="v" onclick="toggleAgentScope()">🛠 平台管理员</button>
+      <button onclick="clearAgentChat()">清空</button>
+      <button onclick="toggleAgentDrawer()">✕</button>
+    </span>
+  </div>
+  <div class="agent-ctx" id="agentCtx">等待选择世界状态…</div>
+  <div class="agent-msgs" id="agentMessages">
+    <div class="amsg bot">你好！我是 AIP 智能助手。可以让我查询对象列表、打开动作表单、查看待审批记录，或基于当前视图协同推演。</div>
+  </div>
+  <div class="agent-foot">
+    <input type="text" id="agentInput" placeholder="输入指令，例如：查询对象 / 打开表单 / 待审批…" onkeydown="if(event.key==='Enter')sendAgentMessage()">
+    <button class="g" onclick="sendAgentMessage()">发送</button>
+  </div>
+</aside>
 <div class="toast" id="toast"></div>
 <script>
 __UI_BUNDLE__
 __TOPOLOGY_JS__
-const S = {catalog:null, ont:null, inst:null, meta:null, objects:{}, type:null,
-           ontoDetail:{}, mcts:null, result:null, pillar:'ontology'};
+const S = {catalog:null, ont:null, inst:null, meta:null, objects:{}, links:[], fp:null, health:null, healthOpen:false, type:null,
+           ontoDetail:{}, mcts:null, result:null, simPreview:null, simSteps:[], simSessionId:null,
+           simulations:[], simOnlyBugs:false, stateTab:'real', pillar:'ontology'};
 const $ = (id) => document.getElementById(id);
 const role = () => $('role').value;
 function setRole(value) {
@@ -1137,18 +1475,7 @@ async function api(path, body) {
 }
 
 function chips() {
-  const c = S.catalog;
-  const parts = [
-    ['领域模型', c.ontologies.length],
-    ['工作空间', c.instances.length],
-    ['Runtime 宿体', (c.runtimes || []).length],
-    ['外部设备', ((c.devices && c.devices.symbolic) || []).length +
-      ((c.devices && c.devices.connectionist) || []).length],
-    ['对象总数', c.instances.reduce((n, i) => n + i.counts.objects, 0)],
-    ['动作执行记录', c.instances.reduce((n, i) => n + i.counts.runs, 0)]
-  ];
-  $('chips').innerHTML = parts.map(([k, n]) =>
-    '<span class="chip">' + k + ' <b>' + n + '</b></span>').join('');
+  if ($('chips')) $('chips').innerHTML = '';
 }
 
 /* ------------------------- 四标签页（四大原语） ------------------------- */
@@ -1192,7 +1519,7 @@ async function switchPillar(name) {
       const first = S.catalog.instances.find(i => !S.ont || i.ontology_id === S.ont.ontology_id) ||
         S.catalog.instances[0];
       if (first) await selectInstance(first.instance_id);
-      else $('stage').innerHTML = '<div class="hint">暂无运行实例。</div>';
+      else $('stage').innerHTML = '<div class="hint">暂无世界状态。</div>';
     }
   } catch (e) { toast('切换失败：' + e.message, true); }
 }
@@ -1207,9 +1534,9 @@ function renderLists() {
     '<h4>' + esc(zh('ontologies', o.ontology_id, o.name)) + '<em>' + esc(zh('categories', o.category, o.category)) + '</em></h4>' +
     '<div class="sub">' + esc(o.description || '') + '</div>' +
     '<div class="badges"><span class="badge c">' + o.counts.object_types + ' 对象类型</span>' +
-    '<span class="badge">' + o.counts.link_types + ' 关系类型</span>' +
+    '<span class="badge">' + o.counts.object_properties + ' 对象属性</span>' +
     '<span class="badge a">' + o.counts.actions + ' 业务动作</span>' +
-    '<span class="badge v">' + o.counts.instances + ' 运行实例</span></div></div>').join('');
+    '<span class="badge v">' + o.counts.instances + ' 世界状态</span></div></div>').join('');
 
   $('instances').innerHTML = instances.map(i => {
     const conns = (i.connectors || []).map(c =>
@@ -1225,7 +1552,7 @@ function renderLists() {
       '<span class="badge">' + i.counts.runs + ' 执行记录</span>' +
       (i.supports_mcts ? '<span class="badge c">多步推演</span>' : '') +
       (i.supports_unplug ? '<span class="badge a">可断开外部系统</span>' : '') + conns + '</div></div>';
-  }).join('') || '<div class="hint">该蓝图暂无运行实例。</div>';
+  }).join('') || '<div class="hint">该蓝图暂无世界状态。</div>';
 }
 
 async function selectOntology(id) {
@@ -1233,7 +1560,7 @@ async function selectOntology(id) {
   S.inst = null;
   S.meta = null;
   setPillar('ontology');
-  // 默认展示全部实例；勾选「仅显示当前蓝图的实例」时才按 S.ont 过滤。
+  // 默认展示全部实例；勾选「仅显示当前蓝图的世界状态」时才按 S.ont 过滤。
   renderLists();
   if (!S.ont) return;
   syncRoleOptions(S.ont.roles || []);
@@ -1250,8 +1577,13 @@ async function selectInstance(id) {
   S.ont = S.catalog.ontologies.find(o => o.ontology_id === summary.ontology_id) || null;
   S.meta = null;
   S.objects = {};
+  S.links = [];
+  S.fp = null;
   S.type = null;
   S.mcts = null;
+  S.simPreview = null;
+  S.simSteps = [];
+  S.stateTab = 'real';
   setPillar('instance');
   syncRoleOptions((S.ont && S.ont.roles) || [], summary.default_actor_role);
   renderLists();
@@ -1260,7 +1592,12 @@ async function selectInstance(id) {
 
 async function loadAll() {
   try {
-    S.catalog = await api('/api/catalog');
+    const [cat, adp] = await Promise.all([
+      api('/api/catalog'),
+      api('/api/adapters').catch(() => ({ adapters: [] })),
+    ]);
+    S.catalog = cat;
+    S.adapters = (adp && adp.adapters) || [];
     chips();
     if (S.inst) {
       const fresh = S.catalog.instances.find(i => i.instance_id === S.inst.instance_id);
@@ -1275,7 +1612,7 @@ async function loadAll() {
       const first = S.catalog.instances.find(i => !S.ont || i.ontology_id === S.ont.ontology_id) ||
         S.catalog.instances[0];
       if (first) await selectInstance(first.instance_id);
-      else $('stage').innerHTML = '<div class="hint">暂无运行实例。</div>';
+      else $('stage').innerHTML = '<div class="hint">暂无世界状态。</div>';
       return;
     }
     if (S.ont) await selectOntology(S.ont.ontology_id);
@@ -1295,6 +1632,11 @@ function renderOntologyView(detail) {
     const rows = t.fields.map(f => {
       const tags = [];
       if (f.name === t.primary_key) tags.push('<span class="badge c">主键</span>');
+      if (f.auto_generated) tags.push('<span class="badge">系统生成</span>');
+      if (f.property_kind === 'object' && f.range) {
+        tags.push('<span class="badge c">对象属性 → ' + esc(zhObject(f.range)) +
+          (f.multiple ? '[]' : '') + '</span>');
+      }
       if (f.owned) tags.push('<span class="badge a">本体自有</span>');
       if (f.masked) tags.push('<span class="badge r">🔒 仅可见：' + esc((f.masked_roles||[]).map(zhRole).join(' / ')) + '</span>');
       return '<tr><td><b>' + esc(zhField(t.name, f.name)) + '</b> <span class="en">' + esc(f.name) +
@@ -1302,14 +1644,16 @@ function renderOntologyView(detail) {
     }).join('');
     return '<div class="sect">📦 ' + esc(zhObject(t.name)) + ' <span class="badge ' + (t.owned ? 'a' : '') + '">' +
       (t.owned ? '本体自有' : '来自外部数据源') + '</span> <span class="en">' + esc(t.name) + '</span></div>' +
-      '<table><tr><th>字段</th><th>类型</th><th>主键 / 主权 / 可见范围</th></tr>' + rows + '</table>';
+      '<table><tr><th>字段</th><th>类型</th><th>属性语义 / 主键 / 主权 / 可见范围</th></tr>' + rows + '</table>';
   }).join('');
 
-  const links = m.link_types.map(l =>
-    '<div class="kv" style="margin:5px 0"><b>' + esc(zh('links', l.name, l.name)) + '</b><span>' +
-    esc(zhObject(l.source)) + ' → ' + esc(zhObject(l.target)) + '</span><span class="badge">' +
+  const links = (m.object_properties || []).map(l =>
+    '<div class="kv" style="margin:5px 0"><b>' + esc(zh('object_properties', l.name, '') || zh('links', l.name, l.name)) + '</b><span>' +
+    esc(zhObject(l.domain)) + ' → ' + esc(zhObject(l.range)) + '</span><span class="badge">' +
     esc(zhCardinality(l.cardinality)) + '</span><span class="badge ' + (l.owned ? 'a' : '') + '">' +
-    (l.owned ? '本体自有' : '来自外部数据源') + '</span><span class="en">' + esc(l.name) + '</span></div>').join('') ||
+    (l.owned ? '本体自有' : '来自外部数据源') + '</span>' +
+    (l.field ? '<span class="badge c">字段：' + esc(l.field) + '</span>' : '') +
+    '<span class="en">' + esc(l.name) + '</span></div>').join('') ||
     '<div class="hint">无。</div>';
 
   const funcs = m.functions.map(f => '<div class="kv" style="margin:5px 0"><b>' + esc(zh('functions', f.name, f.name)) +
@@ -1327,8 +1671,20 @@ function renderOntologyView(detail) {
       '<div class="sub hint">' + esc(a.description) + '</div>' +
       '<div class="badges">' + fields + '</div>' +
       '<div class="badges"><span class="badge c">可执行角色 ' + esc((a.allowed_roles||[]).map(zhRole).join(' / ')) + '</span>' +
+      (a.visibility === 'private' ? '<span class="badge a">🔒 私有 · 仅内部触发</span>' : '') +
       '<span class="badge a">审批角色 ' + esc((a.approver_roles||[]).map(zhRole).join(' / ') || '无需审批') + '</span>' +
       '<span class="badge">' + (a.affects_source ? '来自外部数据源' : '本体自有') + '</span></div></div>';
+  }).join('') || '<div class="hint">无。</div>';
+
+  const roleCards = (m.role_defs || []).map(r => {
+    const allowed = (r.allowed_actions || []).map(a => '<span class="badge c">' + esc(zhAction(a)) + '</span>').join(' ');
+    const approvers = (r.approver_actions || []).map(a => '<span class="badge a">审批：' + esc(zhAction(a)) + '</span>').join(' ');
+    const masked = (r.masked_fields || []).map(f => '<span class="badge r">🔒 ' + esc(f) + '</span>').join(' ');
+    return '<div class="obj"><h4>🎭 ' + esc(zhRole(r.name)) + ' <span class="en">' + esc(r.name) + '</span>' +
+      (r.declared ? ' <span class="badge v">显式 RoleDef</span>' : ' <span class="badge">动作推断</span>') + '</h4>' +
+      (r.description ? '<div class="sub hint">' + esc(r.description) + '</div>' : '') +
+      '<div class="badges">' + (allowed || '<span class="hint">无可执行动作</span>') +
+      (approvers ? ' ' + approvers : '') + (masked ? ' ' + masked : '') + '</div></div>';
   }).join('') || '<div class="hint">无。</div>';
 
   $('stage').innerHTML =
@@ -1338,13 +1694,14 @@ function renderOntologyView(detail) {
     '<p>' + esc(o.description) + '</p><div class="acts">' +
     '<span class="badge v">TBox · 结构声明</span>' +
     '<span class="badge a">Behavior · 受控行为</span>' +
-    (first ? '<button class="g" onclick="selectInstance(\'' + first.instance_id + '\')">🚀 进入该模型的首个工作空间</button>' : '') +
+    (first ? '<button class="g" onclick="selectInstance(\'' + first.instance_id + '\')">🚀 进入该模型的首个世界状态</button>' : '') +
     '<span class="badge">' + m.counts.object_types + ' 对象类型</span>' +
     '<span class="badge">' + m.counts.interfaces + ' 共享接口</span>' +
-    '<span class="badge">' + m.counts.link_types + ' 关系类型</span>' +
+    '<span class="badge">' + m.counts.object_properties + ' 对象属性</span>' +
     '<span class="badge">' + m.counts.functions + ' 查询与计算</span>' +
     '<span class="badge">' + m.counts.actions + ' 业务动作</span>' +
-    '<span class="badge">' + m.counts.automations + ' 自动化规则</span></div></div>' +
+    '<span class="badge">' + m.counts.automations + ' 自动化规则</span>' +
+    '<span class="badge">' + (m.counts.roles || (m.role_defs || []).length) + ' 角色</span></div></div>' +
     '<div class="grid2"><section class="panel"><div class="ph">' +
     '<a class="ph-link" href="' + topoHref + '" target="_blank" rel="noopener" tabindex="0" ' +
     'title="在新标签页打开可缩放的本体关系图"><i>▍</i>本体关系图<small>TBOX · TOPOLOGY</small></a>' +
@@ -1353,10 +1710,12 @@ function renderOntologyView(detail) {
     'title="在新标签页打开可缩放的本体关系图">' + svg + '</a></div></section>' +
     '<section class="panel flat"><div class="ph"><span><i>▍</i>📦 对象类型与共享接口</span><small>TBOX · SCHEMA</small></div>' +
     '<div class="body"><div class="sect">TBox · 结构声明</div>' + objects + '</div></section></div>' +
-    '<div class="grid2b"><section class="panel flat"><div class="ph"><span><i>▍</i>🔗 关系类型</span><small>TBOX · RELATIONS</small></div>' +
+    '<div class="grid2b"><section class="panel flat"><div class="ph"><span><i>▍</i>🔗 对象属性关系</span><small>TBOX · OBJECT PROPERTIES</small></div>' +
     '<div class="body">' + links + '</div></section>' +
     '<section class="panel flat"><div class="ph"><span><i>▍</i>🧮 查询与计算 / ⚡ 自动化规则</span><small>BEHAVIOR · FUNCTIONS &amp; AUTOMATIONS</small></div>' +
     '<div class="body"><div class="sect">Behavior · 查询与计算</div>' + funcs + '<div class="sect">Behavior · 自动化规则</div>' + autos + '</div></section></div>' +
+    '<section class="panel flat"><div class="ph"><span><i>▍</i>🎭 模型角色与授权</span><small>BEHAVIOR · ROLES &amp; AUTHORIZATION</small></div>' +
+    '<div class="body">' + roleCards + '</div></section>' +
     '<section class="panel flat"><div class="ph"><span><i>▍</i>🎯 业务动作</span><small>BEHAVIOR · GOVERNED ACTIONS</small></div>' +
     '<div class="body"><div class="sect">Behavior · 受控行为</div>' + actions + '</div></section>';
 }
@@ -1383,8 +1742,18 @@ async function loadInstanceData() {
     const fp = await api('/api/fingerprint');
     const runs = (await api('/api/action-runs')).runs;
     const links = (await api('/api/links')).links;
+    const simsRes = await api('/api/simulations').catch(() => ({simulations: []}));
+    const health = await api('/api/world-health').catch(() => null);
+    S.fp = fp;
+    S.links = links || [];
+    S.simulations = simsRes.simulations || [];
+    S.health = health;
+    S.healthOpen = false;
+    S.simPreview = null;
+    S.simSteps = [];
+    S.simSessionId = null;
     renderInstanceView(meta, fp, runs, links);
-  } catch (e) { toast('实例加载失败：' + e.message, true); }
+  } catch (e) { toast('世界状态加载失败：' + e.message, true); }
 }
 
 function connectorChips(conns) {
@@ -1393,38 +1762,79 @@ function connectorChips(conns) {
     '（' + esc(zhStatus(c.status)) + '）</span>').join('') || '<span class="badge">无外部连接器</span>';
 }
 
-function renderInstanceView(meta, fp, runs, links) {
-  const i = S.inst;
-  const objectTabs = meta.object_types.map(t =>
-    '<span class="tab' + (t.name === S.type ? ' on' : '') + '" data-name="' + esc(t.name) +
-    '" onclick="pickType(\'' + t.name + '\')">' +
-    esc(zhObject(t.name)) + ' <b style="color:#7f93ab">' + ((S.objects[t.name] || []).length) + '</b></span>').join('');
-  const ifaceTabs = meta.interfaces.map(f =>
+function renderStateTabs() {
+  const box = $('stateTabs');
+  if (!box) return;
+  const objChanges = mergeObjectChanges((S.simPreview && S.simPreview.diff && S.simPreview.diff.object_changes) || []);
+  const linkChanges = mergeLinkChanges((S.simPreview && S.simPreview.diff && S.simPreview.diff.link_changes) || []);
+  const total = objChanges.length + linkChanges.length;
+  const simBadge = S.simPreview
+    ? ' <span class="badge v" style="padding:0 5px;font-size:9px">' + (total ? total + ' 项变更' : '无变更') + '</span>'
+    : '';
+  box.innerHTML =
+    '<span class="state-tab' + (S.stateTab === 'real' ? ' on' : '') + '" data-state-tab="real" onclick="pickStateTab(\'real\')">🌍 当前业务状态</span>' +
+    '<span class="state-tab' + (S.stateTab === 'sim' ? ' on' : '') + '" data-state-tab="sim" onclick="pickStateTab(\'sim\')">🧪 沙盘推演状态' + simBadge + '</span>';
+}
+
+function pickStateTab(tab) {
+  S.stateTab = (tab === 'sim') ? 'sim' : 'real';
+  renderStateTabs();
+  renderObjectTabs();
+  renderObjects();
+  renderLinks(S.links);
+  refreshParamOptions();
+}
+
+function renderObjectTabs() {
+  const box = $('objectTabs');
+  if (!box || !S.meta) return;
+  const changes = mergeObjectChanges((S.simPreview && S.simPreview.diff && S.simPreview.diff.object_changes) || []);
+  const countByType = {};
+  changes.forEach(c => { countByType[c.object_type] = (countByType[c.object_type] || 0) + 1; });
+  const objectTabs = S.meta.object_types.map(t => {
+    const cnt = countByType[t.name] || 0;
+    const simBadge = (S.stateTab === 'sim' && cnt) ? ' <span class="badge v" style="padding:0 5px;font-size:9px">沙盘 ' + cnt + '</span>' : '';
+    return '<span class="tab' + (t.name === S.type ? ' on' : '') + '" data-name="' + esc(t.name) +
+      '" onclick="pickType(\'' + t.name + '\')">' +
+      esc(zhObject(t.name)) + ' <b style="color:#7f93ab">' + ((S.objects[t.name] || []).length) + '</b>' + simBadge + '</span>';
+  }).join('');
+  const ifaceTabs = S.meta.interfaces.map(f =>
     '<span class="tab" data-name="' + esc(f.name) + '" onclick="pickInterface(\'' + f.name + '\')">◇ ' +
     esc(zh('interfaces', f.name, f.name)) + '</span>').join('');
+  box.innerHTML = objectTabs + ifaceTabs;
+}
+
+function renderInstanceView(meta, fp, runs, links) {
+  const i = S.inst;
 
   $('stage').innerHTML =
-    '<div class="hero"><h2>🌍 ' + esc(i.label) + ' <span class="badge c">World · 业务世界</span>' +
+    '<div class="hero"><h2>🌍 ' + esc(i.label) + ' <span class="badge c">World · 世界状态</span>' +
     ' <span class="badge">' + esc(zh('ontologies', i.ontology_id, i.ontology_name)) + '</span></h2>' +
     '<p>' + esc(i.description || '') + ' · <b style="color:#a5e4ff">数据源 ' + esc(i.db_uri) + '</b></p>' +
     '<div class="acts"><span class="badge v" id="formula" title="World = Model + Runtime">🧬 认知降维：' +
-    esc(i.formula || '') + '</span><span class="badge">ABox · 事实状态</span>' + connectorChips(i.connectors) + '</div></div>' +
-    '<section class="panel"><div class="mount"><b>实例环境与后台挂载栏</b>' +
-    '<span class="badge">' + esc(i.instance_id) + '</span><span class="sp"></span>' +
+    esc(i.formula || '') + '</span><span class="badge">ABox · 事实状态</span>' +
+    '<a class="badge c" style="text-decoration:none" href="/api/worlds/' + encodeURIComponent(i.instance_id) + '/openapi.json" target="_blank" rel="noopener">📡 OpenAPI 3.1</a>' +
+    connectorChips(i.connectors) + '</div></div>' +
+    '<section class="panel"><div class="mount"><b>世界状态环境与后台挂载栏</b>' +
+    '<span class="badge">' + esc(i.instance_id) + '</span>' +
+    '<span id="worldHealthBadge"></span><span class="sp"></span>' +
     '<small style="color:#8ea3bd;font-size:9.5px;letter-spacing:1px">当前状态指纹</small>' +
     '<div class="fp" id="fp"></div>' +
     '<button class="v" onclick="runAutomations()">🔄 触发自动化规则</button>' +
     '<button class="v" onclick="forkInstance()">🍴 克隆沙盘</button>' +
     (i.supports_unplug ? '<button class="r" onclick="unplug()">🔌 断开外部系统</button>' : '') +
-    '</div></section>' +
-    '<div class="grid2"><section class="panel"><div class="ph"><span><i>▍</i>🌍 当前业务状态 · ABox 事实</span><small>ABOX · WORLD STATE</small></div>' +
-    '<div class="tabs">' + objectTabs + ifaceTabs + '</div><div class="body" id="objects"></div></section>' +
+    '</div>' +
+    '<div id="worldHealthPanel" hidden style="padding:9px 12px;border-top:1px dashed var(--line);background:rgba(8,15,26,.88);font-size:11px"></div>' +
+    '</section>' +
+    '<div class="grid2"><section class="panel"><div class="ph"><span><i>▍</i>🌍 世界状态 · ABox 事实</span><small>ABOX · WORLD STATE</small></div>' +
+    '<div class="state-tabs" id="stateTabs" style="background:rgba(167,139,250,.06);border-bottom:1px solid var(--line)"></div>' +
+    '<div class="tabs" id="objectTabs"></div><div class="body" id="objects"></div></section>' +
     '<section class="panel"><div class="ph"><span><i>▍</i>🎯 业务动作与沙盘推演台</span><small>GOVERNED ACTION</small></div>' +
     '<div class="body"><div class="row"><select id="action" onchange="fillParams()"></select>' +
     '<span class="badge" id="actmeta"></span></div><div id="form" class="row"></div>' +
     '<div class="row"><button id="simBtn" onclick="simulate()">🔍 沙盘预演</button>' +
     (i.supports_mcts ? '<button class="v" onclick="runMcts()">🌳 多步智能推演</button>' : '') +
-    '<button class="g" id="submitBtn" onclick="submitAction()">⚡ 正式执行</button></div>' +
+    '</div>' +
     '<pre id="result" class="hint">沙盘预演或正式执行后，这里显示对象变更 / 错误码。</pre>' +
     '<div id="mcts" class="hint" style="margin-top:8px"></div>' +
     '<div class="hint" style="margin-top:8px">⚡ 自动化规则按（规则、对象、版本）去重执行。</div>' +
@@ -1432,15 +1842,22 @@ function renderInstanceView(meta, fp, runs, links) {
     '<div class="grid2b"><section class="panel"><div class="ph"><span><i>▍</i>🔗 语义关系与 🧮 查询计算</span><small>SEMANTIC EDGES</small></div>' +
     '<div class="body" id="links"></div></section>' +
     '<section class="panel"><div class="ph"><span><i>▍</i>📋 动作执行记录</span><small>ACTION RUNS</small></div>' +
-    '<div class="body" id="runs"></div></section></div>';
+    '<div class="body" id="runs"></div></section></div>' +
+    '<section class="panel"><div class="ph"><span><i>▍</i>🧪 沙盘推演日志（本体 Bug 诊断库）</span><small>SIMULATION LEDGER · DB PERSISTED</small></div>' +
+    '<div class="body" id="simulations"></div></section>';
 
   const sel = $('action');
-  sel.innerHTML = meta.actions.map(a => '<option value="' + a.name + '">' + esc(zhAction(a.name)) + '</option>').join('');
-  if (S.lastAction && meta.actions.some(a => a.name === S.lastAction)) sel.value = S.lastAction;
+  const publicActions = (meta.actions || []).filter(a => a.visibility !== 'private');
+  sel.innerHTML = publicActions.map(a => '<option value="' + a.name + '">' + esc(zhAction(a.name)) + '</option>').join('');
+  if (S.lastAction && publicActions.some(a => a.name === S.lastAction)) sel.value = S.lastAction;
+  renderStateTabs();
+  renderObjectTabs();
   renderFingerprint(fp);
+  renderWorldHealth();
   renderObjects();
   renderLinks(links);
   renderRuns(runs);
+  renderSimulations();
   fillParams();
 }
 
@@ -1472,14 +1889,60 @@ function renderRuntimeView() {
       '</div></section>';
   }).join('') || '<div class="hint">暂无 Runtime 宿体。</div>';
 
+  const adaptersList = S.adapters || [];
+  const adapterCards = adaptersList.map(a => {
+    const running = a.status === 'RUNNING';
+    const nextStatus = running ? 'PAUSED' : 'RUNNING';
+    const mappingEntries = Object.entries(a.field_mapping || {});
+    const mappingHtml = mappingEntries.length
+      ? mappingEntries.map(([k, v]) => '<span class="badge c">' + esc(k) + ' → ' + esc(v) + '</span>').join('')
+      : '<span class="badge">同名透传</span>';
+    return '<section class="card"><div class="card-h"><h3>' + esc(a.id) + '</h3>' +
+      '<span class="badge ' + (running ? 'g' : 'a') + '">' + esc(a.status) + '</span></div>' +
+      '<div class="card-b">' +
+      '<div class="kv"><span>源设备 <b>' + esc(a.device_id) + '</b></span>' +
+      '<span>目标世界 <b>' + esc(a.world_id) + '</b></span>' +
+      '<span>对象类型 <b>' + esc(a.object_type) + '</b></span>' +
+      '<span>接口路径 <b>' + esc(a.data_path) + '</b></span>' +
+      '<span>轮询周期 <b>' + (a.interval_sec > 0 ? esc(a.interval_sec + 's') : '仅手动') + '</b></span>' +
+      '<span>累计同步 <b>' + esc(String(a.sync_count || 0)) + ' 次</b></span>' +
+      '<span>最近同步 <b>' + esc(a.last_sync_at || '尚未同步') + '</b></span></div>' +
+      (a.sync_error ? '<div style="margin-top:8px;color:var(--red);font-size:12px">最近错误：' + esc(a.sync_error) + '</div>' : '') +
+      '<div class="sect">Webhook 接收地址</div><div style="font-size:11px;color:var(--muted);word-break:break-all"><code>' + esc(location.origin + '/api/adapter/webhook?adapter_id=' + encodeURIComponent(a.id)) + '</code></div>' +
+      '<div class="sect">字段映射 (field_mapping)</div><div class="badges">' + mappingHtml + '</div>' +
+      '<div style="display:flex;gap:8px;margin-top:12px">' +
+      '<button class="btn primary" onclick="syncAdapterOnce(\'' + esc(a.id) + '\')">▶ 立即同步</button>' +
+      '<button class="btn" onclick="toggleAdapterState(\'' + esc(a.id) + '\',\'' + nextStatus + '\')">' + (running ? '⏸ 暂停' : '▶ 恢复') + '</button>' +
+      '</div></div></section>';
+  }).join('');
+
   $('stage').innerHTML = '<div class="hero"><h2>⚙️ Runtime · 算力与治理宿体</h2>' +
     '<p>Runtime = Core 微内核 + Aspect 系统调用切面 + DeviceAdapter 设备驱动。' +
-    '同一套微内核在不同宿体上执行领域模型定义，隔离承载各工作空间的 ABox 事实与审计历史。</p>' +
+    '同一套微内核在不同宿体上执行领域模型定义，隔离承载各世界状态的 ABox 事实与审计历史。</p>' +
     '<div class="acts"><span class="badge c">' + list.length + ' 台宿体</span>' +
     '<span class="badge v">' + list.reduce((n, r) => n + (r.aspects || []).length, 0) +
     ' 个切面挂载</span><span class="badge a">' +
-    list.reduce((n, r) => n + (r.adapters || []).length, 0) + ' 个设备驱动</span></div></div>' +
-    '<div class="grid2">' + cards + '</div>';
+    adaptersList.length + ' 个活动适配器</span></div></div>' +
+    '<div class="grid2">' + cards + '</div>' +
+    '<div class="hero" style="margin-top:18px"><h2>🔌 DeviceAdapter · 轻量级设备适配器</h2>' +
+    '<p>替代重型 ESB 的轻量级拉取-映射-写入管道，支持异构字段映射（field_mapping）与周期轮询。</p></div>' +
+    (adapterCards ? '<div class="grid2">' + adapterCards + '</div>' : '<div class="hint">暂无已注册设备适配器，可让平台管理员智能体创建（create_adapter）。</div>');
+}
+
+async function syncAdapterOnce(adapterId) {
+  try {
+    const res = await api('/api/adapter/sync', { method: 'POST', body: JSON.stringify({ adapter_id: adapterId }) });
+    toast('适配器 ' + adapterId + ' 已同步 ' + res.row_count + ' 条记录');
+    await loadAll();
+  } catch (e) { toast('同步失败：' + e.message, true); }
+}
+
+async function toggleAdapterState(adapterId, status) {
+  try {
+    await api('/api/adapter/toggle', { method: 'POST', body: JSON.stringify({ adapter_id: adapterId, status }) });
+    toast('适配器 ' + adapterId + ' 状态已切换为 ' + status);
+    await loadAll();
+  } catch (e) { toast('切换失败：' + e.message, true); }
 }
 
 /* ------------------------- Device 外部世界视图 ------------------------- */
@@ -1495,37 +1958,149 @@ function deviceCard(d, schema) {
 function renderDeviceView() {
   const devices = (S.catalog && S.catalog.devices) || {};
   const symbolic = (devices.symbolic || []).map(d => deviceCard(d, d.openapi_schema));
-  const connectionist = (devices.connectionist || []).map(d => deviceCard(d, d.agent_card));
-  $('stage').innerHTML = '<div class="hero"><h2>🔌 Device · 外部世界(符号+联结)</h2>' +
-    '<p>外部世界是高维混沌的：符号主义设备以 OpenAPI 契约暴露结构化接口，' +
-    '联结主义设备以 A2A Agent Card 声明能力、角色与产出契约。' +
-    'Instance 通过 Runtime 的设备驱动把它们认知降维成受约束的对象图。</p>' +
-    '<div class="acts"><span class="badge c">符号主义 ' + symbolic.length + ' 台</span>' +
-    '<span class="badge v">联结主义 ' + connectionist.length + ' 台</span></div></div>' +
-    '<div class="devcols">' +
-    '<section class="panel flat"><div class="ph"><span><i>▍</i>🔗 符号主义设备 · OpenAPI Schema</span>' +
-    '<small>SYMBOLIC DEVICES</small></div><div class="body" id="symbolicDevices">' +
-    (symbolic.join('') || '<div class="hint">暂无符号主义设备。</div>') + '</div></section>' +
-    '<section class="panel flat"><div class="ph"><span><i>▍</i>🤝 联结主义设备 · A2A Agent Card</span>' +
-    '<small>CONNECTIONIST DEVICES</small></div><div class="body" id="connectionistDevices">' +
-    (connectionist.join('') || '<div class="hint">暂无联结主义设备。</div>') + '</div></section>' +
-    '</div>';
+  $('stage').innerHTML = '<div class="hero"><h2>🔌 Device · 外部工具与设备</h2>' +
+    '<p>外部工具与数据源通过 OpenAPI 契约登记，World 通过 Runtime 的设备驱动将其同步为受约束的对象图；' +
+    '外部 Agent 则直接持有 Actor 身份通过 OSDK / ActionDef 与世界模型交互。</p>' +
+    '<div class="acts"><span class="badge c">OpenAPI 设备 ' + symbolic.length + ' 台</span></div></div>' +
+    '<section class="panel flat"><div class="ph"><span><i>▍</i>🔗 外部工具与设备 · OpenAPI Schema</span>' +
+    '<small>EXTERNAL DEVICES</small></div><div class="body" id="symbolicDevices">' +
+    (symbolic.join('') || '<div class="hint">暂无外部设备。</div>') + '</div></section>';
 }
 
 function renderFingerprint(fp) {
   const box = $('fp');
-  if (!box) return;
-  box.innerHTML = '<span>对象 <b style="color:#dbe7f5">' + fp.objects + '</b></span>' +
-    '<span>关系 <b style="color:#dbe7f5">' + fp.links + '</b></span>' +
+  if (!box || !fp) return;
+  const objChanges = mergeObjectChanges((S.simPreview && S.simPreview.diff && S.simPreview.diff.object_changes) || []);
+  const linkChanges = mergeLinkChanges((S.simPreview && S.simPreview.diff && S.simPreview.diff.link_changes) || []);
+  let objDelta = 0, objUpdates = 0, linkDelta = 0, linkCreates = 0;
+  objChanges.forEach(c => {
+    if (c.kind === 'create') objDelta += 1;
+    else if (c.kind === 'delete') objDelta -= 1;
+    else objUpdates += 1;
+  });
+  linkChanges.forEach(c => {
+    if (c.kind === 'create') { linkDelta += 1; linkCreates += 1; }
+    else if (c.kind === 'delete') linkDelta -= 1;
+  });
+  const objParts = [];
+  if (objDelta !== 0) objParts.push(objDelta > 0 ? '+' + objDelta : String(objDelta));
+  if (objUpdates > 0) objParts.push('~' + objUpdates);
+  const objHint = objParts.length
+    ? ' <small style="color:#c4b5fd">(沙盘 ' + objParts.join(', ') + ')</small>'
+    : '';
+  const linkHint = linkDelta !== 0
+    ? ' <small style="color:#c4b5fd">(沙盘 ' + (linkDelta > 0 ? '+' + linkDelta : linkDelta) + ')</small>'
+    : (linkChanges.length ? ' <small style="color:#c4b5fd">(沙盘 ~' + linkCreates + ')</small>' : '');
+  box.innerHTML = '<span>对象 <b style="color:#dbe7f5">' + fp.objects + '</b>' + objHint + '</span>' +
+    '<span>关系 <b style="color:#dbe7f5">' + fp.links + '</b>' + linkHint + '</span>' +
     '<span>叠加层 <b style="color:#dbe7f5">' + fp.overlay + '</b></span>' +
     '<span>执行记录 <b style="color:#dbe7f5">' + fp.runs + '</b></span>';
 }
 
+function renderWorldHealth() {
+  const badgeBox = $('worldHealthBadge');
+  const panel = $('worldHealthPanel');
+  const h = S.health;
+  if (!badgeBox || !panel) return;
+  if (!h) {
+    badgeBox.innerHTML = '';
+    panel.hidden = true;
+    panel.innerHTML = '';
+    return;
+  }
+
+  const violations = h.violations || [];
+  const invariants = h.invariants || [];
+  if (h.healthy) {
+    const label = h.invariants_total > 0
+      ? ('🟢 自洽 (' + h.invariants_passed + '/' + h.invariants_total + ' 不变量)')
+      : '🟢 自洽 (Schema·引用完整)';
+    badgeBox.innerHTML =
+      '<span class="badge g" id="healthChip" role="button" tabindex="0" style="cursor:pointer" ' +
+      'onclick="toggleWorldHealth()" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();toggleWorldHealth();}" ' +
+      'title="点击查看世界状态自洽详情">' + esc(label) + '</span>';
+  } else {
+    badgeBox.innerHTML =
+      '<span class="badge r" id="healthChip" role="button" tabindex="0" style="cursor:pointer;font-weight:700" ' +
+      'onclick="toggleWorldHealth()" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();toggleWorldHealth();}" ' +
+      'title="点击展开状态违背诊断明细">' +
+      esc('🔴 ' + violations.length + ' 项状态违背 ' + (S.healthOpen ? '▴' : '▾')) + '</span>';
+  }
+
+  panel.hidden = !S.healthOpen;
+  if (!S.healthOpen) return;
+
+  const kindLabel = (k) => k === 'schema' ? 'Schema 漂移' : (k === 'reference' ? '悬空引用' : '不变量违背');
+  const summaryHtml =
+    '<div class="row" style="justify-content:space-between;margin-bottom:6px">' +
+    '<div class="kv"><span>已校验对象 <b>' + esc(String(h.objects_checked || 0)) + '</b></span>' +
+    '<span>语义关系 <b>' + esc(String(h.links_checked || 0)) + '</b></span>' +
+    '<span>不变量通过 <b>' + esc(String(h.invariants_passed || 0) + '/' + String(h.invariants_total || 0)) + '</b></span></div>' +
+    '<button id="recheckHealthBtn" onclick="recheckWorldHealth()">↻ 重新校验</button></div>';
+
+  const violationsHtml = violations.length
+    ? ('<div class="sect" style="color:#fecaca">违背明细（共 ' + violations.length + ' 项）</div>' +
+       violations.map(v =>
+         '<div class="obj" style="border-left-color:var(--rd);background:rgba(239,68,68,.07);margin-bottom:5px">' +
+         '<h4><span>' + esc(kindLabel(v.kind) + ' · ' + (v.subject || '')) + '</span>' +
+         '<span class="badge r">' + esc(v.code || '') + '</span></h4>' +
+         '<div class="hint" style="margin-top:3px;color:#fecaca">' + esc(v.message || '') + '</div></div>'
+       ).join(''))
+    : '';
+
+  const invariantsHtml = invariants.length
+    ? ('<div class="sect">全局状态不变量 (@spec.invariant)</div>' +
+       invariants.map(inv =>
+         '<div class="kv" style="margin:4px 0;align-items:center">' +
+         '<span class="badge ' + (inv.passed ? 'g' : 'r') + '">' + (inv.passed ? '🟢 通过' : '🔴 违背') + '</span>' +
+         '<b>' + esc(inv.name) + '</b>' +
+         '<span class="badge">' + esc(inv.code || '') + '</span>' +
+         '<span class="hint">' + esc(inv.error || inv.description || '') + '</span></div>'
+       ).join(''))
+    : (h.healthy
+        ? '<div class="hint">所有存量对象均满足当前 TBox Schema 与引用完整性约束（该模型未声明额外 @spec.invariant）。</div>'
+        : '');
+
+  panel.innerHTML = summaryHtml + violationsHtml + invariantsHtml;
+}
+
+function toggleWorldHealth() {
+  S.healthOpen = !S.healthOpen;
+  renderWorldHealth();
+}
+
+async function recheckWorldHealth() {
+  if (!S.inst) return;
+  try {
+    S.health = await api('/api/world-health');
+    S.healthOpen = true;
+    renderWorldHealth();
+    const n = (S.health.violations || []).length;
+    toast(
+      S.health.healthy ? '状态自洽巡检通过' : ('发现 ' + n + ' 项状态违背'),
+      !S.health.healthy
+    );
+  } catch (e) { toast('巡检失败：' + e.message, true); }
+}
+
+function clearSimPreview() {
+  S.simPreview = null;
+  S.simSteps = [];
+  S.simSessionId = null;
+  S.stateTab = 'real';
+  renderStateTabs();
+  renderFingerprint(S.fp);
+  renderObjectTabs();
+  renderObjects();
+  renderLinks(S.links);
+  refreshParamOptions();
+}
+
 function pickType(name) {
   S.type = name;
-  document.querySelectorAll('.tab').forEach(el => el.classList.remove('on'));
+  document.querySelectorAll('#objectTabs .tab').forEach(el => el.classList.remove('on'));
   renderObjects();
-  const target = document.querySelector('.tab[data-name="' + name + '"]');
+  const target = document.querySelector('#objectTabs .tab[data-name="' + name + '"]');
   if (target) target.classList.add('on');
   fillParams();
 }
@@ -1560,54 +2135,239 @@ async function pickInterface(name) {
     }).join('');
     $('objects').innerHTML = '<div class="hint" style="margin-bottom:7px">Interface 多态视图：' + esc(title) + '</div>' +
       (rows || '<div class="hint">该接口暂无对象。</div>');
-    document.querySelectorAll('.tab').forEach(el => el.classList.remove('on'));
-    const target = document.querySelector('.tab[data-name="' + name + '"]');
+    document.querySelectorAll('#objectTabs .tab').forEach(el => el.classList.remove('on'));
+    const target = document.querySelector('#objectTabs .tab[data-name="' + name + '"]');
     if (target) target.classList.add('on');
   } catch (e) { toast(e.message, true); }
+}
+
+function formatFieldVal(f, v) {
+  const isRoleMasked = f.masked && role() !== 'system' &&
+    !((f.masked_roles || []).indexOf(role()) >= 0);
+  const masked = isRoleMasked || v === '***MASKED***' || v === 'REDACTED';
+  const cls = masked ? 'masked' : (f.owned ? 'owned' : '');
+  let text = (v === null || v === undefined) ? '—'
+    : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+  if (masked) text = '不可见';
+  else text = zhValue(f.name, text);
+  return { masked, cls, text };
+}
+
+function canonicalJson(v) {
+  if (v === null || v === undefined || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']';
+  const keys = Object.keys(v).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(v[k])).join(',') + '}';
+}
+
+function sameJson(a, b) {
+  return canonicalJson(a) === canonicalJson(b);
+}
+
+function mergeObjectChanges(changes) {
+  const map = new Map();
+  (changes || []).forEach(c => {
+    const key = c.object_type + '|' + c.object_id;
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, Object.assign({}, c));
+      return;
+    }
+    if (prev.kind === 'create' && c.kind === 'update') {
+      prev.after = Object.assign({}, prev.after || {}, c.after || {});
+    } else if (prev.kind === 'create' && c.kind === 'delete') {
+      map.delete(key);
+    } else if (prev.kind === 'update' && c.kind === 'update') {
+      prev.after = Object.assign({}, prev.after || {}, c.after || {});
+      if (prev.before && sameJson(prev.before, prev.after)) map.delete(key);
+    } else if (prev.kind === 'update' && c.kind === 'delete') {
+      prev.kind = 'delete';
+      prev.after = null;
+    } else if (prev.kind === 'delete' && c.kind === 'create') {
+      const nextAfter = Object.assign({}, prev.before || {}, c.after || {});
+      if (prev.before && sameJson(prev.before, nextAfter)) {
+        map.delete(key);
+      } else {
+        prev.kind = 'update';
+        prev.after = nextAfter;
+      }
+    } else {
+      map.set(key, Object.assign({}, c));
+    }
+  });
+  return Array.from(map.values());
+}
+
+function linkChangeKey(l) {
+  return [l.link_type, l.source_type, l.source_id, l.target_type, l.target_id].join('|');
+}
+
+function mergeLinkChanges(changes) {
+  const map = new Map();
+  (changes || []).forEach(l => {
+    const key = linkChangeKey(l);
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, Object.assign({}, l));
+      return;
+    }
+    if ((prev.kind === 'create' && l.kind === 'delete') ||
+        (prev.kind === 'delete' && l.kind === 'create')) {
+      map.delete(key);
+    } else {
+      map.set(key, Object.assign({}, l));
+    }
+  });
+  return Array.from(map.values());
+}
+
+function effectiveObjects(typeName) {
+  const base = (S.objects && S.objects[typeName]) || [];
+  if (S.stateTab !== 'sim' || !S.simPreview) return base;
+  const types = (S.meta && S.meta.object_types) || [];
+  const typeMeta = types.find(t => t.name === typeName);
+  const pk = (typeMeta && typeMeta.primary_key) || 'id';
+  const changes = mergeObjectChanges(
+    (S.simPreview.diff && S.simPreview.diff.object_changes) || []
+  ).filter(c => c.object_type === typeName);
+  if (!changes.length) return base;
+  const byId = new Map();
+  changes.forEach(c => byId.set(String(c.object_id), c));
+  const out = [];
+  base.forEach(row => {
+    const id = String(row[pk]);
+    const ch = byId.get(id);
+    if (!ch) { out.push(row); return; }
+    if (ch.kind === 'delete') { byId.delete(id); return; }
+    out.push(ch.after ? Object.assign({}, row, ch.after, {_simKind: ch.kind}) : row);
+    byId.delete(id);
+  });
+  byId.forEach(ch => {
+    if (ch.kind !== 'delete' && ch.after) {
+      out.push(Object.assign({}, ch.after, {_simKind: ch.kind}));
+    }
+  });
+  return out;
 }
 
 function renderObjects() {
   const box = $('objects');
   if (!box) return;
+  const isSim = S.stateTab === 'sim';
+  if (isSim && !S.simPreview) {
+    box.innerHTML = '<div class="hint" style="padding:12px 4px">暂无沙盘推演结果。请在右侧点击「<b>🔍 沙盘预演</b>」或「<b>🌳 多步智能推演</b>」，推演后的预期状态将展示在此标签页中（主库零写入）。</div>';
+    return;
+  }
   const list = S.objects[S.type] || [];
   const typeMeta = S.meta.object_types.find(t => t.name === S.type) || {fields: []};
-  if (!list.length) { box.innerHTML = '<div class="hint">该类型暂无可见对象。</div>'; return; }
-  box.innerHTML = list.map((o, idx) => {
+  const allObjChanges = isSim ? mergeObjectChanges((S.simPreview && S.simPreview.diff && S.simPreview.diff.object_changes) || []) : [];
+  const allLinkChanges = isSim ? mergeLinkChanges((S.simPreview && S.simPreview.diff && S.simPreview.diff.link_changes) || []) : [];
+  const changeById = {};
+  const creates = [];
+  const otherTypes = {};
+  allObjChanges.forEach(c => {
+    if (c.object_type === S.type) {
+      if (c.kind === 'create') creates.push(c);
+      else changeById[String(c.object_id)] = c;
+    } else {
+      otherTypes[c.object_type] = (otherTypes[c.object_type] || 0) + 1;
+    }
+  });
+
+  let banner = '';
+  if (isSim && S.simPreview) {
+    const jumpBtns = Object.keys(otherTypes).map(t =>
+      '<button class="v" style="padding:2px 7px;font-size:10px" onclick="pickType(\'' + esc(t) + '\')">查看 ' +
+      esc(zhObject(t)) + ' (+' + otherTypes[t] + ')</button>').join('');
+    const stepInfo = S.simSteps.length > 1
+      ? '（已推演 ' + S.simSteps.length + ' 步 · 正式执行仅提交第 1 步，后续需基于新现实重演）'
+      : '';
+    const summaryText = (allObjChanges.length || allLinkChanges.length)
+      ? '「' + esc(zhAction(S.simPreview.action || '')) + '」推演后状态' + stepInfo
+      : '「' + esc(zhAction(S.simPreview.action || '')) + '」推演完成（无对象或关系变更）' + stepInfo;
+    const firstStep = S.simSteps[0];
+    const commitLabel = firstStep
+      ? '⚡ 正式执行第 1 步（' + esc(zhAction(firstStep.action)) + '）'
+      : '⚡ 正式执行第 1 步';
+    banner = '<div class="sim-banner"><span>🧪 <b>沙盘推演状态</b>（主库未写入 · ' + summaryText + '）</span>' +
+      '<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">' + jumpBtns +
+      '<button class="g" id="submitBtn" style="padding:3px 9px;font-size:10.5px" onclick="commitSimPreview()">' + commitLabel + '</button>' +
+      '<button style="padding:2px 8px;font-size:10px" onclick="pickStateTab(\'real\')">查看当前业务状态</button>' +
+      '<button style="padding:2px 8px;font-size:10px" onclick="clearSimPreview()">清除沙盘</button></div></div>';
+  }
+
+  if (!list.length && !creates.length) {
+    box.innerHTML = banner + '<div class="hint">该类型暂无可见对象。</div>';
+    return;
+  }
+
+  const pkKey = typeMeta.primary_key;
+  const existingCards = list.map((o, idx) => {
+    const pk = o[pkKey || Object.keys(o)[0]];
+    const ch = changeById[String(pk)];
+    const simCls = ch ? (ch.kind === 'delete' ? ' sim-delete' : ' sim-update') : '';
+    const simBadge = ch
+      ? (ch.kind === 'delete' ? ' <span class="badge r">沙盘删除</span>' : ' <span class="badge v">沙盘变更</span>')
+      : '';
+    const afterObj = (ch && ch.after) || {};
     const fields = typeMeta.fields.map(f => {
-      const v = o[f.name];
-      // __masked_fields__ 是「可明文查看」的白名单：当前角色不在白名单内即为脱敏。
-      // 数值型会被掩成 0、可空型会被掩成 null，因此不能只认 ***MASKED***。
-      const isRoleMasked = f.masked && role() !== 'system' &&
-        !((f.masked_roles || []).indexOf(role()) >= 0);
-      const masked = isRoleMasked || v === '***MASKED***' || v === 'REDACTED';
-      const cls = masked ? 'masked' : (f.owned ? 'owned' : '');
-      let text = (v === null || v === undefined) ? '—'
-        : (typeof v === 'object' ? JSON.stringify(v) : String(v));
-      if (masked) text = '不可见';
-      else text = zhValue(f.name, text);
+      const cur = formatFieldVal(f, o[f.name]);
+      if (ch && ch.kind === 'update' && !cur.masked && Object.prototype.hasOwnProperty.call(afterObj, f.name)) {
+        const next = formatFieldVal(f, afterObj[f.name]);
+        if (cur.text !== next.text) {
+          return '<span title="' + esc(f.name) + '">' + esc(zhField(S.type, f.name)) +
+            ' <s class="sim-old">' + esc(cur.text) + '</s><b class="sim-new">' + esc(next.text) + '</b></span>';
+        }
+      }
       return '<span title="' + esc(f.name) + '">' + esc(zhField(S.type, f.name)) +
-        ' <b class="' + cls + '">' + esc(text) + '</b></span>';
+        ' <b class="' + cur.cls + '">' + esc(cur.text) + '</b></span>';
     }).join('');
-    const pk = o[typeMeta.primary_key || Object.keys(o)[0]];
-    return '<div class="obj"><h4>' + esc(zhObject(S.type)) + '<span>' + esc(pk) + '</span></h4>' +
+    return '<div class="obj' + simCls + '"><h4><span>' + esc(zhObject(S.type)) + simBadge + '</span><span>' + esc(pk) + '</span></h4>' +
       '<div class="kv">' + fields + '</div>' +
       '<div class="ops"><button onclick="pickObject(' + idx + ')">载入参数</button>' +
       '<button class="v" onclick="quickSim(' + idx + ')">沙盘预演</button></div></div>';
   }).join('');
+
+  const createCards = creates.map(c => {
+    const afterObj = c.after || {};
+    const fields = typeMeta.fields.map(f => {
+      const val = formatFieldVal(f, afterObj[f.name]);
+      return '<span title="' + esc(f.name) + '">' + esc(zhField(S.type, f.name)) +
+        ' <b class="' + (val.masked ? 'masked' : 'sim-new') + '">' + esc(val.text) + '</b></span>';
+    }).join('');
+    return '<div class="obj sim-create"><h4><span>' + esc(zhObject(S.type)) + ' <span class="badge g">沙盘新增</span></span><span>' +
+      esc(c.object_id) + '</span></h4><div class="kv">' + fields + '</div></div>';
+  }).join('');
+
+  box.innerHTML = banner + createCards + existingCards;
 }
 
 function renderLinks(links) {
   const box = $('links');
   if (!box) return;
-  const rows = (links || []).slice(0, 120).map(l =>
-    '<div class="kv" style="margin:4px 0"><b>' + esc(zh('links', l.link_type, l.link_type)) + '</b><span>' +
+  const baseLinks = links || S.links || [];
+  const linkChanges = mergeLinkChanges(
+    (S.stateTab === 'sim' && S.simPreview && S.simPreview.diff && S.simPreview.diff.link_changes) || []
+  );
+  const baseSet = new Set(baseLinks.map(linkChangeKey));
+  const delSet = new Set(linkChanges.filter(c => c.kind === 'delete').map(linkChangeKey));
+  const createList = linkChanges.filter(c => c.kind === 'create' && !baseSet.has(linkChangeKey(c)));
+  const formatLink = (l, extraCls, badge) =>
+    '<div class="kv' + (extraCls ? ' ' + extraCls : '') + '" style="margin:4px 0">' + badge +
+    '<b>' + esc(zh('object_properties', l.link_type, '') || zh('links', l.link_type, l.link_type)) + '</b><span>' +
     esc(zhObject(l.source_type)) + '：' + esc(l.source_id) + ' → ' + esc(zhObject(l.target_type)) + '：' +
-    esc(l.target_id) + '</span></div>').join('');
+    esc(l.target_id) + '</span></div>';
+
+  const createRows = createList.map(l => formatLink(l, 'sim-link-create', '<span class="badge g">沙盘新增</span> ')).join('');
+  const rows = baseLinks.slice(0, 120).map(l => {
+    const isDel = delSet.has(linkChangeKey(l));
+    return formatLink(l, isDel ? 'sim-link-delete' : '', isDel ? '<span class="badge r">沙盘删除</span> ' : '');
+  }).join('');
   const funcs = (S.meta.functions || []).map(f =>
     '<div class="ops" style="margin:4px 0"><span class="badge">' + esc(zh('functions', f.name, f.name)) + '</span>' +
     '<span class="en">' + esc(f.name) + '</span>' +
     '<button onclick="callFunction(\'' + f.name + '\')">调用</button></div>').join('');
-  box.innerHTML = '<div class="sect">🔗 语义关系</div>' + (rows || '<div class="hint">暂无关系边。</div>') +
+  box.innerHTML = '<div class="sect">🔗 语义关系</div>' + (createRows + rows || '<div class="hint">暂无关系边。</div>') +
     '<div class="sect">🧮 查询与计算（点击实时调用）</div>' + (funcs || '<div class="hint">无。</div>') +
     '<pre id="fnout" class="hint" style="margin-top:6px"></pre>';
 }
@@ -1636,10 +2396,171 @@ function typeOf(prop) {
 }
 
 function defaultFor(prop) {
+  const enums = enumValuesFor(prop);
+  if (enums && enums.length && !isNullable(prop)) return enums[0];
   const t = typeOf(prop);
   if (t === 'integer' || t === 'number') return 0;
   if (t === 'boolean') return false;
   return '';
+}
+
+function enumValuesFor(prop) {
+  if (!prop) return null;
+  if (Array.isArray(prop.enum)) return prop.enum;
+  if (Array.isArray(prop.anyOf)) {
+    const hit = prop.anyOf.find(x => x && Array.isArray(x.enum));
+    if (hit) return hit.enum;
+  }
+  return null;
+}
+
+function enumOptionsFor(k, prop) {
+  const enums = enumValuesFor(prop);
+  if (!enums) return null;
+  return enums.map(ev => {
+    const raw = String(ev);
+    const zhLabel = (k === 'role' ? zh('roles', raw, '') : '') ||
+      zh('statuses', raw, '') || zh('roles', raw, '');
+    return {
+      value: raw,
+      label: zhLabel && zhLabel !== raw ? (zhLabel + ' (' + raw + ')') : raw,
+    };
+  });
+}
+
+function isNullable(prop) {
+  if (!prop) return false;
+  if (prop.nullable) return true;
+  if (Array.isArray(prop.anyOf)) return prop.anyOf.some(x => x && x.type === 'null');
+  return false;
+}
+
+function isAutoGenerated(prop) {
+  if (!prop) return false;
+  if (prop.auto_generated || prop['x-auto-generated']) return true;
+  if (Array.isArray(prop.anyOf)) return prop.anyOf.some(x => x && (x.auto_generated || x['x-auto-generated']));
+  return false;
+}
+
+function isMultiple(prop) {
+  return !!(prop && (typeOf(prop) === 'array' || prop.multiple));
+}
+
+function refOptionsFor(prop) {
+  const refType = prop && (
+    prop.range ||
+    (Array.isArray(prop.anyOf) && (prop.anyOf.find(x => x && x.range) || {}).range)
+  );
+  if (!refType) return null;
+  const types = (S.meta && S.meta.object_types) || [];
+  const typeMeta = types.find(t => t.name === refType);
+  const pk = (typeMeta && typeMeta.primary_key) || 'id';
+  const tf = typeMeta && typeMeta.title;
+  const rows = effectiveObjects(refType);
+  return rows
+    .filter(r => r && r[pk] !== undefined && r[pk] !== null && r[pk] !== '***MASKED***')
+    .map(r => {
+      const val = String(r[pk]);
+      const title = tf && r[tf] && r[tf] !== '***MASKED***' ? String(r[tf]) : '';
+      const simTag = r._simKind === 'create' ? ' [沙盘]' : '';
+      return {value: val, label: (title ? (val + ' · ' + title) : val) + simTag};
+    });
+}
+
+function mselLabel(selected) {
+  return selected.length ? ('已选 ' + selected.length + ' 项：' + selected.join(', ')) : '未选择（可多选）';
+}
+
+function closeAllMsels(exceptEl) {
+  document.querySelectorAll('.msel.open').forEach(el => {
+    if (el !== exceptEl) el.classList.remove('open');
+  });
+}
+
+function toggleMsel(btn, ev) {
+  if (ev) ev.stopPropagation();
+  const msel = btn && btn.closest('.msel');
+  if (!msel) return;
+  const willOpen = !msel.classList.contains('open');
+  closeAllMsels(msel);
+  if (!willOpen) { msel.classList.remove('open'); return; }
+  msel.classList.add('open');
+  const menu = msel.querySelector('.msel-menu');
+  const r = btn.getBoundingClientRect();
+  if (menu && r.width) {
+    const w = Math.min(Math.max(r.width, 260), window.innerWidth - 24);
+    const left = Math.max(12, Math.min(r.left, window.innerWidth - w - 12));
+    menu.style.left = left + 'px';
+    menu.style.width = w + 'px';
+    const below = window.innerHeight - r.bottom - 12;
+    if (below >= 120 || below >= r.top) {
+      menu.style.top = (r.bottom + 4) + 'px';
+      menu.style.bottom = 'auto';
+      menu.style.maxHeight = Math.max(120, Math.min(240, below)) + 'px';
+    } else {
+      menu.style.top = 'auto';
+      menu.style.bottom = (window.innerHeight - r.top + 4) + 'px';
+      menu.style.maxHeight = Math.max(120, Math.min(240, r.top - 12)) + 'px';
+    }
+  }
+}
+
+function syncMsel(cb) {
+  const msel = cb && cb.closest('.msel');
+  if (!msel) return;
+  const vals = Array.from(msel.querySelectorAll('input[type="checkbox"]:checked')).map(x => x.value);
+  const txt = msel.querySelector('.msel-txt');
+  if (txt) txt.textContent = mselLabel(vals);
+}
+
+function mselMenuHtml(opts, selected, extraCbAttrs) {
+  if (!opts.length) return '<div class="hint" style="padding:6px 8px">暂无可选对象</div>';
+  return opts.map(o =>
+    '<label class="msel-opt"><input type="checkbox" value="' + esc(o.value) + '"' +
+    (selected.indexOf(o.value) >= 0 ? ' checked' : '') +
+    ' onchange="syncMsel(this)' + (extraCbAttrs || '') + '"><span>' + esc(o.label) + '</span></label>'
+  ).join('');
+}
+
+function renderFieldHtml(k, prop, v, headHtml, attrs, isAgent) {
+  const t = typeOf(prop);
+  if (isAutoGenerated(prop)) {
+    return '<label class="f">' + headHtml + '<input ' + attrs +
+      ' type="text" value="" placeholder="系统自动生成" readonly class="auto-id"></label>';
+  }
+  if (t === 'boolean') {
+    return '<label class="f">' + headHtml + '<select ' + attrs + '><option value="true"' +
+      (v ? ' selected' : '') + '>是</option><option value="false"' + (v ? '' : ' selected') + '>否</option></select></label>';
+  }
+  const refOpts = refOptionsFor(prop);
+  const opts = refOpts !== null ? refOpts : enumOptionsFor(k, prop);
+  if (isMultiple(prop)) {
+    const selected = Array.isArray(v) ? v.map(String) : [];
+    if (opts !== null) {
+      const cbExtra = isAgent ? ';pushGhostEvent(\'form_interaction\',{action:this.closest(\'[data-action]\').getAttribute(\'data-action\'),field:\'' + esc(k) + '\'})' : '';
+      return '<div class="f">' + headHtml + '<div class="msel" ' + attrs + ' data-multi="1">' +
+        '<button type="button" class="msel-btn" onclick="toggleMsel(this, event)">' +
+        '<span class="msel-txt">' + esc(mselLabel(selected)) + '</span><span>▾</span></button>' +
+        '<div class="msel-menu">' + mselMenuHtml(opts, selected, cbExtra) + '</div></div></div>';
+    }
+    return '<label class="f">' + headHtml + '<input ' + attrs + ' type="text" value="' +
+      esc(selected.join(', ')) + '" placeholder="逗号分隔"></label>';
+  }
+  if (opts !== null) {
+    const cur = (v === null || v === undefined) ? '' : String(v);
+    const nullable = isNullable(prop);
+    let optionsHtml = nullable ? '<option value=""' + (cur === '' ? ' selected' : '') + '>（不指定 / 无）</option>' : '';
+    optionsHtml += opts.map(o =>
+      '<option value="' + esc(o.value) + '"' + (cur === o.value ? ' selected' : '') + '>' + esc(o.label) + '</option>'
+    ).join('');
+    if (cur !== '' && !opts.some(o => o.value === cur)) {
+      optionsHtml += '<option value="' + esc(cur) + '" selected>' + esc(cur) + '</option>';
+    }
+    return '<label class="f">' + headHtml + '<select ' + attrs + '>' + optionsHtml + '</select></label>';
+  }
+  const strVal = (v === null || v === undefined) ? '' : String(v);
+  return '<label class="f">' + headHtml + '<input ' + attrs + ' type="' +
+    (t === 'integer' || t === 'number' ? 'number' : 'text') + '" value="' + esc(strVal) + '"></label>';
 }
 
 function smartPrefill(actionName) {
@@ -1648,13 +2569,20 @@ function smartPrefill(actionName) {
   const sample = ((S.inst && S.inst.sample_action_params) || {})[actionName] || {};
   const out = {};
   Object.keys(props).forEach(k => {
+    const prop = props[k] || {};
+    if (isAutoGenerated(prop)) { out[k] = ''; return; }
+    if (isMultiple(prop)) {
+      out[k] = Array.isArray(sample[k]) ? sample[k] : (Array.isArray(prop.default) ? prop.default : []);
+      return;
+    }
     if (sample[k] !== undefined) { out[k] = sample[k]; return; }
+    if (isNullable(prop) && prop.default === null) { out[k] = ''; return; }
     let found = null;
     for (const type of Object.keys(S.objects)) {
-      const row = (S.objects[type] || []).find(o => o[k] !== undefined && o[k] !== '***MASKED***');
+      const row = (S.objects[type] || []).find(o => o[k] !== undefined && o[k] !== null && o[k] !== '***MASKED***');
       if (row) { found = row[k]; break; }
     }
-    out[k] = found !== null ? found : defaultFor(props[k]);
+    out[k] = found !== null ? found : defaultFor(prop);
   });
   return out;
 }
@@ -1669,16 +2597,44 @@ function fillParams() {
   const values = smartPrefill(act.name);
   $('actmeta').textContent = '可执行角色：' + ((act.allowed_roles || []).map(zhRole).join(' / ') || '—');
   $('form').innerHTML = Object.keys(props).map(k => {
-    const t = typeOf(props[k]);
-    const v = values[k];
     const head = '<span class="fl">' + esc(zhField(null, k)) + '<em>' + esc(k) + '</em></span>';
-    if (t === 'boolean') {
-      return '<label class="f">' + head + '<select id="p_' + esc(k) + '"><option value="true"' +
-        (v ? ' selected' : '') + '>是</option><option value="false"' + (v ? '' : ' selected') + '>否</option></select></label>';
-    }
-    return '<label class="f">' + head + '<input id="p_' + esc(k) + '" type="' +
-      (t === 'integer' || t === 'number' ? 'number' : 'text') + '" value="' + esc(v) + '"></label>';
+    return renderFieldHtml(k, props[k], values[k], head, 'id="p_' + esc(k) + '"', false);
   }).join('');
+}
+
+function refreshParamOptions() {
+  const act = currentAction();
+  if (!act) return;
+  const props = (act.params && act.params.properties) || {};
+  Object.keys(props).forEach(k => {
+    const prop = props[k] || {};
+    const el = $('p_' + k);
+    if (!el) return;
+    if (isAutoGenerated(prop)) { el.value = ''; return; }
+    const refOpts = refOptionsFor(prop);
+  const opts = refOpts !== null ? refOpts : enumOptionsFor(k, prop);
+    if (opts === null) return;
+    if (el.getAttribute('data-multi') === '1') {
+      const checked = new Set(
+        Array.from(el.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value)
+      );
+      const menu = el.querySelector('.msel-menu');
+      if (menu) menu.innerHTML = mselMenuHtml(opts, Array.from(checked), '');
+      const kept = opts.filter(o => checked.has(o.value)).map(o => o.value);
+      const txt = el.querySelector('.msel-txt');
+      if (txt) txt.textContent = mselLabel(kept);
+      return;
+    }
+    if (el.tagName === 'SELECT') {
+      const prev = el.value;
+      const nullable = isNullable(prop);
+      let html = nullable ? '<option value="">（不指定 / 无）</option>' : '';
+      html += opts.map(o => '<option value="' + esc(o.value) + '">' + esc(o.label) + '</option>').join('');
+      el.innerHTML = html;
+      if (prev && opts.some(o => o.value === prev)) el.value = prev;
+      else if (nullable) el.value = '';
+    }
+  });
 }
 
 function collectParams() {
@@ -1686,12 +2642,27 @@ function collectParams() {
   const props = (act && act.params && act.params.properties) || {};
   const out = {};
   Object.keys(props).forEach(k => {
+    const prop = props[k] || {};
     const el = $('p_' + k);
     if (!el) return;
-    const t = typeOf(props[k]);
+    if (isAutoGenerated(prop)) {
+      const raw = (el.value || '').trim();
+      if (raw) out[k] = raw;
+      return;
+    }
+    const t = typeOf(prop);
+    if (isMultiple(prop)) {
+      if (el.getAttribute('data-multi') === '1') {
+        out[k] = Array.from(el.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value);
+      } else {
+        out[k] = (el.value || '').split(',').map(s => s.trim()).filter(Boolean);
+      }
+      return;
+    }
     if (t === 'integer') out[k] = parseInt(el.value || '0', 10);
     else if (t === 'number') out[k] = parseFloat(el.value || '0');
     else if (t === 'boolean') out[k] = el.value === 'true';
+    else if (isNullable(prop) && el.value === '') out[k] = null;
     else out[k] = el.value;
   });
   return out;
@@ -1703,9 +2674,21 @@ function pickObject(idx) {
   const act = currentAction();
   const props = (act && act.params && act.params.properties) || {};
   Object.keys(props).forEach(k => {
+    const prop = props[k] || {};
+    if (isAutoGenerated(prop)) return;
     const el = $('p_' + k);
     if (!el) return;
-    if (o[k] !== undefined && o[k] !== '***MASKED***') el.value = o[k];
+    if (o[k] === undefined || o[k] === '***MASKED***') return;
+    if (el.getAttribute('data-multi') === '1') {
+      const vals = Array.isArray(o[k]) ? o[k].map(String) : [];
+      el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.checked = vals.indexOf(cb.value) >= 0;
+      });
+      const txt = el.querySelector('.msel-txt');
+      if (txt) txt.textContent = mselLabel(vals);
+      return;
+    }
+    el.value = (o[k] === null) ? '' : o[k];
   });
   toast('已载入对象参数');
 }
@@ -1719,23 +2702,114 @@ function show(title, payload) {
 
 function diffTable(diff) {
   const changes = (diff && diff.object_changes) || [];
-  if (!changes.length) return '<div class="hint">无对象变更。</div>';
-  return '<table class="diff"><tr><th>变更</th><th>对象</th><th>变更前</th><th>变更后</th></tr>' +
-    changes.map(c => '<tr><td>' + esc(c.kind) + '</td><td>' + esc(zhObject(c.object_type)) + '：' +
-      esc(c.object_id) + '</td><td class="b">' + esc(JSON.stringify(c.before || {})) +
-      '</td><td class="a">' + esc(JSON.stringify(c.after || {})) + '</td></tr>').join('') + '</table>';
+  const linkChanges = (diff && diff.link_changes) || [];
+  if (!changes.length && !linkChanges.length) return '<div class="hint">无对象或关系变更。</div>';
+  let html = '';
+  if (changes.length) {
+    html += '<table class="diff"><tr><th>变更</th><th>对象</th><th>变更前</th><th>变更后</th></tr>' +
+      changes.map(c => '<tr><td>' + esc(c.kind) + '</td><td>' + esc(zhObject(c.object_type)) + '：' +
+        esc(c.object_id) + '</td><td class="b">' + esc(JSON.stringify(c.before || {})) +
+        '</td><td class="a">' + esc(JSON.stringify(c.after || {})) + '</td></tr>').join('') + '</table>';
+  }
+  if (linkChanges.length) {
+    html += '<table class="diff" style="margin-top:6px"><tr><th>关系变更</th><th>关系类型</th><th>源对象</th><th>目标对象</th></tr>' +
+      linkChanges.map(l => '<tr><td>' + esc(l.kind) + '</td><td>' +
+        esc(zh('object_properties', l.link_type, '') || zh('links', l.link_type, l.link_type)) + '</td><td>' +
+        esc(zhObject(l.source_type)) + '：' + esc(l.source_id) + '</td><td>' +
+        esc(zhObject(l.target_type)) + '：' + esc(l.target_id) + '</td></tr>').join('') + '</table>';
+  }
+  return html;
+}
+
+function applySimPreview(actionName, simData, params) {
+  const diff = (simData && simData.diff) || { object_changes: [], link_changes: [] };
+  if (simData && simData.valid) {
+    if (params !== undefined) {
+      S.simSteps.push({ action: actionName, params: params || {} });
+      const prevObj = (S.simPreview && S.simPreview.diff && S.simPreview.diff.object_changes) || [];
+      const prevLink = (S.simPreview && S.simPreview.diff && S.simPreview.diff.link_changes) || [];
+      S.simPreview = {
+        action: actionName,
+        diff: {
+          object_changes: mergeObjectChanges(prevObj.concat(diff.object_changes || [])),
+          link_changes: mergeLinkChanges(prevLink.concat(diff.link_changes || [])),
+        },
+      };
+    } else {
+      S.simSteps = [];
+      S.simPreview = {
+        action: actionName,
+        diff: {
+          object_changes: mergeObjectChanges(diff.object_changes || []),
+          link_changes: mergeLinkChanges(diff.link_changes || []),
+        },
+      };
+    }
+    S.stateTab = 'sim';
+    const touchedTypes = (diff.object_changes || []).map(c => c.object_type);
+    if (touchedTypes.length && touchedTypes.indexOf(S.type) < 0) {
+      S.type = touchedTypes[0];
+    }
+  }
+  renderStateTabs();
+  renderFingerprint(S.fp);
+  renderObjectTabs();
+  renderObjects();
+  renderLinks(S.links);
+  refreshParamOptions();
 }
 
 async function simulate() {
   try {
-    const data = await api('/api/simulate', {action: $('action').value, params: collectParams()});
+    const actionName = $('action').value;
+    const params = collectParams();
+    if (!S.simSessionId) S.simSessionId = 'SIM-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+    const data = await api('/api/simulate', {
+      action: actionName,
+      params,
+      prior_steps: S.simSteps,
+      session_id: S.simSessionId,
+    });
     const el = $('result');
     if (el) el.innerHTML = '<b class="' + (data.valid ? 'ok' : 'err') + '">沙盘预演 → ' +
       (data.valid ? '通过' : '被拒绝 ' + esc(data.error_code || '')) + '</b>' +
       (data.error ? '<div class="err">' + esc(data.error) + '</div>' : '') +
-      '<div class="hint">需要审批：' + (data.requires_approval ? '是' : '否') + '</div>' + diffTable(data.diff);
-    toast(data.valid ? '沙盘预演通过（主库零副作用）' : '沙盘预演被符号裁判拒绝', !data.valid);
-  } catch (e) { show('沙盘预演失败', {error: e.message}); toast(e.message, true); }
+      '<div class="hint">需要审批：' + (data.requires_approval ? '是' : '否') +
+      (data.sim_id ? (' · 已存库 ' + esc(data.sim_id)) : '') + '</div>' + diffTable(data.diff);
+    applySimPreview(actionName, data, params);
+    const simsRes = await api('/api/simulations').catch(() => null);
+    if (simsRes) { S.simulations = simsRes.simulations || []; renderSimulations(); }
+    toast(data.valid ? '沙盘预演通过（已存入沙盘诊断库，主库零写入）' : '沙盘预演被拒绝（已存入 Bug 诊断库）', !data.valid);
+  } catch (e) {
+    const simsRes = await api('/api/simulations').catch(() => null);
+    if (simsRes) { S.simulations = simsRes.simulations || []; renderSimulations(); }
+    show('沙盘预演失败', {error: e.message}); toast(e.message, true);
+  }
+}
+
+async function commitSimPreview() {
+  if (!S.simSteps.length) {
+    if (S.mcts) { await commitMcts(); return; }
+    toast('暂无可提交的沙盘推演步骤', true);
+    return;
+  }
+  const totalPlanned = S.simSteps.length;
+  const firstStep = S.simSteps[0];
+  try {
+    const data = await api('/api/submit', {
+      run_id: 'CC-' + Date.now(),
+      action: firstStep.action,
+      params: firstStep.params || {},
+      simulation_session_id: S.simSessionId || null,
+    });
+    const run = data.run || {};
+    const el = $('result');
+    if (el) el.innerHTML = '<b class="ok">正式执行第 1 步 → ' + esc(zhStatus(run.status || 'COMMITTED')) +
+      (totalPlanned > 1 ? '（原推演共 ' + totalPlanned + ' 步，已按滚动视野只执行第 1 步）' : '') + '</b>' +
+      '<div class="hint">执行编号：' + esc(run.run_id || '') + '</div>' + diffTable(run.object_diff);
+    toast('已正式执行第 1 步：' + zhAction(firstStep.action));
+    await refreshInstance();
+  } catch (e) { show('正式执行失败', {error: e.message}); toast(e.message, true); }
 }
 
 async function submitAction() {
@@ -1750,8 +2824,12 @@ async function submitAction() {
   } catch (e) { show('正式执行失败', {error: e.message}); toast(e.message, true); }
 }
 
-async function refreshInstance() {
-  if (!S.inst) return;
+let _refreshInFlight = false;
+
+async function refreshInstance(opts) {
+  opts = opts || {};
+  if (!S.inst || _refreshInFlight) return;
+  _refreshInFlight = true;
   try {
     S.catalog = await api('/api/catalog');
     const fresh = S.catalog.instances.find(i => i.instance_id === S.inst.instance_id);
@@ -1761,15 +2839,41 @@ async function refreshInstance() {
     const fp = await api('/api/fingerprint');
     const runs = (await api('/api/action-runs')).runs;
     const links = (await api('/api/links')).links;
+    const simsRes = await api('/api/simulations').catch(() => ({simulations: []}));
+    const health = await api('/api/world-health').catch(() => null);
+    S.fp = fp;
+    S.links = links || [];
+    S.simulations = simsRes.simulations || [];
+    S.health = health;
+    if (!opts.preserveSim) {
+      S.simPreview = null;
+      S.simSteps = [];
+      S.simSessionId = null;
+      S.stateTab = 'real';
+    }
     for (const t of S.meta.object_types) {
       const res = await api('/api/objects/' + encodeURIComponent(t.name));
       S.objects[t.name] = res.objects;
     }
+    renderStateTabs();
+    renderObjectTabs();
     renderFingerprint(fp);
+    renderWorldHealth();
     renderObjects();
     renderLinks(links);
     renderRuns(runs);
-  } catch (e) { toast(e.message, true); }
+    renderSimulations();
+    const ae = document.activeElement;
+    const inParamField = !!(ae && (
+      (ae.id && (ae.id.startsWith('p_') || ae.id.startsWith('fp_'))) ||
+      (ae.closest && ae.closest('.msel'))
+    ));
+    if (!opts.preserveSim || !inParamField) refreshParamOptions();
+  } catch (e) {
+    if (!opts.silent) toast(e.message, true);
+  } finally {
+    _refreshInFlight = false;
+  }
 }
 
 async function runMcts() {
@@ -1789,6 +2893,9 @@ async function runMcts() {
       '<div class="badges">' + (data.best_sequence || []).map((s, i) =>
         '<span class="badge c">' + (i + 1) + '. ' + esc(s) + '</span>').join('') + '</div>' +
       '<button class="g" style="margin-top:8px" onclick="commitMcts()">⚡ 一键提交最优序列</button>';
+    if (data.diff) {
+      applySimPreview('MCTS 多步推演 (' + (data.best_sequence || []).length + '步)', { valid: true, diff: data.diff });
+    }
     toast('多步推演完成：终局价值 ' + data.best_value);
   } catch (e) {
     const box = $('mcts');
@@ -1822,7 +2929,7 @@ async function revertRun(runId) {
 }
 
 async function runAutomations() {
-  if (!S.inst) { toast('请先选择一个运行实例', true); return; }
+  if (!S.inst) { toast('请先选择一个世界状态', true); return; }
   try {
     const data = await api('/api/automations/run', {});
     toast(data.fired.length ? ('自动化规则触发 ' + data.fired.length + ' 次') : '没有新的可触发对象');
@@ -1831,7 +2938,7 @@ async function runAutomations() {
 }
 
 async function forkInstance() {
-  if (!S.inst) { toast('请先选择一个运行实例', true); return; }
+  if (!S.inst) { toast('请先选择一个世界状态', true); return; }
   try {
     const data = await api('/api/instance/fork', {instance: S.inst.instance_id, label: S.inst.label + ' · 克隆沙盘'});
     S.catalog = await api('/api/catalog');
@@ -1865,6 +2972,478 @@ function renderRuns(runs) {
       (ops.length ? '<div class="ops">' + ops.join('') + '</div>' : '') + '</div>';
   }).join('');
 }
+
+function toggleSimBugFilter(checked) {
+  S.simOnlyBugs = !!checked;
+  renderSimulations();
+}
+
+async function clearSimulationLedger() {
+  try {
+    const res = await fetch('/api/simulations?workspace=' + encodeURIComponent(S.inst.instance_id) +
+      '&role=' + encodeURIComponent(role()), {method: 'DELETE'});
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    S.simulations = [];
+    renderSimulations();
+    toast('已清空当前实例的沙盘推演日志');
+  } catch (e) { toast('清空失败：' + e.message, true); }
+}
+
+function renderSimulations() {
+  const box = $('simulations');
+  if (!box) return;
+  const all = S.simulations || [];
+  const rows = S.simOnlyBugs ? all.filter(s => !s.valid) : all;
+  const bugCount = all.filter(s => !s.valid).length;
+  const toolbar = '<div class="row" style="justify-content:space-between;margin-bottom:8px">' +
+    '<label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:6px">' +
+    '<input type="checkbox" ' + (S.simOnlyBugs ? 'checked ' : '') +
+    'onchange="toggleSimBugFilter(this.checked)">仅看失败/被拒 Bug（' + bugCount + '）</label>' +
+    (all.length ? '<button style="padding:2px 8px;font-size:10px" onclick="clearSimulationLedger()">清空诊断日志</button>' : '') +
+    '</div>';
+  if (!rows.length) {
+    box.innerHTML = toolbar + '<div class="hint">暂无符合条件的沙盘推演记录。</div>';
+    return;
+  }
+  box.innerHTML = toolbar + rows.slice(0, 40).map(s => {
+    const statusBadge = s.valid
+      ? '<span class="tag t-COMMITTED">推演通过</span>'
+      : '<span class="tag t-REJECTED">被拒 ' + esc(s.error_code || 'ERR') + '</span>';
+    const commitTag = s.committed_run_id
+      ? ' <span class="badge g">第1步已提交 ' + esc(s.committed_run_id) + '</span>'
+      : '';
+    return '<div class="run"><div class="id">' + esc(s.sim_id) + ' · 第' + esc(s.step_index) + '步 ' +
+      statusBadge + commitTag + '</div>' +
+      '<div class="kv"><span>' + esc(zhAction(s.action_type)) + '</span><span>' +
+      esc(zhRole(s.actor_role)) + '</span><span>' + esc(s.created_at) + '</span></div>' +
+      '<div class="hint" style="margin-top:3px">参数：' + esc(JSON.stringify(s.params || {})) + '</div>' +
+      (s.error_message ? '<div class="err" style="margin-top:3px">' + esc(s.error_message) + '</div>' : '') +
+      '</div>';
+  }).join('');
+}
+
+S.agent = {open: false, history: [], selectedIds: [], ghostEvents: [], scope: null};
+
+function currentAgentScope() {
+  if (S.agent.scope) return S.agent.scope;
+  return S.pillar === 'instance' ? 'world' : 'platform';
+}
+
+function toggleAgentScope() {
+  S.agent.scope = currentAgentScope() === 'platform' ? 'world' : 'platform';
+  updateAgentContext();
+}
+
+function agentSessionKey() {
+  return 'oo_agent_' + ((S.inst && S.inst.instance_id) || 'default') + '_' + role();
+}
+
+function saveAgentSession() {
+  try {
+    sessionStorage.setItem(agentSessionKey(), JSON.stringify({
+      history: S.agent.history.slice(-20),
+      selectedIds: S.agent.selectedIds.slice(-5),
+    }));
+  } catch (_) {}
+}
+
+function pushGhostEvent(eventType, detail) {
+  const ev = {event_type: eventType, detail: detail || {}};
+  S.agent.ghostEvents.push(ev);
+  if (S.agent.ghostEvents.length > 20) S.agent.ghostEvents.shift();
+  saveAgentSession();
+  if (S.inst) {
+    fetch('/api/agent/ghost?instance=' + encodeURIComponent(S.inst.instance_id) + '&role=' + encodeURIComponent(role()), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(ev),
+    }).catch(() => {});
+  }
+}
+
+if (typeof switchPillar === 'function') {
+  const _origSwitchPillar = switchPillar;
+  switchPillar = function(name) {
+    _origSwitchPillar(name);
+    pushGhostEvent('view_changed', {pillar: name});
+  };
+}
+
+function agentUiContext() {
+  return {
+    ontology_id: S.ont ? S.ont.ontology_id : null,
+    instance_id: S.inst ? S.inst.instance_id : null,
+    active_object_type: S.type || null,
+    selected_object_ids: S.agent.selectedIds.slice(),
+  };
+}
+
+function updateAgentContext() {
+  const scopeBtn = $('agentScopeBtn');
+  const scope = currentAgentScope();
+  if (scopeBtn) {
+    scopeBtn.textContent = scope === 'platform' ? '🛠 平台管理员' : '🌍 业务世界';
+  }
+  const el = $('agentCtx');
+  if (!el) return;
+  if (scope === 'platform') {
+    el.innerHTML = '当前模式：<b>平台管理员（M2 元本体）</b> · 可创建模型 / 宿体 / 世界状态 / 外部设备';
+    return;
+  }
+  const ctx = agentUiContext();
+  const parts = [];
+  if (ctx.instance_id) parts.push('世界状态：' + esc(ctx.instance_id));
+  if (ctx.active_object_type) parts.push('对象：' + esc(zhObject(ctx.active_object_type)));
+  if (ctx.selected_object_ids.length) parts.push('已选：' + esc(ctx.selected_object_ids.join(', ')));
+  if (S.agent.ghostEvents.length) parts.push('静默感知 ' + S.agent.ghostEvents.length + ' 条');
+  el.innerHTML = parts.length ? parts.join(' · ') : '当前未绑定世界状态（将使用默认世界状态）';
+}
+
+function toggleAgentDrawer() {
+  const drawer = $('agentDrawer');
+  if (!drawer) return;
+  S.agent.open = !S.agent.open;
+  drawer.hidden = !S.agent.open;
+  if (S.agent.open) updateAgentContext();
+}
+
+function clearAgentChat() {
+  S.agent.history = [];
+  S.agent.ghostEvents = [];
+  saveAgentSession();
+  const box = $('agentMessages');
+  if (box) box.innerHTML = '<div class="amsg bot">对话已清空，请继续输入指令。</div>';
+  updateAgentContext();
+}
+
+function applyAgentUiCommand(p) {
+  if (!p || !p.command) return;
+  if (p.command === 'open_topology') {
+    if (typeof switchPillar === 'function') switchPillar('ontology');
+    toast('智能助手已联动切换至领域模型拓扑视图');
+    return;
+  }
+  if (p.command === 'focus_object') {
+    if (p.object_type) S.type = p.object_type;
+    if (p.object_id) S.agent.selectedIds = [p.object_id];
+    if (typeof switchPillar === 'function') switchPillar('instance');
+    updateAgentContext();
+    toast('智能助手已聚焦对象：' + (p.object_id || ''));
+    return;
+  }
+  if (p.command === 'apply_filter' && p.object_type) {
+    S.type = p.object_type;
+    if (typeof renderObjects === 'function') renderObjects();
+    toast('已按智能助手指令过滤对象：' + zhObject(p.object_type));
+  }
+}
+
+function appendAgentBubble(roleCls, htmlText, artifacts) {
+  const box = $('agentMessages');
+  if (!box) return null;
+  const div = document.createElement('div');
+  div.className = 'amsg ' + roleCls;
+  const textEl = document.createElement('div');
+  textEl.className = 'amsg-text';
+  textEl.innerHTML = htmlText;
+  div.appendChild(textEl);
+  const artBoxEl = document.createElement('div');
+  artBoxEl.className = 'amsg-cards';
+  div.appendChild(artBoxEl);
+  (artifacts || []).forEach(art => {
+    mountArtifactCard(artBoxEl, art);
+  });
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return {div, textEl, artBoxEl};
+}
+
+function mountArtifactCard(container, art) {
+  const card = document.createElement('div');
+  card.className = 'art-card';
+  card.innerHTML = renderArtifactHtml(art);
+  container.appendChild(card);
+  if (art.kind === 'ui_command') applyAgentUiCommand(art.payload);
+}
+
+function selectAgentObject(objId) {
+  if (!objId) return;
+  S.agent.selectedIds = [objId];
+  pushGhostEvent('selection_changed', {object_id: objId, selected_object_ids: [objId]});
+  updateAgentContext();
+  toast('已选中对象：' + objId + '（已静默同步至智能助手上下文）');
+}
+
+function renderArtifactHtml(art) {
+  const p = art.payload || {};
+  const aid = esc(art.artifact_id || ('art-' + Math.random().toString(36).slice(2, 8)));
+  const head = '<h5><span>' + esc(art.title || art.kind) + '</span><span class="badge c">' + esc(art.kind) + '</span></h5>';
+
+  if (art.kind === 'object_table') {
+    const rows = p.rows || [];
+    if (!rows.length) return head + '<div class="hint">暂无可见记录。</div>';
+    const cols = (p.columns && p.columns.length) ? p.columns : Object.keys(rows[0]).slice(0, 4);
+    const ths = cols.map(c => '<th>' + esc(zhField(p.object_type || '', c)) + '</th>').join('');
+    const trs = rows.slice(0, 12).map(r => {
+      const firstVal = r[cols[0]];
+      const tds = cols.map(c => '<td>' + esc(zhValue(c, typeof r[c] === 'object' ? JSON.stringify(r[c]) : r[c])) + '</td>').join('');
+      return '<tr style="cursor:pointer" onclick="selectAgentObject(\'' + esc(firstVal) + '\')">' + tds + '</tr>';
+    }).join('');
+    return head + '<div style="overflow:auto;max-height:220px"><table><tr>' + ths + '</tr>' + trs + '</table></div>' +
+      '<div class="hint" style="margin-top:4px">点击行可将该对象同步至智能助手上下文</div>';
+  }
+
+  if (art.kind === 'action_form') {
+    const props = (p.schema && p.schema.properties) || {};
+    const prefill = p.prefill_params || {};
+    const fields = Object.keys(props).map(k => {
+      const def = props[k] || {};
+      const val = isAutoGenerated(def)
+        ? ''
+        : (prefill[k] !== undefined ? prefill[k] : (def.default !== undefined ? def.default : ''));
+      const ftype = typeOf(def);
+      const attrs = 'data-art-field="' + esc(k) + '" data-ftype="' + esc(ftype) + '"' +
+        (isNullable(def) ? ' data-nullable="1"' : '') +
+        (isAutoGenerated(def) ? ' data-auto="1"' : '') +
+        ' onchange="pushGhostEvent(\'form_interaction\',{action:\'' + esc(p.action || '') + '\',field:\'' + esc(k) + '\',value:this.value})"';
+      const head = '<span>' + esc(zhField(p.action || '', k)) + '</span>';
+      return renderFieldHtml(k, def, val, head, attrs, true);
+    }).join('');
+    return head + '<div id="' + aid + '" data-action="' + esc(p.action || '') + '">' +
+      '<div class="row">' + (fields || '<div class="hint">此动作无需参数</div>') + '</div>' +
+      '<button class="c" onclick="agentSimulateCard(\'' + aid + '\')">🧪 沙盘模拟</button>' +
+      '</div>';
+  }
+
+  if (art.kind === 'diff_preview') {
+    const sim = p.simulation || {};
+    const okBadge = sim.valid ? '<span class="badge g">校验通过</span>' : '<span class="badge r">被拒绝</span>';
+    const paramsJson = esc(JSON.stringify(p.params || {}));
+    const btn = sim.valid
+      ? '<button class="g" style="margin-top:6px" onclick="agentSubmitCard(\'' + esc(p.action || '') + '\', \'' + paramsJson + '\')">✅ 确认提交</button>'
+      : '';
+    return head + '<div class="row">' + okBadge +
+      (sim.requires_approval ? '<span class="badge a">需审批</span>' : '') + '</div>' +
+      (sim.error ? '<div class="err">' + esc(sim.error) + '</div>' : '') +
+      diffTable(sim.diff) + btn;
+  }
+
+  if (art.kind === 'approval_card') {
+    return head + '<div class="hint">单号：' + esc(p.run_id || '') + ' · 动作：' + esc(zhAction(p.action || '')) + '</div>' +
+      diffTable(p.diff) +
+      '<button class="g" style="margin-top:6px" onclick="agentApproveCard(\'' + esc(p.run_id || '') + '\')">✅ 批准执行</button>';
+  }
+
+  if (art.kind === 'metric_chart') {
+    const bars = p.bars || [];
+    if (!bars.length) return head + '<div class="hint">暂无统计数据。</div>';
+    const maxVal = Math.max(1, ...bars.map(b => Number(b.count || 0)));
+    const rowH = 24;
+    const svgH = bars.length * rowH + 8;
+    const rects = bars.map((b, i) => {
+      const w = Math.max(4, Math.round((Number(b.count || 0) / maxVal) * 190));
+      const y = i * rowH + 4;
+      return '<text x="2" y="' + (y + 13) + '" fill="#b9cbe0" font-size="10.5">' + esc(zhStatus(b.label)) + '</text>' +
+        '<rect x="92" y="' + (y + 2) + '" width="' + w + '" height="14" rx="4" fill="#38bdf8" fill-opacity="0.75"></rect>' +
+        '<text x="' + (98 + w) + '" y="' + (y + 13) + '" fill="#e6eefb" font-size="10.5">' + esc(b.count) + '</text>';
+    }).join('');
+    return head + '<div class="hint">总计：' + esc(p.total || 0) + '</div>' +
+      '<svg width="100%" viewBox="0 0 330 ' + svgH + '" style="margin-top:4px">' + rects + '</svg>';
+  }
+
+  if (art.kind === 'mcts_plan_card') {
+    const seq = (p.best_sequence || []).map((s, i) =>
+      '<span class="badge c">' + (i + 1) + '. ' + esc(s) + '</span>'
+    ).join('') || '<span class="hint">无推荐序列</span>';
+    return head + '<div class="hint">终局价值：<b>' + esc(p.best_value ?? '-') + '</b> · 模拟次数：' + esc(p.simulations ?? '-') + '</div>' +
+      '<div class="badges" style="margin-top:6px">' + seq + '</div>' +
+      '<button class="g" style="margin-top:8px" onclick="commitMcts()">⚡ 一键执行推荐序列</button>';
+  }
+
+  if (art.kind === 'ui_command') {
+    return head + '<div class="hint">已执行界面联动指令：<b>' + esc(p.command || '') + '</b></div>';
+  }
+
+  return head + '<pre>' + esc(JSON.stringify(p, null, 2)) + '</pre>';
+}
+
+function collectCardParams(cardId) {
+  const box = $(cardId);
+  if (!box) return {};
+  const out = {};
+  box.querySelectorAll('[data-art-field]').forEach(inp => {
+    const k = inp.getAttribute('data-art-field');
+    const ft = inp.getAttribute('data-ftype');
+    if (inp.getAttribute('data-multi') === '1') {
+      out[k] = Array.from(inp.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value);
+      return;
+    }
+    const raw = inp.value;
+    if (inp.getAttribute('data-auto') === '1' && !(raw || '').trim()) return;
+    if (raw === '') {
+      if (inp.getAttribute('data-nullable') === '1') out[k] = null;
+      return;
+    }
+    if (ft === 'integer') out[k] = parseInt(raw, 10);
+    else if (ft === 'number') out[k] = parseFloat(raw);
+    else if (ft === 'boolean') out[k] = raw === 'true';
+    else if (ft === 'array') out[k] = raw.split(',').map(s => s.trim()).filter(Boolean);
+    else out[k] = raw;
+  });
+  return out;
+}
+
+async function agentSimulateCard(cardId) {
+  const box = $(cardId);
+  if (!box) return;
+  const action = box.getAttribute('data-action');
+  const params = collectCardParams(cardId);
+  try {
+    const sim = await api('/api/simulate', {action, params, prior_steps: S.simSteps, scope: currentAgentScope()});
+    applySimPreview(action, sim, params);
+    appendAgentBubble('bot', '已完成沙盘预演：', [{
+      artifact_id: 'sim-' + Date.now(),
+      kind: 'diff_preview',
+      title: '沙盘预演：' + zhAction(action),
+      payload: {action, params, simulation: sim},
+    }]);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function agentSubmitCard(action, paramsJson) {
+  const scope = currentAgentScope();
+  try {
+    const params = JSON.parse(paramsJson || '{}');
+    const data = await api('/api/submit', {run_id: 'AGENT-' + Date.now(), action, params, scope});
+    const run = data.run || {};
+    if (run.status === 'PENDING_APPROVAL') {
+      appendAgentBubble('bot', '动作已提交，命中审批门禁，请审批：', [{
+        artifact_id: 'apr-' + Date.now(),
+        kind: 'approval_card',
+        title: '待审批：' + zhAction(action),
+        payload: {run_id: run.run_id, action: run.action_type, status: run.status, diff: run.object_diff},
+      }]);
+    } else {
+      appendAgentBubble('bot', '正式执行成功：<b>' + esc(zhStatus(run.status)) + '</b>（' + esc(run.run_id) + '）');
+    }
+    if (scope === 'platform') await loadAll();
+    else await refreshInstance();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function agentApproveCard(runId) {
+  const scope = currentAgentScope();
+  try {
+    const data = await api('/api/approve', {run_id: runId, scope});
+    appendAgentBubble('bot', '审批完成：' + esc(runId) + ' → ' + esc(zhStatus((data.run || {}).status || '')));
+    if (scope === 'platform') await loadAll();
+    else await refreshInstance();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function sendAgentMessage() {
+  const inp = $('agentInput');
+  if (!inp) return;
+  const msg = inp.value.trim();
+  if (!msg) return;
+  inp.value = '';
+  appendAgentBubble('user', esc(msg));
+  const bubble = appendAgentBubble('bot', '<span class="hint">思考中…</span>');
+  const qs = [];
+  if (S.inst) qs.push('instance=' + encodeURIComponent(S.inst.instance_id));
+  qs.push('role=' + encodeURIComponent(role()));
+  const url = '/api/agent/chat' + (qs.length ? '?' + qs.join('&') : '');
+
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'Accept': 'text/event-stream'},
+      body: JSON.stringify({
+        message: msg,
+        history: S.agent.history,
+        ui_context: agentUiContext(),
+        ghost_events: S.agent.ghostEvents,
+        scope: currentAgentScope(),
+        stream: true,
+      }),
+    });
+    const ctype = resp.headers.get('content-type') || '';
+    if (!ctype.includes('text/event-stream') || !resp.body) {
+      const res = await resp.json();
+      if (!resp.ok || res.ok === false) throw new Error(res.error || ('HTTP ' + resp.status));
+      bubble.textEl.innerHTML = esc(res.reply_text || '').replace(/\n/g, '<br>');
+      (res.artifacts || []).forEach(art => mountArtifactCard(bubble.artBoxEl, art));
+      S.agent.history.push({role: 'user', content: msg});
+      S.agent.history.push({role: 'assistant', content: res.reply_text || ''});
+      saveAgentSession();
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    let accText = '';
+    const box = $('agentMessages');
+    bubble.textEl.innerHTML = '';
+
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      const frames = buf.split('\n\n');
+      buf = frames.pop() || '';
+      for (const frame of frames) {
+        let evName = 'message';
+        let dataLine = '';
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('event:')) evName = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataLine += line.slice(5).trim();
+        }
+        if (!dataLine) continue;
+        const payload = JSON.parse(dataLine);
+        if (evName === 'tool_call') {
+          bubble.textEl.innerHTML = '<span class="hint">⚙ 正在调用 ' + esc(payload.name || '') + '…</span>';
+        } else if (evName === 'token') {
+          accText += (payload.text || '');
+          bubble.textEl.innerHTML = esc(accText).replace(/\n/g, '<br>');
+        } else if (evName === 'artifact') {
+          mountArtifactCard(bubble.artBoxEl, payload);
+        } else if (evName === 'done') {
+          const finalText = payload.reply_text || accText;
+          bubble.textEl.innerHTML = esc(finalText).replace(/\n/g, '<br>');
+          S.agent.history.push({role: 'user', content: msg});
+          S.agent.history.push({role: 'assistant', content: finalText});
+          saveAgentSession();
+        }
+        if (box) box.scrollTop = box.scrollHeight;
+      }
+    }
+  } catch (e) {
+    if (bubble) bubble.textEl.innerHTML = '<span class="err">调用失败：' + esc(e.message) + '</span>';
+  }
+}
+
+document.addEventListener('click', ev => {
+  if (!ev.target || !ev.target.closest || !ev.target.closest('.msel')) closeAllMsels();
+});
+window.addEventListener('scroll', ev => {
+  if (!ev.target || !ev.target.closest || !ev.target.closest('.msel-menu')) closeAllMsels();
+}, true);
+
+async function pollLiveFingerprint() {
+  if (document.hidden || S.pillar !== 'instance' || !S.inst || _refreshInFlight) return;
+  try {
+    const fp = await api('/api/fingerprint');
+    const prevRev = S.fp && S.fp.revision;
+    if (prevRev && fp && fp.revision && fp.revision !== prevRev) {
+      await refreshInstance({ preserveSim: true, silent: true });
+    } else if (!prevRev && fp) {
+      S.fp = fp;
+    }
+  } catch (_) {}
+}
+setInterval(pollLiveFingerprint, 1500);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollLiveFingerprint(); });
 
 loadAll();
 </script></body></html>
@@ -2010,13 +3589,94 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send_json(status, {"ok": False, "error": message})
 
-    def _actor(self, role: str | None = None, entry: OntologyInstanceEntry | None = None) -> Actor:
-        if role:
-            return Actor(actor_id=f"workshop:{role}", role=role, clearance_tags={"*"})
+    def _resolve_request_actor(
+        self,
+        entry: OntologyInstanceEntry | None = None,
+        *,
+        role: str | None = None,
+        body: dict[str, Any] | None = None,
+        query: dict[str, list[str]] | None = None,
+    ) -> tuple[Actor, bool]:
+        """Resolve caller Actor from Bearer token or explicit actor headers/params.
+
+        Returns ``(actor, from_bearer_token)``. When an ``Authorization: Bearer``
+        header is present, the token's bound Actor cannot be overridden by query
+        parameters or request headers.
+        """
+        auth = (self.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+            if not token:
+                raise _UnauthorizedError("empty bearer token")
+            ws_id = entry.instance_id if entry is not None else None
+            return self._registry.resolve_actor_token(token, workspace_id=ws_id), True
+
+        q = query or {}
+        b = body or {}
+        hdr_id = (self.headers.get("X-Actor-Id") or "").strip() or None
+        q_id = (q.get("actor_id", [None])[0] or "").strip() or None
+        b_id = (str(b.get("actor_id")).strip() if b.get("actor_id") else None)
+        explicit_id = hdr_id or b_id or q_id
+
+        hdr_role = (self.headers.get("X-Actor-Role") or "").strip() or None
+        q_role = (q.get("role", [None])[0] or "").strip() or None
+        b_role = (str(b.get("role")).strip() if b.get("role") else None)
+        eff_role = role or b_role or hdr_role or q_role
+
+        hdr_tags = (self.headers.get("X-Clearance-Tags") or "").strip()
+        tags = (
+            {t.strip() for t in hdr_tags.split(",") if t.strip()}
+            if hdr_tags
+            else {"*"}
+        )
+
+        if eff_role or explicit_id:
+            if not eff_role:
+                if entry is not None and entry.default_actor is not None:
+                    eff_role = entry.default_actor.role
+                else:
+                    eff_role = self.server.default_actor.role  # type: ignore[attr-defined]
+            actor_id = explicit_id or f"workshop:{eff_role}"
+            return Actor(actor_id=actor_id, role=eff_role, clearance_tags=tags), False
+
         if entry is not None and entry.default_actor is not None:
-            return entry.default_actor
-        role = self.server.default_actor.role  # type: ignore[attr-defined]
-        return Actor(actor_id=f"workshop:{role}", role=role, clearance_tags={"*"})
+            return entry.default_actor, False
+        default_role = self.server.default_actor.role  # type: ignore[attr-defined]
+        return Actor(actor_id=f"workshop:{default_role}", role=default_role, clearance_tags=tags), False
+
+    def _actor(
+        self, role: str | None = None, entry: OntologyInstanceEntry | None = None
+    ) -> Actor:
+        actor, _ = self._resolve_request_actor(entry, role=role)
+        return actor
+
+    def _base_url(self) -> str:
+        host = (self.headers.get("Host") or "").strip()
+        return f"http://{host}" if host else ""
+
+    @staticmethod
+    def _visible_links(runtime: OntologyRuntime, actor: Actor) -> list[dict[str, Any]]:
+        rows = runtime.connection.execute(
+            """
+            SELECT link_type, source_type, source_id, target_type, target_id
+            FROM ontology_links ORDER BY link_type, source_id, target_id
+            """
+        ).fetchall()
+        visible = {
+            (row["object_type"], row["object_id"])
+            for row in runtime.connection.execute(
+                "SELECT object_type, object_id, security_tags_json "
+                "FROM ontology_objects"
+            ).fetchall()
+            if actor.has_access(json.loads(row["security_tags_json"]))
+        }
+        # 任一端的对象缺失（悬空边）或被 RLS 隐藏，整条边都不出口。
+        return [
+            dict(row)
+            for row in rows
+            if (row["source_type"], row["source_id"]) in visible
+            and (row["target_type"], row["target_id"]) in visible
+        ]
 
     def _read_json(self) -> dict[str, Any]:
         try:
@@ -2064,7 +3724,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     "counts": {
                         "object_types": len(meta["object_types"]),
                         "interfaces": len(meta["interfaces"]),
-                        "link_types": len(meta["link_types"]),
+                        "object_properties": len(meta["object_properties"]),
                         "functions": len(meta["functions"]),
                         "actions": len(meta["actions"]),
                         "automations": len(meta["automations"]),
@@ -2089,10 +3749,6 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             "devices": {
                 "symbolic": [
                     asdict(item) for item in self._registry.symbolic_devices.values()
-                ],
-                "connectionist": [
-                    asdict(item)
-                    for item in self._registry.connectionist_devices.values()
                 ],
             },
         }
@@ -2121,10 +3777,11 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                 "counts": {
                     "object_types": len(payload["object_types"]),
                     "interfaces": len(payload["interfaces"]),
-                    "link_types": len(payload["link_types"]),
+                    "object_properties": len(payload["object_properties"]),
                     "functions": len(payload["functions"]),
                     "actions": len(payload["actions"]),
                     "automations": len(payload["automations"]),
+                    "roles": len(payload["role_defs"]),
                     "instances": len(workspaces),
                     "workspaces": len(workspaces),
                 },
@@ -2227,6 +3884,17 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                         },
                     )
                     return
+
+                if path == "/api/adapters":
+                    meta_admin = getattr(self.server, "meta_admin", None)
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "adapters": meta_admin.list_adapters() if meta_admin else [],
+                        },
+                    )
+                    return
                 if path == "/api/devices":
                     self._send_json(
                         200,
@@ -2235,10 +3903,6 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                             "symbolic": [
                                 asdict(item)
                                 for item in self._registry.symbolic_devices.values()
-                            ],
-                            "connectionist": [
-                                asdict(item)
-                                for item in self._registry.connectionist_devices.values()
                             ],
                         },
                     )
@@ -2265,20 +3929,37 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     self._send_json(200, self._ontology_detail(model_id))
                     return
 
+                if path.startswith("/api/worlds/"):
+                    self._handle_world_get(path, query)
+                    return
+
                 entry = self._instance_entry(None, query)
                 runtime = entry.runtime
-                actor = self._actor(role, entry)
+                actor, _ = self._resolve_request_actor(entry, role=role, query=query)
 
                 if path == "/api/meta":
                     self._send_json(200, self._meta(actor, runtime, entry))
                     return
                 if path == "/api/fingerprint":
+                    fp, revision = _compute_live_revision(runtime)
                     self._send_json(
                         200,
                         {
                             "ok": True,
                             "instance": entry.instance_id,
-                            **runtime.state_fingerprint(),
+                            **fp,
+                            "revision": revision,
+                        },
+                    )
+                    return
+                if path == "/api/world-health":
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "instance": entry.instance_id,
+                            "workspace": entry.instance_id,
+                            **runtime.inspect_health(),
                         },
                     )
                     return
@@ -2293,6 +3974,9 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                         },
                     )
                     return
+                if path == "/api/simulations":
+                    self._send_json(200, self._list_simulations_payload(entry, query))
+                    return
                 if path == "/api/automations/history":
                     self._send_json(
                         200,
@@ -2303,27 +3987,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     )
                     return
                 if path == "/api/links":
-                    rows = runtime.connection.execute(
-                        """
-                        SELECT link_type, source_type, source_id, target_type, target_id
-                        FROM ontology_links ORDER BY link_type, source_id, target_id
-                        """
-                    ).fetchall()
-                    visible = {
-                        (row["object_type"], row["object_id"])
-                        for row in runtime.connection.execute(
-                            "SELECT object_type, object_id, security_tags_json "
-                            "FROM ontology_objects"
-                        ).fetchall()
-                        if actor.has_access(json.loads(row["security_tags_json"]))
-                    }
-                    # 任一端的对象缺失（悬空边）或被 RLS 隐藏，整条边都不出口。
-                    links = [
-                        dict(row)
-                        for row in rows
-                        if (row["source_type"], row["source_id"]) in visible
-                        and (row["target_type"], row["target_id"]) in visible
-                    ]
+                    links = self._visible_links(runtime, actor)
                     self._send_json(
                         200,
                         {"ok": True, "count": len(links), "links": links},
@@ -2383,7 +4047,17 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     return
 
                 self._error(404, "not found")
-            except KeyError as exc:
+            except _UnauthorizedError as exc:
+                self._error(401, str(exc))
+            except PermissionDeniedError as exc:
+                self._error(403, str(exc))
+            except (
+                KeyError,
+                ObjectNotFoundError,
+                UnknownObjectTypeError,
+                ActionNotFoundError,
+                FunctionNotFoundError,
+            ) as exc:
                 self._error(404, str(exc))
             except OpenOntologyError as exc:
                 self._error(400, str(exc))
@@ -2405,10 +4079,25 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
 
         with self._lock:
             try:
+                if path.startswith("/api/worlds/"):
+                    self._handle_world_post(path, query, body)
+                    return
                 entry = self._instance_entry(body, query)
-                actor = self._actor(body.get("role") or role, entry)
+                actor, _ = self._resolve_request_actor(
+                    entry, role=body.get("role") or role, body=body, query=query
+                )
                 self._dispatch_post(path, body, actor, entry)
-            except KeyError as exc:
+            except _UnauthorizedError as exc:
+                self._error(401, str(exc))
+            except PermissionDeniedError as exc:
+                self._error(403, str(exc))
+            except (
+                KeyError,
+                ObjectNotFoundError,
+                UnknownObjectTypeError,
+                ActionNotFoundError,
+                FunctionNotFoundError,
+            ) as exc:
                 self._error(404, str(exc))
             except OpenOntologyError as exc:
                 self._error(400, str(exc))
@@ -2416,6 +4105,423 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                 self._error(400, str(exc))
             except Exception as exc:  # pragma: no cover - defensive boundary
                 self._error(500, str(exc))
+
+    # -- /api/worlds/{world_id}/... (REST + OpenAPI 3.1) -------------------
+    def _handle_world_get(
+        self, path: str, query: dict[str, list[str]]
+    ) -> None:
+        parts = [unquote(p) for p in path[len("/api/worlds/"):].split("/") if p]
+        if not parts:
+            self._error(404, "world id required")
+            return
+        entry = self._registry.get_instance(parts[0])
+        runtime = entry.runtime
+        actor, from_token = self._resolve_request_actor(entry, query=query)
+
+        if len(parts) == 1:
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "world": _instance_summary(entry, self._registry),
+                    "actor": {"actor_id": actor.actor_id, "role": actor.role},
+                    "openapi_url": f"/api/worlds/{entry.instance_id}/openapi.json",
+                    "fingerprint": runtime.state_fingerprint(),
+                },
+            )
+            return
+
+        sub = parts[1:]
+        if sub == ["openapi.json"]:
+            role_filter = (
+                actor.role
+                if from_token
+                else (
+                    (query.get("role", [None])[0] or "").strip()
+                    or (self.headers.get("X-Actor-Role") or "").strip()
+                    or None
+                )
+            )
+            spec_doc = describe_openapi(
+                runtime.spec,
+                world_id=entry.instance_id,
+                base_url=self._base_url(),
+                role=role_filter,
+                title=entry.label,
+                description=entry.description,
+            )
+            self._send_json(200, spec_doc)
+            return
+
+        if sub == ["links"]:
+            links = self._visible_links(runtime, actor)
+            self._send_json(200, {"ok": True, "count": len(links), "links": links})
+            return
+
+        if sub == ["health"]:
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "world_id": entry.instance_id,
+                    **runtime.inspect_health(),
+                },
+            )
+            return
+
+        if sub == ["action-runs"]:
+            status = query.get("status", [None])[0]
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "world_id": entry.instance_id,
+                    "runs": runtime.list_action_runs(status),
+                },
+            )
+            return
+
+        if len(sub) == 2 and sub[0] == "objects":
+            cls = runtime.spec.get_object_type(sub[1])
+            objects = runtime.query_objects(cls, actor)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "object_type": cls.__name__,
+                    "count": len(objects),
+                    "objects": [o.model_dump(mode="json") for o in objects],
+                },
+            )
+            return
+
+        if len(sub) == 3 and sub[0] == "objects":
+            cls = runtime.spec.get_object_type(sub[1])
+            obj = runtime.get_object(cls, sub[2], actor)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "object_type": cls.__name__,
+                    "object": obj.model_dump(mode="json"),
+                },
+            )
+            return
+
+        if sub == ["simulations"]:
+            self._send_json(200, self._list_simulations_payload(entry, query))
+            return
+
+        if sub == ["webhooks"]:
+            self._require_webhook_admin(actor, entry)
+            subs = [
+                s.to_public_dict()
+                for s in self._registry.webhooks.list_subscriptions(entry.instance_id)
+            ]
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "world_id": entry.instance_id,
+                    "count": len(subs),
+                    "subscriptions": subs,
+                },
+            )
+            return
+
+        if len(sub) == 3 and sub[0] == "webhooks" and sub[2] == "deliveries":
+            self._require_webhook_admin(actor, entry)
+            rows = self._registry.webhooks.list_deliveries(
+                sub[1], world_id=entry.instance_id
+            )
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "world_id": entry.instance_id,
+                    "sub_id": sub[1],
+                    "count": len(rows),
+                    "deliveries": rows,
+                },
+            )
+            return
+
+        self._error(404, "not found")
+
+    @staticmethod
+    def _require_webhook_admin(actor: Actor, entry: OntologyInstanceEntry) -> None:
+        allowed = {"admin", "system"}
+        if entry.default_actor is not None and entry.default_actor.role:
+            allowed.add(entry.default_actor.role)
+        if actor.role not in allowed:
+            raise PermissionDeniedError(
+                f"role {actor.role!r} is not allowed to manage webhooks "
+                f"(allowed: {sorted(allowed)})"
+            )
+
+    def _handle_world_post(
+        self, path: str, query: dict[str, list[str]], body: dict[str, Any]
+    ) -> None:
+        parts = [unquote(p) for p in path[len("/api/worlds/"):].split("/") if p]
+        if len(parts) == 2 and parts[1] == "webhooks":
+            entry = self._registry.get_instance(parts[0])
+            actor, _ = self._resolve_request_actor(entry, query=query)
+            self._require_webhook_admin(actor, entry)
+            target_url = str(body.get("target_url") or "")
+            raw_filter = body.get("filter")
+            if raw_filter is not None and not isinstance(raw_filter, dict):
+                raise ValueError("filter must be a JSON object")
+            sub = self._registry.webhooks.register(
+                world_id=entry.instance_id,
+                target_url=target_url,
+                filter_spec=WebhookFilter.from_mapping(raw_filter),
+                secret=str(body.get("secret") or ""),
+                description=str(body.get("description") or ""),
+                sub_id=str(body["sub_id"]) if body.get("sub_id") else None,
+                enabled=bool(body.get("enabled", True)),
+                created_by=actor.actor_id,
+            )
+            self._send_json(
+                201,
+                {
+                    "ok": True,
+                    "world_id": entry.instance_id,
+                    "subscription": sub.to_public_dict(),
+                },
+            )
+            return
+
+        if len(parts) != 3 or parts[1] not in ("functions", "actions"):
+            self._error(404, "not found")
+            return
+
+        world_id, kind, name = parts
+        entry = self._registry.get_instance(world_id)
+        runtime = entry.runtime
+        actor, _ = self._resolve_request_actor(entry, query=query)
+
+        if kind == "functions":
+            runtime.spec.get_function(name)
+            result = runtime.call_function(name, body, actor)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "world_id": entry.instance_id,
+                    "actor": {"actor_id": actor.actor_id, "role": actor.role},
+                    "function": name,
+                    "result": result,
+                },
+            )
+            return
+
+        action_def = runtime.spec.get_action(name)
+        if action_def.visibility == "private":
+            raise PermissionDeniedError(f"action {name!r} is private")
+        dry_run = (
+            str((query.get("dry_run") or [""])[0]).lower() in ("1", "true", "yes")
+            or str(self.headers.get("X-Dry-Run") or "").lower() in ("1", "true", "yes")
+        )
+        if dry_run:
+            res = self._simulate_and_record(
+                entry,
+                actor=actor,
+                action_name=name,
+                params=body,
+                prior_steps=[],
+                session_id=(query.get("session_id") or [None])[0],
+            )
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "world_id": entry.instance_id,
+                    "dry_run": True,
+                    **res,
+                },
+            )
+            return
+
+        run_id = (
+            (query.get("run_id") or [None])[0]
+            or (self.headers.get("X-Run-Id") or "").strip()
+            or f"API-{len(runtime.list_action_runs()) + 1:04d}-{uuid.uuid4().hex[:6]}"
+        )
+        run = runtime.submit_action(run_id, name, body, actor)
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "world_id": entry.instance_id,
+                "actor": {"actor_id": actor.actor_id, "role": actor.role},
+                "run": run,
+            },
+        )
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib naming
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        query = parse_qs(parsed.query)
+        with self._lock:
+            try:
+                if path.startswith("/api/worlds/"):
+                    parts = [
+                        unquote(p) for p in path[len("/api/worlds/"):].split("/") if p
+                    ]
+                    if len(parts) == 3 and parts[1] == "webhooks":
+                        entry = self._registry.get_instance(parts[0])
+                        actor, _ = self._resolve_request_actor(entry, query=query)
+                        self._require_webhook_admin(actor, entry)
+                        removed = self._registry.webhooks.delete_subscription(
+                            parts[2], world_id=entry.instance_id
+                        )
+                        self._send_json(
+                            200,
+                            {
+                                "ok": True,
+                                "world_id": entry.instance_id,
+                                "deleted": removed.to_public_dict(),
+                            },
+                        )
+                        return
+                    if parts[1:] == ["simulations"]:
+                        entry = self._registry.get_instance(parts[0])
+                        self._resolve_request_actor(entry, query=query)
+                        deleted_count = self._registry.simulation_ledger.clear(entry)
+                        self._send_json(
+                            200,
+                            {
+                                "ok": True,
+                                "world_id": entry.instance_id,
+                                "deleted": deleted_count,
+                            },
+                        )
+                        return
+                if path == "/api/simulations":
+                    entry = self._instance_entry(None, query)
+                    self._resolve_request_actor(entry, query=query)
+                    deleted_count = self._registry.simulation_ledger.clear(entry)
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "instance": entry.instance_id,
+                            "deleted": deleted_count,
+                        },
+                    )
+                    return
+                self._error(404, "not found")
+            except _UnauthorizedError as exc:
+                self._error(401, str(exc))
+            except PermissionDeniedError as exc:
+                self._error(403, str(exc))
+            except (KeyError, ObjectNotFoundError) as exc:
+                self._error(404, str(exc))
+            except OpenOntologyError as exc:
+                self._error(400, str(exc))
+            except ValueError as exc:
+                self._error(400, str(exc))
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                self._error(500, str(exc))
+
+    def _list_simulations_payload(
+        self, entry: OntologyInstanceEntry, query: dict[str, list[str]]
+    ) -> dict[str, Any]:
+        valid_raw = (query.get("valid") or [None])[0]
+        valid_filter: bool | None = None
+        if valid_raw is not None:
+            low = str(valid_raw).strip().lower()
+            if low in ("1", "true", "yes"):
+                valid_filter = True
+            elif low in ("0", "false", "no"):
+                valid_filter = False
+        session_id = (query.get("session_id") or [None])[0]
+        limit_raw = (query.get("limit") or ["100"])[0]
+        rows = self._registry.simulation_ledger.list(
+            entry,
+            valid=valid_filter,
+            session_id=session_id,
+            limit=int(limit_raw or "100"),
+        )
+        return {
+            "ok": True,
+            "instance": entry.instance_id,
+            "world_id": entry.instance_id,
+            "count": len(rows),
+            "simulations": rows,
+        }
+
+    def _simulate_and_record(
+        self,
+        entry: OntologyInstanceEntry,
+        *,
+        actor: Actor,
+        action_name: str,
+        params: dict[str, Any],
+        prior_steps: list[dict[str, Any]],
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        runtime = entry.runtime
+        eff_session = (str(session_id or "").strip()) or f"SIM-{uuid.uuid4().hex[:10]}"
+        step_index = len(prior_steps) + 1
+        fp_hash = str(runtime.state_fingerprint().get("fingerprint", ""))
+
+        try:
+            if prior_steps:
+                sim_fork = runtime.fork()
+                try:
+                    for idx, step in enumerate(prior_steps, start=1):
+                        step_run_id = f"SIM-PRIOR-{idx}-{uuid.uuid4().hex[:6]}"
+                        run = sim_fork.submit_action(
+                            step_run_id,
+                            step["action"],
+                            step.get("params") or {},
+                            actor,
+                        )
+                        if (run or {}).get("status") == "PENDING_APPROVAL":
+                            sim_fork.approve_action(
+                                step_run_id,
+                                Actor(actor_id="sim-approver", role="system"),
+                            )
+                    sim = sim_fork.simulate_action(action_name, params, actor)
+                finally:
+                    sim_fork.close()
+            else:
+                sim = runtime.simulate_action(action_name, params, actor)
+        except Exception as exc:
+            self._registry.simulation_ledger.record(
+                entry,
+                session_id=eff_session,
+                step_index=step_index,
+                action_name=action_name,
+                actor=actor,
+                params=params,
+                prior_steps=prior_steps,
+                valid=False,
+                requires_approval=False,
+                error_code=getattr(exc, "code", None) or type(exc).__name__,
+                error_message=str(exc),
+                base_fingerprint=fp_hash,
+            )
+            raise
+
+        sim_dict = sim.to_dict()
+        meta = self._registry.simulation_ledger.record(
+            entry,
+            session_id=eff_session,
+            step_index=step_index,
+            action_name=action_name,
+            actor=actor,
+            params=params,
+            prior_steps=prior_steps,
+            valid=sim.valid,
+            requires_approval=sim.requires_approval,
+            error_code=sim.error_code,
+            error_message=sim.error,
+            diff=sim_dict.get("diff"),
+            base_fingerprint=fp_hash,
+        )
+        return {**sim_dict, **meta}
 
     def _dispatch_post(
         self,
@@ -2425,26 +4531,98 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
         entry: OntologyInstanceEntry,
     ) -> None:
         runtime = entry.runtime
+        is_platform = body.get("scope") == "platform"
+        meta_admin = getattr(self.server, "meta_admin", None)
+        if is_platform and meta_admin is not None:
+            runtime = meta_admin.runtime
+
+        if path == "/api/adapter/sync":
+            if meta_admin is None:
+                raise KeyError("meta_admin not configured")
+            adapter_id = str(body.get("adapter_id") or "")
+            if not adapter_id:
+                raise ValueError("adapter_id is required")
+            res = meta_admin.run_adapter_once(adapter_id)
+            self._send_json(200, {"ok": True, **res})
+            return
+
+        if path == "/api/adapter/toggle":
+            if meta_admin is None:
+                raise KeyError("meta_admin not configured")
+            adapter_id = str(body.get("adapter_id") or "")
+            status = str(body.get("status") or "")
+            if not adapter_id or not status:
+                raise ValueError("adapter_id and status are required")
+            res = meta_admin.toggle_adapter(adapter_id, status)
+            self._send_json(200, {"ok": True, **res})
+            return
+
+        if path == "/api/adapter/webhook":
+            if meta_admin is None:
+                raise KeyError("meta_admin not configured")
+            parsed_q = parse_qs(urlparse(self.path).query)
+            adapter_id = str(
+                (parsed_q.get("adapter_id") or [None])[0]
+                or body.get("adapter_id")
+                or ""
+            )
+            if not adapter_id:
+                raise ValueError("adapter_id is required")
+            res = meta_admin.ingest_adapter_webhook(adapter_id, body)
+            self._send_json(200, {"ok": True, **res})
+            return
 
         if path == "/api/simulate":
-            sim = runtime.simulate_action(
-                body["action"], body.get("params") or {}, actor
+            prior_steps = body.get("prior_steps") or []
+            res = self._simulate_and_record(
+                entry,
+                actor=actor,
+                action_name=body["action"],
+                params=body.get("params") or {},
+                prior_steps=prior_steps,
+                session_id=body.get("session_id"),
             )
-            self._send_json(200, {"ok": True, **sim.to_dict()})
+            self._send_json(200, {"ok": True, **res})
             return
 
         if path == "/api/submit":
+            steps = body.get("steps")
+            if isinstance(steps, list) and steps:
+                runs = []
+                base_idx = len(runtime.list_action_runs()) + 1
+                for offset, step in enumerate(steps):
+                    run_id = step.get("run_id") or f"CC-{base_idx + offset:04d}-{uuid.uuid4().hex[:6]}"
+                    run = runtime.submit_action(
+                        run_id,
+                        step["action"],
+                        step.get("params") or {},
+                        actor,
+                    )
+                    if is_platform and meta_admin is not None and run.get("status") == "COMMITTED":
+                        meta_admin.sync_to_registry()
+                    runs.append(run)
+                self._send_json(200, {"ok": True, "run": runs[-1], "runs": runs})
+                return
             run = runtime.submit_action(
                 body.get("run_id") or f"UI-{len(runtime.list_action_runs()) + 1:04d}",
                 body["action"],
                 body.get("params") or {},
                 actor,
             )
+            sim_sess = str(body.get("simulation_session_id") or "").strip()
+            if sim_sess and run.get("run_id"):
+                self._registry.simulation_ledger.mark_first_step_committed(
+                    entry, session_id=sim_sess, run_id=str(run["run_id"])
+                )
+            if is_platform and meta_admin is not None and run.get("status") == "COMMITTED":
+                meta_admin.sync_to_registry()
             self._send_json(200, {"ok": True, "run": run})
             return
 
         if path == "/api/approve":
             run = runtime.approve_action(body["run_id"], actor)
+            if is_platform and meta_admin is not None and run.get("status") == "COMMITTED":
+                meta_admin.sync_to_registry()
             self._send_json(200, {"ok": True, "run": run})
             return
 
@@ -2472,6 +4650,77 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     "history": runtime.automation_history(),
                 },
             )
+            return
+
+        if path == "/api/agent/ghost":
+            event_type = str(body.get("event_type") or "").strip()
+            if not event_type:
+                raise ValueError("ghost event_type is required")
+            ghost_key = f"{entry.instance_id}:{actor.actor_id}"
+            store = getattr(self.server, "agent_ghost_events", None)
+            if store is None:
+                store = {}
+                self.server.agent_ghost_events = store
+            buf = store.setdefault(ghost_key, [])
+            buf.append(
+                {
+                    "event_type": event_type,
+                    "detail": dict(body.get("detail") or {}),
+                }
+            )
+            if len(buf) > 20:
+                del buf[:-20]
+            self._send_json(200, {"ok": True, "count": len(buf)})
+            return
+
+        if path == "/api/agent/chat":
+            msg = str(body.get("message") or "").strip()
+            if not msg:
+                raise ValueError("agent message must be a non-empty string")
+            executor = AIPAgentExecutor(runtime, actor)
+            llm_fn = getattr(self.server, "agent_llm_fn", None)
+            scope_tag = "platform" if is_platform else entry.instance_id
+            ghost_key = f"{scope_tag}:{actor.actor_id}"
+            stored_ghosts = list(
+                (getattr(self.server, "agent_ghost_events", None) or {}).get(ghost_key) or []
+            )
+            req_ghosts = list(body.get("ghost_events") or [])
+            merged_ghosts = (stored_ghosts + req_ghosts)[-20:]
+
+            accept = str(self.headers.get("Accept") or "")
+            want_stream = bool(body.get("stream")) or ("text/event-stream" in accept)
+            if want_stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for ev in iter_agent_turn(
+                    executor,
+                    msg,
+                    history=body.get("history"),
+                    ui_context=body.get("ui_context"),
+                    ghost_events=merged_ghosts,
+                    llm_fn=llm_fn,
+                ):
+                    frame = (
+                        f"event: {ev['event']}\n"
+                        f"data: {json.dumps(ev['data'], ensure_ascii=False)}\n\n"
+                    ).encode("utf-8")
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+                self.close_connection = True
+                return
+
+            turn = run_agent_turn(
+                executor,
+                msg,
+                history=body.get("history"),
+                ui_context=body.get("ui_context"),
+                ghost_events=merged_ghosts,
+                llm_fn=llm_fn,
+            )
+            self._send_json(200, {"ok": True, **turn.to_dict()})
             return
 
         if path == "/api/snapshot":
@@ -2570,6 +4819,27 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                 )
                 committed.append(run_id)
             payload["committed_runs"] = committed
+        elif report.best_plan:
+            sim_fork = entry.runtime.fork()
+            try:
+                obj_changes: list[dict[str, Any]] = []
+                link_changes: list[dict[str, Any]] = []
+                for index, candidate in enumerate(report.best_plan, start=1):
+                    run = sim_fork.submit_action(
+                        f"MCTS-SIM-{index}",
+                        candidate.action,
+                        candidate.params,
+                        planner_actor,
+                    )
+                    diff_dict = (run or {}).get("object_diff") or {}
+                    obj_changes.extend(diff_dict.get("object_changes") or [])
+                    link_changes.extend(diff_dict.get("link_changes") or [])
+                payload["diff"] = {
+                    "object_changes": obj_changes,
+                    "link_changes": link_changes,
+                }
+            finally:
+                sim_fork.close()
         self._send_json(200, payload)
 
     def _unplug(self, body: dict[str, Any], entry: OntologyInstanceEntry) -> None:
@@ -2611,6 +4881,7 @@ class WorkshopServer(ThreadingHTTPServer):
         registry: CommandCenterRegistry | None = None,
         actor: Actor | None = None,
         title: str = "OpenOntology Workshop",
+        agent_llm_fn: Callable[..., Any] | None = None,
     ) -> None:
         if registry is None:
             if runtime is None:
@@ -2625,10 +4896,18 @@ class WorkshopServer(ThreadingHTTPServer):
         self.runtime = registry.default_instance().runtime
         self.runtime_lock = threading.RLock()
         self.title = title
+        self.agent_llm_fn = agent_llm_fn
+        self.agent_ghost_events: dict[str, list[dict[str, Any]]] = {}
+        self.meta_admin = MetaAdminService(self.registry)
         self.default_actor = actor or Actor(
             actor_id="workshop:admin", role="admin", clearance_tags={"*"}
         )
+        self.meta_admin.start_adapter_loop()
         super().__init__(server_address, _WorkshopHandler)
+
+    def server_close(self) -> None:
+        self.meta_admin.stop()
+        super().server_close()
 
 
 @dataclass

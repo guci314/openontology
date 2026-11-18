@@ -64,7 +64,7 @@ def _build_spec() -> OntologySpec:
     spec = OntologySpec()
     spec.interface("Named", required_fields=("name",), description="有名字的对象")
     spec.object_type(Widget)
-    spec.link_type(
+    spec.object_property(
         "widget_parent",
         "Widget",
         "Widget",
@@ -121,6 +121,7 @@ def test_describe_tbox_projects_only_declarations():
 
     fields = {row["name"]: row for row in widget["fields"]}
     assert fields["price"]["type"] == "float"
+    assert fields["price"]["property_kind"] == "datatype"
     assert fields["price"]["masked"] is True
     assert fields["price"]["masked_roles"] == ["finance"]
     assert fields["price"]["required"] is True
@@ -140,13 +141,14 @@ def test_describe_tbox_projects_only_declarations():
             "implementations": ["Widget"],
         }
     ]
-    assert tbox["link_types"] == [
+    assert tbox["object_properties"] == [
         {
             "name": "widget_parent",
-            "source": "Widget",
-            "target": "Widget",
+            "domain": "Widget",
+            "range": "Widget",
             "cardinality": "one-to-many",
             "owned": False,
+            "field": None,
             "description": "父子关系",
         }
     ]
@@ -155,7 +157,7 @@ def test_describe_tbox_projects_only_declarations():
     for forbidden in (
         "objects",
         "object_values",
-        "properties",
+        '"properties"',
         "action_runs",
         "audit",
         "handler",
@@ -176,7 +178,7 @@ def test_describe_behavior_keeps_existing_contract_shape():
     behavior = describe_behavior(spec)
     serialized = json.dumps(behavior, ensure_ascii=False)
 
-    assert list(behavior) == ["functions", "actions", "automations"]
+    assert list(behavior) == ["functions", "actions", "automations", "roles"]
 
     assert behavior["functions"] == [
         {"name": "widget_briefing", "description": "只读摘要"}
@@ -189,8 +191,10 @@ def test_describe_behavior_keeps_existing_contract_shape():
         "allowed_roles",
         "approver_roles",
         "affects_source",
+        "visibility",
         "params",
     }
+    assert action["visibility"] == "public"
     assert action["name"] == "activate_widget"
     assert action["allowed_roles"] == ["ops"]
     assert action["approver_roles"] == ["manager"]
@@ -236,19 +240,21 @@ def test_spec_meta_reuses_views_and_keeps_workspace_roles_outside_tbox():
         "roles",
         "object_types",
         "interfaces",
-        "link_types",
+        "object_properties",
         "functions",
         "actions",
         "automations",
+        "role_defs",
     ]
     tbox = describe_tbox(spec)
     behavior = describe_behavior(spec)
     assert meta["object_types"] == tbox["object_types"]
     assert meta["interfaces"] == tbox["interfaces"]
-    assert meta["link_types"] == tbox["link_types"]
+    assert meta["object_properties"] == tbox["object_properties"]
     assert meta["functions"] == behavior["functions"]
     assert meta["actions"] == behavior["actions"]
     assert meta["automations"] == behavior["automations"]
+    assert meta["role_defs"] == behavior["roles"]
 
     # default actor 角色来自工作空间，不属于纯 TBox 投影
     assert "workspace_owner" in meta["roles"]
@@ -329,4 +335,112 @@ def test_describe_tbox_emits_strict_plain_json_for_tuple_and_non_finite_defaults
     fields = {f["name"]: f for f in tbox["object_types"][0]["fields"]}
     assert fields["tags"]["default"] == ["a", "b"]
     assert "default" not in fields["bad_float"]
+
+
+def test_role_def_validation_and_behavior_projection():
+    import pytest
+    from open_ontology import RoleDef, UnknownRoleError
+
+    class SecretItem(ObjectType):
+        __primary_key__ = "item_id"
+        __masked_fields__ = {"secret": ("typo_role",)}
+        item_id: str
+        secret: str = ""
+
+    strict_spec = OntologySpec()
+    role = strict_spec.role("operator", "值守操作员")
+    assert isinstance(role, RoleDef)
+    assert strict_spec.get_role("operator") == role
+    assert strict_spec.summary()["roles"] == ["operator"]
+
+    with pytest.raises(UnknownRoleError):
+        strict_spec.object_type(SecretItem)
+
+    @strict_spec.action("do_op", params=WidgetActionParams, allowed_roles=("operator",))
+    def do_op(runtime: Any, params: WidgetActionParams) -> None:
+        return None
+
+    with pytest.raises(UnknownRoleError):
+
+        @strict_spec.action("bad_op", params=WidgetActionParams, allowed_roles=("ghost",))
+        def bad_op(runtime: Any, params: WidgetActionParams) -> None:
+            return None
+
+    with pytest.raises(UnknownRoleError):
+
+        @strict_spec.action(
+            "bad_approver",
+            params=WidgetActionParams,
+            allowed_roles=("operator",),
+            approver_roles=("missing_mgr",),
+        )
+        def bad_approver(runtime: Any, params: WidgetActionParams) -> None:
+            return None
+
+    behavior = describe_behavior(strict_spec)
+    assert behavior["roles"] == [
+        {
+            "name": "operator",
+            "description": "值守操作员",
+            "declared": True,
+            "allowed_actions": ["do_op"],
+            "approver_actions": [],
+            "masked_fields": [],
+        }
+    ]
+
+    meta = _spec_meta(strict_spec)
+    assert meta["roles"][0] == "operator"
+    assert meta["role_defs"] == behavior["roles"]
+
+
+def test_describe_openapi_filters_actions_by_role_and_rewrites_refs():
+    from open_ontology.model_views import describe_openapi
+
+    class NestedInput(BaseModel):
+        tag: str
+
+    class ComplexActionParams(BaseModel):
+        widget_id: str
+        nested: NestedInput
+
+    s = OntologySpec()
+    s.role("worker")
+    s.role("admin")
+    s.role("finance")
+    s.interface("Named", required_fields=("name",))
+    s.object_type(Widget)
+
+    @s.action("public_worker", params=ComplexActionParams, allowed_roles=("worker",))
+    def public_worker(runtime: Any, params: ComplexActionParams) -> None:
+        return None
+
+    @s.action("admin_only", params=WidgetActionParams, allowed_roles=("admin",))
+    def admin_only(runtime: Any, params: WidgetActionParams) -> None:
+        return None
+
+    @s.action(
+        "secret_internal",
+        params=WidgetActionParams,
+        allowed_roles=("worker",),
+        visibility="private",
+    )
+    def secret_internal(runtime: Any, params: WidgetActionParams) -> None:
+        return None
+
+    doc = describe_openapi(
+        s,
+        world_id="ws-demo",
+        base_url="http://127.0.0.1:8765",
+        role="worker",
+    )
+    assert doc["openapi"] == "3.1.0"
+    assert doc["servers"] == [{"url": "http://127.0.0.1:8765"}]
+    assert "/api/worlds/ws-demo/objects/Widget" in doc["paths"]
+    assert "/api/worlds/ws-demo/objects/Widget/{widget_id}" in doc["paths"]
+    assert "/api/worlds/ws-demo/actions/public_worker" in doc["paths"]
+    assert "/api/worlds/ws-demo/actions/admin_only" not in doc["paths"]
+    assert "/api/worlds/ws-demo/actions/secret_internal" not in doc["paths"]
+    assert "NestedInput" in doc["components"]["schemas"]
+    assert "#/$defs/" not in json.dumps(doc, ensure_ascii=False)
 

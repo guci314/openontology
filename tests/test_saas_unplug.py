@@ -107,7 +107,7 @@ def test_spec_factory_matches_model_factory():
         "SupportTicket",
         "RefundRecord",
     }
-    assert set(spec.link_types) == {
+    assert set(spec.object_properties) == {
         "customer_orders",
         "order_tickets",
         "ticket_refund",
@@ -543,11 +543,11 @@ def test_action_and_tool_surface_is_unchanged_across_modes():
             == stand.spec.get_action(action_name).params.model_json_schema()
         )
     for link_name in ("customer_orders", "order_tickets", "ticket_refund"):
-        para_link = para.spec.get_link_type(link_name)
-        stand_link = stand.spec.get_link_type(link_name)
-        assert (para_link.source, para_link.target, para_link.cardinality) == (
-            stand_link.source,
-            stand_link.target,
+        para_link = para.spec.get_object_property(link_name)
+        stand_link = stand.spec.get_object_property(link_name)
+        assert (para_link.domain, para_link.range, para_link.cardinality) == (
+            stand_link.domain,
+            stand_link.range,
             stand_link.cardinality,
         )
 

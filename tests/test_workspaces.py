@@ -19,17 +19,21 @@
 
 from __future__ import annotations
 
+import builtins
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from open_ontology import Actor, OntologyRuntime
-from open_ontology.kanban import spec as kanban_spec
+from open_ontology import Actor, ObjectType, OntologyRuntime
+from examples.kanban import BOARD_MANAGER, Board, Card, spec as kanban_spec
 from open_ontology.spec import OntologySpec
 from open_ontology.workshop import CommandCenterRegistry
 from open_ontology.workspaces import (
+    IncompleteKernelDatabaseError,
+    MANIFEST_FILENAME,
     MANIFEST_FORMAT_VERSION,
     WorkspaceCatalog,
     WorkspaceConflictError,
@@ -39,6 +43,9 @@ from open_ontology.workspaces import (
     WorkspaceModelUnavailableError,
     WorkspaceNotFoundError,
     UnsupportedWorkspaceManifestError,
+    find_ontology_sqlite_files,
+    locate_object_in_databases,
+    takeover_workspace,
 )
 
 MANAGER = Actor(actor_id="manager-01", role="board_manager", clearance_tags={"*"})
@@ -522,7 +529,7 @@ def test_reopening_demo_keeps_catalog_and_does_not_reseed(tmp_path):
     first = build_default_command_center(data_dir=tmp_path)
     first_runtime = first.get_workspace("board-prod").runtime
     run_count = len(first_runtime.list_action_runs())
-    goal = first_runtime.get_object("Board", "BD-CC-001", MANAGER).goal
+    title = first_runtime.get_object("Board", "BD-CC-001", MANAGER).title
     first_runtime.close()
     manifest = tmp_path / "workspaces.json"
     manifest_before = manifest.read_bytes()
@@ -532,7 +539,7 @@ def test_reopening_demo_keeps_catalog_and_does_not_reseed(tmp_path):
     runtime = second.get_workspace("board-prod").runtime
     try:
         assert len(runtime.list_action_runs()) == run_count
-        assert runtime.get_object("Board", "BD-CC-001", MANAGER).goal == goal
+        assert runtime.get_object("Board", "BD-CC-001", MANAGER).title == title
         assert manifest.read_bytes() == manifest_before
 
         rows = second.list_workspaces(MANAGER)
@@ -579,4 +586,215 @@ def test_catalog_only_workspace_with_unregistered_model_reports_reason(tmp_path)
     assert rows[0]["root_status"] == "not_loaded"
     assert rows[0]["reason"] == "model_not_registered"
     assert rows[0]["aggregate_roots"] is None
+
+
+class _Ledger(ObjectType):
+    __primary_key__ = "ledger_id"
+    __title__ = "name"
+    __security_tag_fields__ = ("region",)
+    __aggregate_root__ = True
+
+    ledger_id: str
+    name: str
+    region: str
+
+
+def _ledger_spec() -> OntologySpec:
+    s = OntologySpec()
+    s.object_type(_Ledger)
+    return s
+
+
+_LEDGER_SPEC = _ledger_spec()
+_EAST_READER = Actor(
+    actor_id="reader-east", role="reader", clearance_tags={"region:east"}
+)
+
+
+def _seed_ledger_workspace(tmp_path: Path) -> Path:
+    data_dir = tmp_path / ".instances"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "ledger.sqlite3"
+    runtime = OntologyRuntime(_LEDGER_SPEC, db_path=db_path)
+    try:
+        runtime.put_object(_Ledger(ledger_id="L-1", name="东区台账", region="east"))
+        runtime.put_object(_Ledger(ledger_id="L-2", name="西区台账", region="west"))
+    finally:
+        runtime.close()
+    catalog = WorkspaceCatalog(data_dir / MANIFEST_FILENAME)
+    catalog.register(
+        WorkspaceDescriptor(
+            workspace_id="ledger-ws",
+            model_id="ledger",
+            runtime_id="rt-ledger-ws",
+            db_path="ledger.sqlite3",
+        )
+    )
+    return db_path
+
+
+def _table_names(db_path: Path) -> list[str]:
+    conn = sqlite3.connect(
+        db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0
+    )
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [row[0] for row in rows]
+
+
+@pytest.mark.parametrize(
+    "dirname",
+    ["#fragment", "percent%20dir", "query?part", "literal space"],
+    ids=["hash-fragment", "percent-encoded", "question-query", "literal-space"],
+)
+def test_readonly_scan_and_locate_survive_uri_reserved_directory(tmp_path, dirname):
+    data_dir = tmp_path / dirname
+    data_dir.mkdir()
+    db_path = data_dir / "board_prod.sqlite3"
+    runtime = OntologyRuntime(kanban_spec, db_path=db_path)
+    try:
+        runtime.submit_action(
+            "SEED-1",
+            "create_board",
+            {
+                "board_key": "BD-CC-001",
+                "title": "看板",
+                "tenant": "acme",
+                "created_by": "board-manager-01",
+            },
+            BOARD_MANAGER,
+        )
+    finally:
+        runtime.close()
+
+    assert find_ontology_sqlite_files(data_dir) == [db_path]
+    matches = locate_object_in_databases("BD-CC-001", data_dir)
+    assert len(matches) == 1
+    assert matches[0]["db_path"] == str(db_path.resolve())
+    assert matches[0]["object_type"] == "Board"
+    assert matches[0]["properties"]["title"] == "看板"
+
+    allowed = {db_path.name, db_path.name + "-wal", db_path.name + "-shm"}
+    assert {path.name for path in data_dir.iterdir()} <= allowed
+    assert sorted(path.name for path in tmp_path.iterdir()) == [dirname]
+
+
+def test_takeover_workspace_is_model_agnostic_and_respects_actor_visibility(
+    tmp_path, monkeypatch
+):
+    db_path = _seed_ledger_workspace(tmp_path)
+    real_import = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name in {"examples.kanban", "open_ontology.kanban"}:
+            raise AssertionError(f"generic workspace takeover must not import {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+
+    taken = takeover_workspace(
+        "ledger-ws",
+        models={"ledger": _LEDGER_SPEC},
+        search_root=tmp_path,
+        actor=_EAST_READER,
+    )
+    try:
+        assert taken["workspace_id"] == "ledger-ws"
+        assert taken["model_id"] == "ledger"
+        assert taken["runtime_id"] == "rt-ledger-ws"
+        assert taken["db_path"] == str(db_path.resolve())
+        assert taken["model"] is _LEDGER_SPEC
+        assert taken["aggregate_root_types"] == ["_Ledger"]
+        assert taken["aggregate_roots"] == [
+            {
+                "workspace_id": "ledger-ws",
+                "object_type": "_Ledger",
+                "object_id": "L-1",
+                "title": "东区台账",
+            }
+        ]
+    finally:
+        taken["runtime"].close()
+
+    unscoped = takeover_workspace(
+        "ledger-ws", models={"ledger": _LEDGER_SPEC}, search_root=tmp_path
+    )
+    try:
+        assert unscoped["aggregate_root_types"] == ["_Ledger"]
+        assert unscoped["aggregate_roots"] is None
+    finally:
+        unscoped["runtime"].close()
+
+
+def test_takeover_workspace_missing_workspace_model_and_file_create_nothing(tmp_path):
+    data_dir = tmp_path / ".instances"
+    data_dir.mkdir()
+    catalog = WorkspaceCatalog(data_dir / MANIFEST_FILENAME)
+    catalog.register(
+        WorkspaceDescriptor(
+            workspace_id="ws-model",
+            model_id="ledger",
+            runtime_id="rt-ws-model",
+            db_path="future.sqlite3",
+        )
+    )
+    before = sorted(path.name for path in data_dir.iterdir())
+
+    with pytest.raises(WorkspaceNotFoundError):
+        takeover_workspace("ghost", models={"ledger": _LEDGER_SPEC}, catalog=catalog)
+    with pytest.raises(WorkspaceModelUnavailableError):
+        takeover_workspace(
+            "ws-model", models={"other_model": _LEDGER_SPEC}, catalog=catalog
+        )
+    with pytest.raises(WorkspaceDatabaseMissingError):
+        takeover_workspace("ws-model", models={"ledger": _LEDGER_SPEC}, catalog=catalog)
+
+    assert sorted(path.name for path in data_dir.iterdir()) == before
+    assert not (data_dir / "future.sqlite3").exists()
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(WorkspaceNotFoundError):
+        takeover_workspace("ghost", models={"ledger": _LEDGER_SPEC}, search_root=empty)
+    assert list(empty.iterdir()) == []
+
+
+def test_takeover_workspace_rejects_partial_kernel_database_without_creating_tables(
+    tmp_path,
+):
+    data_dir = tmp_path / ".instances"
+    data_dir.mkdir()
+    db_path = data_dir / "partial.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE ontology_objects (object_type TEXT, object_id TEXT)")
+    conn.commit()
+    conn.close()
+    before_tables = _table_names(db_path)
+    before_bytes = db_path.read_bytes()
+
+    catalog = WorkspaceCatalog(data_dir / MANIFEST_FILENAME)
+    catalog.register(
+        WorkspaceDescriptor(
+            workspace_id="ws-partial",
+            model_id="ledger",
+            runtime_id="rt-ws-partial",
+            db_path="partial.sqlite3",
+        )
+    )
+
+    with pytest.raises(IncompleteKernelDatabaseError):
+        takeover_workspace(
+            "ws-partial", models={"ledger": _LEDGER_SPEC}, catalog=catalog
+        )
+
+    assert _table_names(db_path) == before_tables
+    assert db_path.read_bytes() == before_bytes
+    assert sorted(path.name for path in data_dir.iterdir()) == [
+        "partial.sqlite3",
+        MANIFEST_FILENAME,
+    ]
 

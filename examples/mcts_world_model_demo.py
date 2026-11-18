@@ -57,9 +57,9 @@ from open_ontology import (
     Actor,
     CandidateAction,
     InvariantError,
-    LinkType,
     MCTSNode,
     MCTSPlanResult,
+    ObjectProperty,
     ObjectType,
     OntologyMCTSPlanner as CoreMCTSPlanner,
     OntologyRuntime,
@@ -132,12 +132,12 @@ class ColdTruck(ObjectType):
 
 
 # ---------------------------------------------------------------------------
-# Link types
+# Object properties
 # ---------------------------------------------------------------------------
-SERVES = LinkType(
+SERVES = ObjectProperty(
     name="serves",
-    source="ColdTruck",
-    target="EmergencyOrder",
+    domain="ColdTruck",
+    range="EmergencyOrder",
     cardinality="one-to-many",
     description="冷链车承运某张急救运单",
 )
@@ -162,7 +162,7 @@ class EvaluateValueParams(BaseModel):
 spec = OntologySpec()
 for _cls in (EmergencyOrder, ColdTruck):
     spec.object_type(_cls)
-spec.add_link_type(SERVES)
+spec.add_object_property(SERVES)
 
 
 @spec.function(

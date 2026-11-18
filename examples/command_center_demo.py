@@ -18,36 +18,38 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import threading
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from pydantic import BaseModel
 
 from open_ontology import (
     Actor,
     InvariantError,
-    LinkType,
+    ObjectProperty,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
     start_command_center_server,
 )
-from open_ontology.agent_hosts import (
-    DEFAULT_GOAL_RELPATH,
-    GOAL_DOC_SEPARATOR,
-    TASK_BOARD_DOC_RELPATH,
-)
 from open_ontology.dev_factory import FACTORY_MANAGER
 from open_ontology.dev_factory import spec as factory_spec
-from open_ontology.kanban import BOARD_MANAGER
-from open_ontology.kanban import spec as board_spec
 from open_ontology.workshop import (
     CommandCenterRegistry,
     ConnectorMount,
     OntologyInstanceEntry,
 )
-from open_ontology.workspaces import WorkspaceCatalog
+from open_ontology.workspaces import WorkspaceCatalog, check_kernel_database
+
+from .kanban import BOARD_MANAGER
+from .kanban import spec as board_spec
+from .o2c_ontology import (
+    FINANCE_DIRECTOR as O2C_FINANCE_DIRECTOR,
+    build_o2c_demo,
+    spec as o2c_spec,
+)
 
 from .mcts_world_model_demo import (
     ActionCandidate,
@@ -71,6 +73,7 @@ __all__ = [
     "BOARD_KEY",
     "IncompatibleBoardDatabaseError",
     "build_default_command_center",
+    "build_o2c_command_center",
     "build_osv2_governance",
     "coldchain_mcts_config",
     "main",
@@ -81,6 +84,17 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: 默认持久化目录：实例库真实落盘，供新会话按对象 ID 直接从 SQLite 接管。
 _DEFAULT_DATA_DIR = _REPO_ROOT / ".instances"
+
+#: Hermes O2C 助手实时同步的 SQLite 状态库（存在时默认接入指挥台）。
+_DEFAULT_HERMES_O2C_DB = (
+    Path.home()
+    / ".hermes"
+    / "profiles"
+    / "o2c"
+    / "state"
+    / "o2c_erp"
+    / "o2c_world.sqlite3"
+)
 
 #: 演示看板的对象 ID。
 BOARD_KEY = "BD-CC-001"
@@ -174,28 +188,6 @@ def _board_database_state(db_path: str | Path, board_key: str) -> str:
 
 
 
-def _read_repo_doc(relpath: str) -> str:
-    """读取仓库根目录下的文档全文；缺失时返回空串，由调用方回退。"""
-    path = _REPO_ROOT / relpath
-    if not path.is_file():
-        return ""
-    return path.read_text(encoding="utf-8").strip()
-
-
-def _read_goal_docs() -> str:
-    """组装 ``Board.goal``：M2 平台宪法 + M1/M0 看板规范。
-
-    两份文档都存在时以 :data:`GOAL_DOC_SEPARATOR` 连接，保留各自的文档边界；
-    只有 ``docs/ARCHITECTURE.md``（例如裁剪过的部署目录）时保持旧的单文件
-    行为，不凭空拼出空段。
-    """
-    architecture = _read_repo_doc(DEFAULT_GOAL_RELPATH)
-    task_board = _read_repo_doc(TASK_BOARD_DOC_RELPATH)
-    if architecture and task_board:
-        return f"{architecture}{GOAL_DOC_SEPARATOR}{task_board}"
-    return architecture
-
-
 def _submit(runtime: OntologyRuntime, run_id: str, action: str, params: dict[str, Any], actor: Actor) -> dict[str, Any]:
     return runtime.submit_action(run_id, action, params, actor)
 
@@ -264,17 +256,17 @@ def _build_software_factory(registry: CommandCenterRegistry) -> None:
     )
     act(
         "dispatch_ticket",
-        {"ticket_id": "TK-CC-101", "engineer_id": "ENG-CODER-A"},
+        {"ticket": "TK-CC-101", "engineer": "ENG-CODER-A"},
     )
     act(
         "dispatch_ticket",
-        {"ticket_id": "TK-CC-103", "engineer_id": "ENG-CODER-B"},
+        {"ticket": "TK-CC-103", "engineer": "ENG-CODER-B"},
     )
     act(
         "submit_work",
         {
-            "ticket_id": "TK-CC-103",
-            "engineer_id": "ENG-CODER-B",
+            "ticket": "TK-CC-103",
+            "engineer": "ENG-CODER-B",
             "summary": "16 条验收测试全绿",
             "artifact_uri": "tests/test_dev_factory.py",
         },
@@ -282,8 +274,8 @@ def _build_software_factory(registry: CommandCenterRegistry) -> None:
     act(
         "review_ticket",
         {
-            "ticket_id": "TK-CC-103",
-            "reviewer_id": "ENG-TEST-01",
+            "ticket": "TK-CC-103",
+            "reviewer": "ENG-TEST-01",
             "verdict": "PASS",
             "feedback": "单测与静态审计全部通过",
         },
@@ -291,8 +283,8 @@ def _build_software_factory(registry: CommandCenterRegistry) -> None:
     act(
         "review_ticket",
         {
-            "ticket_id": "TK-CC-103",
-            "reviewer_id": "ENG-ARCH-01",
+            "ticket": "TK-CC-103",
+            "reviewer": "ENG-ARCH-01",
             "verdict": "PASS",
             "feedback": "架构验收通过",
         },
@@ -320,18 +312,18 @@ def _build_software_factory(registry: CommandCenterRegistry) -> None:
         default_actor=FACTORY_MANAGER,
         sample_action_params={
             "dispatch_ticket": {
-                "ticket_id": "TK-CC-102",
-                "engineer_id": "ENG-CODER-C",
+                "ticket": "TK-CC-102",
+                "engineer": "ENG-CODER-C",
             },
             "submit_work": {
-                "ticket_id": "TK-CC-101",
-                "engineer_id": "ENG-CODER-A",
+                "ticket": "TK-CC-101",
+                "engineer": "ENG-CODER-A",
                 "summary": "多实例路由实现完成",
                 "artifact_uri": "open_ontology/workshop.py",
             },
             "review_ticket": {
-                "ticket_id": "TK-CC-101",
-                "reviewer_id": "ENG-ARCH-01",
+                "ticket": "TK-CC-101",
+                "reviewer": "ENG-ARCH-01",
                 "verdict": "PASS",
                 "feedback": "通过",
             },
@@ -342,73 +334,9 @@ def _build_software_factory(registry: CommandCenterRegistry) -> None:
 # ---------------------------------------------------------------------------
 # 2. task_board
 # ---------------------------------------------------------------------------
-BOARD_COLUMNS: list[dict[str, Any]] = [
-    {
-        "key": "todo",
-        "label": "待办",
-        "purpose": "initial",
-        "order": 0,
-        "allowed_targets": ("ready", "blocked"),
-    },
-    {
-        "key": "ready",
-        "label": "可认领",
-        "purpose": "ready",
-        "order": 1,
-        "claimable": True,
-        "allowed_roles": ("developer", "tester"),
-        "allowed_targets": ("todo", "blocked"),
-        "on_claimed": "doing",
-    },
-    {
-        "key": "doing",
-        "label": "执行中",
-        "purpose": "working",
-        "order": 2,
-        "on_completed": "done",
-        "on_failed": "ready",
-        "on_exhausted": "blocked",
-        "on_blocked": "blocked",
-        "on_abandoned": "triage",
-    },
-    {
-        "key": "done",
-        "label": "已完成",
-        "purpose": "completion",
-        "order": 3,
-        "is_terminal": True,
-        "allowed_targets": ("todo",),
-    },
-    {
-        "key": "blocked",
-        "label": "阻塞",
-        "purpose": "failure",
-        "order": 4,
-        "max_retries": 2,
-        "allowed_targets": ("ready", "todo"),
-        "on_unblocked": "ready",
-    },
-    {
-        "key": "triage",
-        "label": "分诊",
-        "purpose": "escalation",
-        "order": 5,
-        "allowed_targets": ("todo",),
-    },
-]
-
-
 def _seed_task_board(runtime: OntologyRuntime) -> None:
-    """首次创建时播种演示数据：成员、四张卡、认领、裁决、阻塞。
-
-    只在「库不存在」或「显式 reset」时调用；重复打开时一行都不执行，
-    因此种子动作（``CC-BOARD-001``…）绝不会重放。
-    """
+    """首次创建时播种演示数据：成员、四张卡、认领、阻塞。"""
     run = 0
-
-    # Board.goal / Board.state 直接承载完整文档全文，指挥台与换代供血都不再缺上下文。
-    goal_doc = _read_goal_docs()
-    state_doc = _read_repo_doc("_state.md")
 
     def act(action: str, params: dict[str, Any]) -> None:
         nonlocal run
@@ -419,15 +347,10 @@ def _seed_task_board(runtime: OntologyRuntime) -> None:
         "create_board",
         {
             "board_key": BOARD_KEY,
-            "title": "多智能体任务看板",
+            "title": "任务看板",
             "tenant": "acme",
             "created_by": "board-manager-01",
-            "description": "列拓扑即数据：谁可认领、哪列是终态、失败回哪列，全部声明式。",
-            "goal": goal_doc
-            or "四层元模型（M2→M1→PSM→M0）单向依赖，M2 内核零业务污染，脑手分离协同。",
-            # 建板只是初始化；首个完工才会把完整基线真值表折叠进 Board.state。
-            "state": "初始化：看板已建立，等待首个完工基线。",
-            "columns": BOARD_COLUMNS,
+            "description": "固定 6 态流（todo/ready/doing/done/blocked/triage），全部不变量由本体裁决。",
         },
     )
 
@@ -446,82 +369,69 @@ def _seed_task_board(runtime: OntologyRuntime) -> None:
         "create_card",
         {
             "card_id": "C-100",
-            "board_key": "BD-CC-001",
-            "title": "任务看板本体与宿主胶水",
-            "body": "本体负责认领与裁决，宿主负责执行。",
+            "board": "BD-CC-001",
+            "title": "搭建任务看板领域模型",
+            "body": "定义看板、成员、卡片与固定 6 态流不变量。",
         },
     )
     act(
         "create_card",
         {
             "card_id": "C-101",
-            "board_key": "BD-CC-001",
-            "title": "PSM 接入 CodeBuddy 与 OpenCode",
-            "body": "两个宿主统一返回结构化裁决。",
+            "board": "BD-CC-001",
+            "title": "实现外部 OpenAPI 快照接入",
+            "body": "完成源字段与自有覆盖层同步。",
         },
     )
     act(
         "create_card",
         {
             "card_id": "C-102",
-            "board_key": "BD-CC-001",
-            "title": "编排器认领超时回收",
-            "body": "技术执行账本的后续能力。",
+            "board": "BD-CC-001",
+            "title": "完善认领超时释放动作",
+            "body": "通过 release_claim 释放滞留卡片并累计重试。",
         },
     )
     act(
         "create_card",
         {
             "card_id": "C-103",
-            "board_key": "BD-CC-001",
-            "title": "看板流程视图",
-            "body": "把列拓扑画成可读的流程图。",
+            "board": "BD-CC-001",
+            "title": "看板状态流视图",
+            "body": "展示固定 6 态节点与流转关系。",
             "waits_for": ("C-101",),
         },
     )
 
-    # 一张已完成的卡（带数字证据）、一张在途卡、一张阻塞卡。
-    act("claim_card", {"card_id": "C-100", "member_id": "M-DEV-01"})
+    act("claim_card", {"card": "C-100", "member": "M-DEV-01"})
     act(
         "record_outcome",
         {
-            "card_id": "C-100",
-            "member_id": "M-DEV-01",
+            "card": "C-100",
+            "member": "M-DEV-01",
             "outcome": "completed",
-            "summary": "本体与宿主胶水跑通",
-            "evidence": [
-                {"metric": "测试条数", "value": "17 passed", "detail": ""},
-                {"metric": "新模块行数", "value": "627 行", "detail": ""},
-            ],
-            "artifact_uri": "open_ontology/agent_hosts.py",
-            # 首个完工把完整基线真值表作为新 state 折叠进来（与初始化占位不同）。
-            "board_state": state_doc
-            or "微内核 1,400 行 + 7 大系统调用切面，全仓测试 430+ passed，看板流自举就绪。",
-            "goal_changed": False,
-            "goal_review_reason": "完工未改变架构目标，沿用建板时的架构宪法。",
+            "summary": "看板领域模型与状态机完成",
+            "artifact_uri": "examples/kanban.py",
         },
     )
-    act("claim_card", {"card_id": "C-102", "member_id": "M-DEV-02"})
+    act("claim_card", {"card": "C-102", "member": "M-DEV-02"})
     act(
         "add_comment",
         {
-            "card_id": "C-102",
+            "card": "C-102",
             "author": "M-REV-01",
-            "body": "先做技术执行账本，别塞进业务对象。",
+            "body": "注意补充超时释放的单元测试。",
         },
     )
-    act("claim_card", {"card_id": "C-101", "member_id": "M-DEV-01"})
+    act("claim_card", {"card": "C-101", "member": "M-DEV-01"})
     act(
         "record_outcome",
         {
-            "card_id": "C-101",
-            "member_id": "M-DEV-01",
+            "card": "C-101",
+            "member": "M-DEV-01",
             "outcome": "blocked",
-            "summary": "等宿主额度窗口",
+            "summary": "等待接口字段确认",
             "block_kind": "awaiting_review",
-            "evidence": [
-                {"metric": "已接通宿主数", "value": "2 个", "detail": ""}
-            ],
         },
     )
 
@@ -562,45 +472,34 @@ def _build_task_board(
 
     registry.register_ontology(
         "task_board",
-        "多智能体任务看板",
+        "任务看板",
         board_spec,
-        category="Agentic Delivery",
-        description="看板列拓扑即数据；认领、裁决、带数字的证据全部由本体判定。",
+        category="Collaboration",
+        description="固定 6 态流任务看板：依赖 DAG、WIP 上限与 Actor/Member 身份绑定。",
     )
     registry.register_workspace(
         "board-prod",
         "task_board",
-        "任务看板 · 生产实例",
+        "任务看板 · 示例实例",
         runtime,
         db_uri="sqlite://board_prod.sqlite3",
         description="4 名成员 + 4 张卡（已完成 / 执行中 / 阻塞 / 待前置）。",
-        connectors=[
-            ConnectorMount("CodeBuddy CLI", "Harness", "cli://codebuddy", "CONNECTED"),
-            ConnectorMount("OpenCode HTTP", "Harness", "http://localhost:4096", "CONNECTED"),
-        ],
         default_actor=BOARD_MANAGER,
         sample_action_params={
-            "claim_card": {"card_id": "C-102", "member_id": "M-DEV-02"},
+            "claim_card": {"card": "C-102", "member": "M-DEV-02"},
             "record_outcome": {
-                "card_id": "C-102",
-                "member_id": "M-DEV-02",
+                "card": "C-102",
+                "member": "M-DEV-02",
                 "outcome": "completed",
-                "summary": "回收策略已实现",
-                "evidence": [
-                    {"metric": "测试条数", "value": "9 passed", "detail": ""}
-                ],
-                "board_state": "新基线：回收策略已实现，9 passed。",
-                "goal_changed": False,
-                "goal_review_reason": "回收策略不改变架构目标。",
+                "summary": "任务完成",
             },
             "create_card": {
-                "card_id": "C-104",
-                "board_key": "BD-CC-001",
+                "board": "BD-CC-001",
                 "title": "新卡片",
                 "body": "在这里写任务说明。",
             },
             "add_comment": {
-                "card_id": "C-102",
+                "card": "C-102",
                 "author": "M-REV-01",
                 "body": "补一条评论。",
             },
@@ -884,8 +783,8 @@ class ScrapLot(ObjectType):
 
 for _cls in (SteelCoil, ScrapLot):
     osv2_spec.object_type(_cls)
-osv2_spec.add_link_type(
-    LinkType(name="feeds", source="ScrapLot", target="SteelCoil", cardinality="many-to-many")
+osv2_spec.add_object_property(
+    ObjectProperty(name="feeds", domain="ScrapLot", range="SteelCoil", cardinality="many-to-many")
 )
 
 
@@ -1057,6 +956,134 @@ def build_osv2_governance(registry: CommandCenterRegistry | None = None) -> Comm
     return registry
 
 
+class _LiveSQLiteRuntimeProxy:
+    """按文件 inode 自动重载的只读/交互式 SQLite Runtime 代理。
+
+    使 ``http://127.0.0.1:8765`` 在 O2C MCP 服务执行 ``重置演示`` 重建数据库文件后，
+    无需重启指挥台即可自动追踪到最新 inode 上的状态与账本。
+    """
+
+    def __init__(self, spec: OntologySpec, db_path: Path) -> None:
+        self._spec = spec
+        self._db_path = Path(db_path).expanduser().resolve()
+        self._lock = threading.RLock()
+        self._hooks: list[Callable[[Actor, dict[str, Any]], None]] = []
+        self._inner: OntologyRuntime | None = None
+        self._inode: int | None = None
+        self._fallback: OntologyRuntime | None = None
+
+    @property
+    def spec(self) -> OntologySpec:
+        return self._spec
+
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
+
+    def _current(self) -> OntologyRuntime:
+        with self._lock:
+            if self._db_path.is_file():
+                inode = self._db_path.stat().st_ino
+                if self._inner is not None and self._inode == inode:
+                    return self._inner
+                check_kernel_database(self._db_path)
+                new_rt = OntologyRuntime(self._spec, db_path=self._db_path)
+                for hook in self._hooks:
+                    if hook not in new_rt._post_commit_hooks:
+                        new_rt.add_post_commit_hook(hook)
+                old_inner = self._inner
+                self._inner = new_rt
+                self._inode = inode
+                if old_inner is not None:
+                    try:
+                        old_inner.close()
+                    except Exception:
+                        pass
+                return new_rt
+
+            if self._inner is not None:
+                try:
+                    self._inner.close()
+                except Exception:
+                    pass
+                self._inner = None
+                self._inode = None
+            if self._fallback is None:
+                self._fallback = build_o2c_demo().runtime
+                for hook in self._hooks:
+                    if hook not in self._fallback._post_commit_hooks:
+                        self._fallback.add_post_commit_hook(hook)
+            return self._fallback
+
+    def add_post_commit_hook(
+        self, hook: Callable[[Actor, dict[str, Any]], None]
+    ) -> None:
+        with self._lock:
+            if hook not in self._hooks:
+                self._hooks.append(hook)
+            rt = self._current()
+            if hook not in rt._post_commit_hooks:
+                rt.add_post_commit_hook(hook)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._current(), name)
+
+
+def build_o2c_command_center(
+    registry: CommandCenterRegistry | None = None,
+    *,
+    db_path: str | Path = ":memory:",
+) -> CommandCenterRegistry:
+    """注册标准 O2C 业财治理蓝图及其内存/实时工作空间。"""
+    registry = registry or CommandCenterRegistry()
+    if str(db_path) == ":memory:":
+        runtime: Any = build_o2c_demo().runtime
+        db_uri = "sqlite://o2c_erp_north.sqlite3"
+    else:
+        runtime = _LiveSQLiteRuntimeProxy(o2c_spec, Path(db_path))
+        db_uri = "sqlite://o2c_world.sqlite3"
+
+    registry.register_ontology(
+        "o2c_order_to_cash",
+        "订单到收款业财治理",
+        o2c_spec,
+        category="Order-to-Cash",
+        description="客户授信红线、未发货禁开票硬护栏、飞书交互签批与真实 ERP 一键时光机冲正。",
+    )
+    registry.register_workspace(
+        "o2c-erp-north",
+        "o2c_order_to_cash",
+        "订单到收款 · 华北 ERP 实时沙盘",
+        runtime,
+        db_uri=db_uri,
+        description="连接真实 Odoo 19 (erp_north) 与飞书 O2C业财助手，实时同步挂起审批、回写凭据与冲正账本。",
+        connectors=[
+            ConnectorMount("华北 Odoo 19 账套", "ERP", "http://127.0.0.1:8069/erp_north", "CONNECTED"),
+            ConnectorMount("飞书交互审批网关", "SaaS", "wss://msg-frontier.feishu.cn/ws/v2", "CONNECTED"),
+        ],
+        default_actor=O2C_FINANCE_DIRECTOR,
+        sample_action_params={
+            "create_sales_order": {
+                "order_id": "O2C-SO-003",
+                "customer": "O2C-CUST-001",
+                "product_summary": "O2C Widget",
+                "quantity": 5,
+                "unit_price_cents": 1000000,
+            },
+            "confirm_sales_order": {"order": "O2C-SO-002"},
+            "ship_order_delivery": {"order": "O2C-SO-001"},
+            "issue_and_post_invoice": {"order": "O2C-SO-001"},
+            "record_customer_payment": {"order": "O2C-SO-001", "payment_cents": 2000000},
+            "annotate_o2c_governance": {
+                "order": "O2C-SO-002",
+                "account_rep": "智能销售助理",
+                "fulfillment_note": "战略特批大客户",
+            },
+        },
+    )
+    return registry
+
+
 # ---------------------------------------------------------------------------
 # 组装
 # ---------------------------------------------------------------------------
@@ -1065,8 +1092,9 @@ def build_default_command_center(
     *,
     reset: bool = False,
     workspace_catalog: WorkspaceCatalog | None = None,
+    o2c_db_path: str | Path | None = None,
 ) -> CommandCenterRegistry:
-    """预装 5 个 Ontology 蓝图 + 7 个真实数据 Instance。
+    """预装 7 个 Ontology 蓝图 + 9 个真实数据 Instance。
 
     默认把 ``board-prod`` 的 SQLite 库落在 ``.instances/board_prod.sqlite3``，
     使实例真实落盘可被新会话按对象 ID 检索。文件落盘的 runtime 身份写入
@@ -1093,7 +1121,8 @@ def build_default_command_center(
     _build_saas(registry)
     _build_steel(registry)
     build_osv2_governance(registry)
-    # 第 7 个实例：冷链 MCTS 实验室（毫秒级 fork，破坏性实验不碰生产）。
+    build_o2c_command_center(registry, db_path=o2c_db_path or ":memory:")
+    # 第 9 个工作空间：冷链 MCTS 实验室（毫秒级 fork，破坏性实验不碰生产）。
     registry.fork_instance(
         "coldchain-wave3",
         "coldchain-wave3-lab",
@@ -1112,9 +1141,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="显式重建演示看板库（只重建 .instances/board_prod.sqlite3，不删目录）",
     )
+    default_o2c_db = (
+        str(_DEFAULT_HERMES_O2C_DB)
+        if _DEFAULT_HERMES_O2C_DB.is_file()
+        else ":memory:"
+    )
+    parser.add_argument(
+        "--o2c-db",
+        default=default_o2c_db,
+        help="O2C 实时工作空间挂载的 SQLite 数据库路径（默认连接 Hermes o2c 状态库）",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    registry = build_default_command_center(reset=args.reset)
+    registry = build_default_command_center(
+        reset=args.reset,
+        o2c_db_path=args.o2c_db,
+    )
     handle = start_command_center_server(
         registry, args.host, args.port, title=args.title
     )

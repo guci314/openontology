@@ -41,11 +41,13 @@ from examples import cold_chain as cc
 from open_ontology import (
     AIPAgentExecutor,
     Actor,
+    AutoID,
     ConcurrencyConflictError,
     GovernanceViolationError,
     InvariantError,
     ObjectDiff,
     ObjectNotFoundError,
+    ObjectProperty,
     ObjectSet,
     OntologyRuntime,
     OntologySpec,
@@ -55,6 +57,7 @@ from open_ontology import (
     export_llm_tools,
     run_eval_suite,
 )
+from open_ontology.model_views import describe_behavior, describe_tbox
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -698,7 +701,7 @@ def test_spec_registry_is_persisted(demo):
     counts = {row["kind"]: row["n"] for row in rows}
     assert counts == {
         "object_type": 4,
-        "link_type": 3,
+        "object_property": 3,
         "function": 1,
         "action": 2,
     }
@@ -754,7 +757,7 @@ class MakeNoteParams(BaseModel):
 mini_spec = OntologySpec()
 mini_spec.object_type(Note)
 mini_spec.object_type(Box)
-mini_spec.link_type("in_box", "Note", "Box")
+mini_spec.object_property("in_box", "Note", "Box")
 EDITED = Actor(actor_id="editor-01", role="editor", clearance_tags={"*"})
 OBSERVED: list[tuple] = []
 
@@ -1364,7 +1367,7 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
     runtime = demo.runtime
     conn = runtime.connection
 
-    # 1. SQLite schema: exactly the five pure ontology tables + write gate
+    # 1. SQLite schema: strictly the five pure ontology tables + physical write gate
     tables = {
         row["name"].lower()
         for row in conn.execute(
@@ -1448,6 +1451,7 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
         "approver_roles",
         "approval_rule",
         "affects_source",
+        "visibility",
         "post_approval",
         "description",
     }
@@ -1476,3 +1480,184 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
         text = path.read_text(encoding="utf-8").lower()
         for term in BANNED_IT_TERMS:
             assert term not in text, f"{term!r} leaked into {path.name}"
+
+
+# ---------------------------------------------------------------------------
+# 19. M2 OWL ObjectProperty + AutoID：自动三元组同步、参照完整性与元模型投影
+# ---------------------------------------------------------------------------
+def test_object_property_auto_sync_referential_integrity_and_autoid() -> None:
+    class TargetObj(ObjectType):
+        __primary_key__ = "target_id"
+        target_id: AutoID
+        label: str
+
+    class SourceObj(ObjectType):
+        __primary_key__ = "source_id"
+        source_id: str
+        single_ref: ObjectProperty[TargetObj] | None = None
+        multi_refs: ObjectProperty[tuple[TargetObj, ...]] = ()
+
+    class CreateSourceParams(BaseModel):
+        source_id: AutoID | None = None
+        single_ref: ObjectProperty[TargetObj] | None = None
+        multi_refs: ObjectProperty[tuple[TargetObj, ...]] = ()
+
+    class UpdateSourceParams(BaseModel):
+        source: ObjectProperty[SourceObj]
+        single_ref: ObjectProperty[TargetObj] | None = None
+        multi_refs: ObjectProperty[tuple[TargetObj, ...]] = ()
+
+    class DeleteSourceParams(BaseModel):
+        source: ObjectProperty[SourceObj]
+
+    m2_spec = OntologySpec()
+    m2_spec.add_object_type(TargetObj)
+    m2_spec.add_object_type(SourceObj)
+
+    assert "SourceObj.single_ref" in m2_spec.object_properties
+    assert m2_spec.object_properties["SourceObj.single_ref"].domain == "SourceObj"
+    assert m2_spec.object_properties["SourceObj.single_ref"].range == "TargetObj"
+    assert m2_spec.object_properties["SourceObj.single_ref"].cardinality == "many-to-one"
+    assert "SourceObj.multi_refs" in m2_spec.object_properties
+    assert m2_spec.object_properties["SourceObj.multi_refs"].domain == "SourceObj"
+    assert m2_spec.object_properties["SourceObj.multi_refs"].range == "TargetObj"
+    assert m2_spec.object_properties["SourceObj.multi_refs"].cardinality == "many-to-many"
+
+    @m2_spec.action("create_source", CreateSourceParams, allowed_roles=("admin",))
+    def _create_source(batch, params: CreateSourceParams) -> None:
+        sid = (params.source_id or "").strip() or "SRC-001"
+        batch.create(
+            SourceObj(
+                source_id=sid,
+                single_ref=params.single_ref,
+                multi_refs=params.multi_refs,
+            )
+        )
+
+    @m2_spec.action("update_source", UpdateSourceParams, allowed_roles=("admin",))
+    def _update_source(batch, params: UpdateSourceParams) -> None:
+        src = batch.get(SourceObj, params.source)
+        batch.modify(
+            src,
+            single_ref=params.single_ref,
+            multi_refs=params.multi_refs,
+        )
+
+    @m2_spec.action("delete_source", DeleteSourceParams, allowed_roles=("admin",))
+    def _delete_source(batch, params: DeleteSourceParams) -> None:
+        batch.delete(batch.get(SourceObj, params.source))
+
+    admin = Actor(actor_id="admin-1", role="admin", clearance_tags={"*"})
+    runtime = OntologyRuntime(m2_spec)
+    try:
+        t1 = TargetObj(target_id="T-1", label="Target 1")
+        t2 = TargetObj(target_id="T-2", label="Target 2")
+        t3 = TargetObj(target_id="T-3", label="Target 3")
+        runtime.put_object(t1)
+        runtime.put_object(t2)
+        runtime.put_object(t3)
+
+        # 1) Referential integrity on missing target: simulate_action & submit_action
+        sim_bad_single = runtime.simulate_action(
+            "create_source",
+            {"source_id": "SRC-BAD-1", "single_ref": "T-MISSING"},
+            admin,
+        )
+        assert sim_bad_single.valid is False
+        assert sim_bad_single.error_code == "TARGET_NOT_FOUND"
+
+        with pytest.raises(InvariantError) as exc_single:
+            runtime.submit_action(
+                "run-bad-single",
+                "create_source",
+                {"source_id": "SRC-BAD-1", "single_ref": "T-MISSING"},
+                admin,
+            )
+        assert exc_single.value.code == "TARGET_NOT_FOUND"
+
+        sim_bad_multi = runtime.simulate_action(
+            "create_source",
+            {"source_id": "SRC-BAD-2", "multi_refs": ("T-1", "T-NOPE")},
+            admin,
+        )
+        assert sim_bad_multi.valid is False
+        assert sim_bad_multi.error_code == "TARGET_NOT_FOUND"
+
+        with pytest.raises(InvariantError) as exc_multi:
+            runtime.submit_action(
+                "run-bad-multi",
+                "create_source",
+                {"source_id": "SRC-BAD-2", "multi_refs": ("T-1", "T-NOPE")},
+                admin,
+            )
+        assert exc_multi.value.code == "TARGET_NOT_FOUND"
+
+        # 2) EditBatch create -> automatic triples in ontology_links
+        runtime.submit_action(
+            "run-create-src",
+            "create_source",
+            {"source_id": "SRC-1", "single_ref": "T-1", "multi_refs": ("T-2", "T-3")},
+            admin,
+        )
+        src = runtime.get_object(SourceObj, "SRC-1", admin)
+        assert [t.target_id for t in runtime.get_linked(src, "SourceObj.single_ref", TargetObj, admin)] == ["T-1"]
+        assert sorted(t.target_id for t in runtime.get_linked(src, "SourceObj.multi_refs", TargetObj, admin)) == ["T-2", "T-3"]
+        assert [s.source_id for s in runtime.get_linked_to(t1, "SourceObj.single_ref", SourceObj, admin)] == ["SRC-1"]
+        assert [s.source_id for s in runtime.get_linked_to(t2, "SourceObj.multi_refs", SourceObj, admin)] == ["SRC-1"]
+
+        # 3) EditBatch modify -> automatically updates triples in ontology_links
+        runtime.submit_action(
+            "run-update-src",
+            "update_source",
+            {"source": "SRC-1", "single_ref": "T-2", "multi_refs": ("T-3",)},
+            admin,
+        )
+        src = runtime.get_object(SourceObj, "SRC-1", admin)
+        assert [t.target_id for t in runtime.get_linked(src, "SourceObj.single_ref", TargetObj, admin)] == ["T-2"]
+        assert [t.target_id for t in runtime.get_linked(src, "SourceObj.multi_refs", TargetObj, admin)] == ["T-3"]
+        assert runtime.get_linked_to(t1, "SourceObj.single_ref", SourceObj, admin) == []
+        assert runtime.get_linked_to(t2, "SourceObj.multi_refs", SourceObj, admin) == []
+
+        # 4) EditBatch delete -> automatically removes triples from ontology_links
+        runtime.submit_action(
+            "run-delete-src",
+            "delete_source",
+            {"source": "SRC-1"},
+            admin,
+        )
+        assert runtime.get_linked_to(t2, "SourceObj.single_ref", SourceObj, admin) == []
+        assert runtime.get_linked_to(t3, "SourceObj.multi_refs", SourceObj, admin) == []
+
+        # 5) Direct put_object -> automatically syncs triples in ontology_links
+        runtime.put_object(SourceObj(source_id="SRC-PUT", single_ref="T-1", multi_refs=("T-2",)))
+        src_put = runtime.get_object(SourceObj, "SRC-PUT", admin)
+        assert [t.target_id for t in runtime.get_linked(src_put, "SourceObj.single_ref", TargetObj, admin)] == ["T-1"]
+        assert [t.target_id for t in runtime.get_linked(src_put, "SourceObj.multi_refs", TargetObj, admin)] == ["T-2"]
+        runtime.put_object(SourceObj(source_id="SRC-PUT", single_ref=None, multi_refs=("T-3",)))
+        src_put = runtime.get_object(SourceObj, "SRC-PUT", admin)
+        assert runtime.get_linked(src_put, "SourceObj.single_ref", TargetObj, admin) == []
+        assert [t.target_id for t in runtime.get_linked(src_put, "SourceObj.multi_refs", TargetObj, admin)] == ["T-3"]
+
+        # 6) TBox & Behavior metadata projection
+        tbox = describe_tbox(m2_spec)
+        tbox_types = {obj["name"]: {f["name"]: f for f in obj["fields"]} for obj in tbox["object_types"]}
+        assert tbox_types["TargetObj"]["target_id"].get("auto_generated") is True
+        assert tbox_types["SourceObj"]["single_ref"].get("property_kind") == "object"
+        assert tbox_types["SourceObj"]["single_ref"].get("range") == "TargetObj"
+        assert tbox_types["SourceObj"]["single_ref"].get("multiple") is False
+        assert tbox_types["SourceObj"]["multi_refs"].get("property_kind") == "object"
+        assert tbox_types["SourceObj"]["multi_refs"].get("range") == "TargetObj"
+        assert tbox_types["SourceObj"]["multi_refs"].get("multiple") is True
+
+        behavior = describe_behavior(m2_spec)
+        create_contract = next(a for a in behavior["actions"] if a["name"] == "create_source")
+        cprops = create_contract["params"]["properties"]
+        assert cprops["source_id"].get("auto_generated") is True
+        assert cprops["single_ref"].get("property_kind") == "object"
+        assert cprops["single_ref"].get("range") == "TargetObj"
+        assert cprops["single_ref"].get("multiple") is False
+        assert cprops["multi_refs"].get("property_kind") == "object"
+        assert cprops["multi_refs"].get("range") == "TargetObj"
+        assert cprops["multi_refs"].get("multiple") is True
+    finally:
+        runtime.close()

@@ -35,7 +35,7 @@ def test_glossary_defines_core_terms_and_identity_boundary():
         "Device",
     ):
         assert term in text, f"术语表缺少 {term}"
-    assert "World · 业务世界" in text
+    assert "World · 世界状态" in text
     assert "workspace_id / object_type / object_id" in text
     assert "工作空间身份" in text and "业务对象身份" in text
     assert "聚合根" in text
@@ -51,22 +51,23 @@ def test_architecture_doc_stays_m2_and_rejects_old_framing():
     assert "BD-CC-001" not in text
     assert "docs/TASK_BOARD.md" in text
     # 迁移后的展示词汇与兼容映射必须写进宪法，而不是留在旧标签里。
-    assert "Model · 领域模型" in text and "World · 业务世界" in text
+    assert "Model · 领域模型" in text and "World · 世界状态" in text
     assert "Workspace · 工作空间" in text
 
 
-def test_task_board_doc_keeps_m1_m0_contract_and_links_m2():
+def test_task_board_doc_keeps_m1_domain_contract_and_links_m2():
     text = _doc("docs/TASK_BOARD.md")
-    assert "M1" in text and "M0" in text
-    assert "Board / BD-CC-001" in text
+    assert "M1" in text
+    assert "examples/kanban.py" in text
     assert "docs/ARCHITECTURE.md" in text
     assert "task_board" in text
+    assert "Board" in text and "Card" in text and "Member" in text
 
 
 def test_readme_and_state_docs_describe_current_implementation():
     readme = _doc("README.md")
     assert "GLOSSARY.md" in readme
-    assert "Model · 领域模型" in readme and "World · 业务世界" in readme
+    assert "Model · 领域模型" in readme and "World · 世界状态" in readme
     assert "Workspace · 工作空间" in readme
     assert "workspaces.py" in readme and "model_views.py" in readme
     # 旧「施工中 / 尚未验收」的状态声明不得继续冒充当前实现状态。
@@ -82,3 +83,18 @@ def test_readme_and_state_docs_describe_current_implementation():
 
     execution = _doc("_execution.md")
     assert "C-WS-06" in execution
+
+
+def test_canonical_docs_reflect_owl_object_property_and_autoid():
+    for relpath in (
+        "GLOSSARY.md",
+        "docs/ARCHITECTURE.md",
+        "docs/TASK_BOARD.md",
+        "README.md",
+        "_state.md",
+    ):
+        text = _doc(relpath)
+        assert "ObjectProperty" in text, f"{relpath} 缺少 ObjectProperty 说明"
+        assert "AutoID" in text, f"{relpath} 缺少 AutoID 说明"
+        assert "LinkType" not in text, f"{relpath} 仍残留已移除的 LinkType"
+        assert "card_waits_for" not in text, f"{relpath} 仍残留旧连边 card_waits_for"

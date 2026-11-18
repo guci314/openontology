@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from .runtime import OntologyRuntime
-from .spec import Actor, OpenOntologyError
+from .spec import Actor, InvariantError, OpenOntologyError
 
-__all__ = ["OntologyHTTPServer", "HTTPHandle", "start_http_server"]
+__all__ = ["OntologyHTTPServer", "HTTPHandle", "start_http_server", "_fetch_device_rows"]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -206,3 +207,23 @@ def start_http_server(
         host=str(actual_host),
         port=int(actual_port),
     )
+
+
+def _fetch_device_rows(
+    endpoint: str, data_path: str, items_key: str
+) -> tuple[str, list[dict[str, Any]]]:
+    """从外部设备拉取 JSON 数组并返回 (完整 URL, 行列表)。"""
+    data_url = (
+        data_path
+        if data_path.startswith(("http://", "https://"))
+        else urljoin(endpoint, data_path)
+    )
+    with urllib.request.urlopen(data_url, timeout=5) as resp:
+        raw = json.loads(resp.read().decode("utf-8"))
+    rows = raw.get(items_key) if (isinstance(raw, dict) and items_key) else raw
+    if not isinstance(rows, list):
+        raise InvariantError(
+            "device response must contain a JSON array of objects",
+            code="INVALID_DEVICE_PAYLOAD",
+        )
+    return data_url, rows

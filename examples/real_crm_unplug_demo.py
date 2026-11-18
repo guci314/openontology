@@ -65,7 +65,7 @@ def capture_original_declarations() -> None:
     for type_name in UNPLUGGABLE_TYPES:
         cls = dom.spec.get_object_type(type_name)
         _ORIGINAL_OWNED.setdefault(type_name, cls.__owned__)
-    for link_name, decl in dom.spec.link_types.items():
+    for link_name, decl in dom.spec.object_properties.items():
         _ORIGINAL_LINKS.setdefault(link_name, decl.owned)
     for action_name, action in dom.spec.actions.items():
         _ORIGINAL_ACTION_AFFECTS.setdefault(action_name, action.affects_source)
@@ -77,9 +77,9 @@ def reset_unplug_state() -> None:
     for type_name, owned in _ORIGINAL_OWNED.items():
         setattr(dom.spec.get_object_type(type_name), "__owned__", owned)
     for link_name, owned in _ORIGINAL_LINKS.items():
-        decl = dom.spec.link_types[link_name]
+        decl = dom.spec.object_properties[link_name]
         if decl.owned != owned:
-            dom.spec.link_types[link_name] = decl.model_copy(
+            dom.spec.object_properties[link_name] = decl.model_copy(
                 update={"owned": owned}
             )
     for action_name, affects in _ORIGINAL_ACTION_AFFECTS.items():
@@ -502,9 +502,9 @@ def unplug_all_saas(
     # 3) promote every relationship to ontology-owned: there is no longer an
     #    external system that could own an edge
     promoted_links: list[str] = []
-    for link_name, decl in list(dom.spec.link_types.items()):
+    for link_name, decl in list(dom.spec.object_properties.items()):
         if not decl.owned:
-            dom.spec.link_types[link_name] = decl.model_copy(
+            dom.spec.object_properties[link_name] = decl.model_copy(
                 update={"owned": True}
             )
             promoted_links.append(link_name)

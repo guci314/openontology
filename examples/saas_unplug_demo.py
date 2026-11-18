@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from open_ontology import (
     Actor,
     InvariantError,
-    LinkType,
+    ObjectProperty,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
@@ -86,9 +86,9 @@ class SaasModel:
     ShopOrder: type[ObjectType]
     SupportTicket: type[ObjectType]
     RefundRecord: type[ObjectType]
-    customer_orders: LinkType
-    order_tickets: LinkType
-    ticket_refund: LinkType
+    customer_orders: ObjectProperty
+    order_tickets: ObjectProperty
+    ticket_refund: ObjectProperty
 
     # -- 便捷读取 ----------------------------------------------------------
     def new_runtime(self, db_path: str = ":memory:") -> OntologyRuntime:
@@ -183,32 +183,32 @@ def build_saas_model(standalone: bool = False) -> SaasModel:
 
     # -- 2. 三条关系边 -----------------------------------------------------
     # 脱壳态下所有边也归 Ontology 自有，否则「建对象 + 建边」会撞 MIXED_AUTHORITY
-    customer_orders = LinkType(
+    customer_orders = ObjectProperty(
         name="customer_orders",
-        source="Customer",
-        target="ShopOrder",
+        domain="Customer",
+        range="ShopOrder",
         cardinality="one-to-many",
         owned=standalone,
         description="客户 -> 订单",
     )
-    order_tickets = LinkType(
+    order_tickets = ObjectProperty(
         name="order_tickets",
-        source="ShopOrder",
-        target="SupportTicket",
+        domain="ShopOrder",
+        range="SupportTicket",
         cardinality="one-to-many",
         owned=standalone,
         description="订单 -> 客诉工单",
     )
-    ticket_refund = LinkType(
+    ticket_refund = ObjectProperty(
         name="ticket_refund",
-        source="SupportTicket",
-        target="RefundRecord",
+        domain="SupportTicket",
+        range="RefundRecord",
         cardinality="one-to-one",
         owned=True,
         description="工单 -> 退款凭证",
     )
-    for link in (customer_orders, order_tickets, ticket_refund):
-        spec.add_link_type(link)
+    for prop in (customer_orders, order_tickets, ticket_refund):
+        spec.add_object_property(prop)
 
     # -- 3. 参数模型 -------------------------------------------------------
     class CreateCustomerOrderParams(BaseModel):

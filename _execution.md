@@ -289,3 +289,19 @@
   5. **红线守恒**：`runtime.py` **1,388** 行（预算 1,400）、`aspects.py` **789** 行且不 import `runtime.py`、`git diff open_ontology/__init__.py open_ontology/ui_display.json` 为空、`workshop.py` / `workshop_ui.py` 仍无业务领域字段。
 * **背景与架构决策**：`post_approval` 是「另一主权平面的第二次单相提交」，因此不能用合并 diff 比对 `action.affects_source`，否则会误杀既有的两段式演示动作；正确口径是「两段各自单平面、钩子增量自身不得跨平面」。
 * **限制**：既有 `/api/function` 用例改为以 `finance` 角色调用 `portfolio_value`（断言值 4,080,000 不变）——非白名单角色（`ops` / `admin`）读到脱敏后的 0.0，这是本卡刻意关闭的读出口缺口；生产 `Board.goal` / `Board.state` 折叠仍须架构师复审后由主控会话执行。
+
+---
+
+## 当前战役：M1 执行账本补强（看板卡片 C-102）
+
+### 13. `C-102` —— 编排器认领超时回收
+* **状态**：🟢 `DONE`（施工完成，待架构师独立复审与 `Board.state` 折叠收单）
+* **背景**：`CardRun` 只是把「谁、第几次、结果如何」记下来。一旦执行者进程消失，`status="running"` 的尝试无人收口，卡片永久停在 `doing`、成员永久 `BUSY`，`dispatch_running_cards` 还可能把上一进程遗留的死认领当成活任务再派给宿主。
+* **已完成结果**：
+  1. **M1 声明式策略与账本字段**：`Board.claim_timeout_seconds`（建板时声明，`0` = 不启用回收，负值 `INVALID_CLAIM_TIMEOUT`）与 `CardRun.heartbeat_at`（`0` 回落到 `started_at`，历史账本无需回填）。
+  2. **M1 三个受控入口**：`heartbeat_claim`（在途执行者续报存活，非承接人 / 非本次尝试分别抛 `CARD_NOT_CLAIMED_BY_MEMBER` / `RUN_OWNED_BY_OTHER_MEMBER`）；只读函数 `stale_claims`（返回 `liveness_at` / `idle_seconds`，未配置时限时 `configured=false`）；动作 `reclaim_stale_claims`（`status="reclaimed"` / `outcome="abandoned"`、`ended_at` + 回收摘要、释放成员、清空承接人、`consecutive_failures += 1`、按 `on_failed` 回可认领列、预算耗尽按 `on_exhausted` 升级）。
+  3. **三条越权红线**：完成列命中即整次拒绝（`COMPLETION_REQUIRES_RECORD_OUTCOME`）；卡片已改派时只收口账本不改列位置与失败计数；`skip_run_ids` 保护在途 run，未配置时限时拒绝回收（`CLAIM_TIMEOUT_NOT_CONFIGURED`）。
+  4. **编排器侧**：`BoardRunner.claim_timeout_seconds` / `heartbeat_interval_seconds` + `_start_heartbeat`（`run_card` 与 `_execute_running_run` 都在宿主执行期间续报，`finally` 停止）；`reclaim_stale_claims(board_key)` 先预览再回收、用 `skip_run_ids` 排除 `_active_run_ids`；`dispatch_running_cards(reclaim_stale=None)` 缺省跟随看板策略，回收后重新查询在途 run 再派发。
+  5. **测试与验收**：`test_kanban.py` 新增 10 条、`test_agent_hosts.py` 新增 3 条；定向 `test_kanban.py` **99 passed**、`test_agent_hosts.py` **84 passed, 2 skipped**；全仓 `pytest -q` **620 passed, 2 skipped, 3 failed（109.37s）**；`open_ontology/runtime.py` 零改动（1,373 行）。
+  6. **文档同步**：`docs/TASK_BOARD.md` 新增 §1.4 执行账本护栏并修订 §1.1 / §2.2；`_state.md` 新增 C-102 检查点并更新测试水位。
+* **已知遗留（不属于本卡）**：`tests/test_command_center_presentation.py` 3 条 UI 用例失败（`.tabs` / `.tab.on` 选择器与新 `#stateTabs` 冲突），已用「隐藏本卡新增动作/函数后复跑仍失败」的对照实验确认与本卡无关。

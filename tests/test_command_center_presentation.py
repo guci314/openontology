@@ -144,7 +144,7 @@ def test_empty_ontology_topology_page():
         assert "该本体暂无对象类型" in html
         detail = _get_json(handle.base_url, "/api/ontology/empty")
         assert detail["object_types"] == []
-        assert detail["link_types"] == []
+        assert detail["object_properties"] == []
     finally:
         handle.stop()
         runtime.close()
@@ -173,8 +173,8 @@ def test_display_mapping_covers_default_blueprints(live):
         spec = entry.spec
         for name in spec.object_types:
             assert show("objects", name) != name, f"missing object label: {name}"
-        for name in spec.link_types:
-            assert show("links", name) != name, f"missing link label: {name}"
+        for name in spec.object_properties:
+            assert show("object_properties", name) != name, f"missing object_property label: {name}"
         for name in spec.actions:
             assert show("actions", name) != name, f"missing action label: {name}"
         for name in spec.functions:
@@ -226,7 +226,7 @@ def test_main_page_chinese_primary_copy(base):
     html = _html(base + "/")
     for marker in (
         "本体蓝图列表",
-        "运行实例列表",
+        "世界状态列表",
         "本体关系图",
         "当前业务状态",
         "动作执行记录",
@@ -494,22 +494,32 @@ def test_browser_topology_shows_objects_links_actions_and_functions(live, browse
     )
     page.wait_for_selector("#scene rect.node")
 
-    # 数据层：6 个对象类型仍走 class="node"，不被新增语义层污染。
-    assert page.locator("#scene rect.node").count() == 6
-    # 语义层：10 个受控业务动作 + 3 个只读查询函数各自独立成卡。
-    assert page.locator("#scene rect.action-node").count() == 10
+    # 数据层：5 个对象类型仍走 class="node"，不被新增语义层污染。
+    assert page.locator("#scene rect.node").count() == 5
+    # 语义层：13 个受控业务动作 + 3 个只读查询函数 + 1 个自动化规则各自独立成卡。
+    assert page.locator("#scene rect.action-node").count() == 13
     assert page.locator("#scene rect.fn-node").count() == 3
+    assert page.locator("#scene rect.auto-node").count() == 1
 
     scene_text = page.evaluate(
         "() => document.getElementById('scene').textContent || ''"
     )
-    for marker in ("认领任务卡片", "登记执行结果", "创建任务卡片"):
+    for marker in (
+        "认领任务卡片",
+        "登记执行结果",
+        "创建任务卡片",
+        "指派承接人",
+        "调度看板任务",
+        "释放卡片认领",
+    ):
         assert marker in scene_text, marker
     for marker in ("看板总览", "看板流程图", "生成任务简报"):
         assert marker in scene_text, marker
+    for marker in ("自动化规则层 · AUTOMATIONS", "看板版本变更自动调度", "监听 看板"):
+        assert marker in scene_text, marker
 
     subtitle = page.inner_text("#subtitle")
-    for marker in ("6 个对象类型", "4 条关系", "10 个业务动作", "3 个查询函数"):
+    for marker in ("5 个对象类型", "6 个对象属性", "13 个业务动作", "3 个查询函数", "1 个自动化规则"):
         assert marker in subtitle, marker
 
     page.locator("#fitBtn").click()
@@ -546,6 +556,8 @@ def test_browser_chinese_action_form_and_submit(live, browser):
     assert "车辆编号" in form_text
     assert "order_id" in form_text  # 英文 key 作为次要技术说明保留
 
+    page.locator("#simBtn").click()
+    page.locator("#submitBtn").wait_for(state="visible", timeout=10_000)
     page.locator("#submitBtn").click()
     page.wait_for_function(
         "() => document.getElementById('result').innerText.includes('已执行')"
@@ -640,8 +652,8 @@ def test_browser_all_ontologies_instance_and_role_isolation_and_demo_flows(live,
         catalog = _get_json(base_url, "/api/catalog")
         ontologies = catalog["ontologies"]
         instances = catalog["instances"]
-        assert len(ontologies) == 6, len(ontologies)
-        assert len(instances) == 8, len(instances)
+        assert len(ontologies) == 7, len(ontologies)
+        assert len(instances) == 9, len(instances)
 
         labels = {row["instance_id"]: row["label"] for row in instances}
         mcts = {row["instance_id"]: row["supports_mcts"] for row in instances}
@@ -891,27 +903,13 @@ def test_ui_kernel_has_no_board_domain_fields():
 
 def test_spec_carries_its_own_display_terms():
     """OntologySpec 自带 display，新增业务本体不必改内核字典。"""
-    from open_ontology.kanban import spec as board_spec
+    from examples.kanban import spec as board_spec
     from open_ontology.workshop_ui import DISPLAY
 
     assert hasattr(board_spec, "display")
-    assert board_spec.display["objects"]["BoardColumn"] == "看板列"
+    assert board_spec.display["objects"]["Card"] == "任务卡片"
     # 内核字典保持 0 污染。
-    assert "BoardColumn" not in DISPLAY.get("objects", {})
-
-
-# ---------------------------------------------------------------------------
-# 3b. 看板实例承载完整架构宪法与基线真值表（TK-ONTO-BOARD-FULL-DOCS）
-# ---------------------------------------------------------------------------
-def test_task_board_instance_carries_full_architecture_and_state_docs(base):
-    payload = _get_json(base, "/api/objects/Board", instance="board-prod")
-    boards = {item["board_key"]: item for item in payload["objects"]}
-    board = boards["BD-CC-001"]
-
-    assert "# OpenOntology 架构设计规范" in board["goal"]
-    assert len(board["goal"]) > 1000
-    assert "# OpenOntology 当前状态真值表" in board["state"]
-    assert len(board["state"]) > 1000
+    assert "Card" not in DISPLAY.get("objects", {})
 
 
 # ---------------------------------------------------------------------------
@@ -960,9 +958,9 @@ def test_browser_task_board_instance_has_no_flow_panel(live, browser):
     errors = _collect_errors(page)
     try:
         page.goto(base_url, wait_until="networkidle")
-        page.get_by_text("多智能体任务看板").first.click()
+        page.get_by_text("任务看板").first.click()
         page.locator("#tab-instance").click()
-        page.get_by_text("任务看板 · 生产实例").first.click()
+        page.get_by_text("任务看板 · 示例实例").first.click()
         page.locator("#action").wait_for(state="visible")
         page.wait_for_selector("#objects .obj")
 
@@ -995,6 +993,95 @@ def test_browser_task_board_instance_has_no_flow_panel(live, browser):
         context.close()
 
 
+def test_browser_task_board_create_card_auto_id_and_dropdowns(live, browser):
+    """创建任务卡片表单：卡片编号系统生成，承接人编号与前置卡片提供下拉列表选择。"""
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    try:
+        page.goto(base_url, wait_until="networkidle")
+        page.get_by_text("任务看板").first.click()
+        page.locator("#tab-instance").click()
+        page.get_by_text("任务看板 · 示例实例").first.click()
+        page.locator("#action").wait_for(state="visible")
+        page.wait_for_selector("#objects .obj")
+        page.locator(".tab[data-name='Card']").click()
+
+        page.select_option("#action", "create_card")
+        page.locator("#p_card_id").wait_for(state="visible")
+
+        # 1. 卡片编号为只读、空值、带「系统自动生成」提示
+        card_id_inp = page.locator("#p_card_id")
+        assert card_id_inp.get_attribute("readonly") is not None
+        assert card_id_inp.input_value() == ""
+        assert "系统自动生成" in (card_id_inp.get_attribute("placeholder") or "")
+
+        # 2. 所属看板、承接人、前置卡片为下拉选择
+        assert page.locator("#p_board").evaluate("el => el.tagName") == "SELECT"
+        assert page.locator("#p_board").input_value() == "BD-CC-001"
+
+        assignee_sel = page.locator("#p_assignee")
+        assert assignee_sel.evaluate("el => el.tagName") == "SELECT"
+        assignee_vals = assignee_sel.locator("option").evaluate_all(
+            "els => els.map(e => e.value)"
+        )
+        assert assignee_vals[0] == ""
+        assert "M-DEV-02" in assignee_vals
+        assert "M-REV-01" in assignee_vals
+
+        waits_box = page.locator("#p_waits_for")
+        assert waits_box.get_attribute("data-multi") == "1"
+        waits_vals = waits_box.locator("input[type='checkbox']").evaluate_all(
+            "els => els.map(e => e.value)"
+        )
+        for existing in ("C-100", "C-101", "C-102", "C-103"):
+            assert existing in waits_vals
+
+        # 选择承接人 M-DEV-02 并从下拉勾选前置卡片 C-101
+        page.select_option("#p_assignee", "M-DEV-02")
+        waits_box.locator(".msel-btn").click()
+        waits_box.locator(".msel-menu").wait_for(state="visible")
+        waits_box.locator("input[type='checkbox'][value='C-101']").check()
+        assert "C-101" in waits_box.locator(".msel-txt").inner_text()
+        page.locator("#p_title").click()  # 关闭下拉菜单
+
+        page.fill("#p_title", "浏览器新建自动编号卡片")
+        page.locator("#simBtn").click()
+        page.wait_for_function(
+            "() => document.getElementById('result').innerText.includes('沙盘预演 → 通过')"
+        )
+        assert "C-104" in page.inner_text("#result")
+
+        page.locator("#submitBtn").wait_for(state="visible", timeout=10_000)
+        page.locator("#submitBtn").click()
+        page.wait_for_function(
+            "() => document.getElementById('result').innerText.includes('正式执行')"
+        )
+        sync_api.expect(page.locator("#objects")).to_contain_text(
+            "C-104", timeout=10_000
+        )
+        sync_api.expect(page.locator("#objects")).to_contain_text(
+            "浏览器新建自动编号卡片", timeout=10_000
+        )
+        # 新建的 C-104 自动出现在前置卡片下拉选项中，且可继续自动生成 C-105
+        sync_api.expect(
+            page.locator("#p_waits_for input[type='checkbox'][value='C-104']")
+        ).to_be_attached(timeout=10_000)
+
+        page.fill("#p_title", "第二张自动编号卡片")
+        page.locator("#simBtn").click()
+        page.locator("#submitBtn").wait_for(state="visible", timeout=10_000)
+        page.locator("#submitBtn").click()
+        sync_api.expect(page.locator("#objects")).to_contain_text(
+            "C-105", timeout=10_000
+        )
+
+        assert errors == [], errors
+    finally:
+        context.close()
+
+
 # ---------------------------------------------------------------------------
 # 6. 微内核顶层命名空间纯洁性（M2 内核不得导出用户态程序与设备驱动）
 # ---------------------------------------------------------------------------
@@ -1009,7 +1096,6 @@ NON_KERNEL_TOP_LEVEL = (
     "Member",
     "Card",
     "CardComment",
-    "CardRun",
     # 业务查询函数
     "factory_board_summary",
     "build_engineer_briefing",
@@ -1052,20 +1138,14 @@ def test_kernel_top_level_has_no_business_or_driver_attributes():
 
 
 def test_business_programs_remain_importable_from_their_own_modules():
-    """清理顶层导出不等于删除能力：业务本体与驱动仍可从各自模块导入。"""
-    from open_ontology.agent_hosts import BoardRunner, CodeBuddyHost, OpenCodeHost
+    """清理顶层导出不等于删除能力：业务本体仍可从各自模块导入。"""
+    from examples.kanban import Board, Card
     from open_ontology.dev_factory import Engineer, WorkTicket
-    from open_ontology.harness_drivers import CodeBuddyCLIDriver
-    from open_ontology.kanban import Board, Card
 
     assert Engineer.__name__ == "Engineer"
     assert WorkTicket.__name__ == "WorkTicket"
     assert Board.__name__ == "Board"
     assert Card.__name__ == "Card"
-    assert CodeBuddyCLIDriver.__name__ == "CodeBuddyCLIDriver"
-    assert BoardRunner.__name__ == "BoardRunner"
-    assert CodeBuddyHost.__name__ == "CodeBuddyHost"
-    assert OpenCodeHost.__name__ == "OpenCodeHost"
 
 
 def test_ingestion_driver_is_a_device_driver_not_kernel():
@@ -1122,8 +1202,8 @@ def test_ingestion_driver_is_a_device_driver_not_kernel():
 PILLAR_TABS = (
     ("tab-ontology", "Model · 领域模型"),
     ("tab-runtime", "Runtime · 算力与治理宿体"),
-    ("tab-instance", "World · 业务世界"),
-    ("tab-device", "Device · 外部世界(符号+联结)"),
+    ("tab-instance", "World · 世界状态"),
+    ("tab-device", "Device · 外部工具与设备"),
 )
 
 
@@ -1188,20 +1268,17 @@ def test_browser_pillar_tabs_switch_four_views(live, browser):
         assert not page.locator("#instancesPanel").is_visible()
         assert page.locator("main.full").count() == 1
 
-        # --- Device：符号 / 联结双栏 ---------------------------------
+        # --- Device：OpenAPI 外部工具与设备 -----------------------------
         page.locator("#tab-device").click()
         page.wait_for_function(
             "() => document.getElementById('stage').innerText"
-            ".includes('外部世界(符号+联结)')"
+            ".includes('外部工具与设备')"
         )
         assert page.locator("#symbolicDevices").count() == 1
-        assert page.locator("#connectionistDevices").count() == 1
+        assert page.locator("#connectionistDevices").count() == 0
         symbolic = page.inner_text("#symbolicDevices")
-        connectionist = page.inner_text("#connectionistDevices")
         assert '"openapi": "3.1.0"' in symbolic
         assert "WMS 仓储" in symbolic
-        assert '"protocol": "A2A/1.0"' in connectionist
-        assert "CodeBuddy CLI" in connectionist
         assert page.locator("#tab-device.on").count() == 1
         # Device 页：侧栏整体隐藏，主舞台独占整幅。
         assert not page.locator("#side").is_visible()
@@ -1262,8 +1339,8 @@ def test_browser_pillar_tabs_switch_four_views(live, browser):
 MODEL_WORKSPACE_PILLARS = (
     ("tab-ontology", "Model · 领域模型"),
     ("tab-runtime", "Runtime · 算力与治理宿体"),
-    ("tab-instance", "World · 业务世界"),
-    ("tab-device", "Device · 外部世界(符号+联结)"),
+    ("tab-instance", "World · 世界状态"),
+    ("tab-device", "Device · 外部工具与设备"),
 )
 
 
@@ -1301,8 +1378,8 @@ def test_catalog_exposes_model_and_workspace_aliases(base):
 
     assert catalog["models"] == catalog["ontologies"]
     assert catalog["workspaces"] == catalog["instances"]
-    assert len(catalog["models"]) == 6
-    assert len(catalog["workspaces"]) == 8
+    assert len(catalog["models"]) == 7
+    assert len(catalog["workspaces"]) == 9
     assert [row["ontology_id"] for row in catalog["ontologies"]] == [
         row["ontology_id"] for row in catalog["models"]
     ]
@@ -1514,7 +1591,7 @@ def test_browser_model_and_workspace_views_label_tbox_behavior_abox(live, browse
         page.wait_for_selector("#pillarTabs .pillar-tab")
         pillars = page.inner_text("#pillarTabs")
         assert "Model · 领域模型" in pillars
-        assert "World · 业务世界" in pillars
+        assert "World · 世界状态" in pillars
 
         page.locator("#ontologies .card").first.click()
         page.wait_for_selector("#stage .topo-link")
@@ -1529,7 +1606,7 @@ def test_browser_model_and_workspace_views_label_tbox_behavior_abox(live, browse
         page.wait_for_selector("#objects .obj")
         workspace_stage = page.inner_text("#stage")
         assert "ABox" in workspace_stage, workspace_stage
-        assert "World · 业务世界" in workspace_stage
+        assert "World · 世界状态" in workspace_stage
 
         assert errors == [], errors
     finally:
@@ -1546,19 +1623,19 @@ def test_browser_topology_model_alias_renders_same_scene(live, browser):
         page.goto(base_url + "/topology?model=task_board", wait_until="networkidle")
         page.wait_for_selector("#scene rect.node")
         assert page.locator("#scene rect.node").count() == 6
-        assert "多智能体任务看板" in page.inner_text("#title")
+        assert "任务看板" in page.inner_text("#title")
         assert errors == [], errors
     finally:
         context.close()
 
 
 def test_docs_page_and_api_docs_served(base):
-    """首页提供架构文档入口，/docs 与 /api/docs 返回 4 份真实文档且无外链脚本。"""
+    """首页提供文档入口，/docs 与 /api/docs 返回 4 份真实文档且无外链脚本。"""
     index_html = _html(base + "/")
-    assert 'id="btnArchDoc"' in index_html
-    assert 'href="/docs?doc=architecture"' in index_html
-    assert 'id="btnPalantirDoc"' in index_html
-    assert 'href="/docs?doc=palantir"' in index_html
+    assert 'id="btnDocs"' in index_html
+    assert 'href="/docs"' in index_html
+    assert 'id="btnArchDoc"' not in index_html
+    assert 'id="btnPalantirDoc"' not in index_html
 
     for suffix in ("/docs", "/docs?doc=architecture", "/docs?doc=palantir"):
         doc_html = _html(base + suffix)
@@ -1591,8 +1668,8 @@ def test_browser_docs_page_switches_and_renders_content(live, browser):
     errors = _collect_errors(page)
     try:
         page.goto(base_url, wait_until="networkidle")
-        page.locator("#btnArchDoc").click()
-        page.wait_for_url("**/docs?doc=architecture")
+        page.locator("#btnDocs").click()
+        page.wait_for_url("**/docs*")
         page.wait_for_selector("#docArticle h1")
         assert "OpenOntology" in page.inner_text("#docArticle")
         assert page.locator("#docArticle .mermaid-card").count() >= 1
@@ -1675,5 +1752,72 @@ def test_storage_planes_separates_overlay_and_enforces_masking(base):
     assert fin_c1["source"]["unit_price_ton"] == 18000.0
     assert fin_c1["source"]["cost_note"] == "主力现货"
     assert fin_c1["source"]["internal_code"] == "NC-304"
+
+
+def test_browser_multistep_sandbox_folds_links_tabs_and_fingerprint(live, browser):
+    """连续多步沙盘推演（建卡 -> 认领 -> 完成）折叠连边增删、Tab 变更计数与指纹提示。"""
+    base_url = live[1].base_url
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    errors = _collect_errors(page)
+    try:
+        page.goto(base_url, wait_until="networkidle")
+        page.locator("#tab-instance").click()
+        page.get_by_text("任务看板 · 示例实例").first.click()
+        page.locator("#action").wait_for(state="visible")
+        page.wait_for_selector("#objects .obj")
+
+        # Step 1: create_card -> 新增 Card:C-104 与 Card.board 连边
+        page.select_option("#action", "create_card")
+        page.fill("#p_title", "沙盘闭环卡")
+        page.fill("#p_body", "验证多步推演连边抵消")
+        page.locator("#simBtn").click()
+        page.wait_for_selector("#objects .sim-create")
+
+        assert "2 项变更" in page.inner_text("#stateTabs")
+        assert "沙盘 1" in page.inner_text(".tab[data-name='Card']")
+        fp_step1 = page.inner_text("#fp")
+        assert "(沙盘 +1)" in fp_step1
+
+        # Step 2: claim_card -> Card:C-104 更新为 doing，新增 Card.assignee 连边
+        page.select_option("#action", "claim_card")
+        page.select_option("#p_card", "C-104")
+        page.select_option("#p_member", "M-DEV-01")
+        page.locator("#simBtn").click()
+        page.wait_for_function(
+            "() => document.getElementById('links').innerText"
+            ".includes('任务卡片：C-104 → 看板成员：M-DEV-01')"
+        )
+        assert "3 项变更" in page.inner_text("#stateTabs")
+        assert "沙盘 1" in page.inner_text(".tab[data-name='Card']")
+
+        # Step 3: record_outcome(completed) -> 删除 Card.assignee 连边，更新 Member:M-DEV-01
+        page.select_option("#action", "record_outcome")
+        page.select_option("#p_card", "C-104")
+        page.select_option("#p_member", "M-DEV-01")
+        page.select_option("#p_outcome", "completed")
+        page.fill("#p_summary", "沙盘验收完成")
+        page.locator("#simBtn").click()
+        page.wait_for_function(
+            "() => document.getElementById('objects').innerText.includes('沙盘验收完成')"
+        )
+
+        # 1) C-104 -> M-DEV-01 的临时承接人连边已在沙盘内正负抵消，不再残留「沙盘新增」
+        links_text = page.inner_text("#links")
+        assert "任务卡片：C-104 → 看板：BD-CC-001" in links_text
+        assert "任务卡片：C-104 → 看板成员：M-DEV-01" not in links_text
+
+        # 2) 净变更计数：Card:C-104(create) + Member:M-DEV-01(update) + Card.board(create) = 3 项
+        assert "3 项变更" in page.inner_text("#stateTabs")
+        assert "沙盘 1" in page.inner_text(".tab[data-name='Card']")
+        assert "沙盘 1" in page.inner_text(".tab[data-name='Member']")
+
+        # 3) 状态指纹同时呈现新增对象 (+1) 与既有对象变更 (~1)
+        fp_step3 = page.inner_text("#fp")
+        assert "(沙盘 +1, ~1)" in fp_step3
+        assert errors == [], errors
+    finally:
+        context.close()
+
 
 

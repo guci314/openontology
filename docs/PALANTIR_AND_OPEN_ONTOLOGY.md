@@ -55,7 +55,7 @@ flowchart TB
 ```
 
 ### 1.1 数字孪生三层架构
-* **Semantic Layer（语义层）**：用领域语言将底层数据集映射为 **Object（实体对象）**、**Property（属性）**、**Link（有向关系边）** 与 **Interface（跨类型多态接口）**，把“物理表”统一投影为“业务对象图”。
+* **Semantic Layer（语义层）**：用领域语言将底层数据集映射为 **`ObjectType`（实体对象）**、**`DatatypeProperty` / `AutoID`（数据属性与系统编号）**、**`ObjectProperty`（OWL 对象属性）** 与 **`InterfaceType`（跨类型多态接口）**，把“物理表”统一投影为“业务对象图”。
 * **Kinetic Layer（动力学层）**：彻底废除裸 CRUD，一切状态变更必须封装为 **Action（具名业务动作）**。Action 内置 **Submission Criteria（准入/不变量条件）**、只读推演 **Function** 与 **Action Log（因果账本）**，保证每一次变化都知道“谁、何时、基于什么前提、改了哪些对象”。
 * **Dynamic Layer（动态决策层）**：在确定性的对象与动作之上，允许人类或 AI 启动 **Scenario（平行沙盘推演）**、配置事件驱动的 **Automation（自动化条件反射）**，并通过 **OSDK（Ontology SDK）** 让大模型安全参与决策。
 
@@ -82,8 +82,8 @@ OpenOntology 完整继承了 Palantir Foundry/AIP 的核心原理，并将其精
 
 | 哲学维度 | Palantir Foundry / AIP 原语 | OpenOntology 对应实现 | 所在模块 |
 |---|---|---|---|
-| **领域模型与业务世界** | Ontology Metadata / Workspace | `OntologySpec`（M1 世界法则容器）+ 隔离 `World / 业务世界`（代码兼容别名 `Workspace`） | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py)、[workspaces.py](file:///Users/guci/work/open-ontology/open_ontology/workspaces.py) |
-| **语义层（TBox）** | Object Type / Link Type / Interface | `ObjectType`（Pydantic 基类）、`LinkType`、`InterfaceType` | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py) |
+| **领域模型与业务世界** | Ontology Metadata / Workspace | `OntologySpec`（M1 世界法则容器）+ 隔离 `World / 世界状态`（代码兼容别名 `Workspace`） | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py)、[workspaces.py](file:///Users/guci/work/open-ontology/open_ontology/workspaces.py) |
+| **语义层（TBox）** | Object Type / Object Property / Interface | `ObjectType`（Pydantic 基类）、`ObjectProperty`、`AutoID`、`InterfaceType` | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py) |
 | **动力学层（Behavior）** | Function / Action / Automation | `FunctionDef`（只读）、`ActionDef`（受控写）、`AutomationDef`（条件反射） | [spec.py](file:///Users/guci/work/open-ontology/open_ontology/spec.py) |
 | **集合代数与遍历** | ObjectSet / SearchAround / Aggregate | `ObjectSet`（去重保序集合代数）、`pivot`、`aggregate` | [query.py](file:///Users/guci/work/open-ontology/open_ontology/query.py) |
 | **OSv2 双平面与摄入** | Backing Dataset + Action / Ontology Edits（原称 User Edits）+ Reindex | `SnapshotIngestionDriver`（`load_snapshot` / `load_mdo_snapshots`）+ `ontology_objects` + `ontology_overlay` | [ingestion.py](file:///Users/guci/work/open-ontology/open_ontology/ingestion.py)、[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql) |
@@ -100,7 +100,7 @@ OpenOntology 完整继承了 Palantir Foundry/AIP 的核心原理，并将其精
 相比重型商业套件或普通 Agent 框架，OpenOntology 在保留 Palantir 灵魂的同时形成了 6 项独特优势：
 
 ### 3.1 极致轻量的“操作系统式微内核”与零重型依赖
-* Palantir Foundry 依赖庞大的分布式集群（Spark、Flink、Cassandra、Phonograph 与重型控制面）；而 OpenOntology 将整个内核收束在不足 **1400 行**的微内核（[runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py) 当前 1388 行）与同构的 **6 张 SQLite 表**（[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql)）中。
+* Palantir Foundry 依赖庞大的分布式集群（Spark、Flink、Cassandra、Phonograph 与重型控制面）；而 OpenOntology 将整个内核收束在不足 **1400 行**的微内核（[runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py) 当前 1343 行）与同构的 **6 张 SQLite 表**（[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql)）中。
 * 支持 `:memory:` 与本地 `.sqlite3` 无缝同构，模型即 Python 代码模块（Pydantic + 装饰器），无需 Kafka 或外部 RDF/OWL 图数据库即可单进程秒级拉起完整治理环境，非常适合嵌入式控制面、边缘业务与敏捷团队落地。
 
 ### 3.2 原生支持 `runtime.fork()` 平行宇宙与 MCTS 世界模型树搜索
@@ -111,9 +111,9 @@ OpenOntology 完整继承了 Palantir Foundry/AIP 的核心原理，并将其精
 * 针对企业“不愿一次性推翻旧 CRM/ERP”的现实痛点，OpenOntology 通过类级 `__owned__` 声明与 `SecurityAndAuthorityAspect` 强制校验 `source`（外部同步）与 `ontology`（本体自有）两个主权平面，配合 `post_approval` 两段式审批追加机制。
 * 企业可先作为“外挂增强层”吸纳外部软件快照（支持多源按列 MDO 拼接与时间戳/自有优先冲突裁决）并叠加 AI 治理属性；待业务闭环成熟后，只需将 `__owned__` 晋升为 `True`，即可物理断开外部 SaaS（参考 [real_crm_unplug_demo.py](file:///Users/guci/work/open-ontology/examples/real_crm_unplug_demo.py)），上层 `ActionDef` 与 Agent 代码一行不改独立运行。
 
-### 3.4 符号主义（OpenAPI）与联结主义（A2A Agent Card）双标准设备统一治理
-* 传统架构往往只把数据库/API 当数据源。OpenOntology 在 M2 架构中将 **符号主义设备（OpenAPI Schema）** 与 **联结主义设备（A2A Agent Card，如 CodeBuddy / OpenCode 宿主）** 平等抽象为外围 `Device`。
-* 外部概率性智能体的任何产出与回执，均经 `ExecutionFabric` 织入观察并通过 `IdleAwareCallbackAspect` 忙闲感知防吞调度，最终必须经过确定性 `ActionDef` 的 `InvariantError` 验收门禁才允许进入 ABox。
+### 3.4 外部设备（OpenAPI）治理与 Agent 零信任接入
+* OpenOntology 在 M2 架构中将外部确定性工具与数据源统一抽象为外围 `Device`（OpenAPI Schema），经 `SnapshotIngestionDriver` 同步进 World；外部智能体（如 CodeBuddy 等）统一作为上游 `Agent（Actor）` 通过 OSDK / `ActionDef` 与世界模型交互。
+* 外部智能体提交的任何参数均属不可信输入，必须经确定性 `ActionDef` 的 RBAC/RLS、`InvariantError` 不变量与主权门禁验收后才允许进入 ABox。
 
 ### 3.5 被拒审计、精确逆向冲正与无 LLM 裁判的确定性评测
 * **被拒企图完整入账**：Agent 因违反不变量被拒的尝试，不会悄无声息消失，而是由 `RejectionAuditAspect` 记入 `ontology_action_runs (status='REJECTED')`，为安全审计和模型调优留下完整证据。
@@ -161,5 +161,5 @@ OpenOntology 完整继承了 Palantir Foundry/AIP 的核心原理，并将其精
 |---|---|---|
 | **定位** | 企业级重型全栈数据与决策操作系统 | 轻量级、嵌入式、AI 原生微内核本体引擎 |
 | **基础设施门槛** | 高（分布式集群、Spark/Flink/专用存储、商业授权） | 极低（纯 Python + SQLite，零重型中间件，毫秒级单测与 `:memory:` 启动） |
-| **强项** | PB 级多源数据融合、大规模 BI/应用编排、海量连接器生态 | MCTS 世界模型树搜索、SaaS 平滑拔插头（`__owned__`）、确定性 Diff 评测、A2A Agent 统一治理 |
+| **强项** | PB 级多源数据融合、大规模 BI/应用编排、海量连接器生态 | MCTS 世界模型树搜索、SaaS 平滑拔插头（`__owned__`）、确定性 Diff 评测、OSDK 零信任动作门禁 |
 | **适用场景** | 大型集团跨几十套系统的重资产数字化底座 | 垂直领域核心决策系统、AI Agent 受控执行中枢、遗留 SaaS 渐进替换、高可靠自动化工作流 |

@@ -37,7 +37,9 @@ __all__ = [
     "WorkspaceNotFoundError",
     "UnsupportedWorkspaceManifestError",
     "check_kernel_database",
+    "find_ontology_sqlite_files",
     "load_catalog",
+    "locate_object_in_databases",
     "takeover_workspace",
 ]
 
@@ -492,3 +494,128 @@ def takeover_workspace(
         "aggregate_root_types": root_types,
         "aggregate_roots": roots,
     }
+
+
+_SQLITE_SUFFIXES = frozenset({".sqlite3", ".db", ".sqlite"})
+_SQLITE_SKIP_DIRS = frozenset({".git", "__pycache__", ".pytest_cache"})
+
+
+def _open_readonly(db_path: Path) -> sqlite3.Connection | None:
+    """以只读方式打开 SQLite 文件；打不开（损坏 / 非库）时返回 ``None``。"""
+    try:
+        conn = sqlite3.connect(
+            Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0
+        )
+    except sqlite3.Error:
+        return None
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _has_ontology_objects(conn: sqlite3.Connection) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ontology_objects'"
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def find_ontology_sqlite_files(search_root: str | Path = ".") -> list[Path]:
+    """递归扫描目录下所有合法的 OpenOntology SQLite 库。"""
+    root = Path(search_root)
+    if root.is_file():
+        candidates = [root] if root.suffix.lower() in _SQLITE_SUFFIXES else []
+    elif root.is_dir():
+        candidates = [
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in _SQLITE_SUFFIXES
+            and not _SQLITE_SKIP_DIRS.intersection(path.parts)
+        ]
+    else:
+        return []
+
+    found: list[Path] = []
+    for path in sorted(candidates):
+        conn = _open_readonly(path)
+        if conn is None:
+            continue
+        try:
+            if _has_ontology_objects(conn):
+                found.append(path)
+        finally:
+            conn.close()
+    return found
+
+
+def _row_matches_target(properties: Any, target: str) -> bool:
+    if not isinstance(properties, dict):
+        return False
+    return any(
+        isinstance(value, str) and value == target for value in properties.values()
+    )
+
+
+def locate_object_in_databases(
+    target_id: str, search_root: str | Path = "."
+) -> list[dict[str, Any]]:
+    """在所有 OpenOntology 库里只读查找 ``target_id`` 对应的本体对象。"""
+    target = str(target_id or "").strip()
+    if not target:
+        return []
+
+    matches: list[dict[str, Any]] = []
+    for db_path in find_ontology_sqlite_files(search_root):
+        conn = _open_readonly(db_path)
+        if conn is None:
+            continue
+        try:
+            rows = conn.execute(
+                """
+                SELECT object_type, object_id, title, properties_json
+                FROM ontology_objects
+                WHERE object_id = ?
+                ORDER BY object_type, object_id
+                """,
+                (target,),
+            ).fetchall()
+            if not rows:
+                rows = [
+                    row
+                    for row in conn.execute(
+                        """
+                        SELECT object_type, object_id, title, properties_json
+                        FROM ontology_objects
+                        ORDER BY object_type, object_id
+                        """
+                    ).fetchall()
+                    if _row_matches_target(json.loads(row["properties_json"]), target)
+                ]
+            if not rows:
+                continue
+            registered_types = [
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM ontology_registry "
+                    "WHERE kind='object_type' ORDER BY name"
+                ).fetchall()
+            ]
+            for row in rows:
+                matches.append(
+                    {
+                        "db_path": str(db_path.resolve()),
+                        "object_type": row["object_type"],
+                        "object_id": row["object_id"],
+                        "title": row["title"],
+                        "properties": json.loads(row["properties_json"]),
+                        "registered_types": list(registered_types),
+                    }
+                )
+        except (sqlite3.Error, json.JSONDecodeError):
+            continue
+        finally:
+            conn.close()
+    return matches

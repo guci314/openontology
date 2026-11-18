@@ -10,7 +10,7 @@
 失联换人时的**无损交接**。
 
 这里不出现任何执行宿主、会话、端口、传输协议或限流细节 ——
-那些都属于外围机械臂适配层（见 ``harness_drivers``）。
+外部执行器统一作为独立 Actor 通过 OpenAPI / ActionDef 与本模型交互。
 """
 
 from __future__ import annotations
@@ -19,15 +19,12 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .spec import Actor, InvariantError, LinkType, ObjectType, OntologySpec
+from .spec import Actor, InvariantError, ObjectProperty, ObjectType, OntologySpec
 
 __all__ = [
     "Engineer",
     "WorkTicket",
     "Deliverable",
-    "TICKET_ASSIGNED_TO",
-    "TICKET_REVIEWED_BY",
-    "TICKET_DELIVERABLES",
     "spec",
     "ENGINEER_ROLES",
     "TICKET_STAGES",
@@ -51,7 +48,7 @@ class Engineer(ObjectType):
     role: str  # architect | coder | tester | auditor
     specialty: str = "general"
     availability: str = "IDLE"  # IDLE | BUSY | UNAVAILABLE
-    active_ticket_id: str | None = None
+    active_ticket: ObjectProperty["WorkTicket"] | None = None
     completed_tickets: int = 0
     Security_Classification: str = "INTERNAL"
 
@@ -69,8 +66,8 @@ class WorkTicket(ObjectType):
     isolated_scope: str
     stage: str = "OPEN"  # OPEN | CODING | TESTING | ARCH_REVIEW | DONE | BLOCKED
     require_testing: bool = False
-    assignee_id: str | None = None
-    reviewer_id: str | None = None
+    assignee: ObjectProperty[Engineer] | None = None
+    reviewer: ObjectProperty[Engineer] | None = None
     rework_round: int = 0
     max_rework: int = 5
     instructions: str = ""
@@ -88,8 +85,8 @@ class Deliverable(ObjectType):
     __owned__ = True
 
     deliverable_id: str
-    ticket_id: str
-    engineer_id: str
+    ticket: ObjectProperty[WorkTicket]
+    engineer: ObjectProperty[Engineer]
     round_index: int
     artifact_uri: str
     summary: str
@@ -98,42 +95,12 @@ class Deliverable(ObjectType):
 
 
 # ---------------------------------------------------------------------------
-# 纯业务关系
+# Spec（对象上的 ObjectProperty 自动注册为关系语义）
 # ---------------------------------------------------------------------------
-TICKET_ASSIGNED_TO = LinkType(
-    name="ticket_assigned_to",
-    source="WorkTicket",
-    target="Engineer",
-    cardinality="many-to-one",
-    owned=True,
-    description="工单当前承接人",
-)
-TICKET_REVIEWED_BY = LinkType(
-    name="ticket_reviewed_by",
-    source="WorkTicket",
-    target="Engineer",
-    cardinality="many-to-one",
-    owned=True,
-    description="工单最近一次评审人",
-)
-TICKET_DELIVERABLES = LinkType(
-    name="ticket_deliverables",
-    source="WorkTicket",
-    target="Deliverable",
-    cardinality="one-to-many",
-    owned=True,
-    description="工单历次交付物",
-)
-
-
-# ---------------------------------------------------------------------------
-# Spec
-# ---------------------------------------------------------------------------
-spec = OntologySpec()
+spec = OntologySpec(read_only_source=True)
 for _cls in (Engineer, WorkTicket, Deliverable):
     spec.object_type(_cls)
-for _link in (TICKET_ASSIGNED_TO, TICKET_REVIEWED_BY, TICKET_DELIVERABLES):
-    spec.add_link_type(_link)
+spec.object_type(Engineer)  # 完成 Engineer.active_ticket -> WorkTicket 双向解析
 
 
 ENGINEER_ROLES: tuple[str, ...] = ("architect", "coder", "tester", "auditor")
@@ -176,28 +143,28 @@ class OpenTicketParams(BaseModel):
 
 
 class DispatchTicketParams(BaseModel):
-    ticket_id: str
-    engineer_id: str
+    ticket: ObjectProperty[WorkTicket]
+    engineer: ObjectProperty[Engineer]
     instructions_override: str | None = None
 
 
 class SubmitWorkParams(BaseModel):
-    ticket_id: str
-    engineer_id: str
+    ticket: ObjectProperty[WorkTicket]
+    engineer: ObjectProperty[Engineer]
     summary: str
     artifact_uri: str = ""
 
 
 class ReviewTicketParams(BaseModel):
-    ticket_id: str
-    reviewer_id: str
+    ticket: ObjectProperty[WorkTicket]
+    reviewer: ObjectProperty[Engineer]
     verdict: str
     feedback: str = ""
 
 
 class ReassignTicketParams(BaseModel):
-    ticket_id: str
-    new_engineer_id: str
+    ticket: ObjectProperty[WorkTicket]
+    new_engineer: ObjectProperty[Engineer]
     reason: str = ""
 
 
@@ -206,7 +173,7 @@ class BoardSummaryParams(BaseModel):
 
 
 class EngineerBriefingParams(BaseModel):
-    ticket_id: str
+    ticket: ObjectProperty[WorkTicket]
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +221,7 @@ def _latest_deliverable(ctx: Any, ticket: WorkTicket) -> Deliverable | None:
     rows = [
         row
         for row in ctx.query(Deliverable)
-        if row.ticket_id == ticket.ticket_id
+        if row.ticket == ticket.ticket_id
     ]
     if not rows:
         return None
@@ -341,14 +308,14 @@ def open_ticket(ctx: Any, params: OpenTicketParams) -> None:
     description="把 OPEN 工单派给空闲程序员；同一隔离目录不允许并发在途。",
 )
 def dispatch_ticket(ctx: Any, params: DispatchTicketParams) -> None:
-    ticket = _require_ticket(ctx, params.ticket_id)
+    ticket = _require_ticket(ctx, params.ticket)
     if ticket.stage != "OPEN":
         raise InvariantError(
             f"工单 {ticket.ticket_id} 处于 {ticket.stage}，只有 OPEN 可以派单",
             code="INVALID_DISPATCH_STATE",
         )
 
-    engineer = _require_engineer(ctx, params.engineer_id)
+    engineer = _require_engineer(ctx, params.engineer)
     if engineer.role != "coder":
         raise InvariantError(
             f"{engineer.engineer_id} 的角色是 {engineer.role}，派单对象必须是 coder",
@@ -378,15 +345,14 @@ def dispatch_ticket(ctx: Any, params: DispatchTicketParams) -> None:
     ctx.modify(
         ticket,
         stage="CODING",
-        assignee_id=engineer.engineer_id,
+        assignee=engineer.engineer_id,
         instructions=instructions,
     )
     ctx.modify(
         engineer,
         availability="BUSY",
-        active_ticket_id=ticket.ticket_id,
+        active_ticket=ticket.ticket_id,
     )
-    ctx.link(ticket, TICKET_ASSIGNED_TO, engineer)
 
 
 # ---------------------------------------------------------------------------
@@ -400,31 +366,30 @@ def dispatch_ticket(ctx: Any, params: DispatchTicketParams) -> None:
     description="程序员交卷：生成交付物、释放程序员、推进到测试或架构评审。",
 )
 def submit_work(ctx: Any, params: SubmitWorkParams) -> None:
-    ticket = _require_ticket(ctx, params.ticket_id)
-    if ticket.stage != "CODING" or ticket.assignee_id != params.engineer_id:
+    ticket = _require_ticket(ctx, params.ticket)
+    if ticket.stage != "CODING" or ticket.assignee != params.engineer:
         raise InvariantError(
             f"工单 {ticket.ticket_id} 处于 {ticket.stage}，"
-            f"承接人是 {ticket.assignee_id}，{params.engineer_id} 无法交卷",
+            f"承接人是 {ticket.assignee}，{params.engineer} 无法交卷",
             code="INVALID_SUBMISSION_STATE",
         )
-    engineer = _require_engineer(ctx, params.engineer_id)
+    engineer = _require_engineer(ctx, params.engineer)
 
     round_rows = [
-        row for row in ctx.query(Deliverable) if row.ticket_id == ticket.ticket_id
+        row for row in ctx.query(Deliverable) if row.ticket == ticket.ticket_id
     ]
     deliverable = Deliverable(
         deliverable_id=f"{ticket.ticket_id}-D{len(round_rows) + 1}",
-        ticket_id=ticket.ticket_id,
-        engineer_id=engineer.engineer_id,
+        ticket=ticket.ticket_id,
+        engineer=engineer.engineer_id,
         round_index=ticket.rework_round,
         artifact_uri=params.artifact_uri,
         summary=params.summary,
         verified=False,
     )
     ctx.create(deliverable)
-    ctx.link(ticket, TICKET_DELIVERABLES, deliverable)
 
-    ctx.modify(engineer, availability="IDLE", active_ticket_id=None)
+    ctx.modify(engineer, availability="IDLE", active_ticket=None)
     next_stage = "TESTING" if ticket.require_testing else "ARCH_REVIEW"
     ctx.modify(
         ticket,
@@ -445,7 +410,7 @@ def submit_work(ctx: Any, params: SubmitWorkParams) -> None:
     description="测试员或架构师裁决；FAIL 自动返工，超过 max_rework 熔断。",
 )
 def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
-    ticket = _require_ticket(ctx, params.ticket_id)
+    ticket = _require_ticket(ctx, params.ticket)
     if params.verdict not in ("PASS", "FAIL"):
         raise InvariantError(
             f"非法裁决 {params.verdict!r}，只允许 PASS / FAIL",
@@ -457,7 +422,7 @@ def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
             code="INVALID_REVIEW_STATE",
         )
 
-    reviewer = _require_engineer(ctx, params.reviewer_id)
+    reviewer = _require_engineer(ctx, params.reviewer)
     if ticket.stage == "TESTING":
         allowed = ("tester", "architect")
     else:
@@ -468,8 +433,7 @@ def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
             code="REVIEWER_ROLE_NOT_ALLOWED",
         )
 
-    ctx.modify(ticket, reviewer_id=reviewer.engineer_id)
-    ctx.link(ticket, TICKET_REVIEWED_BY, reviewer)
+    ctx.modify(ticket, reviewer=reviewer.engineer_id)
 
     if params.verdict == "PASS":
         if ticket.stage == "TESTING":
@@ -490,8 +454,8 @@ def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
             verdict="PASS",
             latest_feedback=params.feedback,
         )
-        if ticket.assignee_id:
-            engineer = ctx.get(Engineer, ticket.assignee_id)
+        if ticket.assignee:
+            engineer = ctx.get(Engineer, ticket.assignee)
             if engineer is not None:
                 ctx.modify(
                     engineer,
@@ -515,7 +479,7 @@ def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
         verdict="FAIL",
         latest_feedback=params.feedback,
     )
-    assignee = ctx.get(Engineer, ticket.assignee_id) if ticket.assignee_id else None
+    assignee = ctx.get(Engineer, ticket.assignee) if ticket.assignee else None
     if assignee is not None and assignee.availability == "IDLE":
         ctx.modify(
             ticket,
@@ -524,13 +488,13 @@ def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
         ctx.modify(
             assignee,
             availability="BUSY",
-            active_ticket_id=ticket.ticket_id,
+            active_ticket=ticket.ticket_id,
         )
     else:
         ctx.modify(
             ticket,
             stage="OPEN",
-            assignee_id=None,
+            assignee=None,
         )
 
 
@@ -545,10 +509,10 @@ def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
     description="原承接人失联时，把工单连同全部历史上下文原子交接给空闲程序员。",
 )
 def reassign_ticket(ctx: Any, params: ReassignTicketParams) -> None:
-    ticket = _require_ticket(ctx, params.ticket_id)
-    new_engineer = _require_engineer(ctx, params.new_engineer_id)
+    ticket = _require_ticket(ctx, params.ticket)
+    new_engineer = _require_engineer(ctx, params.new_engineer)
 
-    if ticket.assignee_id == new_engineer.engineer_id:
+    if ticket.assignee == new_engineer.engineer_id:
         raise InvariantError(
             f"{new_engineer.engineer_id} 已经是工单承接人",
             code="REASSIGN_SAME_ENGINEER",
@@ -565,23 +529,21 @@ def reassign_ticket(ctx: Any, params: ReassignTicketParams) -> None:
         )
 
     previous = (
-        ctx.get(Engineer, ticket.assignee_id) if ticket.assignee_id else None
+        ctx.get(Engineer, ticket.assignee) if ticket.assignee else None
     )
     if previous is not None:
-        ctx.modify(previous, availability="UNAVAILABLE", active_ticket_id=None)
-        ctx.unlink(ticket, TICKET_ASSIGNED_TO, previous)
+        ctx.modify(previous, availability="UNAVAILABLE", active_ticket=None)
 
     ctx.modify(
         new_engineer,
         availability="BUSY",
-        active_ticket_id=ticket.ticket_id,
+        active_ticket=ticket.ticket_id,
     )
     ctx.modify(
         ticket,
-        assignee_id=new_engineer.engineer_id,
+        assignee=new_engineer.engineer_id,
         stage="CODING",
     )
-    ctx.link(ticket, TICKET_ASSIGNED_TO, new_engineer)
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +575,7 @@ def factory_board_summary(ctx: Any, params: BoardSummaryParams) -> dict[str, Any
         {
             "ticket_id": ticket.ticket_id,
             "scope": _normalize_scope(ticket.isolated_scope),
-            "engineer_id": ticket.assignee_id,
+            "engineer": ticket.assignee,
         }
         for ticket in sorted(tickets, key=lambda row: row.ticket_id)
         if ticket.stage == "CODING"
@@ -662,25 +624,25 @@ def factory_board_summary(ctx: Any, params: BoardSummaryParams) -> dict[str, Any
 def build_engineer_briefing(
     ctx: Any, params: EngineerBriefingParams
 ) -> dict[str, Any]:
-    ticket = _require_ticket(ctx, params.ticket_id)
+    ticket = _require_ticket(ctx, params.ticket)
     assignee = (
-        ctx.get(Engineer, ticket.assignee_id) if ticket.assignee_id else None
+        ctx.get(Engineer, ticket.assignee) if ticket.assignee else None
     )
     reviewer = (
-        ctx.get(Engineer, ticket.reviewer_id) if ticket.reviewer_id else None
+        ctx.get(Engineer, ticket.reviewer) if ticket.reviewer else None
     )
 
     history = [
         {
             "deliverable_id": row.deliverable_id,
-            "engineer_id": row.engineer_id,
+            "engineer": row.engineer,
             "round_index": row.round_index,
             "artifact_uri": row.artifact_uri,
             "summary": row.summary,
             "verified": row.verified,
         }
         for row in sorted(
-            (row for row in ctx.query(Deliverable) if row.ticket_id == ticket.ticket_id),
+            (row for row in ctx.query(Deliverable) if row.ticket == ticket.ticket_id),
             key=lambda row: (row.round_index, row.deliverable_id),
         )
     ]
@@ -693,9 +655,9 @@ def build_engineer_briefing(
         "normalized_scope": _normalize_scope(ticket.isolated_scope),
         "stage": ticket.stage,
         "instructions": ticket.instructions,
-        "assignee_id": ticket.assignee_id,
+        "assignee": ticket.assignee,
         "assignee_name": assignee.name if assignee is not None else None,
-        "reviewer_id": ticket.reviewer_id,
+        "reviewer": ticket.reviewer,
         "reviewer_name": reviewer.name if reviewer is not None else None,
         "rework_round": ticket.rework_round,
         "max_rework": ticket.max_rework,
@@ -715,7 +677,7 @@ def render_briefing(briefing: dict[str, Any]) -> str:
         f"隔离目录：{briefing['isolated_scope']}",
         f"当前阶段：{briefing['stage']}（返工 {briefing['rework_round']}/"
         f"{briefing['max_rework']}）",
-        f"承接人：{briefing.get('assignee_name') or briefing.get('assignee_id')}",
+        f"承接人：{briefing.get('assignee_name') or briefing.get('assignee')}",
     ]
     if briefing.get("instructions"):
         lines.append(f"任务说明：{briefing['instructions']}")
@@ -728,7 +690,7 @@ def render_briefing(briefing: dict[str, Any]) -> str:
         for row in briefing["history"]:
             mark = "已验收" if row["verified"] else "待验收"
             lines.append(
-                f"  - 第 {row['round_index']} 轮 {row['engineer_id']} "
+                f"  - 第 {row['round_index']} 轮 {row['engineer']} "
                 f"[{mark}] {row['summary']}"
             )
     return "\n".join(lines)

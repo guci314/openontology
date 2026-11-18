@@ -43,6 +43,9 @@ dist/
 /video*/audio/
 /video*/frames/
 /video*/segments/
+/video*/studio_state/
+/.archify/
+/路演视频合集/
 *.mp4
 *.mov
 *.m4a

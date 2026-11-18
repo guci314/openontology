@@ -18,18 +18,21 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
+import open_ontology.runtime as runtime_mod
 from examples.command_center_demo import (
     IncompatibleBoardDatabaseError,
     build_default_command_center,
 )
-from open_ontology.kanban import (
+from examples.kanban import (
     BOARD_MANAGER,
-    CARD_WAITS_FOR,
     Card,
     spec as board_spec,
 )
+from open_ontology import Actor, ObjectType, OntologySpec
 from open_ontology.runtime import OntologyRuntime
+from open_ontology.workspaces import check_kernel_database
 
 BOARD_KEY = "BD-CC-001"
 INSTANCE_ID = "board-prod"
@@ -102,7 +105,7 @@ def _board(runtime):
 
 def _cards(runtime) -> dict[str, tuple[str, str, str | None]]:
     return {
-        card.card_id: (card.title, card.column_key, card.assignee_id)
+        card.card_id: (card.title, card.status, card.assignee)
         for card in runtime.query_objects(Card, BOARD_MANAGER)
     }
 
@@ -189,34 +192,33 @@ def test_first_build_creates_database_under_given_directory(tmp_path):
 def test_reopening_demo_preserves_objects_versions_links_and_runs(tmp_path):
     first = build_default_command_center(data_dir=tmp_path)
     runtime = _runtime(first)
-    original_goal = _board(runtime).goal
+    original_title = _board(runtime).title
     original_cards = _cards(runtime)
     assert len(original_cards) == 4
 
     # 关系：C-103 waits_for C-101
     waits = runtime.get_linked(
         runtime.get_object("Card", "C-103", BOARD_MANAGER),
-        CARD_WAITS_FOR,
+        "Card.waits_for",
         Card,
         BOARD_MANAGER,
     )
     assert [card.card_id for card in waits] == ["C-101"]
 
-    # 通过动作改状态：更新基线 + 新增一张卡
-    runtime.submit_action(
-        "T-EDIT-STATE",
-        "update_board_state",
-        {"board_key": BOARD_KEY, "state": "人工编辑后的基线：C-WS-01 进行中"},
-        BOARD_MANAGER,
-    )
+    # 通过动作改状态：新增一张卡与一条评论
     runtime.submit_action(
         "T-EDIT-CARD",
         "create_card",
-        {"card_id": "C-900", "board_key": BOARD_KEY, "title": "人工新增卡"},
+        {"card_id": "C-900", "board": BOARD_KEY, "title": "人工新增卡"},
+        BOARD_MANAGER,
+    )
+    runtime.submit_action(
+        "T-EDIT-COMMENT",
+        "add_comment",
+        {"card": "C-900", "author": "M-REV-01", "body": "人工补充说明"},
         BOARD_MANAGER,
     )
     before = _snapshot(runtime)
-    assert _board(runtime).state == "人工编辑后的基线：C-WS-01 进行中"
     runtime.close()
 
     # 重新打开演示：默认非破坏性
@@ -224,8 +226,7 @@ def test_reopening_demo_preserves_objects_versions_links_and_runs(tmp_path):
     reopened = _runtime(second)
     try:
         board = _board(reopened)
-        assert board.state == "人工编辑后的基线：C-WS-01 进行中"
-        assert board.goal == original_goal
+        assert board.title == original_title
 
         # 对象值、版本、关系、动作记录全部原样
         assert _snapshot(reopened) == before
@@ -237,7 +238,7 @@ def test_reopening_demo_preserves_objects_versions_links_and_runs(tmp_path):
 
         waits_after = reopened.get_linked(
             reopened.get_object("Card", "C-103", BOARD_MANAGER),
-            CARD_WAITS_FOR,
+            "Card.waits_for",
             Card,
             BOARD_MANAGER,
         )
@@ -262,9 +263,9 @@ def test_explicit_reset_reseeds_only_the_specified_database(tmp_path):
     first = build_default_command_center(data_dir=data_dir)
     runtime = _runtime(first)
     runtime.submit_action(
-        "T-EDIT-STATE",
-        "update_board_state",
-        {"board_key": BOARD_KEY, "state": "改过的基线"},
+        "T-EDIT-CARD",
+        "create_card",
+        {"card_id": "C-901", "board": BOARD_KEY, "title": "临时新增卡"},
         BOARD_MANAGER,
     )
     runtime.close()
@@ -272,9 +273,8 @@ def test_explicit_reset_reseeds_only_the_specified_database(tmp_path):
     reset_registry = build_default_command_center(data_dir=data_dir, reset=True)
     reopened = _runtime(reset_registry)
     try:
-        board = _board(reopened)
-        assert board.state != "改过的基线"
-        assert board.state
+        assert "C-901" not in _cards(reopened)
+        assert _board(reopened).title == "任务看板"
         assert len(_cards(reopened)) == 4
         assert _seed_runs(reopened) == 1
 
@@ -352,7 +352,7 @@ def test_partial_database_missing_core_table_fails_before_schema_recreation(
     assert set(KERNEL_TABLES) <= _table_names(db_path)
     state_before = _logical_state(db_path)
     assert state_before["board"] is not None
-    assert state_before["objects"] == 19
+    assert state_before["objects"] == 10
     assert state_before["runs"] == 15
 
     # 只删这一张表：目标看板与其余数据保持原样。
@@ -411,9 +411,9 @@ def test_reopening_under_uri_reserved_directory_stays_on_target(tmp_path, dirnam
     runtime = _runtime(first)
     assert Path(runtime.db_path) == db_path
     runtime.submit_action(
-        "T-EDIT-STATE",
-        "update_board_state",
-        {"board_key": BOARD_KEY, "state": f"保留字符目录基线：{dirname}"},
+        "T-EDIT-CARD",
+        "create_card",
+        {"card_id": "C-902", "board": BOARD_KEY, "title": f"保留字符目录：{dirname}"},
         BOARD_MANAGER,
     )
     before = _snapshot(runtime)
@@ -428,15 +428,144 @@ def test_reopening_under_uri_reserved_directory_stays_on_target(tmp_path, dirnam
     try:
         # 1. 命中的就是目标库，且数据是同一份
         assert Path(reopened.db_path) == db_path
-        assert _board(reopened).state == f"保留字符目录基线：{dirname}"
+        assert _cards(reopened)["C-902"][0] == f"保留字符目录：{dirname}"
         # 2. 完整状态（对象 / 关系 / 账本）原样保留，种子动作不重放
         assert _snapshot(reopened) == before
         assert _seed_runs(reopened) == 1
-        assert len(_cards(reopened)) == 4
+        assert len(_cards(reopened)) == 5
     finally:
         reopened.close()
 
     # 3. 目录条目完全一致：没有 ``board`` / ``query`` / ``literal space`` 之类旁路
     assert _entries(data_dir) == entries_after_first
     assert _entries(tmp_path) == [dirname]
+
+
+# ---------------------------------------------------------------------------
+# 7. I-003 遗留 7 表世界（含残留 ontology_expectations）无损重开兼容
+# ---------------------------------------------------------------------------
+def test_reopen_seven_table_world_with_leftover_ontology_expectations(
+    tmp_path, monkeypatch
+):
+    """带有 I-003 残留 ``ontology_expectations`` 表的 7 表旧库：
+
+    1. 新建世界只建 6 张核心表；
+    2. 对旧 7 表库执行 ``check_kernel_database`` 与 ``OntologyRuntime`` 重开均照常通过，
+       不重跑 ``schema.sql``、不报错、不主动 DROP 残留表，使其静默闲置；
+    3. 原有事实、overlay 与动作历史完整保留，后续 ``load_snapshot`` 正常更新且不返回
+       已退役的 ``reconciliation`` 键。
+    """
+    spec = OntologySpec()
+
+    class OrderRecord(ObjectType):
+        __primary_key__ = "order_id"
+        __title__ = "order_id"
+        __owned__ = {"ops_note": None}
+
+        order_id: str
+        qty: int
+        ops_note: str | None = None
+
+    class AnnotateParams(BaseModel):
+        order_id: str
+        ops_note: str
+
+    spec.object_type(OrderRecord)
+
+    @spec.action(
+        "set_ops_note",
+        AnnotateParams,
+        allowed_roles=("ops",),
+        affects_source=False,
+    )
+    def set_ops_note(ctx, params: AnnotateParams) -> None:
+        doc = ctx.require(OrderRecord, params.order_id)
+        ctx.modify(doc, ops_note=params.ops_note)
+
+    ops = Actor(actor_id="ops-1", role="ops")
+    db_path = tmp_path / "legacy_seven_tables.sqlite3"
+
+    # 1) 新建世界严格只有 6 张核心表，且 load_snapshot 不含 reconciliation
+    rt1 = OntologyRuntime(spec, db_path=db_path)
+    try:
+        assert _table_names(db_path) == set(KERNEL_TABLES)
+        s1 = rt1.load_snapshot({"OrderRecord": [{"order_id": "O-1", "qty": 10}]})
+        assert "reconciliation" not in s1
+        rt1.submit_action(
+            "RUN-NOTE-1",
+            "set_ops_note",
+            {"order_id": "O-1", "ops_note": "keep-across-reopen"},
+            ops,
+        )
+    finally:
+        rt1.close()
+
+    # 2) 注入 I-003 遗留的第 7 张表 ontology_expectations 及其哨兵行和触发器
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE ontology_expectations (
+                entry_kind   TEXT NOT NULL CHECK (entry_kind IN ('cursor', 'object', 'link')),
+                entry_key    TEXT NOT NULL,
+                run_id       TEXT,
+                payload_json TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                PRIMARY KEY (entry_kind, entry_key)
+            );
+            INSERT INTO ontology_expectations
+                (entry_kind, entry_key, run_id, payload_json, updated_at)
+            VALUES
+                ('cursor', 'reconciler', NULL, '{"last_run_rowid":1}', '2026-01-01T00:00:00+00:00');
+            CREATE TRIGGER trg_expectations_guard_insert
+            BEFORE INSERT ON ontology_expectations
+            FOR EACH ROW
+            WHEN (SELECT is_open FROM ontology_write_gate WHERE id = 1) = 0
+            BEGIN
+                SELECT RAISE(ABORT, 'GOVERNANCE_VIOLATION: direct INSERT into ontology_expectations is blocked');
+            END;
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _table_names(db_path) == set(KERNEL_TABLES) | {"ontology_expectations"}
+
+    # 3) 工作空间只读预检允许该 7 表旧库通过
+    assert check_kernel_database(db_path) == db_path
+
+    # 4) 验证 OntologyRuntime 重开 7 表旧库时不重跑 schema.sql
+    class _ForbiddenSchemaPath:
+        def read_text(self, *_args, **_kwargs):
+            raise AssertionError("reopening existing 7-table DB must not re-run schema.sql")
+
+    monkeypatch.setattr(runtime_mod, "SCHEMA_PATH", _ForbiddenSchemaPath())
+
+    rt2 = OntologyRuntime(spec, db_path=db_path)
+    try:
+        assert _table_names(db_path) == set(KERNEL_TABLES) | {"ontology_expectations"}
+        before_obj = rt2.get_object(OrderRecord, "O-1", ops)
+        assert before_obj.qty == 10
+        assert before_obj.ops_note == "keep-across-reopen"
+        assert [r["run_id"] for r in rt2.list_action_runs()] == ["RUN-NOTE-1"]
+
+        # 5) load_snapshot 正常刷新外部事实并保留 overlay；遗留表静默闲置、不被删除也不被修改
+        s2 = rt2.load_snapshot({"OrderRecord": [{"order_id": "O-1", "qty": 25}]})
+        assert "reconciliation" not in s2
+        assert s2["objects"] == 1
+        assert s2["overlays_reapplied"] == 1
+
+        after_obj = rt2.get_object(OrderRecord, "O-1", ops)
+        assert after_obj.qty == 25
+        assert after_obj.ops_note == "keep-across-reopen"
+
+        leftover_rows = rt2.connection.execute(
+            "SELECT entry_kind, entry_key, payload_json FROM ontology_expectations"
+        ).fetchall()
+        assert [(r["entry_kind"], r["entry_key"], r["payload_json"]) for r in leftover_rows] == [
+            ("cursor", "reconciler", '{"last_run_rowid":1}')
+        ]
+    finally:
+        rt2.close()
 
