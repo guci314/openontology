@@ -34,6 +34,18 @@ from open_ontology import (
     OntologyRuntime,
     OntologySpec,
 )
+from .saas_unplug_ontology import (
+    AI_AGENT,
+    CS_AGENT,
+    FRAUD_BLOCK_THRESHOLD,
+    MANAGER_APPROVAL_THRESHOLD_CENTS,
+    PARASITIC_OWNED_FIELDS,
+    RETURN_WINDOW_DAYS,
+    STORE_MANAGER,
+    SaasOntologyBundle,
+    build_saas_ontology,
+    build_saas_ontology_spec,
+)
 
 __all__ = [
     "AI_AGENT",
@@ -49,455 +61,29 @@ __all__ = [
     "main",
 ]
 
-# 退货窗口（天）与需要店长审批的金额门槛（分）
-RETURN_WINDOW_DAYS = 30
-MANAGER_APPROVAL_THRESHOLD_CENTS = 100_00
-FRAUD_BLOCK_THRESHOLD = 80
-
-# ---------------------------------------------------------------------------
-# 角色（两种模式共用，纯身份，不绑定任何 SaaS 账号体系）
-# ---------------------------------------------------------------------------
-AI_AGENT = Actor(actor_id="ai-agent-01", role="ai_agent", clearance_tags={"*"})
-CS_AGENT = Actor(actor_id="cs-agent-01", role="cs_agent", clearance_tags={"*"})
-STORE_MANAGER = Actor(
-    actor_id="store-manager-01", role="store_manager", clearance_tags={"*"}
-)
-
-# 寄生态下每个对象类型里「归 Ontology 自有」的字段。
-#
-# 刻意只收「风控评分 / VIP 分层 / 内部备注 / AI 分诊结论」这类
-# *源系统没有的派生治理字段*：它们写进 ontology_overlay 补丁层，
-# 无论 Shopify / Stripe / Zendesk 怎么全量重刷都杀不掉。
-# 订单状态、工单状态、LTV 等仍属源系统字段（由 SaaS 快照供给）。
-PARASITIC_OWNED_FIELDS: dict[str, dict[str, Any]] = {
-    "Customer": {"fraud_score": 0, "vip_tier": "STANDARD"},
-    "ShopOrder": {"ops_memo": None},
-    "SupportTicket": {"ai_triage_note": None},
-}
-
 
 @dataclass
-class SaasModel:
-    """一次 spec 构建产出的全部可调用句柄（类、边、spec）。"""
+class SaasModel(SaasOntologyBundle):
+    """带 Runtime 启动入口的 SaaS 演示模型包装。"""
 
-    spec: OntologySpec
-    standalone: bool
-    Customer: type[ObjectType]
-    ShopOrder: type[ObjectType]
-    SupportTicket: type[ObjectType]
-    RefundRecord: type[ObjectType]
-    customer_orders: ObjectProperty
-    order_tickets: ObjectProperty
-    ticket_refund: ObjectProperty
-
-    # -- 便捷读取 ----------------------------------------------------------
     def new_runtime(self, db_path: str = ":memory:") -> OntologyRuntime:
         return OntologyRuntime(self.spec, db_path)
 
-    def object_type(self, name: str) -> type[ObjectType]:
-        return self.spec.object_types[name]
 
-
-# ---------------------------------------------------------------------------
-# Spec 工厂：业务逻辑写一次，主权声明随模式切换
-# ---------------------------------------------------------------------------
 def build_saas_model(standalone: bool = False) -> SaasModel:
-    """构建整套 SaaS 业务本体。
-
-    ``standalone=False`` -> 寄生态（字段级 overlay 主权）
-    ``standalone=True``  -> 脱壳态（全对象 100% Ontology 自有）
-    """
-    spec = OntologySpec()
-
-    customer_owned: Any = True if standalone else dict(
-        PARASITIC_OWNED_FIELDS["Customer"]
-    )
-    order_owned: Any = True if standalone else dict(
-        PARASITIC_OWNED_FIELDS["ShopOrder"]
-    )
-    ticket_owned: Any = True if standalone else dict(
-        PARASITIC_OWNED_FIELDS["SupportTicket"]
-    )
-
-    # -- 1. 四类业务对象 ---------------------------------------------------
-    class Customer(ObjectType):
-        """客户（寄生态来自 Shopify/CRM 快照，脱壳态由 Ontology 原生持有）。"""
-
-        __primary_key__ = "customer_id"
-        __title__ = "name"
-        __owned__ = customer_owned
-
-        customer_id: str
-        email: str
-        name: str
-        lifetime_value_cents: int = 0
-        fraud_score: int = 0
-        vip_tier: str = "STANDARD"
-
-    class ShopOrder(ObjectType):
-        """订单（寄生态来自 Shopify，脱壳态由 Ontology 原生持有）。"""
-
-        __primary_key__ = "order_id"
-        __title__ = "order_id"
-        __owned__ = order_owned
-
-        order_id: str
-        customer_id: str
-        item_sku: str
-        amount_cents: int
-        age_days: int
-        status: str = "paid"
-        ops_memo: str | None = None
-
-    class SupportTicket(ObjectType):
-        """客诉工单（寄生态来自 Zendesk，脱壳态由 Ontology 原生持有）。"""
-
-        __primary_key__ = "ticket_id"
-        __title__ = "ticket_id"
-        __owned__ = ticket_owned
-
-        ticket_id: str
-        order_id: str
-        customer_id: str
-        issue_type: str
-        requested_refund_cents: int
-        status: str = "open"
-        ai_triage_note: str | None = None
-
-    class RefundRecord(ObjectType):
-        """退款凭证 —— 无论哪种模式都 100% 由 Ontology 自有。"""
-
-        __primary_key__ = "refund_id"
-        __title__ = "refund_id"
-        __owned__ = True
-
-        refund_id: str
-        ticket_id: str
-        order_id: str
-        customer_id: str
-        amount_cents: int
-        approved_by: str
-
-    for cls in (Customer, ShopOrder, SupportTicket, RefundRecord):
-        spec.object_type(cls)
-
-    # -- 2. 三条关系边 -----------------------------------------------------
-    # 脱壳态下所有边也归 Ontology 自有，否则「建对象 + 建边」会撞 MIXED_AUTHORITY
-    customer_orders = ObjectProperty(
-        name="customer_orders",
-        domain="Customer",
-        range="ShopOrder",
-        cardinality="one-to-many",
-        owned=standalone,
-        description="客户 -> 订单",
-    )
-    order_tickets = ObjectProperty(
-        name="order_tickets",
-        domain="ShopOrder",
-        range="SupportTicket",
-        cardinality="one-to-many",
-        owned=standalone,
-        description="订单 -> 客诉工单",
-    )
-    ticket_refund = ObjectProperty(
-        name="ticket_refund",
-        domain="SupportTicket",
-        range="RefundRecord",
-        cardinality="one-to-one",
-        owned=True,
-        description="工单 -> 退款凭证",
-    )
-    for prop in (customer_orders, order_tickets, ticket_refund):
-        spec.add_object_property(prop)
-
-    # -- 3. 参数模型 -------------------------------------------------------
-    class CreateCustomerOrderParams(BaseModel):
-        customer_id: str
-        email: str
-        name: str
-        order_id: str
-        item_sku: str
-        amount_cents: int
-        age_days: int = 0
-
-    class OpenTicketParams(BaseModel):
-        ticket_id: str
-        order_id: str
-        issue_type: str
-        requested_refund_cents: int
-
-    class TriageParams(BaseModel):
-        ticket_id: str
-        fraud_score: int = 0
-        vip_tier: str = "STANDARD"
-        note: str | None = None
-
-    class RefundParams(BaseModel):
-        ticket_id: str
-        refund_id: str
-        amount_cents: int
-        approved_by: str | None = None
-
-    class OverviewParams(BaseModel):
-        pass
-
-    # -- 4. 受控动作（业务逻辑两种模式完全一致） ---------------------------
-    @spec.action(
-        "create_customer_and_order",
-        CreateCustomerOrderParams,
-        allowed_roles=("ai_agent", "cs_agent", "store_manager", "sales"),
-        affects_source=not standalone,
-        description="原生建客下单：创建 Customer + ShopOrder 并建立 customer_orders 边。",
-    )
-    def create_customer_and_order(ctx: Any, params: CreateCustomerOrderParams) -> None:
-        if params.amount_cents <= 0:
-            raise InvariantError(
-                "order amount must be positive", code="INVALID_ORDER_AMOUNT"
-            )
-        if params.age_days < 0:
-            raise InvariantError(
-                "order age_days must not be negative", code="INVALID_ORDER_AGE"
-            )
-        customer = Customer(
-            customer_id=params.customer_id,
-            email=params.email,
-            name=params.name,
-            lifetime_value_cents=params.amount_cents,
-        )
-        order = ShopOrder(
-            order_id=params.order_id,
-            customer_id=params.customer_id,
-            item_sku=params.item_sku,
-            amount_cents=params.amount_cents,
-            age_days=params.age_days,
-            status="paid",
-        )
-        ctx.create(customer)
-        ctx.create(order)
-        ctx.link(customer, customer_orders, order)
-
-    @spec.action(
-        "open_support_ticket",
-        OpenTicketParams,
-        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
-        affects_source=not standalone,
-        description="原生建客诉工单（替代 Zendesk）：校验订单存在并建立 order_tickets 边。",
-    )
-    def open_support_ticket(ctx: Any, params: OpenTicketParams) -> None:
-        order = ctx.require(ShopOrder, params.order_id)
-        if params.issue_type not in ("damaged", "late", "remorse"):
-            raise InvariantError(
-                f"unsupported issue_type {params.issue_type!r}", code="INVALID_ISSUE_TYPE"
-            )
-        if params.requested_refund_cents <= 0:
-            raise InvariantError(
-                "requested_refund_cents must be positive",
-                code="INVALID_REFUND_REQUEST",
-            )
-        ticket = SupportTicket(
-            ticket_id=params.ticket_id,
-            order_id=order.order_id,
-            customer_id=order.customer_id,
-            issue_type=params.issue_type,
-            requested_refund_cents=params.requested_refund_cents,
-            status="open",
-        )
-        ctx.create(ticket)
-        ctx.link(order, order_tickets, ticket)
-
-    def _mark_triaged(ctx: Any, params: TriageParams) -> None:
-        """工单流转状态由治理流程推进（寄生态写回 Zendesk，脱壳态写本体）。"""
-        ticket = ctx.require(SupportTicket, params.ticket_id)
-        ctx.modify(ticket, status="triaged")
-
-    @spec.action(
-        "ai_triage_ticket",
-        TriageParams,
-        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
-        affects_source=False,
-        post_approval=_mark_triaged,
-        description="AI 智能分诊与反欺诈评分：写客户风控字段与工单分诊备注。",
-    )
-    def ai_triage_ticket(ctx: Any, params: TriageParams) -> None:
-        """AI 分诊 = 两个同主权平面的一次业务动作。
-
-        主编辑计划只写 Ontology 自有字段（``fraud_score`` / ``vip_tier`` /
-        ``ai_triage_note``，落 ``ontology_overlay``），因此本动作声明
-        ``affects_source=False``；工单状态流转（``open -> triaged``）属于
-        另一主权平面，交给 ``post_approval`` 钩子单独成一个 diff ——
-        寄生态写回 Zendesk，脱壳态写本体，业务语义完全一致。
-        """
-        if not 0 <= params.fraud_score <= 100:
-            raise InvariantError(
-                f"fraud_score {params.fraud_score} out of range 0..100",
-                code="INVALID_FRAUD_SCORE",
-            )
-        ticket = ctx.require(SupportTicket, params.ticket_id)
-        customer = ctx.require(Customer, ticket.customer_id)
-        ctx.modify(
-            customer,
-            fraud_score=params.fraud_score,
-            vip_tier=params.vip_tier,
-        )
-        ctx.modify(
-            ticket,
-            ai_triage_note=params.note
-            or (
-                f"AI triage: fraud_score={params.fraud_score} "
-                f"vip_tier={params.vip_tier} issue={ticket.issue_type}"
-            ),
-        )
-
-    def _record_refund(ctx: Any, params: RefundParams) -> None:
-        """资金凭证落账（替代 Stripe Refund 对象）。"""
-        ticket = ctx.require(SupportTicket, params.ticket_id)
-        refund = RefundRecord(
-            refund_id=params.refund_id,
-            ticket_id=ticket.ticket_id,
-            order_id=ticket.order_id,
-            customer_id=ticket.customer_id,
-            amount_cents=params.amount_cents,
-            approved_by=params.approved_by or ctx.actor.actor_id,
-        )
-        ctx.create(refund)
-        ctx.link(ticket, ticket_refund, refund)
-
-    def _needs_manager(params: RefundParams, actor: Actor) -> bool:
-        """≥ $100 的退款由 AI 提交时必须挂起等店长审批。"""
-        return (
-            params.amount_cents >= MANAGER_APPROVAL_THRESHOLD_CENTS
-            and actor.role == "ai_agent"
-        )
-
-    @spec.action(
-        "process_return_and_refund",
-        RefundParams,
-        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
-        approver_roles=("store_manager",),
-        approval_rule=_needs_manager,
-        affects_source=not standalone,
-        post_approval=_record_refund,
-        description=(
-            "跨订单 + 工单 + 资金的核心治理动作（替代 Stripe+Shopify+Zendesk+Zapier 联动）。"
-        ),
-    )
-    def process_return_and_refund(ctx: Any, params: RefundParams) -> None:
-        ticket = ctx.require(SupportTicket, params.ticket_id)
-        order = ctx.require(ShopOrder, ticket.order_id)
-        customer = ctx.require(Customer, ticket.customer_id)
-
-        # ① 超期拦截
-        if order.age_days > RETURN_WINDOW_DAYS:
-            raise InvariantError(
-                f"order {order.order_id} is {order.age_days} days old; "
-                f"return window is {RETURN_WINDOW_DAYS} days",
-                code="RETURN_WINDOW_EXPIRED",
-            )
-        # ② 反欺诈拦截
-        if customer.fraud_score >= FRAUD_BLOCK_THRESHOLD:
-            raise InvariantError(
-                f"customer {customer.customer_id} fraud_score "
-                f"{customer.fraud_score} >= {FRAUD_BLOCK_THRESHOLD}",
-                code="HIGH_FRAUD_RISK_BLOCKED",
-            )
-        # ③ 防重复退款与超额退款
-        if order.status == "refunded":
-            raise InvariantError(
-                f"order {order.order_id} was already refunded",
-                code="INVALID_REFUND_STATE",
-            )
-        if params.amount_cents != ticket.requested_refund_cents:
-            raise InvariantError(
-                f"refund amount {params.amount_cents} does not match the "
-                f"ticket request {ticket.requested_refund_cents}",
-                code="REFUND_AMOUNT_MISMATCH",
-            )
-        if params.amount_cents > order.amount_cents:
-            raise InvariantError(
-                f"refund {params.amount_cents} exceeds order amount "
-                f"{order.amount_cents}",
-                code="INVALID_REFUND_STATE",
-            )
-
-        # 主编辑计划只动「订单/工单/客户」这三条业务主线的状态；
-        # 资金凭证 RefundRecord 属于纯 Ontology 自有状态，交给
-        # post_approval 钩子，避免单次 diff 同时跨源系统与本体主权。
-        ctx.modify(order, status="refunded")
-        ctx.modify(ticket, status="resolved")
-        ctx.modify(
-            customer,
-            lifetime_value_cents=customer.lifetime_value_cents - params.amount_cents,
-        )
-
-    # -- 5. 只读全景看板 ---------------------------------------------------
-    @spec.function(
-        "workspace_overview",
-        OverviewParams,
-        description=(
-            "只读全景看板：ObjectSet + pivot + aggregate 汇总客户、GMV、"
-            "工单状态、退款总额与被审计拦截数。"
-        ),
-    )
-    def workspace_overview(ctx: Any, params: OverviewParams) -> dict[str, Any]:
-        customers = ctx.query(Customer)
-        orders = ctx.query(ShopOrder)
-        tickets = ctx.query(SupportTicket)
-        refunds = ctx.query(RefundRecord)
-
-        ticket_status: dict[str, int] = {}
-        for ticket in tickets:
-            ticket_status[ticket.status] = ticket_status.get(ticket.status, 0) + 1
-
-        overview: dict[str, Any] = {
-            "customers": len(customers),
-            "orders": len(orders),
-            "gmv_cents": sum(o.amount_cents for o in orders),
-            "tickets": len(tickets),
-            "ticket_status": dict(sorted(ticket_status.items())),
-            "refund_count": len(refunds),
-            "refunded_cents": sum(r.amount_cents for r in refunds),
-            "ltv_cents": sum(c.lifetime_value_cents for c in customers),
-        }
-
-        loader = ctx.loader
-        if hasattr(loader, "search_set"):
-            # ObjectSet -> pivot -> aggregate：把「订单集」沿 customer_orders
-            # 反向枢轴回客户集，并按订单状态聚合金额。
-            order_set = loader.search_set(ShopOrder, ctx.actor)
-            customer_set = loader.pivot(
-                order_set, customer_orders, ctx.actor, direction="reverse"
-            )
-            order_agg = loader.aggregate(
-                order_set, group_by="status", sum_field="amount_cents"
-            )
-            overview["order_status_amounts"] = {
-                str(row.key): row.metrics["sum"] for row in order_agg.rows
-            }
-            overview["pivot_customers"] = sorted(customer_set.ids)
-        if hasattr(loader, "list_action_runs"):
-            blocked: dict[str, int] = {}
-            for run in loader.list_action_runs("REJECTED"):
-                code = run.get("error_code") or "UNKNOWN"
-                blocked[code] = blocked.get(code, 0) + 1
-            overview["blocked_runs"] = dict(sorted(blocked.items()))
-        return overview
-
+    """构建整套 SaaS 业务本体（包装纯 M1 spec + new_runtime 便捷方法）。"""
+    bundle = build_saas_ontology(standalone=standalone)
     return SaasModel(
-        spec=spec,
-        standalone=standalone,
-        Customer=Customer,
-        ShopOrder=ShopOrder,
-        SupportTicket=SupportTicket,
-        RefundRecord=RefundRecord,
-        customer_orders=customer_orders,
-        order_tickets=order_tickets,
-        ticket_refund=ticket_refund,
+        spec=bundle.spec,
+        standalone=bundle.standalone,
+        Customer=bundle.Customer,
+        ShopOrder=bundle.ShopOrder,
+        SupportTicket=bundle.SupportTicket,
+        RefundRecord=bundle.RefundRecord,
+        customer_orders=bundle.customer_orders,
+        order_tickets=bundle.order_tickets,
+        ticket_refund=bundle.ticket_refund,
     )
-
-
-def build_saas_ontology_spec(standalone: bool = False) -> OntologySpec:
-    """规格书要求的工厂函数入口。"""
-    return build_saas_model(standalone=standalone).spec
 
 
 # ---------------------------------------------------------------------------

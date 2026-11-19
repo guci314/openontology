@@ -26,7 +26,7 @@ from open_ontology import (
     OntologyRuntime,
     start_workshop_server,
 )
-from open_ontology.dev_factory import Deliverable, Engineer, WorkTicket, spec
+from examples.dev_factory_ontology import Deliverable, Engineer, WorkTicket, spec
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER = Actor(
@@ -185,25 +185,25 @@ FORBIDDEN_WORDS = ("port", "cli", "api")
 
 
 def test_business_purity_static_scan():
-    path = ROOT / "open_ontology" / "dev_factory.py"
+    path = ROOT / "examples" / "dev_factory_ontology.py"
     source = path.read_text(encoding="utf-8")
     lowered = source.lower()
 
     for token in FORBIDDEN_SUBSTRINGS:
-        assert token not in lowered, f"{token!r} leaked into dev_factory.py"
+        assert token not in lowered, f"{token!r} leaked into dev_factory_ontology.py"
     for token in FORBIDDEN_WORDS:
         assert not re.search(rf"(?<![a-z]){token}(?![a-z])", lowered), (
-            f"word {token!r} leaked into dev_factory.py"
+            f"word {token!r} leaked into dev_factory_ontology.py"
         )
 
     tree = ast.parse(source)
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
+            imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            imported.add((node.module or "").split(".")[0])
-    assert imported <= {"__future__", "typing", "pydantic", "spec"}, imported
+            imported.add(node.module or "")
+    assert imported <= {"__future__", "typing", "pydantic", "open_ontology.spec"}, imported
 
 
 def test_business_purity_runtime_surface():
@@ -553,7 +553,7 @@ def test_build_engineer_briefing_includes_history(factory):
     assert briefing["history"][0]["summary"] == "MCTS 内核完成"
     assert briefing["history"][0]["artifact_uri"] == "artifacts/TK-1.zip"
 
-    from open_ontology.dev_factory import render_briefing
+    from examples.dev_factory_ontology import render_briefing
 
     text = render_briefing(briefing)
     assert "SPEC_TK-1.md" in text

@@ -124,22 +124,23 @@ def _compute_live_revision(runtime: Any) -> tuple[dict[str, Any], str]:
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_DOC_FILES: dict[str, tuple[str, str]] = {
-    "palantir": (
-        "Palantir Foundry / AIP vs OpenOntology 对标与协同指南",
-        "docs/PALANTIR_AND_OPEN_ONTOLOGY.md",
-    ),
+#: 内核默认只暴露 M2 平台宪法与词典；具体 M1/M0 文档（如演进真值表）由宿主通过
+#: ``registry.register_doc(...)`` 注入。
+_DEFAULT_DOC_FILES: dict[str, tuple[str, str, str]] = {
     "architecture": (
         "OpenOntology 架构设计规范",
         "docs/ARCHITECTURE.md",
+        "🏛 架构规范",
     ),
-    "task_board": (
-        "架构演进与当前状态真值表",
-        "docs/TASK_BOARD.md",
+    "palantir": (
+        "Palantir Foundry / AIP vs OpenOntology 对标与协同指南",
+        "docs/PALANTIR_AND_OPEN_ONTOLOGY.md",
+        "📖 Palantir 对比",
     ),
     "glossary": (
         "OpenOntology 概念词典",
         "GLOSSARY.md",
+        "📚 概念字典",
     ),
 }
 
@@ -514,6 +515,7 @@ class CommandCenterRegistry:
         self.runtimes: dict[str, RuntimeCatalogEntry] = {}
         self.symbolic_devices: dict[str, SymbolicDeviceEntry] = {}
         self.actor_tokens: dict[str, ActorTokenEntry] = {}
+        self.extra_docs: dict[str, tuple[str, str, str]] = {}
         self.webhooks: OutboundWebhookDispatcher = OutboundWebhookDispatcher(
             sender=_http_webhook_sender
         )
@@ -529,6 +531,29 @@ class CommandCenterRegistry:
             description="纯内存零外设沙盘宿体，用于验证 Ontology 与虚拟现实推演",
             aspects=list(RUNTIME_ASPECTS),
         )
+
+    def register_doc(
+        self,
+        key: str,
+        title: str,
+        rel_path: str,
+        *,
+        tab_label: str | None = None,
+    ) -> None:
+        """为文档中心注入宿主扩展文档（不修改 M2 内核默认文档列表）。"""
+        with self.lock:
+            self.extra_docs[str(key)] = (
+                str(title),
+                str(rel_path),
+                str(tab_label or title),
+            )
+
+    def doc_entries(self) -> dict[str, tuple[str, str, str]]:
+        """返回完整文档目录（M2 默认文档 + 宿主注册文档）。"""
+        entries = dict(_DEFAULT_DOC_FILES)
+        with self.lock:
+            entries.update(self.extra_docs)
+        return entries
 
     # -- actor token binding -----------------------------------------------
     def register_actor_token(
@@ -3474,6 +3499,28 @@ def merged_display(registry: CommandCenterRegistry | None = None) -> dict[str, A
     return merged
 
 
+def _docs_catalog_payload(
+    registry: CommandCenterRegistry | None = None,
+) -> list[dict[str, str]]:
+    entries = (
+        registry.doc_entries()
+        if registry is not None and hasattr(registry, "doc_entries")
+        else dict(_DEFAULT_DOC_FILES)
+    )
+    items: list[dict[str, str]] = []
+    for k, (title, rel_path, tab_label) in entries.items():
+        items.append(
+            {
+                "key": k,
+                "title": title,
+                "path": rel_path,
+                "basename": Path(rel_path).name,
+                "tab_label": tab_label,
+            }
+        )
+    return items
+
+
 def _render_ui_page(
     template: str,
     title: str,
@@ -3492,6 +3539,10 @@ def _render_ui_page(
     return (
         template.replace("__UI_BUNDLE__", bundle)
         .replace("__TOPOLOGY_JS__", TOPOLOGY_JS)
+        .replace(
+            "__DOCS_CATALOG_JSON__",
+            json.dumps(_docs_catalog_payload(registry), ensure_ascii=False),
+        )
         .replace("__TITLE__", title)
     )
 
@@ -3845,11 +3896,12 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                     doc_key = (
                         query.get("doc", ["architecture"])[0] or "architecture"
                     ).strip()
-                    doc_entry = _DOC_FILES.get(doc_key)
+                    entries = self._registry.doc_entries()
+                    doc_entry = entries.get(doc_key)
                     if doc_entry is None:
                         self._error(404, f"unknown doc '{doc_key}'")
                         return
-                    title, rel_path = doc_entry
+                    title, rel_path, _tab = doc_entry
                     doc_path = _REPO_ROOT / rel_path
                     if not doc_path.is_file():
                         self._error(404, f"doc file missing: {rel_path}")
@@ -3864,7 +3916,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                             "content": doc_path.read_text(encoding="utf-8"),
                             "docs": [
                                 {"key": k, "title": t, "path": p}
-                                for k, (t, p) in _DOC_FILES.items()
+                                for k, (t, p, _lbl) in entries.items()
                             ],
                         },
                     )

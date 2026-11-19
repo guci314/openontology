@@ -205,6 +205,7 @@ def test_display_mapping_covers_default_blueprints(live):
 
 def test_business_display_terms_live_in_their_own_spec(live):
     """业务词条必须住在业务本体自己的 spec.display 里，不进内核字典。"""
+    from open_ontology.workshop import merged_display
     from open_ontology.workshop_ui import DISPLAY
 
     registry, _ = live
@@ -212,14 +213,15 @@ def test_business_display_terms_live_in_their_own_spec(live):
     assert board.spec.display, "task_board 必须在自己的 spec.display 声明词条"
     assert board.spec.display["objects"]["Card"] == "任务卡片"
 
-    # 内核字典里不许出现看板专属词条。
-    for group in ("objects", "links", "actions", "functions"):
+    # 内核字典保持 M2 纯洁性：不得夹带任何具体 M1 业务对象、关系、动作或函数名。
+    for group in ("ontologies", "objects", "object_properties", "actions", "functions", "automations", "interfaces"):
         table = DISPLAY.get(group) or {}
-        assert "Card" not in table, f"看板词条泄漏进内核 {group}"
-        assert "claim_card" not in table, f"看板词条泄漏进内核 {group}"
+        assert table == {}, f"M1 业务词条泄漏进内核 ui_display.json[{group!r}]: {table}"
 
-    # 其它蓝图不受影响：内核通用词条仍然生效。
-    assert DISPLAY["objects"]["Engineer"] == "研发成员"
+    # 动态合并后各业务本体中文名依然完整可用。
+    merged = merged_display(registry)
+    assert merged["objects"]["Engineer"] == "研发成员"
+    assert DISPLAY["roles"]["admin"] == "管理员"
 
 
 def test_main_page_chinese_primary_copy(base):
@@ -1139,8 +1141,8 @@ def test_kernel_top_level_has_no_business_or_driver_attributes():
 
 def test_business_programs_remain_importable_from_their_own_modules():
     """清理顶层导出不等于删除能力：业务本体仍可从各自模块导入。"""
+    from examples.dev_factory_ontology import Engineer, WorkTicket
     from examples.kanban import Board, Card
-    from open_ontology.dev_factory import Engineer, WorkTicket
 
     assert Engineer.__name__ == "Engineer"
     assert WorkTicket.__name__ == "WorkTicket"

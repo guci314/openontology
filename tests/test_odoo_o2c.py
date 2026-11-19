@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from examples import o2c_ontology as o2c
+from examples.o2c_demo_seed import build_o2c_demo
 from examples import odoo_o2c_adapter as adapter_mod
 from open_ontology import EditBatch, InvariantError, OntologyRuntime
 
@@ -518,7 +519,7 @@ def test_owl_metamodel_roles_invariants_and_masking():
         "voucher_backed_balance_conservation",
     }
 
-    demo = o2c.build_o2c_demo()
+    demo = build_o2c_demo()
     rt = demo.runtime
     try:
         # 1. Referential integrity (TARGET_NOT_FOUND) on dangling customer

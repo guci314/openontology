@@ -1078,7 +1078,7 @@ def test_antigravity_cli_abduction_backend_isolation_reuse_retry_and_single_turn
         return responses.pop(0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr("open_ontology.induction.agents.time.sleep", lambda _s: None)
+    monkeypatch.setattr("open_ontology.induction.backends.time.sleep", lambda _s: None)
 
     be = AntigravityCLIAbductionBackend(
         model="gemini-4-neon-medium",
@@ -1314,7 +1314,7 @@ def test_extract_json_object_handles_trailing_extra_data_and_wall_clock_deadline
 ) -> None:
     """Verify JSON raw_decode ignores trailing commentary and HTTP helper enforces wall-clock timeout."""
     import urllib.request
-    from open_ontology.induction.agents import (
+    from open_ontology.induction.backends import (
         _extract_json_object,
         _read_http_body_with_deadline,
     )
@@ -1341,7 +1341,7 @@ def test_extract_json_object_handles_trailing_extra_data_and_wall_clock_deadline
 
     ticks = iter([0.0, 0.2, 2.5])
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _SlowResp())
-    monkeypatch.setattr("open_ontology.induction.agents.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("open_ontology.induction.backends.time.monotonic", lambda: next(ticks))
 
     dummy_req = urllib.request.Request("https://example.invalid", method="POST")
     with pytest.raises(TimeoutError, match="hard wall-clock deadline"):

@@ -664,9 +664,16 @@ def test_workshop_automations_approve_and_revert(workshop):
     assert approved["run"]["status"] == "COMMITTED"
     assert approved["run"]["approved_by"] == "workshop:finance_manager"
 
-    # 3) 时光机撤回
+    # 3) 时光机撤回：普通提交角色拒绝 403，财务经理可冲正回滚
+    with pytest.raises(urllib.error.HTTPError) as denied:
+        _http(
+            workshop.base_url + "/api/revert",
+            {"run_id": "WS-PENDING-1", "revert_run_id": "WS-REV-DENIED"},
+        )
+    assert denied.value.code == 403
+
     reverted = _http(
-        workshop.base_url + "/api/revert",
+        workshop.base_url + "/api/revert?role=finance_manager",
         {"run_id": "WS-PENDING-1", "revert_run_id": "WS-REV-1"},
     )
     assert reverted["run"]["status"] == "COMMITTED"

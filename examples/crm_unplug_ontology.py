@@ -6,18 +6,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
 from pydantic import BaseModel
 
-from open_ontology import (
+from open_ontology.spec import (
     Actor,
     InvariantError,
     ObjectProperty,
     ObjectType,
-    OntologyRuntime,
     OntologySpec,
 )
 
@@ -522,12 +520,3 @@ SALES_REP = Actor(actor_id="sales-rep-01", role="sales_rep", clearance_tags={"*"
 OPS_MANAGER = Actor(
     actor_id="ops-manager-01", role="ops_manager", clearance_tags={"*"}
 )
-
-
-@dataclass
-class UnplugDemo:
-    runtime: OntologyRuntime
-
-
-def new_runtime() -> OntologyRuntime:
-    return OntologyRuntime(spec)

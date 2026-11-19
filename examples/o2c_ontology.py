@@ -11,22 +11,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, ClassVar, Literal
 
-from open_ontology import (
+from open_ontology.spec import (
     Actor,
     AutoID,
     InvariantError,
     ObjectNotFoundError,
     ObjectProperty,
-    OntologyRuntime,
     OntologySpec,
 )
 from pydantic import BaseModel
 
 try:
-    from examples.business_ontology import (
+    from .business_ontology import (
         BalanceLedger,
         EventVoucher,
         MasterEntity,
@@ -34,12 +32,6 @@ try:
         spec as business_spec,
     )
 except ImportError:
-    from pathlib import Path
-    import sys
-
-    _REPO_ROOT = str(Path(__file__).resolve().parents[1])
-    if _REPO_ROOT not in sys.path:
-        sys.path.insert(0, _REPO_ROOT)
     from examples.business_ontology import (
         BalanceLedger,
         EventVoucher,
@@ -1034,50 +1026,3 @@ WAREHOUSE = Actor(
     role="warehouse",
     clearance_tags={"*"},
 )
-
-
-@dataclass
-class O2CDemo:
-    runtime: OntologyRuntime
-    customer_id: str = "O2C-CUST-001"
-    small_order_id: str = "O2C-SO-001"
-    large_order_id: str = "O2C-SO-002"
-
-
-def build_o2c_demo() -> O2CDemo:
-    runtime = OntologyRuntime(spec)
-    customer = Customer(
-        customer_id="O2C-CUST-001",
-        name="O2C Demo Customer",
-        credit_limit_cents=10_000_000,
-    )
-    runtime.put_object(customer)
-    runtime.put_object(
-        ReceivableBalance(
-            ledger_id=ar_ledger_id(customer.customer_id),
-            customer=customer.customer_id,
-            ar_balance_cents=0,
-        )
-    )
-    for order in (
-        SalesOrder(
-            order_id="O2C-SO-001",
-            customer=customer.customer_id,
-            product_summary="O2C Widget",
-            quantity=2,
-            unit_price_cents=1_000_000,
-            total_cents=2_000_000,
-            status="draft",
-        ),
-        SalesOrder(
-            order_id="O2C-SO-002",
-            customer=customer.customer_id,
-            product_summary="O2C Widget",
-            quantity=12,
-            unit_price_cents=1_000_000,
-            total_cents=12_000_000,
-            status="draft",
-        ),
-    ):
-        runtime.put_object(order)
-    return O2CDemo(runtime=runtime)

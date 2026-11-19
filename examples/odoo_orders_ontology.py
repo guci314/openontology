@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from open_ontology import Actor, InvariantError, ObjectProperty, ObjectType, OntologySpec
+from open_ontology.spec import Actor, InvariantError, ObjectProperty, ObjectType, OntologySpec
 
 # ---------------------------------------------------------------------------
 # Object types

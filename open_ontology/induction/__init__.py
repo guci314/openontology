@@ -15,20 +15,22 @@ from .agents import (
     BUILDER_SYSTEM_PROMPT,
     EVOLVER_SYSTEM_PROMPT,
     L2_ARCHITECT_SYSTEM_PROMPT,
-    AbductionBackend,
-    AntigravityCLIAbductionBackend,
-    CallableAbductionBackend,
-    GeminiAbductionBackend,
     InductionCycleResult,
     InductionRoundTrace,
     OntologyBuilderAgent,
     OntologyEvolverAgent,
     OntologyL2ArchitectAgent,
-    OpenAICompatibleAbductionBackend,
-    OpenRouterAbductionBackend,
     build_builder_system_prompt,
     build_evolver_system_prompt,
     build_l2_architect_system_prompt,
+)
+from .backends import (
+    AbductionBackend,
+    AntigravityCLIAbductionBackend,
+    CallableAbductionBackend,
+    GeminiAbductionBackend,
+    OpenAICompatibleAbductionBackend,
+    OpenRouterAbductionBackend,
 )
 from .crucible import (
     CrucibleContext,

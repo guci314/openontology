@@ -1647,9 +1647,9 @@ def test_object_level_read_only_source_protects_external_object_in_mixed_spec(tm
 
 
 def test_kanban_and_dev_factory_enforce_read_only_source():
-    """kanban.py 与 dev_factory.py 已从平台层锁定 read_only_source=True。"""
+    """kanban.py 与 dev_factory_ontology.py 已从平台层锁定 read_only_source=True。"""
+    from examples import dev_factory_ontology as dev_factory
     from examples import kanban
-    from open_ontology import dev_factory
     from open_ontology.spec import GovernanceViolationError
 
     assert kanban.spec.read_only_source is True

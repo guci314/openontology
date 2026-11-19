@@ -1233,10 +1233,6 @@ main{max-width:1040px;width:100%;margin:0 auto;padding:20px 20px 60px}
     <div><b id="docTitle">架构文档中心</b><span id="docPath">docs/ARCHITECTURE.md</span></div>
   </div>
   <nav class="docnav" id="docNav">
-    <button class="doc-tab" data-doc="architecture" onclick="selectDoc('architecture')">🏛 架构规范</button>
-    <button class="doc-tab" data-doc="palantir" onclick="selectDoc('palantir')">📖 Palantir 对比</button>
-    <button class="doc-tab" data-doc="task_board" onclick="selectDoc('task_board')">📋 演进清单</button>
-    <button class="doc-tab" data-doc="glossary" onclick="selectDoc('glossary')">📚 概念字典</button>
     <a class="back" id="back" href="/" target="_self" rel="noopener">返回指挥台</a>
   </nav>
 </header>
@@ -1247,12 +1243,23 @@ main{max-width:1040px;width:100%;margin:0 auto;padding:20px 20px 60px}
   </div>
 </main>
 <script>
-const DOC_MAP = {
-  'ARCHITECTURE.md': 'architecture',
-  'PALANTIR_AND_OPEN_ONTOLOGY.md': 'palantir',
-  'TASK_BOARD.md': 'task_board',
-  'GLOSSARY.md': 'glossary'
-};
+const DOCS_CATALOG = __DOCS_CATALOG_JSON__;
+const DOC_MAP = {};
+(function initDocNav() {
+  const nav = document.getElementById('docNav');
+  const backLink = document.getElementById('back');
+  for (const item of DOCS_CATALOG) {
+    if (item && item.basename && item.key) {
+      DOC_MAP[item.basename] = item.key;
+    }
+    const btn = document.createElement('button');
+    btn.className = 'doc-tab';
+    btn.dataset.doc = item.key;
+    btn.textContent = item.tab_label || item.title || item.key;
+    btn.addEventListener('click', function() { selectDoc(item.key); });
+    nav.insertBefore(btn, backLink);
+  }
+})();
 
 function esc(s) {
   return String(s == null ? '' : s)

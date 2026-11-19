@@ -19,7 +19,13 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .spec import Actor, InvariantError, ObjectProperty, ObjectType, OntologySpec
+from open_ontology.spec import (
+    Actor,
+    InvariantError,
+    ObjectProperty,
+    ObjectType,
+    OntologySpec,
+)
 
 __all__ = [
     "Engineer",
@@ -694,3 +700,80 @@ def render_briefing(briefing: dict[str, Any]) -> str:
                 f"[{mark}] {row['summary']}"
             )
     return "\n".join(lines)
+
+
+spec.update_display(
+    {
+        "ontologies": {
+            "software_factory": "AI 软件研发工厂",
+        },
+        "categories": {
+            "Agentic Delivery": "智能体交付",
+        },
+        "objects": {
+            "Engineer": "研发成员",
+            "WorkTicket": "研发工单",
+            "Deliverable": "交付物",
+        },
+        "object_properties": {
+            "Engineer.active_ticket": "当前工单",
+            "WorkTicket.assignee": "工单承接人",
+            "WorkTicket.reviewer": "工单评审人",
+            "Deliverable.ticket": "所属工单",
+            "Deliverable.engineer": "交付工程师",
+        },
+        "fields": {
+            "engineer_id": "研发成员编号",
+            "engineer": "研发成员",
+            "new_engineer": "新承接人",
+            "specialty": "专长",
+            "availability": "可用状态",
+            "active_ticket": "当前工单",
+            "completed_tickets": "已完成工单数",
+            "ticket_id": "工单编号",
+            "ticket": "工单",
+            "spec_uri": "规格书路径",
+            "isolated_scope": "隔离目录",
+            "stage": "阶段",
+            "require_testing": "需要测试",
+            "assignee": "承接人",
+            "reviewer": "评审人",
+            "rework_round": "返工轮次",
+            "max_rework": "最大返工轮次",
+            "instructions": "任务说明",
+            "latest_submission": "最近交卷",
+            "latest_feedback": "评审意见",
+            "verdict": "裁决",
+            "deliverable_id": "交付物编号",
+            "round_index": "轮次",
+            "artifact_uri": "交付物路径",
+        },
+        "actions": {
+            "recruit_engineer": "招募研发成员",
+            "open_ticket": "创建研发工单",
+            "dispatch_ticket": "派发研发工单",
+            "submit_work": "提交交付物",
+            "review_ticket": "评审研发工单",
+            "reassign_ticket": "转派研发工单",
+        },
+        "functions": {
+            "factory_board_summary": "研发工厂看板",
+            "build_engineer_briefing": "生成研发任务简报",
+        },
+        "roles": {
+            "factory_manager": "研发负责人",
+            "architect": "架构师",
+            "coder": "程序员",
+            "tester": "测试员",
+            "auditor": "审计员",
+        },
+        "statuses": {
+            "CODING": "研发中",
+            "TESTING": "测试中",
+            "ARCH_REVIEW": "架构评审",
+            "IDLE": "空闲",
+            "BUSY": "忙碌",
+            "UNAVAILABLE": "不可用",
+        },
+    }
+)

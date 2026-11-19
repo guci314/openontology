@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, ClassVar
 
-from open_ontology import InvariantError, ObjectType, OntologySpec
+from open_ontology.spec import InvariantError, ObjectType, OntologySpec
 
 __all__ = [
     "spec",
@@ -216,7 +216,7 @@ spec.display = {
 
 def build_business_seed_ontology() -> Any:
     """将 ``business_ontology`` 封装为可供符号训练器插拔的企业领域种子本体论底座。"""
-    from open_ontology.induction import seed_from_spec
+    from open_ontology.induction.seed import seed_from_spec
 
     return seed_from_spec(
         seed_id="business_ontology",

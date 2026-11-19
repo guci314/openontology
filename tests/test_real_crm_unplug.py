@@ -21,7 +21,7 @@ import pytest
 from examples import crm_unplug_ontology as dom
 from examples import real_crm_unplug_demo as demo
 from examples.odoo_dual_erp_demo import DB_NORTH, ensure_database
-from open_ontology import GovernanceViolationError, InvariantError
+from open_ontology import GovernanceViolationError, InvariantError, OntologyRuntime
 
 ROOT = Path(__file__).resolve().parents[1]
 VENDOR = ROOT / "vendor_crm"
@@ -46,7 +46,7 @@ def absorbed(odoo_client):
     bottlecrm = demo.BottleCRMConnector()
     demo.seed_real_odoo_orders(odoo_client)
     erp = demo.OdooERPConnector(odoo_client)
-    runtime = dom.new_runtime()
+    runtime = OntologyRuntime(dom.spec)
     demo.absorb_from_real_saas(runtime, bottlecrm, erp)
     demo.apply_overlay_governance(runtime)
     yield runtime, bottlecrm, erp

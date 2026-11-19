@@ -610,7 +610,7 @@ def main() -> dict[str, Any]:
         )
     )
     erp = OdooERPConnector(odoo_client)
-    runtime = dom.new_runtime()
+    runtime = OntologyRuntime(dom.spec)
 
     _section("1. Phase A — 吸干两个真实开源 SaaS")
     absorb = absorb_from_real_saas(runtime, bottlecrm, erp)

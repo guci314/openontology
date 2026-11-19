@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from examples import o2c_ontology as o2c
+from examples.o2c_demo_seed import build_o2c_demo
 from examples.feishu_card_bridge import (
     FeishuApprovalGateway,
     FeishuOpenAPIClient,
@@ -34,7 +35,7 @@ from open_ontology import (
 # 1. 内核 reject_action 与 全生命周期 run_event_hooks
 # ---------------------------------------------------------------------------
 def test_reject_action_and_run_event_hooks():
-    demo = o2c.build_o2c_demo()
+    demo = build_o2c_demo()
     rt = demo.runtime
     events: list[tuple[str, str]] = []
     rt.add_run_event_hook(lambda actor, run: events.append((run["run_id"], run["status"])))
@@ -98,7 +99,7 @@ def test_reject_action_and_run_event_hooks():
 # 2. 飞书交互卡片零黑话格式化、签名校验与 OpenAPI 推送/更新
 # ---------------------------------------------------------------------------
 def test_feishu_card_jargon_free_and_openapi_push_patch():
-    demo = o2c.build_o2c_demo()
+    demo = build_o2c_demo()
     rt = demo.runtime
     http_calls: list[tuple[str, str, dict[str, Any]]] = []
 
