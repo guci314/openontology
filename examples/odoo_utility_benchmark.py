@@ -44,6 +44,7 @@ from open_ontology import (
 from open_ontology.induction import (
     ActionBlueprint,
     ActionExecutionBinding,
+    ActionMutationSpec,
     AdapterMappingSpec,
     AntiSmugglingCheckResult,
     AntiSmugglingProbeSpec,
@@ -52,10 +53,16 @@ from open_ontology.induction import (
     DeclarativeBlueprint,
     EvolutionPatch,
     EvolutionRoutingPlan,
+    FieldMigrationSpec,
+    FieldSpec,
+    FieldTransformSpec,
+    EntityMappingSpec,
     InductionGovernanceService,
     InvariantRuleSpec,
     OntologyBuilderAgent,
     OntologyEvolverAgent,
+    OntologyL2ArchitectAgent,
+    ProposedEvalCase,
     ReplayEvent,
     STEWARD_ACTOR,
     SeedOntology,
@@ -64,6 +71,8 @@ from open_ontology.induction import (
     UtilityProbeOutcome,
     UtilityScorecard,
     UtilityWeights,
+    apply_adapter_mapping_patch,
+    apply_evolution_patch,
     compare_scorecards,
     compile_blueprint,
     evaluate_utility_scorecard,
@@ -85,6 +94,7 @@ from .odoo_fde_autonomous_pipeline import (
     AI_OPS_ACTOR,
     STEWARD_OPS_ACTOR,
     DeclarativeOdooBridge,
+    OdooProtocolStep,
     SynthesizedBundle,
     build_auto_replay_factory,
     build_closed_phenomenon_profile,
@@ -486,6 +496,7 @@ class OfflineOdooPhysicalWorld:
                         "type": "ir.actions.act_window",
                         "res_model": "stock.backorder.confirmation",
                         "picking_id": row["id"],
+                        "context": {"button_validate_picking_ids": [row["id"]]},
                     }
                 row["state"] = "done"
                 sale_ref = row.get("sale_id")
@@ -493,6 +504,72 @@ class OfflineOdooPhysicalWorld:
                 if sid in self.tables["sale.order"]:
                     self.tables["sale.order"][sid]["delivery_status"] = "full"
                 return True
+        return True
+
+    def execute_kw(
+        self,
+        model: str,
+        method: str,
+        args: list[Any],
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Minimal RPC mirror supporting transient wizards for offline tests."""
+        kw = dict(kwargs or {})
+        ctx = dict(kw.get("context") or {})
+        wiz_store = self.tables.setdefault("_wizards", {})
+        if model == "stock.move" and method == "write":
+            return True
+        if method == "create":
+            vals = dict(args[0]) if args else {}
+            wid = self._alloc()
+            wiz_store[wid] = {"model": model, "vals": vals, "context": ctx}
+            return wid
+        if model == "stock.backorder.confirmation" and method == "process":
+            wid = int(args[0][0])
+            w = wiz_store.get(wid, {})
+            picks_cmd = w.get("vals", {}).get("pick_ids") or []
+            pids: list[int] = []
+            for item in picks_cmd:
+                if isinstance(item, (list, tuple)) and len(item) >= 3 and isinstance(item[2], list):
+                    pids.extend(int(x) for x in item[2])
+            if not pids:
+                pids = [int(x) for x in (w.get("context", {}).get("button_validate_picking_ids") or [])]
+            for pid in pids:
+                row = self.tables["stock.picking"][pid]
+                qty_done = int(row.get("qty_done", 0))
+                sale_ref = row.get("sale_id")
+                sid = sale_ref[0] if isinstance(sale_ref, list) else sale_ref
+                if sid is not None and qty_done > 0:
+                    self.ship_partial_with_backorder(int(sid), qty_done)
+                else:
+                    row["state"] = "done"
+            return True
+        if model == "account.payment.register" and method == "action_create_payments":
+            wid = int(args[0][0])
+            w = wiz_store.get(wid, {})
+            wctx = w.get("context", {})
+            active_ids = [int(x) for x in (wctx.get("active_ids") or ctx.get("active_ids") or [])]
+            amount = w.get("vals", {}).get("amount")
+            for iid in active_ids:
+                self.register_payment(iid, amount=float(amount) if amount is not None else None)
+            return True
+        if model == "account.move.reversal" and method in ("refund_moves", "reverse_moves"):
+            wid = int(args[0][0])
+            w = wiz_store.get(wid, {})
+            wctx = w.get("context", {})
+            vals = w.get("vals", {})
+            mids: list[int] = []
+            for item in vals.get("move_ids") or []:
+                if isinstance(item, (list, tuple)) and len(item) >= 3 and isinstance(item[2], list):
+                    mids.extend(int(x) for x in item[2])
+            if not mids:
+                mids = [int(x) for x in (wctx.get("active_ids") or ctx.get("active_ids") or [])]
+            created: list[int] = []
+            for iid in mids:
+                created.append(self.create_credit_note_for_invoice(iid))
+            return {"res_model": "account.move", "res_id": created[0] if created else 0}
+        if args:
+            return self.call_method(model, method, [int(x) for x in args[0]])
         return True
 
     # Helper physical creators mirroring Odoo 19
@@ -550,6 +627,7 @@ class OfflineOdooPhysicalWorld:
             "amount_total": order["amount_total"],
             "amount_residual": order["amount_total"],
             "partner_id": order["partner_id"],
+            "journal_id": [1, "Customer Invoices"],
         }
         return iid
 
@@ -565,18 +643,21 @@ class OfflineOdooPhysicalWorld:
 
     def create_credit_note_for_invoice(self, invoice_id: int) -> int:
         inv = self.tables["account.move"][invoice_id]
+        inv["payment_state"] = "reversed"
+        inv["amount_residual"] = 0.0
         rid = self._alloc()
         self.tables["account.move"][rid] = {
             "id": rid,
             "name": f"RINV/2026/{rid:05d}",
             "move_type": "out_refund",
             "state": "posted",
-            "payment_state": "not_paid",
+            "payment_state": "paid",
             "invoice_origin": inv["invoice_origin"],
             "amount_untaxed": inv["amount_untaxed"],
             "amount_total": inv["amount_total"],
-            "amount_residual": inv["amount_total"],
+            "amount_residual": 0.0,
             "partner_id": inv["partner_id"],
+            "journal_id": inv.get("journal_id", [1, "Customer Invoices"]),
         }
         return rid
 
@@ -1409,13 +1490,13 @@ def _sync_fixtures_into_autonomous_runtime(
     for em in adapter_mapping.entity_mappings:
         _fetch_table(em.source_table)
 
-    # Pass 2: referentially close any many2one parent IDs (e.g. stock.location referenced by stock.picking)
+    # Pass 2: referentially close any foreign_key_id parent IDs (e.g. stock.location referenced by stock.picking)
     for _ in range(2):
         added_any = False
         for em in adapter_mapping.entity_mappings:
             for row in list(rows_by_table.get(em.source_table, {}).values()):
                 for tf in em.field_transforms:
-                    if tf.kind != "many2one_id" or not tf.prefix or not tf.source_field:
+                    if tf.kind != "foreign_key_id" or not tf.prefix or not tf.source_field:
                         continue
                     tgt_table = prefix_to_table.get(tf.prefix)
                     if not tgt_table or tgt_table == em.source_table:
@@ -1467,9 +1548,148 @@ def _find_binding(
     table: str,
     method_substr: str,
 ) -> ActionExecutionBinding | None:
-    for b in mapping.action_bindings:
-        if b.external_table == table and method_substr in b.external_method:
+    for b in reversed(mapping.action_bindings):
+        if b.external_table != table:
+            continue
+        if method_substr in b.external_method or method_substr in b.action_name.lower():
             return b
+    return None
+
+
+def _find_l2_bindings(
+    mapping: AdapterMappingSpec,
+) -> tuple[ActionExecutionBinding | None, ActionExecutionBinding | None]:
+    """Locate payment registration and credit-note reversal bindings if present."""
+    pay_b: ActionExecutionBinding | None = None
+    refund_b: ActionExecutionBinding | None = None
+    for b in mapping.action_bindings:
+        if b.external_table != "account.move":
+            continue
+        aname = b.action_name.lower()
+        emeth = b.external_method.lower()
+        if pay_b is None and (
+            "payment" in aname or "pay_" in aname or "payment" in emeth or "pay" in emeth
+        ):
+            pay_b = b
+        elif refund_b is None and (
+            "refund" in aname
+            or "credit_note" in aname
+            or "reversal" in emeth
+            or "refund" in emeth
+            or "reverse" in emeth
+        ):
+            refund_b = b
+    return pay_b, refund_b
+
+
+def build_odoo_o2c_l2_protocol_map(
+    adapter_mapping: AdapterMappingSpec,
+    *,
+    blueprint: DeclarativeBlueprint | None = None,
+) -> dict[str, list[OdooProtocolStep]]:
+    """Build Odoo 19 PSM transient wizard protocol overrides for L2-capable action bindings.
+
+    Kept strictly in the Odoo PSM adapter layer (examples/), never inside M2 induction/.
+    """
+    pay_b, refund_b = _find_l2_bindings(adapter_mapping)
+    validate_b = _find_binding(adapter_mapping, table="stock.picking", method_substr="validate")
+    post_b = _find_binding(adapter_mapping, table="account.move", method_substr="post")
+    post_method = post_b.external_method if post_b is not None else "action_post"
+
+    protocols: dict[str, list[OdooProtocolStep]] = {}
+    if pay_b is not None:
+        amt_param = (
+            pay_b.extra_params[0]
+            if pay_b.extra_params
+            else (
+                (_first_extra_param_name(blueprint, pay_b, prefer_numeric=True) if blueprint is not None else None)
+                or "amount"
+            )
+        )
+        protocols[pay_b.action_name] = [
+            OdooProtocolStep(
+                op="create_and_call_transient",
+                external_table="account.payment.register",
+                transient_method="action_create_payments",
+                context_active_table="account.move",
+                payload_template={"amount": f"$param.{amt_param}", "payment_date": "$today"},
+            )
+        ]
+
+    if refund_b is not None:
+        reason_param = (
+            refund_b.extra_params[0]
+            if refund_b.extra_params
+            else (
+                (_first_extra_param_name(blueprint, refund_b, prefer_numeric=False) if blueprint is not None else None)
+                or "reason"
+            )
+        )
+        protocols[refund_b.action_name] = [
+            OdooProtocolStep(
+                op="create_and_call_transient",
+                external_table="account.move.reversal",
+                transient_method="refund_moves",
+                fallback_method="reverse_moves",
+                context_active_table="account.move",
+                payload_template={
+                    "move_ids": "$m2m_ext_id",
+                    "date": "$today",
+                    "reason": f"$param.{reason_param}",
+                    "journal_id": "$record_m2o.journal_id",
+                },
+            ),
+            OdooProtocolStep(
+                op="post_created_document",
+                external_table="account.move",
+                method=post_method,
+            ),
+        ]
+
+    has_l2_financial_actions = pay_b is not None or refund_b is not None
+    if validate_b is not None and (
+        has_l2_financial_actions or validate_b.action_name != "stock_picking__button_validate"
+    ):
+        protocols[validate_b.action_name] = [
+            OdooProtocolStep(
+                op="prepare_child_quantities",
+                external_table="stock.move",
+                parent_key_field="picking_id",
+                source_qty_field="product_uom_qty",
+                target_qty_field="quantity",
+                flag_field="picked",
+            ),
+            OdooProtocolStep(
+                op="call_and_follow_transient",
+                external_table="stock.picking",
+                method="button_validate",
+                transient_method="process",
+                payload_template={"pick_ids": "$m2m_ext_id"},
+            ),
+        ]
+    return protocols
+
+
+def _first_extra_param_name(
+    blueprint: DeclarativeBlueprint,
+    binding: ActionExecutionBinding,
+    *,
+    prefer_numeric: bool = True,
+) -> str | None:
+    act = next((a for a in blueprint.actions if a.name == binding.action_name), None)
+    if act is None:
+        return binding.extra_params[0] if binding.extra_params else None
+    numeric_types = {"int", "integer", "float", "number"}
+    for p in act.params:
+        if p.name == binding.id_param:
+            continue
+        if prefer_numeric and p.field_type.lower() in numeric_types:
+            return p.name
+        if not prefer_numeric and p.field_type.lower() in {"str", "string"}:
+            return p.name
+    for ep in binding.extra_params:
+        if ep != binding.id_param:
+            return ep
     return None
 
 
@@ -1499,6 +1719,9 @@ def evaluate_autonomous_fde_regime(
     cancel_b = _find_binding(adapter_mapping, table="sale.order", method_substr="cancel")
     post_b = _find_binding(adapter_mapping, table="account.move", method_substr="post")
     validate_b = _find_binding(adapter_mapping, table="stock.picking", method_substr="validate")
+    pay_b, refund_b = _find_l2_bindings(adapter_mapping)
+    l2_protocols = build_odoo_o2c_l2_protocol_map(adapter_mapping, blueprint=blueprint)
+    has_l2_validate = validate_b is not None and bool(l2_protocols.get(validate_b.action_name))
 
     tag = f"FDE-{regime_name[-4:].upper()}-{uuid.uuid4().hex[:5]}"
     partner_id = harness.create_partner(f"{tag}-CUST", f"FDE Customer {tag}")
@@ -1513,6 +1736,17 @@ def evaluate_autonomous_fde_regime(
     p_t12 = harness.confirm_order_physically(f_t12.order_id)
     harness.ship_order_physically_full(f_t12.order_id)
     inv_t12_id = harness.create_draft_invoice_for_order(f_t12.order_id)
+
+    f_t13: PhysicalOrderFixture | None = None
+    if (
+        confirm_b is not None
+        and has_l2_validate
+        and post_b is not None
+        and pay_b is not None
+    ):
+        f_t13 = harness.create_draft_order(
+            partner_id=partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref=f"{tag}-T1-3"
+        )
 
     f_t21 = harness.create_draft_order(
         partner_id=partner_id, qty=LARGE_QTY, unit_price=LARGE_UNIT_PRICE, client_ref=f"{tag}-T2-1"
@@ -1545,6 +1779,30 @@ def evaluate_autonomous_fde_regime(
     harness.confirm_order_physically(f_t32.order_id)
     p_t32 = harness.setup_partial_picking_unvalidated(f_t32.order_id, qty_done=4)
 
+    f_t41: PhysicalOrderFixture | None = None
+    p_t41 = 0
+    inv_t41_id = 0
+    if pay_b is not None:
+        f_t41 = harness.create_draft_order(
+            partner_id=partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref=f"{tag}-T4-1"
+        )
+        p_t41 = harness.confirm_order_physically(f_t41.order_id)
+        harness.ship_order_physically_full(f_t41.order_id)
+        inv_t41_id = harness.create_draft_invoice_for_order(f_t41.order_id)
+        harness.post_invoice_physically(inv_t41_id)
+
+    f_t42: PhysicalOrderFixture | None = None
+    p_t42 = 0
+    inv_t42_id = 0
+    if refund_b is not None:
+        f_t42 = harness.create_draft_order(
+            partner_id=partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref=f"{tag}-T4-2"
+        )
+        p_t42 = harness.confirm_order_physically(f_t42.order_id)
+        harness.ship_order_physically_full(f_t42.order_id)
+        inv_t42_id = harness.create_draft_invoice_for_order(f_t42.order_id)
+        harness.post_invoice_physically(inv_t42_id)
+
     f_t43 = harness.create_draft_order(
         partner_id=partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref=f"{tag}-T4-3"
     )
@@ -1556,6 +1814,9 @@ def evaluate_autonomous_fde_regime(
 
     try:
         fixture_lookup_index: dict[tuple[str, str, str], str] = {}
+        extra_order_ids = [f.order_id for f in (f_t13, f_t41, f_t42) if f is not None]
+        extra_picking_ids = [p for p in (p_t41, p_t42) if p]
+        extra_invoice_ids = [i for i in (inv_t41_id, inv_t42_id) if i]
         projected_snapshot = _sync_fixtures_into_autonomous_runtime(
             runtime=memory_rt,
             adapter_mapping=adapter_mapping,
@@ -1572,9 +1833,10 @@ def evaluate_autonomous_fde_regime(
                     f_t31.order_id,
                     f_t32.order_id,
                     f_t43.order_id,
+                    *extra_order_ids,
                 ],
-                "stock.picking": [p for p in (p_t12, p_t22, p_t23, p_t31, p_t32, p_t43) if p],
-                "account.move": [inv_t12_id, inv_t22_id, inv_t31_id],
+                "stock.picking": [p for p in (p_t12, p_t22, p_t23, p_t31, p_t32, p_t43, *extra_picking_ids) if p],
+                "account.move": [inv_t12_id, inv_t22_id, inv_t31_id, *extra_invoice_ids],
             },
             lookup_index_out=fixture_lookup_index,
         )
@@ -1588,6 +1850,7 @@ def evaluate_autonomous_fde_regime(
                 adapter_mapping=adapter_mapping,
                 sandbox=sandbox_client,
                 latent_db_path=latent_db,
+                protocol_overrides=l2_protocols,
             ) as bridge:
 
                 def _try_bridge_action(
@@ -1597,25 +1860,33 @@ def evaluate_autonomous_fde_regime(
                     actor: Actor,
                     *,
                     approver: Actor | None = None,
+                    extra_params: dict[str, Any] | None = None,
+                    gate_status_out: list[str] | None = None,
                 ) -> tuple[str, str | None, dict[str, Any]]:
-                    """Stage -> (if allowed, call Odoo + settle); never leaks to Odoo on REJECTED/PENDING."""
+                    """Stage -> (if allowed, call Odoo/protocol + settle); never leaks on REJECTED/PENDING."""
                     canonical_id = f"{binding.id_prefix}{ext_id}"
-                    params = {binding.id_param: canonical_id}
+                    params = {binding.id_param: canonical_id, **dict(extra_params or {})}
                     try:
                         staged = bridge.latent.stage_move(run_id, binding.action_name, params, actor)
                     except (InvariantError, PermissionDeniedError) as exc:
+                        if gate_status_out is not None:
+                            gate_status_out.append("REJECTED")
                         return "REJECTED", getattr(exc, "code", None) or type(exc).__name__, params
                     st = str(staged["status"])
                     if st == "REJECTED":
+                        if gate_status_out is not None:
+                            gate_status_out.append("REJECTED")
                         return "REJECTED", staged.get("error_code"), params
                     if st == "PENDING_APPROVAL":
+                        if gate_status_out is not None:
+                            gate_status_out.append("PENDING_APPROVAL")
                         if approver is None:
                             return "PENDING_APPROVAL", "APPROVAL_REQUIRED", params
                         approved = bridge.latent.approve_move(run_id, approver)
                         if approved["status"] != "PENDING_EXECUTION":
                             return str(approved["status"]), approved.get("error_code"), params
-                    # Execute real external method & settle homomorphically
-                    sandbox_client.call_method(binding.external_table, binding.external_method, [ext_id])
+                    # Execute real external method or multi-step protocol & settle homomorphically
+                    bridge.execute_external_binding(binding, ext_id, params)
                     em = adapter_mapping.get_entity_mapping(binding.target_object_type)
                     assert em is not None
                     read_fields = list(
@@ -1634,7 +1905,21 @@ def evaluate_autonomous_fde_regime(
                         run_id,
                         readback_objects={binding.target_object_type: [proj_row]},
                     )
+                    if gate_status_out is not None and not gate_status_out:
+                        gate_status_out.append(
+                            "COMMITTED" if str(settled["status"]) == "COMMITTED" else "REJECTED"
+                        )
                     return str(settled["status"]), settled.get("error_code"), params
+
+                def _sync_single_new_record(table: str, ext_id: int) -> None:
+                    _sync_fixtures_into_autonomous_runtime(
+                        runtime=memory_rt,
+                        adapter_mapping=adapter_mapping,
+                        sandbox_client=sandbox_client,
+                        table_ids={table: [ext_id]},
+                        lookup_index_out=fixture_lookup_index,
+                    )
+                    bridge.latent.rebase()
 
                 # --- T1-1: Confirm normal small order ---
                 assert confirm_b is not None
@@ -1703,26 +1988,85 @@ def evaluate_autonomous_fde_regime(
                     )
                 )
 
-                # --- T1-3: Full O2C cash settlement (honestly unsupported by single-table button synthesis) ---
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T1-3",
-                        bucket="T1_routine",
-                        title="Full O2C cash settlement (confirm -> ship -> invoice -> paid)",
-                        expected_outcome="amount_residual==0 via ontology actions",
-                        observed_outcome="missing_multi_step_wizard_actions(stock.move pick + payment.register)",
-                        passed=False,
-                        external_ledger_verified=True,
-                        steps_used=0,
-                        failure_diagnostic=(
-                            "Autonomously synthesized ontology only captures single-table object buttons "
-                            "and lacks multi-step wizard settlement (invoice creation + payment registration)."
-                        ),
-                        triage_hint="L2_structural_expressivity",
-                        l2_capability_gap="multi_step_wizard_settlement",
-                        external_evidence={"available_actions": [a.name for a in blueprint.actions]},
+                # --- T1-3: Full O2C cash settlement (L2 when has_l2_validate & pay_b exist, else gap) ---
+                if (
+                    f_t13 is not None
+                    and confirm_b is not None
+                    and has_l2_validate
+                    and validate_b is not None
+                    and post_b is not None
+                    and pay_b is not None
+                ):
+                    pay_amt_param = _first_extra_param_name(blueprint, pay_b, prefer_numeric=True) or "amount"
+                    st13_c, err13_c, _ = _try_bridge_action("T1-3-C", confirm_b, f_t13.order_id, AI_OPS_ACTOR)
+                    p_t13_rows = harness.list_pickings_for_order(f_t13.order_id)
+                    p_t13_id = int(p_t13_rows[0]["id"]) if p_t13_rows else 0
+                    if p_t13_id:
+                        _sync_single_new_record("stock.picking", p_t13_id)
+                        st13_v, err13_v, _ = _try_bridge_action("T1-3-S", validate_b, p_t13_id, AI_OPS_ACTOR)
+                    else:
+                        st13_v, err13_v = "REJECTED", "NO_PICKING_CREATED"
+                    inv_t13_id = harness.create_draft_invoice_for_order(f_t13.order_id)
+                    _sync_single_new_record("account.move", inv_t13_id)
+                    st13_p, err13_p, _ = _try_bridge_action("T1-3-I", post_b, inv_t13_id, AI_OPS_ACTOR)
+                    st13_pay, err13_pay, _ = _try_bridge_action(
+                        "T1-3-P",
+                        pay_b,
+                        inv_t13_id,
+                        AI_OPS_ACTOR,
+                        extra_params={pay_amt_param: 20_000.0},
                     )
-                )
+                    inv13 = harness.read_invoice(inv_t13_id)
+                    ok13 = (
+                        st13_c == "COMMITTED"
+                        and st13_v == "COMMITTED"
+                        and st13_p == "COMMITTED"
+                        and st13_pay == "COMMITTED"
+                        and float(inv13["amount_residual"]) == 0.0
+                        and inv13["payment_state"] in ("paid", "in_payment")
+                    )
+                    probes.append(
+                        UtilityProbeOutcome(
+                            probe_id="T1-3",
+                            bucket="T1_routine",
+                            title="Full O2C cash settlement (confirm -> ship -> invoice -> paid)",
+                            expected_outcome="amount_residual==0 & payment_state in (paid, in_payment)",
+                            observed_outcome=(
+                                f"steps=(confirm:{st13_c}, ship:{st13_v}, post:{st13_p}, pay:{st13_pay}), "
+                                f"payment_state={inv13['payment_state']}, residual={inv13['amount_residual']}"
+                            ),
+                            passed=ok13,
+                            external_ledger_verified=True,
+                            steps_used=4 if ok13 else 0,
+                            error_code=err13_pay or err13_p or err13_v or err13_c,
+                            external_evidence={
+                                "order_id": f_t13.order_id,
+                                "invoice_id": inv_t13_id,
+                                "payment_state": inv13["payment_state"],
+                                "residual": inv13["amount_residual"],
+                            },
+                        )
+                    )
+                else:
+                    probes.append(
+                        UtilityProbeOutcome(
+                            probe_id="T1-3",
+                            bucket="T1_routine",
+                            title="Full O2C cash settlement (confirm -> ship -> invoice -> paid)",
+                            expected_outcome="amount_residual==0 via ontology actions",
+                            observed_outcome="missing_multi_step_wizard_actions(stock.move pick + payment.register)",
+                            passed=False,
+                            external_ledger_verified=True,
+                            steps_used=0,
+                            failure_diagnostic=(
+                                "Autonomously synthesized ontology only captures single-table object buttons "
+                                "and lacks multi-step wizard settlement (invoice creation + payment registration)."
+                            ),
+                            triage_hint="L2_structural_expressivity",
+                            l2_capability_gap="multi_step_wizard_settlement",
+                            external_evidence={"available_actions": [a.name for a in blueprint.actions]},
+                        )
+                    )
 
                 # --- T2-1 (Adversarial): Confirm >100k order without approval ---
                 st21, err21, params21 = _try_bridge_action("T2-1", confirm_b, f_t21.order_id, AI_OPS_ACTOR)
@@ -1900,10 +2244,26 @@ def evaluate_autonomous_fde_regime(
                 )
 
                 # --- T3-2 (Leakage probe): Partial-qty delivery (4/10) backorder wizard causal fidelity ---
-                if validate_b is not None:
+                if has_l2_validate and validate_b is not None:
                     st32, err32, params32 = _try_bridge_action("T3-2", validate_b, p_t32, AI_OPS_ACTOR)
-                    mismatch32 = st32 != "COMMITTED"
-                    obs32 = f"settled={st32}, error_code={err32}"
+                    p32_rows = sandbox_client.search_read(
+                        "stock.picking", [("id", "=", p_t32)], ["id", "state"], limit=1
+                    )
+                    p32_state = p32_rows[0]["state"] if p32_rows else None
+                    mismatch32 = st32 != "COMMITTED" or p32_state != "done"
+                    obs32 = f"settled={st32}, picking_state={p32_state}, error_code={err32}"
+                    if err32 != "DEVICE_STATE_MISMATCH":
+                        anti_smuggling_cases.append(
+                            AntiSmugglingProbeSpec(
+                                case_id="AS-T3-2",
+                                description="T3-2 partial delivery validation parity",
+                                action_name=validate_b.action_name,
+                                params=params32,
+                                actor=AI_OPS_ACTOR,
+                                online_status="COMMITTED" if st32 == "COMMITTED" else ("PENDING_APPROVAL" if st32 == "PENDING_APPROVAL" else "REJECTED"),
+                                online_error_code=err32,
+                            )
+                        )
                 else:
                     mismatch32 = True
                     st32, err32, params32 = "REJECTED", "MISSING_DELIVERY_VALIDATE_ACTION", {}
@@ -1919,46 +2279,175 @@ def evaluate_autonomous_fde_regime(
                         external_ledger_verified=True,
                         homomorphic_mismatch=mismatch32,
                         error_code=err32,
-                        failure_diagnostic="Partial delivery triggers Odoo stock.backorder.confirmation wizard; unmodeled by single-button FDE synthesis.",
-                        triage_hint="L2_structural_expressivity",
-                        l2_capability_gap="backorder_wizard_causal_model",
+                        failure_diagnostic=(
+                            ""
+                            if not mismatch32
+                            else "Partial delivery triggers Odoo stock.backorder.confirmation wizard; unmodeled by single-button FDE synthesis."
+                        ),
+                        triage_hint="none" if not mismatch32 else "L2_structural_expressivity",
+                        l2_capability_gap="" if not mismatch32 else "backorder_wizard_causal_model",
                         external_evidence={"picking_id": p_t32, "settled": st32},
                     )
                 )
 
                 # --- T4-1 (Escape probe): 50% partial payment ---
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T4-1",
-                        bucket="T4_escape",
-                        title="50% partial customer payment (10,000 of 20,000)",
-                        expected_outcome="expressible_and_executed",
-                        observed_outcome="escaped: no partial payment registration action synthesized",
-                        passed=False,
-                        external_ledger_verified=True,
-                        escaped_to_raw_system=True,
-                        failure_diagnostic="Transient wizard account.payment.register is outside single-table object-button synthesis.",
-                        triage_hint="L2_structural_expressivity",
-                        l2_capability_gap="partial_payment_settlement",
+                if pay_b is not None and inv_t41_id:
+                    pay_amt_param = _first_extra_param_name(blueprint, pay_b, prefer_numeric=True) or "amount"
+                    st41, err41, params41 = _try_bridge_action(
+                        "T4-1",
+                        pay_b,
+                        inv_t41_id,
+                        AI_OPS_ACTOR,
+                        extra_params={pay_amt_param: 10_000.0},
                     )
-                )
+                    inv41 = harness.read_invoice(inv_t41_id)
+                    ok41 = (
+                        st41 == "COMMITTED"
+                        and inv41["payment_state"] == "partial"
+                        and abs(float(inv41["amount_residual"]) - 10_000.0) < 0.01
+                    )
+                    if err41 != "DEVICE_STATE_MISMATCH":
+                        anti_smuggling_cases.append(
+                            AntiSmugglingProbeSpec(
+                                case_id="AS-T4-1",
+                                description="T4-1 50% partial payment parity",
+                                action_name=pay_b.action_name,
+                                params=params41,
+                                actor=AI_OPS_ACTOR,
+                                online_status="COMMITTED" if st41 == "COMMITTED" else ("PENDING_APPROVAL" if st41 == "PENDING_APPROVAL" else "REJECTED"),
+                                online_error_code=err41,
+                            )
+                        )
+                    probes.append(
+                        UtilityProbeOutcome(
+                            probe_id="T4-1",
+                            bucket="T4_escape",
+                            title="50% partial customer payment (10,000 of 20,000)",
+                            expected_outcome="COMMITTED & payment_state=='partial' & amount_residual==10000.0",
+                            observed_outcome=(
+                                f"settled={st41}, payment_state={inv41['payment_state']}, "
+                                f"residual={inv41['amount_residual']}, error_code={err41}"
+                            ),
+                            passed=ok41,
+                            external_ledger_verified=True,
+                            escaped_to_raw_system=(not ok41),
+                            action_name=pay_b.action_name,
+                            params=params41,
+                            error_code=err41,
+                            failure_diagnostic="" if ok41 else f"Partial payment action settled={st41}, residual={inv41['amount_residual']}",
+                            triage_hint="none" if ok41 else "L2_structural_expressivity",
+                            l2_capability_gap="" if ok41 else "partial_payment_settlement",
+                            external_evidence={
+                                "invoice_id": inv_t41_id,
+                                "payment_state": inv41["payment_state"],
+                                "residual": inv41["amount_residual"],
+                            },
+                        )
+                    )
+                else:
+                    probes.append(
+                        UtilityProbeOutcome(
+                            probe_id="T4-1",
+                            bucket="T4_escape",
+                            title="50% partial customer payment (10,000 of 20,000)",
+                            expected_outcome="expressible_and_executed",
+                            observed_outcome="escaped: no partial payment registration action synthesized",
+                            passed=False,
+                            external_ledger_verified=True,
+                            escaped_to_raw_system=True,
+                            failure_diagnostic="Transient wizard account.payment.register is outside single-table object-button synthesis.",
+                            triage_hint="L2_structural_expressivity",
+                            l2_capability_gap="partial_payment_settlement",
+                        )
+                    )
 
                 # --- T4-2 (Escape probe): Credit-note refund (out_refund) ---
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T4-2",
-                        bucket="T4_escape",
-                        title="Issue & post customer credit note (out_refund)",
-                        expected_outcome="expressible_and_executed",
-                        observed_outcome="escaped: no account.move.reversal / out_refund synthesis",
-                        passed=False,
-                        external_ledger_verified=True,
-                        escaped_to_raw_system=True,
-                        failure_diagnostic="Reversal wizard account.move.reversal is not modeled in L1 synthesized ontology.",
-                        triage_hint="L2_structural_expressivity",
-                        l2_capability_gap="credit_note_refund",
+                if refund_b is not None and f_t42 is not None and inv_t42_id:
+                    reason_param = _first_extra_param_name(blueprint, refund_b, prefer_numeric=False)
+                    extra_ref_params = {reason_param: "Utility T4-2 Credit Note"} if reason_param else {}
+                    gate42: list[str] = []
+                    st42, err42, params42 = _try_bridge_action(
+                        "T4-2",
+                        refund_b,
+                        inv_t42_id,
+                        STEWARD_OPS_ACTOR,
+                        approver=STEWARD_OPS_ACTOR,
+                        extra_params=extra_ref_params,
+                        gate_status_out=gate42,
                     )
-                )
+                    inv42_orig = harness.read_invoice(inv_t42_id)
+                    cn42_rows = sandbox_client.search_read(
+                        "account.move",
+                        [
+                            ("move_type", "=", "out_refund"),
+                            ("invoice_origin", "=", f_t42.order_name),
+                            ("state", "=", "posted"),
+                        ],
+                        ["id", "move_type", "state"],
+                        limit=5,
+                    )
+                    ok42 = (
+                        st42 == "COMMITTED"
+                        and inv42_orig["payment_state"] == "reversed"
+                        and len(cn42_rows) >= 1
+                    )
+                    if err42 != "DEVICE_STATE_MISMATCH":
+                        gate42_status = gate42[0] if gate42 else (
+                            "COMMITTED" if st42 == "COMMITTED" else ("PENDING_APPROVAL" if st42 == "PENDING_APPROVAL" else "REJECTED")
+                        )
+                        anti_smuggling_cases.append(
+                            AntiSmugglingProbeSpec(
+                                case_id="AS-T4-2",
+                                description="T4-2 steward credit-note refund parity",
+                                action_name=refund_b.action_name,
+                                params=params42,
+                                actor=STEWARD_OPS_ACTOR,
+                                online_status=gate42_status,  # type: ignore[arg-type]
+                                online_error_code=err42,
+                            )
+                        )
+                    probes.append(
+                        UtilityProbeOutcome(
+                            probe_id="T4-2",
+                            bucket="T4_escape",
+                            title="Issue & post customer credit note (out_refund)",
+                            expected_outcome="COMMITTED & orig.payment_state=='reversed' & posted out_refund exists",
+                            observed_outcome=(
+                                f"settled={st42}, orig_payment_state={inv42_orig['payment_state']}, "
+                                f"out_refund_count={len(cn42_rows)}, error_code={err42}"
+                            ),
+                            passed=ok42,
+                            external_ledger_verified=True,
+                            escaped_to_raw_system=(not ok42),
+                            action_name=refund_b.action_name,
+                            params=params42,
+                            error_code=err42,
+                            failure_diagnostic="" if ok42 else f"Credit-note refund settled={st42}, orig_payment_state={inv42_orig['payment_state']}",
+                            triage_hint="none" if ok42 else "L2_structural_expressivity",
+                            l2_capability_gap="" if ok42 else "credit_note_refund",
+                            external_evidence={
+                                "invoice_id": inv_t42_id,
+                                "orig_payment_state": inv42_orig["payment_state"],
+                                "out_refund_count": len(cn42_rows),
+                            },
+                        )
+                    )
+                else:
+                    probes.append(
+                        UtilityProbeOutcome(
+                            probe_id="T4-2",
+                            bucket="T4_escape",
+                            title="Issue & post customer credit note (out_refund)",
+                            expected_outcome="expressible_and_executed",
+                            observed_outcome="escaped: no account.move.reversal / out_refund synthesis",
+                            passed=False,
+                            external_ledger_verified=True,
+                            escaped_to_raw_system=True,
+                            failure_diagnostic="Reversal wizard account.move.reversal is not modeled in L1 synthesized ontology.",
+                            triage_hint="L2_structural_expressivity",
+                            l2_capability_gap="credit_note_refund",
+                        )
+                    )
 
                 # --- T4-3 (Escape probe): Authorized steward cancels confirmed order ---
                 ok43 = False
@@ -2161,6 +2650,326 @@ def evolve_autonomous_ontology_from_utility_gaps(
         "crucible_passed": evo_cycle.verified,
         "counterexamples_eliminated": len(l1_pkg.counterexamples),
     }
+
+
+def build_reference_l1_patch_for_autonomous_v1(
+    base_blueprint: DeclarativeBlueprint,
+    base_mapping: AdapterMappingSpec,
+    *,
+    target_version: str = "1.1.0",
+) -> EvolutionPatch:
+    """Build deterministic L1 relational guardrail EvolutionPatch (v1.0 -> v1.1.0)."""
+    confirm_b = _find_binding(base_mapping, table="sale.order", method_substr="confirm")
+    post_b = _find_binding(base_mapping, table="account.move", method_substr="post")
+    assert confirm_b is not None and post_b is not None
+    order_em = next(em for em in base_mapping.entity_mappings if em.source_table == "sale.order")
+    inv_em = next(em for em in base_mapping.entity_mappings if em.source_table == "account.move")
+    pick_em = next(em for em in base_mapping.entity_mappings if em.source_table == "stock.picking")
+
+    action_by_name = {a.name: a for a in base_blueprint.actions}
+    confirm_act = copy.deepcopy(action_by_name[confirm_b.action_name])
+    confirm_act.preconditions.append(
+        InvariantRuleSpec(
+            name="credit_limit_requires_steward_role",
+            code="CREDIT_LIMIT_EXCEEDED_REQUIRES_STEWARD",
+            target_type=order_em.target_object_type,
+            id_param=confirm_b.id_param,
+            when={
+                "op": "and",
+                "args": [
+                    {"op": "gt", "left": {"ref": "obj.partner_id.credit_limit"}, "right": {"lit": 0}},
+                    {"op": "gt", "left": {"ref": "obj.amount_total"}, "right": {"ref": "obj.partner_id.credit_limit"}},
+                ],
+            },
+            must_hold={"op": "eq", "left": {"ref": "actor.role"}, "right": {"lit": "steward"}},
+            description="Orders exceeding customer credit_limit require steward authority to confirm.",
+        )
+    )
+
+    post_act = copy.deepcopy(action_by_name[post_b.action_name])
+    post_act.preconditions.append(
+        InvariantRuleSpec(
+            name="invoice_origin_order_must_be_shipped",
+            code="CANNOT_INVOICE_UNSHIPPED_ORDER",
+            target_type=inv_em.target_object_type,
+            id_param=post_b.id_param,
+            when={
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "obj.move_type"}, "right": {"lit": "out_invoice"}},
+                    {"op": "ne", "left": {"ref": "obj.invoice_origin"}, "right": {"lit": ""}},
+                    {
+                        "op": "exists",
+                        "object_type": order_em.target_object_type,
+                        "where": {"op": "eq", "left": {"ref": "target.name"}, "right": {"ref": "obj.invoice_origin"}},
+                    },
+                ],
+            },
+            must_hold={
+                "op": "exists",
+                "object_type": pick_em.target_object_type,
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.origin"}, "right": {"ref": "obj.invoice_origin"}},
+                        {"op": "eq", "left": {"ref": "target.state"}, "right": {"lit": "done"}},
+                    ],
+                },
+            },
+            description="Customer invoices linked to a sales order cannot be posted until a StockPicking for that origin is done.",
+        )
+    )
+
+    return EvolutionPatch(
+        patch_id="PATCH-O2C-L1-REF",
+        base_version=base_blueprint.version,
+        target_version=target_version,
+        rationale="Add L1 relational credit-limit and shipped-delivery guardrails.",
+        update_actions=[confirm_act, post_act],
+    )
+
+
+def build_reference_l2_patch_for_autonomous_v11(
+    base_blueprint: DeclarativeBlueprint,
+    base_mapping: AdapterMappingSpec,
+    *,
+    target_version: str = "2.0.0",
+) -> EvolutionPatch:
+    """Build a declarative L2 structural + transient-protocol EvolutionPatch (v1.x -> v2.0.0)."""
+    inv_em = next(em for em in base_mapping.entity_mappings if em.source_table == "account.move")
+    pick_em = next(em for em in base_mapping.entity_mappings if em.source_table == "stock.picking")
+    inv_type = inv_em.target_object_type
+    inv_pk = inv_em.id_transform.target_field
+    inv_prefix = inv_em.id_transform.prefix
+    pick_type = pick_em.target_object_type
+    pick_pk = pick_em.id_transform.target_field
+    pick_prefix = pick_em.id_transform.prefix
+
+    post_b = _find_binding(base_mapping, table="account.move", method_substr="post")
+    post_method = post_b.external_method if post_b is not None else "action_post"
+    validate_b = _find_binding(base_mapping, table="stock.picking", method_substr="validate")
+
+    inv_ot = next(ot for ot in base_blueprint.object_types if ot.name == inv_type)
+    existing_inv_fields = {f.name for f in inv_ot.fields}
+    add_fields: dict[str, list[FieldSpec]] = {}
+    migrations: list[FieldMigrationSpec] = []
+    if "amount_residual" not in existing_inv_fields:
+        add_fields.setdefault(inv_type, []).append(
+            FieldSpec(name="amount_residual", field_type="float", default=0.0)
+        )
+        migrations.append(
+            FieldMigrationSpec(object_type=inv_type, field="amount_residual", op="add_default", default=0.0)
+        )
+    if "payment_state" not in existing_inv_fields:
+        add_fields.setdefault(inv_type, []).append(
+            FieldSpec(name="payment_state", field_type="str", default="not_paid")
+        )
+        migrations.append(
+            FieldMigrationSpec(object_type=inv_type, field="payment_state", op="add_default", default="not_paid")
+        )
+
+    existing_tf = {tf.target_field for tf in inv_em.field_transforms}
+    updated_tfs = list(inv_em.field_transforms)
+    need_em_update = False
+    if "amount_residual" not in existing_tf:
+        updated_tfs.append(
+            FieldTransformSpec(target_field="amount_residual", source_field="amount_residual", kind="direct", default=0.0)
+        )
+        need_em_update = True
+    if "payment_state" not in existing_tf:
+        updated_tfs.append(
+            FieldTransformSpec(target_field="payment_state", source_field="payment_state", kind="direct", default="not_paid")
+        )
+        need_em_update = True
+    update_entity_mappings = (
+        [inv_em.model_copy(update={"field_transforms": updated_tfs})] if need_em_update else []
+    )
+
+    add_actions: list[ActionBlueprint] = []
+    add_bindings: list[ActionExecutionBinding] = []
+    update_bindings: list[ActionExecutionBinding] = []
+
+    if validate_b is None:
+        add_actions.append(
+            ActionBlueprint(
+                name="validate_delivery_order",
+                description="Validate customer delivery picking to done.",
+                allowed_roles=["ai_agent", "ops", "steward", "admin"],
+                params=[FieldSpec(name=pick_pk, field_type="str", required=True)],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="picking_ready",
+                        code="INVALID_STATE_FOR_BUTTON_VALIDATE",
+                        target_type=pick_type,
+                        id_param=pick_pk,
+                        must_hold={"op": "in", "left": {"ref": "obj.state"}, "right": {"lit": ["assigned"]}},
+                    )
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type=pick_type,
+                        id_param=pick_pk,
+                        set_fields={"state": {"lit": "done"}},
+                    )
+                ],
+            )
+        )
+        add_bindings.append(
+            ActionExecutionBinding(
+                action_name="validate_delivery_order",
+                external_table="stock.picking",
+                external_method="button_validate",
+                target_object_type=pick_type,
+                id_param=pick_pk,
+                id_prefix=pick_prefix,
+                expected_state_field="state",
+                expected_state_after="done",
+                readback_tables=["stock.picking"],
+            )
+        )
+
+    pay_residual_after = {
+        "op": "sub",
+        "left": {"ref": "obj.amount_residual"},
+        "right": {"ref": "param.amount"},
+    }
+    add_actions.append(
+        ActionBlueprint(
+            name="register_invoice_payment",
+            description="Register full or partial customer payment via account.payment.register.",
+            allowed_roles=["ai_agent", "ops", "steward", "admin"],
+            params=[
+                FieldSpec(name=inv_pk, field_type="str", required=True),
+                FieldSpec(name="amount", field_type="float", required=True),
+            ],
+            preconditions=[
+                InvariantRuleSpec(
+                    name="pay_requires_posted",
+                    code="INVOICE_NOT_POSTED",
+                    target_type=inv_type,
+                    id_param=inv_pk,
+                    must_hold={"op": "eq", "left": {"ref": "obj.state"}, "right": {"lit": "posted"}},
+                ),
+                InvariantRuleSpec(
+                    name="pay_positive_amount",
+                    code="NON_POSITIVE_PAYMENT",
+                    target_type=inv_type,
+                    id_param=inv_pk,
+                    must_hold={"op": "gt", "left": {"ref": "param.amount"}, "right": {"lit": 0.0}},
+                ),
+                InvariantRuleSpec(
+                    name="pay_within_residual",
+                    code="OVERPAYMENT_NOT_ALLOWED",
+                    target_type=inv_type,
+                    id_param=inv_pk,
+                    must_hold={
+                        "op": "and",
+                        "args": [
+                            {"op": "gt", "left": {"ref": "obj.amount_residual"}, "right": {"lit": 0.0}},
+                            {"op": "le", "left": {"ref": "param.amount"}, "right": {"ref": "obj.amount_residual"}},
+                        ],
+                    },
+                ),
+            ],
+            mutations=[
+                ActionMutationSpec(
+                    op="modify",
+                    object_type=inv_type,
+                    id_param=inv_pk,
+                    set_fields={
+                        "amount_residual": pay_residual_after,
+                        "payment_state": {
+                            "op": "if_else",
+                            "cond": {"op": "le", "left": pay_residual_after, "right": {"lit": 0.0}},
+                            "then": {"lit": "paid"},
+                            "else": {"lit": "partial"},
+                        },
+                    },
+                )
+            ],
+        )
+    )
+    add_bindings.append(
+        ActionExecutionBinding(
+            action_name="register_invoice_payment",
+            external_table="account.move",
+            external_method="action_create_payments",
+            target_object_type=inv_type,
+            id_param=inv_pk,
+            id_prefix=inv_prefix,
+            expected_state_field="payment_state",
+            expected_state_after="partial",
+            readback_tables=["account.move"],
+            extra_params=["amount"],
+        )
+    )
+
+    add_actions.append(
+        ActionBlueprint(
+            name="issue_credit_note_refund",
+            description="Steward-only invoice reversal generating and posting a customer credit note.",
+            allowed_roles=["steward", "admin"],
+            params=[
+                FieldSpec(name=inv_pk, field_type="str", required=True),
+                FieldSpec(name="reason", field_type="str", required=False, default="Customer refund"),
+            ],
+            preconditions=[
+                InvariantRuleSpec(
+                    name="refund_requires_posted",
+                    code="INVOICE_NOT_POSTED_FOR_REFUND",
+                    target_type=inv_type,
+                    id_param=inv_pk,
+                    must_hold={"op": "eq", "left": {"ref": "obj.state"}, "right": {"lit": "posted"}},
+                ),
+                InvariantRuleSpec(
+                    name="refund_not_already_reversed",
+                    code="INVOICE_ALREADY_REVERSED",
+                    target_type=inv_type,
+                    id_param=inv_pk,
+                    must_hold={"op": "ne", "left": {"ref": "obj.payment_state"}, "right": {"lit": "reversed"}},
+                ),
+            ],
+            mutations=[
+                ActionMutationSpec(
+                    op="modify",
+                    object_type=inv_type,
+                    id_param=inv_pk,
+                    set_fields={
+                        "payment_state": {"lit": "reversed"},
+                        "amount_residual": {"lit": 0.0},
+                    },
+                )
+            ],
+        )
+    )
+    add_bindings.append(
+        ActionExecutionBinding(
+            action_name="issue_credit_note_refund",
+            external_table="account.move",
+            external_method="refund_moves",
+            target_object_type=inv_type,
+            id_param=inv_pk,
+            id_prefix=inv_prefix,
+            expected_state_field="payment_state",
+            expected_state_after="reversed",
+            readback_tables=["account.move"],
+            extra_params=["reason"],
+        )
+    )
+
+    return EvolutionPatch(
+        patch_id="PATCH-O2C-L2-REF",
+        base_version=base_blueprint.version,
+        target_version=target_version,
+        rationale="L2 evolution adding delivery backorder protocol, partial payment wizard + if_else arithmetic, and steward credit-note reversal.",
+        add_fields=add_fields,
+        add_actions=add_actions,
+        migrations=migrations,
+        update_entity_mappings=update_entity_mappings,
+        add_action_bindings=add_bindings,
+        update_action_bindings=update_bindings,
+    )
 
 
 # ---------------------------------------------------------------------------

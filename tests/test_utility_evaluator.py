@@ -430,3 +430,66 @@ def test_odoo_utility_benchmark_live_cloned_odoo19_zero_leak() -> None:
     assert "raw_odoo_baseline" not in out["comparison"]["pareto_frontier"]
     assert "autonomous_fde_v1.1_evolved" in out["comparison"]["pareto_frontier"]
     assert "handwritten_o2c_reference" in out["comparison"]["pareto_frontier"]
+
+
+def test_l2_evolved_autonomous_regime_offline_closes_t1_t3_t4_gaps() -> None:
+    """Verify autonomous FDE v1.1 upgraded via L2 EvolutionPatch + protocol_steps closes T1-3, T3-2, T4-1, T4-2."""
+    from examples.odoo_fde_autonomous_pipeline import (
+        build_closed_phenomenon_profile,
+        build_business_seed_ontology,
+        synthesize_from_fde_evidence,
+    )
+    from examples.odoo_fde_prober import OdooActiveProber
+    from examples.odoo_fde_scout import OdooFDEScout
+    from examples.odoo_utility_benchmark import (
+        OfflineOdooPhysicalWorld,
+        PhysicalOdooHarness,
+        build_reference_l1_patch_for_autonomous_v1,
+        build_reference_l2_patch_for_autonomous_v11,
+        evaluate_autonomous_fde_regime,
+        evaluate_raw_odoo_baseline,
+    )
+    from open_ontology.induction import apply_adapter_mapping_patch, apply_evolution_patch
+
+    world = OfflineOdooPhysicalWorld()
+    harness = PhysicalOdooHarness(offline_world=world)
+    _, _, raw_total_models, raw_total_fields = harness.measure_raw_schema_counts()
+    seed = build_business_seed_ontology()
+
+    sr = OdooFDEScout(world, source_locator="offline://l2_eval", max_models=6).scout()
+    profile = build_closed_phenomenon_profile(sr, client=world)
+    pr = OdooActiveProber(world, sandbox_db="offline_l2").probe(sr)
+    bundle = synthesize_from_fde_evidence(
+        sr, pr, profile=profile, seed_ontology=seed, model_id="auto_o2c_l2", version="1.0.0"
+    )
+    _, raw_baseline_tokens = evaluate_raw_odoo_baseline(harness)
+
+    out_v1 = run_odoo_utility_benchmark(offline=True)
+    l1_patch = build_reference_l1_patch_for_autonomous_v1(bundle.blueprint, bundle.adapter_mapping)
+    bp_v11 = apply_evolution_patch(bundle.blueprint, l1_patch)
+    l2_patch = build_reference_l2_patch_for_autonomous_v11(bp_v11, bundle.adapter_mapping, target_version="2.0.0")
+    bp_v2 = apply_evolution_patch(bp_v11, l2_patch)
+    mapping_v2 = apply_adapter_mapping_patch(bundle.adapter_mapping, l2_patch)
+    assert mapping_v2 is not None
+
+    sc_v2 = evaluate_autonomous_fde_regime(
+        regime_name="autonomous_fde_v2.0_l2",
+        blueprint=bp_v2,
+        adapter_mapping=mapping_v2,
+        harness=harness,
+        sandbox_client=world,
+        raw_baseline_tokens=raw_baseline_tokens,
+        raw_total_models=raw_total_models,
+        raw_total_fields=raw_total_fields,
+        seed_ontology=seed,
+    )
+    probe_map = {p.probe_id: p for p in sc_v2.probes}
+    assert sc_v2.anti_smuggling.passed is True, sc_v2.anti_smuggling.violations
+    for pid in ("T1-1", "T1-2", "T1-3", "T2-1", "T2-2", "T2-3", "T2-4", "T3-1", "T3-2", "T4-1", "T4-2"):
+        assert probe_map[pid].passed is True, f"{pid} failed: {probe_map[pid].observed_outcome}"
+    sc_d = sc_v2.to_dict()["metrics"]
+    assert sc_d["t2_dirty_external_writes"] == 0
+    assert sc_d["t2_guardrail_f1"] == 1.0
+    assert sc_d["t3_homomorphic_fidelity"] == 1.0
+    assert sc_d["composite_utility"] > 0.60
+    assert out_v1["scorecards"]["autonomous_fde_v1.1_evolved"]["metrics"]["composite_utility"] < sc_d["composite_utility"]

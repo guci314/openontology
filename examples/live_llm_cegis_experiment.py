@@ -36,17 +36,20 @@ from open_ontology import OntologyRuntime
 from open_ontology.induction import (
     AbductionBackend,
     ActionExecutionBinding,
+    AdapterMappingSpec,
     AntigravityCLIAbductionBackend,
     CallableAbductionBackend,
     CrucibleContext,
     DeclarativeBlueprint,
     EvolutionPatch,
     EvolutionRoutingPlan,
+    FrictionClusterSummary,
     GeminiAbductionBackend,
     IncidentCounterexample,
     InductionGovernanceService,
     OntologyBuilderAgent,
     OntologyEvolverAgent,
+    OntologyL2ArchitectAgent,
     OpenRouterAbductionBackend,
     ReplayEvent,
     STEWARD_ACTOR,
@@ -67,7 +70,7 @@ from .odoo_fde_autonomous_pipeline import (
     build_closed_phenomenon_profile,
     synthesize_from_fde_evidence,
 )
-from .odoo_fde_prober import EphemeralOdooSandbox, OdooActiveProber
+from .odoo_fde_prober import EphemeralOdooSandbox, OdooActiveProber, discover_transient_wizards
 from .odoo_fde_scout import OdooFDEScout, ReadOnlyOdooClient
 from .odoo_utility_benchmark import (
     LARGE_QTY,
@@ -76,7 +79,10 @@ from .odoo_utility_benchmark import (
     SMALL_UNIT_PRICE,
     PhysicalOdooHarness,
     _find_binding,
+    _find_l2_bindings,
+    _first_extra_param_name,
     _sync_fixtures_into_autonomous_runtime,
+    build_reference_l1_patch_for_autonomous_v1,
     evaluate_autonomous_fde_regime,
     evaluate_raw_odoo_baseline,
 )
@@ -866,7 +872,7 @@ def run_live_llm_genesis_purification_experiment(
             "bearing on state transitions, relational integrity, approval governance, or monetary amounts.\n"
             "3. Provide a complete bidirectional AdapterMappingSpec:\n"
             "   - Every mapped entity's id_transform MUST use kind='id_prefix' on source_field='id' with a distinct "
-            "non-empty prefix (e.g. 'CUST-'), and any many2one_id FieldTransformSpec pointing to that entity MUST "
+            "non-empty prefix (e.g. 'CUST-'), and any foreign_key_id FieldTransformSpec pointing to that entity MUST "
             "use the exact same prefix (keep optional relations required=False).\n"
             "   - If an ObjectTypeBlueprint uses archetype='ProcessDocument', note status_field defaults to 'status': "
             "either name your status field 'status' (mapped from raw 'state') or set status_field explicitly to match "
@@ -1038,9 +1044,681 @@ def run_live_llm_genesis_purification_experiment(
         }
 
 
+def _probe_odoo_wizard_effects(
+    sandbox_client: Any,
+    harness: PhysicalOdooHarness,
+) -> list[dict[str, Any]]:
+    """Observe real before/after raw column transitions on cloned Odoo 19 transient workflows."""
+    obs: list[dict[str, Any]] = []
+    partner_id = harness.create_partner(f"WIZPROBE-{int(time.time()) % 10000}", "L2 Wizard Probe Customer")
+
+    # 1. Partial delivery (4/10) backorder wizard effect
+    f_deliv = harness.create_draft_order(partner_id=partner_id, qty=10, unit_price=1000.0, client_ref="WIZ-DELIV")
+    harness.confirm_order_physically(f_deliv.order_id)
+    p_before = harness.list_pickings_for_order(f_deliv.order_id)
+    p_id = int(p_before[0]["id"])
+    harness.validate_partial_picking_creating_backorder(f_deliv.order_id, 4)
+    p_after = sandbox_client.search_read("stock.picking", [("id", "=", p_id)], ["id", "state"], limit=1)
+    obs.append(
+        {
+            "workflow": "partial_delivery_validation",
+            "table": "stock.picking",
+            "before": {"state": p_before[0].get("state")},
+            "after": {"state": p_after[0].get("state") if p_after else None},
+        }
+    )
+
+    # 2. 50% partial payment then remaining 50% full payment
+    f_pay = harness.create_draft_order(partner_id=partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref="WIZ-PAY")
+    harness.confirm_order_physically(f_pay.order_id)
+    harness.ship_order_physically_full(f_pay.order_id)
+    inv_pay_id = harness.create_draft_invoice_for_order(f_pay.order_id)
+    harness.post_invoice_physically(inv_pay_id)
+    inv_before = harness.read_invoice(inv_pay_id)
+    harness.register_payment_physically(inv_pay_id, 10_000.0)
+    inv_mid = harness.read_invoice(inv_pay_id)
+    harness.register_payment_physically(inv_pay_id, 10_000.0)
+    inv_full = harness.read_invoice(inv_pay_id)
+    obs.append(
+        {
+            "workflow": "partial_and_full_customer_payment",
+            "table": "account.move",
+            "before": {
+                "state": inv_before["state"],
+                "payment_state": inv_before["payment_state"],
+                "amount_total": inv_before["amount_total"],
+                "amount_residual": inv_before["amount_residual"],
+            },
+            "after_50pct_payment": {
+                "payment_state": inv_mid["payment_state"],
+                "amount_residual": inv_mid["amount_residual"],
+            },
+            "after_remaining_50pct_payment": {
+                "payment_state": inv_full["payment_state"],
+                "amount_residual": inv_full["amount_residual"],
+            },
+        }
+    )
+
+    # 3. Credit-note reversal
+    f_cn = harness.create_draft_order(partner_id=partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref="WIZ-CN")
+    harness.confirm_order_physically(f_cn.order_id)
+    harness.ship_order_physically_full(f_cn.order_id)
+    inv_cn_id = harness.create_draft_invoice_for_order(f_cn.order_id)
+    harness.post_invoice_physically(inv_cn_id)
+    cn_before = harness.read_invoice(inv_cn_id)
+    cn_doc = harness.create_and_post_credit_note_physically(inv_cn_id)
+    cn_orig_after = harness.read_invoice(inv_cn_id)
+    obs.append(
+        {
+            "workflow": "credit_note_reversal",
+            "table": "account.move",
+            "before_orig": {
+                "state": cn_before["state"],
+                "payment_state": cn_before["payment_state"],
+                "amount_residual": cn_before["amount_residual"],
+            },
+            "after_orig": {
+                "state": cn_orig_after["state"],
+                "payment_state": cn_orig_after["payment_state"],
+                "amount_residual": cn_orig_after["amount_residual"],
+            },
+            "created_credit_note": {
+                "move_type": cn_doc["move_type"],
+                "state": cn_doc["state"],
+                "payment_state": cn_doc["payment_state"],
+                "amount_total": cn_doc["amount_total"],
+            },
+        }
+    )
+    return obs
+
+
+def run_live_llm_l2_architect_experiment(
+    *,
+    models: list[str],
+    source_db: str = DB_NORTH,
+    max_rounds: int = 4,
+    save_v2_bundle_path: str | None = None,
+) -> dict[str, Any]:
+    """Experiment C: Live LLM M1 Structural & Business-Rule Evolution (v1.1.0 -> v2.0.0) on cloned Odoo 19."""
+    _log(f"ExpC (L2): scouting {source_db} and synthesizing v1.0/v1.1 baseline")
+    ro_client = ReadOnlyOdooClient(db=source_db)
+    scout_report = OdooFDEScout(ro_client, source_locator=f"odoo://{source_db}", max_models=6).scout()
+    profile = build_closed_phenomenon_profile(scout_report, client=ro_client)
+    seed = build_business_seed_ontology()
+
+    with EphemeralOdooSandbox(source_db=source_db) as sandbox_client:
+        sandbox_client._ensure_login()
+        harness = PhysicalOdooHarness(live_client=sandbox_client._client)
+        _, _, raw_total_models, raw_total_fields = harness.measure_raw_schema_counts()
+        probe_report = OdooActiveProber(sandbox_client, sandbox_db=sandbox_client.db).probe(scout_report)
+
+        bundle = synthesize_from_fde_evidence(
+            scout_report,
+            probe_report,
+            profile=profile,
+            seed_ontology=seed,
+            model_id="autonomous_o2c_fde",
+            version="1.0.0",
+        )
+        l1_patch = build_reference_l1_patch_for_autonomous_v1(
+            bundle.blueprint, bundle.adapter_mapping, target_version="1.1.0"
+        )
+        bp_v11 = apply_evolution_patch(bundle.blueprint, l1_patch)
+        mapping_v1 = bundle.adapter_mapping
+        confirm_b = _find_binding(mapping_v1, table="sale.order", method_substr="confirm")
+        post_b = _find_binding(mapping_v1, table="account.move", method_substr="post")
+        validate_b = _find_binding(mapping_v1, table="stock.picking", method_substr="validate")
+        assert confirm_b is not None and post_b is not None
+
+        _, raw_baseline_tokens = evaluate_raw_odoo_baseline(harness)
+        sc_v11 = evaluate_autonomous_fde_regime(
+            regime_name="autonomous_fde_v1.1_baseline",
+            blueprint=bp_v11,
+            adapter_mapping=mapping_v1,
+            harness=harness,
+            sandbox_client=sandbox_client,
+            raw_baseline_tokens=raw_baseline_tokens,
+            raw_total_models=raw_total_models,
+            raw_total_fields=raw_total_fields,
+            seed_ontology=seed,
+        )
+        routing_v11 = triage_utility_failures(sc_v11)
+        l2_tickets = list(routing_v11.l2_evolution_tickets)
+
+        # Observe ERP phenomena & transient wizard state transitions empirically
+        wizard_catalog = discover_transient_wizards(
+            sandbox_client,
+            [m.model for m in scout_report.discovered_models],
+            probe_report=probe_report,
+        )
+        wizard_effects = _probe_odoo_wizard_effects(sandbox_client, harness)
+
+        # Pre-execution L2 M0 snapshot & replays on live Odoo records
+        l2_partner_id = harness.create_partner("L2-EVO-PARTNER", "L2 Evolution Proof Partner")
+        f_small = harness.create_draft_order(partner_id=l2_partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref="L2-SMALL")
+        f_large = harness.create_draft_order(partner_id=l2_partner_id, qty=LARGE_QTY, unit_price=LARGE_UNIT_PRICE, client_ref="L2-LARGE")
+        f_deliv = harness.create_draft_order(partner_id=l2_partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref="L2-DELIV")
+        p_assigned = harness.confirm_order_physically(f_deliv.order_id)
+
+        f_inv_ok = harness.create_draft_order(partner_id=l2_partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref="L2-INVOK")
+        p_inv_ok = harness.confirm_order_physically(f_inv_ok.order_id)
+        harness.ship_order_physically_full(f_inv_ok.order_id)
+        inv_draft_id = harness.create_draft_invoice_for_order(f_inv_ok.order_id)
+
+        f_inv_posted = harness.create_draft_order(partner_id=l2_partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref="L2-POSTED")
+        p_inv_posted = harness.confirm_order_physically(f_inv_posted.order_id)
+        harness.ship_order_physically_full(f_inv_posted.order_id)
+        inv_posted_id = harness.create_draft_invoice_for_order(f_inv_posted.order_id)
+        harness.post_invoice_physically(inv_posted_id)
+
+        f_inv_cn = harness.create_draft_order(partner_id=l2_partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref="L2-CN")
+        p_inv_cn = harness.confirm_order_physically(f_inv_cn.order_id)
+        harness.ship_order_physically_full(f_inv_cn.order_id)
+        inv_cn_id = harness.create_draft_invoice_for_order(f_inv_cn.order_id)
+        harness.post_invoice_physically(inv_cn_id)
+
+        f_unshipped = harness.create_draft_order(partner_id=l2_partner_id, qty=SMALL_QTY, unit_price=SMALL_UNIT_PRICE, client_ref="L2-UNSHIPPED")
+        p_unshipped = harness.confirm_order_physically(f_unshipped.order_id)
+        inv_unshipped_id = harness.create_draft_invoice_for_order(f_unshipped.order_id)
+
+        inv_em = next(em for em in mapping_v1.entity_mappings if em.source_table == "account.move")
+        pick_em = next(em for em in mapping_v1.entity_mappings if em.source_table == "stock.picking")
+        inv_type = inv_em.target_object_type
+        inv_pk = inv_em.id_transform.target_field
+        pick_type = pick_em.target_object_type
+        pick_pk = pick_em.id_transform.target_field
+
+        evo_m0_rt = OntologyRuntime(compile_blueprint(bp_v11, seed_ontology=seed), db_path=":memory:")
+        try:
+            evo_m0 = _sync_fixtures_into_autonomous_runtime(
+                runtime=evo_m0_rt,
+                adapter_mapping=mapping_v1,
+                sandbox_client=sandbox_client,
+                table_ids={
+                    "res.partner": [l2_partner_id],
+                    "sale.order": [f_small.order_id, f_large.order_id, f_deliv.order_id, f_inv_ok.order_id, f_inv_posted.order_id, f_inv_cn.order_id, f_unshipped.order_id],
+                    "stock.picking": [p_assigned, p_inv_ok, p_inv_posted, p_inv_cn, p_unshipped],
+                    "account.move": [inv_draft_id, inv_posted_id, inv_cn_id, inv_unshipped_id],
+                },
+            )
+        finally:
+            evo_m0_rt.close()
+
+        pos_events = [
+            ReplayEvent(
+                name="HIST-POS-CONFIRM-SMALL",
+                action=confirm_b.action_name,
+                params={confirm_b.id_param: f"{confirm_b.id_prefix}{f_small.order_id}"},
+                actor=AI_OPS_ACTOR,
+                expected_valid=True,
+            ),
+            ReplayEvent(
+                name="HIST-POS-POST-SHIPPED",
+                action=post_b.action_name,
+                params={post_b.id_param: f"{post_b.id_prefix}{inv_draft_id}"},
+                actor=AI_OPS_ACTOR,
+                expected_valid=True,
+            ),
+        ]
+        if validate_b is not None:
+            pos_events.append(
+                ReplayEvent(
+                    name="HIST-POS-VALIDATE-PICKING",
+                    action=validate_b.action_name,
+                    params={validate_b.id_param: f"{validate_b.id_prefix}{p_assigned}"},
+                    actor=AI_OPS_ACTOR,
+                    expected_valid=True,
+                )
+            )
+        hist_cxs = [
+            IncidentCounterexample(
+                name="HIST-CX-OVER-CREDIT",
+                action=confirm_b.action_name,
+                params={confirm_b.id_param: f"{confirm_b.id_prefix}{f_large.order_id}"},
+                actor=AI_OPS_ACTOR,
+                expect_valid=False,
+                expect_error_code="CREDIT_LIMIT_EXCEEDED_REQUIRES_STEWARD",
+            ),
+            IncidentCounterexample(
+                name="HIST-CX-UNSHIPPED-POST",
+                action=post_b.action_name,
+                params={post_b.id_param: f"{post_b.id_prefix}{inv_unshipped_id}"},
+                actor=AI_OPS_ACTOR,
+                expect_valid=False,
+                expect_error_code="CANNOT_INVOICE_UNSHIPPED_ORDER",
+            ),
+        ]
+
+        ext_phenomenon_ctx = {
+            "target_system": "cloned_erp_l2_settlement",
+            "rule_provenance": {
+                "mechanical_legacy_erp_probing": [
+                    "Discovered transient wizard schemas & child move lines on cloned ERP.",
+                    "Empirically observed partial delivery validation transitions picking state assigned->done.",
+                    "Empirically observed customer payment registration decrements account.move.amount_residual and transitions payment_state not_paid -> partial (residual > 0) or paid (residual == 0).",
+                    "Empirically observed credit-note reversal sets original account.move payment_state='reversed' and amount_residual=0.0.",
+                ],
+                "nl_policy_and_friction_requirements": [
+                    "Keep existing L1 guardrails & existing fields intact (do NOT re-add fields already present in base_blueprint).",
+                    "Ensure a delivery validation action exists on StockPicking (if absent from base_blueprint, add validate_delivery_order: assigned -> done, bound to external_table='stock.picking', external_method='button_validate').",
+                    "Add M1 action register_invoice_payment on AccountMove (id param + float extra param) supporting 50% partial and 100% full settlement: reject draft invoices, amount <= 0, or amount > amount_residual; update amount_residual and use 'if_else' for payment_state ('paid' if residual - amount <= 0 else 'partial'). Bind via account.move external_method='action_create_payments' with extra_params naming the amount parameter.",
+                    "Add M1 action issue_credit_note_refund on AccountMove restricted to steward/admin (or requiring steward approval when actor is ai_agent): require state=='posted' and payment_state!='reversed'; set payment_state='reversed' and amount_residual=0.0; bind via account.move external_method='refund_moves' (keep any optional reason param required=False).",
+                ],
+            },
+            "observed_transitions": wizard_effects,
+            "discovered_wizard_schemas": wizard_catalog,
+        }
+
+        def _l2_behavioral_hook(
+            candidate_bp: DeclarativeBlueprint,
+            candidate_mapping: AdapterMappingSpec | None,
+        ) -> list[str]:
+            errs: list[str] = []
+            if candidate_mapping is None:
+                return ["AdapterMappingSpec must be updated for L2 capabilities."]
+            c_inv_em = next((e for e in candidate_mapping.entity_mappings if e.source_table == "account.move"), None)
+            if c_inv_em is None:
+                return ["Missing EntityMappingSpec for account.move."]
+            tf_names = {tf.target_field for tf in c_inv_em.field_transforms}
+            for req_f in ("amount_residual", "payment_state"):
+                if req_f not in tf_names:
+                    errs.append(f"account.move EntityMappingSpec missing field_transform for {req_f!r}.")
+
+            c_val = _find_binding(candidate_mapping, table="stock.picking", method_substr="validate")
+            c_pay, c_ref = _find_l2_bindings(candidate_mapping)
+            if c_val is None:
+                errs.append("Missing ActionExecutionBinding for stock.picking validation.")
+            if c_pay is None:
+                errs.append(
+                    "Missing ActionExecutionBinding on account.move for payment registration "
+                    "(e.g. action_name='register_invoice_payment', external_method='action_create_payments')."
+                )
+            if c_ref is None:
+                errs.append(
+                    "Missing ActionExecutionBinding on account.move for credit-note refund "
+                    "(e.g. action_name='issue_credit_note_refund', external_method='refund_moves')."
+                )
+            if errs:
+                return errs
+
+            assert c_pay is not None and c_ref is not None and c_val is not None
+            amt_p = _first_extra_param_name(candidate_bp, c_pay, prefer_numeric=True)
+            if not amt_p or amt_p not in c_pay.extra_params:
+                errs.append(
+                    f"Payment binding {c_pay.action_name!r} MUST declare its numeric amount param {amt_p!r} in extra_params."
+                )
+
+            act_map = {a.name: a for a in candidate_bp.actions}
+            for req_name in (c_val.action_name, c_pay.action_name, c_ref.action_name):
+                if req_name not in act_map:
+                    errs.append(f"Blueprint missing action {req_name!r} referenced by ActionExecutionBinding.")
+            if errs:
+                return errs
+
+            # Black-box behavioral checks in a compiled memory sandbox
+            try:
+                spec = compile_blueprint(candidate_bp, seed_ontology=seed)
+            except Exception as exc:
+                return [f"Failed to compile L2 blueprint: {exc}"]
+
+            rt = OntologyRuntime(spec, db_path=":memory:")
+            try:
+                inv_cls = spec.get_object_type(inv_type)
+                pick_cls = spec.get_object_type(pick_type)
+                rt.put_object(
+                    pick_cls(
+                        **{
+                            pick_pk: f"{pick_em.id_transform.prefix}901",
+                            "state": "assigned",
+                            "name": "WH/L2/901",
+                            "origin": "SO-L2",
+                        }
+                    )
+                )
+                rt.put_object(
+                    inv_cls(
+                        **{
+                            inv_pk: f"{inv_em.id_transform.prefix}901",
+                            "state": "posted",
+                            "name": "INV/L2/901",
+                            "move_type": "out_invoice",
+                            "invoice_origin": "SO-L2",
+                            "amount_total": 20000.0,
+                            "amount_residual": 20000.0,
+                            "payment_state": "not_paid",
+                        }
+                    )
+                )
+                rt.put_object(
+                    inv_cls(
+                        **{
+                            inv_pk: f"{inv_em.id_transform.prefix}902",
+                            "state": "posted",
+                            "name": "INV/L2/902",
+                            "move_type": "out_invoice",
+                            "invoice_origin": "SO-L2",
+                            "amount_total": 20000.0,
+                            "amount_residual": 20000.0,
+                            "payment_state": "not_paid",
+                        }
+                    )
+                )
+                rt.put_object(
+                    inv_cls(
+                        **{
+                            inv_pk: f"{inv_em.id_transform.prefix}903",
+                            "state": "draft",
+                            "name": "INV/L2/903",
+                            "move_type": "out_invoice",
+                            "invoice_origin": "SO-L2",
+                            "amount_total": 20000.0,
+                            "amount_residual": 20000.0,
+                            "payment_state": "not_paid",
+                        }
+                    )
+                )
+
+                # 1. Partial payment 50% (10,000 of 20,000)
+                s_part = rt.simulate_action(
+                    c_pay.action_name,
+                    {c_pay.id_param: f"{c_pay.id_prefix}901", amt_p: 10000.0},
+                    AI_OPS_ACTOR,
+                )
+                if not s_part.valid or s_part.requires_approval:
+                    errs.append(
+                        f"50% partial payment simulation should commit cleanly as ai_agent, got valid={s_part.valid}, approval={s_part.requires_approval}, err={s_part.error_code}"
+                    )
+                else:
+                    fk = rt.fork()
+                    try:
+                        fk.submit_action("SIM-PART", c_pay.action_name, {c_pay.id_param: f"{c_pay.id_prefix}901", amt_p: 10000.0}, AI_OPS_ACTOR)
+                        o = fk.get_object(inv_cls, f"{c_pay.id_prefix}901", AI_OPS_ACTOR)
+                        if abs(float(o.amount_residual) - 10000.0) > 0.01 or o.payment_state != "partial":
+                            errs.append(
+                                f"50% partial payment must yield amount_residual=10000.0 & payment_state='partial', got residual={o.amount_residual}, payment_state={o.payment_state!r}"
+                            )
+                    finally:
+                        fk.close()
+
+                # 2. Full payment 100% (20,000 of 20,000)
+                s_full = rt.simulate_action(
+                    c_pay.action_name,
+                    {c_pay.id_param: f"{c_pay.id_prefix}902", amt_p: 20000.0},
+                    AI_OPS_ACTOR,
+                )
+                if not s_full.valid or s_full.requires_approval:
+                    errs.append(f"100% full payment must be valid for ai_agent, got err={s_full.error_code}")
+                else:
+                    fk = rt.fork()
+                    try:
+                        fk.submit_action("SIM-FULL", c_pay.action_name, {c_pay.id_param: f"{c_pay.id_prefix}902", amt_p: 20000.0}, AI_OPS_ACTOR)
+                        o = fk.get_object(inv_cls, f"{c_pay.id_prefix}902", AI_OPS_ACTOR)
+                        if abs(float(o.amount_residual) - 0.0) > 0.01 or o.payment_state != "paid":
+                            errs.append(
+                                f"100% full payment must yield amount_residual=0.0 & payment_state='paid', got residual={o.amount_residual}, payment_state={o.payment_state!r}"
+                            )
+                    finally:
+                        fk.close()
+
+                # 3. Overpayment / negative / draft payment must reject
+                for bad_label, inv_num, amt in (
+                    ("overpayment", "901", 25000.0),
+                    ("non_positive", "901", 0.0),
+                    ("draft_invoice", "903", 10000.0),
+                ):
+                    s_bad = rt.simulate_action(
+                        c_pay.action_name,
+                        {c_pay.id_param: f"{c_pay.id_prefix}{inv_num}", amt_p: amt},
+                        AI_OPS_ACTOR,
+                    )
+                    if s_bad.valid:
+                        errs.append(f"Payment action MUST reject {bad_label}, but simulate_action returned valid=True.")
+
+                # 4. Delivery validation assigned -> done
+                s_val = rt.simulate_action(
+                    c_val.action_name,
+                    {c_val.id_param: f"{c_val.id_prefix}901"},
+                    AI_OPS_ACTOR,
+                )
+                if not s_val.valid or s_val.requires_approval:
+                    errs.append(
+                        f"Delivery validation {c_val.action_name!r} should commit cleanly for assigned picking, got valid={s_val.valid}, err={s_val.error_code}"
+                    )
+                else:
+                    fk = rt.fork()
+                    try:
+                        fk.submit_action("SIM-VAL", c_val.action_name, {c_val.id_param: f"{c_val.id_prefix}901"}, AI_OPS_ACTOR)
+                        po = fk.get_object(pick_cls, f"{c_val.id_prefix}901", AI_OPS_ACTOR)
+                        if po.state != "done":
+                            errs.append(f"Delivery validation must set picking.state='done', got {po.state!r}")
+                    finally:
+                        fk.close()
+
+                # 5. Steward credit-note refund vs ai_agent blocked/approval
+                s_ref_ai = rt.simulate_action(
+                    c_ref.action_name,
+                    {c_ref.id_param: f"{c_ref.id_prefix}901"},
+                    AI_OPS_ACTOR,
+                )
+                if s_ref_ai.valid and not s_ref_ai.requires_approval:
+                    errs.append("Credit-note refund MUST NOT commit unapproved for ai_agent.")
+                s_ref_st = rt.simulate_action(
+                    c_ref.action_name,
+                    {c_ref.id_param: f"{c_ref.id_prefix}901"},
+                    STEWARD_OPS_ACTOR,
+                )
+                if not s_ref_st.valid:
+                    errs.append(
+                        f"Steward credit-note refund simulation failed: err={s_ref_st.error_code} {s_ref_st.message}"
+                    )
+                else:
+                    fk = rt.fork()
+                    try:
+                        fk.submit_action("SIM-REF", c_ref.action_name, {c_ref.id_param: f"{c_ref.id_prefix}901"}, STEWARD_OPS_ACTOR)
+                        o = fk.get_object(inv_cls, f"{c_ref.id_prefix}901", STEWARD_OPS_ACTOR)
+                        if o.payment_state != "reversed" or abs(float(o.amount_residual) - 0.0) > 0.01:
+                            errs.append(
+                                f"Credit-note refund must set payment_state='reversed' & amount_residual=0.0, got payment_state={o.payment_state!r}, residual={o.amount_residual}"
+                            )
+                    finally:
+                        fk.close()
+            finally:
+                rt.close()
+            return errs
+
+        per_model_results: dict[str, Any] = {}
+        saved_bundle_payload: dict[str, Any] | None = None
+        for model_spec in models:
+            model_name, backend = _make_live_backend(model_spec)
+            ok_auth, auth_msg = _probe_backend_auth(backend)
+            if not ok_auth:
+                per_model_results[model_name] = {"status": "SKIPPED_AUTH_OR_NETWORK", "detail": auth_msg}
+                continue
+
+            with InductionGovernanceService(db_path=":memory:") as gov:
+                # Seed governance history with v1.0.0 -> v1.1.0 so Gate 4 preserves prior golden cases
+                def _v10_fn(_s: str, _u: str, _r: int) -> dict[str, Any]:
+                    return {
+                        "blueprint": bundle.blueprint.model_dump(mode="json"),
+                        "adapter_mapping": mapping_v1.model_dump(mode="json"),
+                        "proposed_eval_cases": [],
+                    }
+
+                builder = OntologyBuilderAgent(
+                    backend=CallableAbductionBackend(_v10_fn),
+                    governance=gov,
+                    crucible=SymbolicCrucible(),
+                    seed_ontology=seed,
+                )
+                g0 = builder.run_genesis_cycle(
+                    model_id="autonomous_o2c_fde",
+                    phenomenon_brief={"source_db": source_db},
+                    external_profile=profile,
+                    crucible_context=CrucibleContext(
+                        mode="genesis",
+                        replay_factory=build_auto_replay_factory(bundle),
+                        default_actor=AI_OPS_ACTOR,
+                        seed_ontology=seed,
+                    ),
+                    seed_ontology=seed,
+                    max_rounds=1,
+                )
+                assert g0.verified and g0.pending_approval_run_id is not None
+                gov.approve_crystallization(g0.pending_approval_run_id, STEWARD_ACTOR)
+
+                def _v11_fn(_s: str, _u: str, _r: int) -> dict[str, Any]:
+                    return {"patch": l1_patch.model_dump(mode="json")}
+
+                evolver_l1 = OntologyEvolverAgent(
+                    backend=CallableAbductionBackend(_v11_fn),
+                    governance=gov,
+                    crucible=SymbolicCrucible(),
+                    seed_ontology=seed,
+                )
+                g1 = evolver_l1.run_evolution_cycle(
+                    model_id="autonomous_o2c_fde",
+                    cluster=FrictionClusterSummary(
+                        cluster_id="L1-BASELINE-SYN",
+                        signal_kind="INVARIANT_GUARDRAIL_GAP",
+                        action_type=confirm_b.action_name,
+                        signature="over_credit+unshipped_post",
+                        support_count=2,
+                        run_ids=("L1-1", "L1-2"),
+                        escalated=True,
+                        evidences=(),
+                    ),
+                    crucible_context=CrucibleContext(
+                        mode="evolution",
+                        m0_objects=evo_m0,
+                        positive_events=[pos_events[0], pos_events[1]],
+                        incident_counterexamples=hist_cxs,
+                        default_actor=AI_OPS_ACTOR,
+                        seed_ontology=seed,
+                    ),
+                    seed_ontology=seed,
+                    max_rounds=1,
+                )
+                assert g1.verified and g1.pending_approval_run_id is not None, (
+                    f"L1 baseline seed failed: {g1.final_report.diagnostic_feedback()}"
+                )
+                gov.approve_crystallization(g1.pending_approval_run_id, STEWARD_ACTOR)
+
+                _log(f"ExpC (L2): starting live L2 Architect cycle for {model_name}")
+                t0 = time.monotonic()
+                architect = OntologyL2ArchitectAgent(
+                    backend=backend,
+                    governance=gov,
+                    crucible=SymbolicCrucible(),
+                    seed_ontology=seed,
+                )
+                l2_cycle = architect.run_l2_evolution_cycle(
+                    model_id="autonomous_o2c_fde",
+                    l2_tickets=l2_tickets,
+                    external_phenomenon_context=ext_phenomenon_ctx,
+                    crucible_context=CrucibleContext(
+                        mode="evolution",
+                        m0_objects=evo_m0,
+                        positive_events=pos_events,
+                        incident_counterexamples=hist_cxs,
+                        default_actor=AI_OPS_ACTOR,
+                        seed_ontology=seed,
+                    ),
+                    base_mapping=mapping_v1,
+                    seed_ontology=seed,
+                    max_rounds=max_rounds,
+                    l2_validation_hook=_l2_behavioral_hook,
+                )
+                elapsed_sec = round(time.monotonic() - t0, 2)
+                _log(
+                    f"ExpC (L2): finished for {model_name} verified={l2_cycle.verified} "
+                    f"rounds={len(l2_cycle.rounds)} elapsed={elapsed_sec}s"
+                )
+                entry: dict[str, Any] = {
+                    "status": "CRYSTALLIZED" if l2_cycle.verified else "REFUTED_AFTER_MAX_ROUNDS",
+                    "elapsed_sec": elapsed_sec,
+                    "rounds_used": len(l2_cycle.rounds),
+                    "round_traces": [
+                        {
+                            "round": tr.round_index,
+                            "passed": tr.passed,
+                            "failed_gates": list(tr.failed_gates),
+                            "feedback_preview": tr.feedback[:650],
+                        }
+                        for tr in l2_cycle.rounds
+                    ],
+                }
+                if getattr(backend, "last_usage", None):
+                    entry["last_usage"] = backend.last_usage
+
+                if l2_cycle.verified and l2_cycle.pending_approval_run_id is not None:
+                    gov.approve_crystallization(l2_cycle.pending_approval_run_id, STEWARD_ACTOR)
+                    bp_v2 = gov.get_active_blueprint("autonomous_o2c_fde")
+                    map_v2 = gov.get_active_adapter_mapping("autonomous_o2c_fde")
+                    assert bp_v2 is not None and map_v2 is not None
+
+                    _log(f"ExpC (L2): evaluating {model_name} v2.0.0 on live cloned Odoo 19")
+                    sc_v2 = evaluate_autonomous_fde_regime(
+                        regime_name=f"llm_{model_name}_v2.0",
+                        blueprint=bp_v2,
+                        adapter_mapping=map_v2,
+                        harness=harness,
+                        sandbox_client=sandbox_client,
+                        raw_baseline_tokens=raw_baseline_tokens,
+                        raw_total_models=raw_total_models,
+                        raw_total_fields=raw_total_fields,
+                        seed_ontology=seed,
+                    )
+                    entry["proposed_patch"] = (
+                        l2_cycle.patch.model_dump(mode="json") if l2_cycle.patch else None
+                    )
+                    entry["v2_live_odoo_evaluation"] = {
+                        "anti_smuggling_passed": sc_v2.anti_smuggling.passed,
+                        "anti_smuggling_violations": [v.__dict__ for v in sc_v2.anti_smuggling.violations],
+                        "strict_improvement_over_v1_1": is_strict_utility_improvement(sc_v11, sc_v2),
+                        "metrics": sc_v2.to_dict()["metrics"],
+                        "probes": [
+                            {
+                                "probe_id": p.probe_id,
+                                "bucket": p.bucket,
+                                "passed": p.passed,
+                                "observed": p.observed_outcome,
+                            }
+                            for p in sc_v2.probes
+                        ],
+                    }
+                    if saved_bundle_payload is None:
+                        saved_bundle_payload = {
+                            "model_id": "autonomous_o2c_fde",
+                            "source_db": source_db,
+                            "induced_by_model": model_name,
+                            "version": bp_v2.version,
+                            "rule_provenance": ext_phenomenon_ctx["rule_provenance"],
+                            "blueprint": bp_v2.model_dump(mode="json"),
+                            "adapter_mapping": map_v2.model_dump(mode="json"),
+                        }
+
+                per_model_results[model_name] = entry
+
+    if save_v2_bundle_path and saved_bundle_payload is not None:
+        p = Path(save_v2_bundle_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(saved_bundle_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "source_db": source_db,
+        "v1_1_baseline": {
+            "metrics": sc_v11.to_dict()["metrics"],
+            "l2_tickets": [t.to_dict() for t in l2_tickets],
+        },
+        "models": per_model_results,
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Live LLM (Gemini / Antigravity / OpenRouter) L1 Symbolic Gradient & Genesis Purification on Cloned Odoo 19"
+        description="Live LLM (Gemini / Antigravity / OpenRouter) Symbolic Gradient & Genesis/L2 Evolution on Cloned Odoo 19"
     )
     parser.add_argument(
         "--models",
@@ -1049,9 +1727,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["l1", "genesis", "both"],
+        choices=["l1", "genesis", "both", "l2"],
         default="l1",
-        help="Experiment mode: l1 (Exp A), genesis (Exp B), or both",
+        help="Experiment mode: l1 (Exp A), genesis (Exp B), both, or l2 (Exp C)",
     )
     parser.add_argument("--db", default=DB_NORTH)
     parser.add_argument("--max-rounds", type=int, default=4)
@@ -1059,6 +1737,11 @@ def main(argv: list[str] | None = None) -> None:
         "--output-json",
         default=None,
         help="Optional path to incrementally checkpoint experiment JSON results",
+    )
+    parser.add_argument(
+        "--save-v2-bundle",
+        default=None,
+        help="Optional path to export crystallized L2 v2.0.0 blueprint+adapter_mapping bundle",
     )
     args = parser.parse_args(argv)
 
@@ -1078,6 +1761,14 @@ def main(argv: list[str] | None = None) -> None:
     elif args.mode == "genesis":
         out = run_live_llm_genesis_purification_experiment(
             models=models, source_db=args.db, max_rounds=args.max_rounds
+        )
+        _checkpoint(out)
+    elif args.mode == "l2":
+        out = run_live_llm_l2_architect_experiment(
+            models=models,
+            source_db=args.db,
+            max_rounds=args.max_rounds,
+            save_v2_bundle_path=args.save_v2_bundle,
         )
         _checkpoint(out)
     else:

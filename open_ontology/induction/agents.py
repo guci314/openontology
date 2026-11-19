@@ -21,8 +21,9 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 from ..spec import Actor, InvariantError
 from .crucible import CrucibleContext, CrucibleReport, SymbolicCrucible
@@ -30,6 +31,7 @@ from .dsl import (
     DeclarativeBlueprint,
     EvolutionPatch,
     ProposedEvalCase,
+    apply_adapter_mapping_patch,
     apply_evolution_patch,
     dsl_schema_prompt_guide,
 )
@@ -41,12 +43,15 @@ from .phenomenon import (
     project_external_phenomenon,
 )
 from .seed import SeedOntology
+from .utility import L2EvolutionTicket
 
 __all__ = [
     "BUILDER_SYSTEM_PROMPT",
     "EVOLVER_SYSTEM_PROMPT",
+    "L2_ARCHITECT_SYSTEM_PROMPT",
     "build_builder_system_prompt",
     "build_evolver_system_prompt",
+    "build_l2_architect_system_prompt",
     "AbductionBackend",
     "CallableAbductionBackend",
     "GeminiAbductionBackend",
@@ -57,6 +62,7 @@ __all__ = [
     "InductionCycleResult",
     "OntologyBuilderAgent",
     "OntologyEvolverAgent",
+    "OntologyL2ArchitectAgent",
 ]
 
 
@@ -455,6 +461,18 @@ _EVOLVER_PERSONA_HEADER = (
     "SCHEMA_GUIDE:\n"
 )
 
+_L2_ARCHITECT_PERSONA_HEADER = (
+    "You are Ontology L2 Architect (本体结构与业务规则架构师). "
+    "Given L2EvolutionTickets (structural expressivity/capability/settlement gaps), the current "
+    "DeclarativeBlueprint + AdapterMappingSpec, and external domain phenomenon context, propose a pure M1 "
+    "EvolutionPatch JSON adding new M1 fields/relations/actions (using safe 'if_else'/arithmetic expressions "
+    "and preconditions), FieldMigrations, update_entity_mappings, declarative 1-to-1 "
+    "add_action_bindings/update_action_bindings (declaring extra_params when actions take extra arguments), "
+    "and self-contained ProposedEvalCase assertions. Output ONLY valid JSON matching the exact schema below.\n"
+    "Never embed external wire/ORM protocols, concrete instance IDs, or break historical eval cases.\n"
+    "SCHEMA_GUIDE:\n"
+)
+
 
 def build_builder_system_prompt(
     *,
@@ -476,8 +494,19 @@ def build_evolver_system_prompt(*, seed_ontology: SeedOntology | None = None) ->
     return f"{_EVOLVER_PERSONA_HEADER}{dsl_schema_prompt_guide(mode='evolution', seed_ontology=seed_ontology)}"
 
 
+def build_l2_architect_system_prompt(*, seed_ontology: SeedOntology | None = None) -> str:
+    guide = dsl_schema_prompt_guide(mode="evolution", seed_ontology=seed_ontology)
+    adapter_schema = json.dumps(
+        AdapterMappingSpec.model_json_schema(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return f"{_L2_ARCHITECT_PERSONA_HEADER}{guide}\nADAPTER_MAPPING_SCHEMA:\n{adapter_schema}"
+
+
 BUILDER_SYSTEM_PROMPT = build_builder_system_prompt(include_adapter_schema=True)
 EVOLVER_SYSTEM_PROMPT = build_evolver_system_prompt()
+L2_ARCHITECT_SYSTEM_PROMPT = build_l2_architect_system_prompt()
 
 
 @dataclass(frozen=True)
@@ -750,9 +779,15 @@ class OntologyEvolverAgent:
         cluster: FrictionClusterSummary,
         crucible_context: CrucibleContext,
         base_blueprint: DeclarativeBlueprint | None = None,
+        base_mapping: AdapterMappingSpec | None = None,
         seed_ontology: SeedOntology | None = None,
         max_rounds: int = 4,
         proposal_id: str | None = None,
+        system_prompt_override: str | None = None,
+        extra_prompt_context: dict[str, Any] | None = None,
+        l2_validation_hook: Callable[
+            [DeclarativeBlueprint, AdapterMappingSpec | None], list[str]
+        ] | None = None,
     ) -> InductionCycleResult:
         if crucible_context.mode != "evolution":
             raise ValueError("OntologyEvolverAgent requires crucible_context.mode == 'evolution'")
@@ -769,6 +804,11 @@ class OntologyEvolverAgent:
                 f"no active crystallized blueprint found for model {model_id!r}",
                 code="NO_ACTIVE_MODEL",
             )
+        active_base_mapping = (
+            base_mapping
+            or crucible_context.adapter_mapping
+            or self.governance.get_active_adapter_mapping(model_id)
+        )
 
         # Record friction cluster under crucible's own actor
         self.governance.runtime.submit_action(
@@ -799,12 +839,13 @@ class OntologyEvolverAgent:
         merged_ctx.golden_eval_cases = combined_golden
 
         pid = proposal_id or f"PROP-EVO-{model_id}-{uuid.uuid4().hex[:6]}"
-        sys_prompt = build_evolver_system_prompt(seed_ontology=active_seed)
+        sys_prompt = system_prompt_override or build_evolver_system_prompt(seed_ontology=active_seed)
         traces: list[InductionRoundTrace] = []
         last_feedback = ""
         last_report: CrucibleReport | None = None
         last_blueprint: DeclarativeBlueprint = base
         last_patch: EvolutionPatch | None = None
+        last_mapping: AdapterMappingSpec | None = active_base_mapping
         pending_run_id: str | None = None
         proposal_created = False
 
@@ -833,8 +874,12 @@ class OntologyEvolverAgent:
                 },
                 "previous_crucible_feedback": last_feedback,
             }
+            if active_base_mapping is not None:
+                prompt_payload["base_adapter_mapping"] = active_base_mapping.model_dump(mode="json")
             if active_seed is not None:
                 prompt_payload["seed_ontology"] = active_seed.prompt_summary()
+            if extra_prompt_context:
+                prompt_payload.update(extra_prompt_context)
             rid = f"RPT-{pid}-R{r}"
             try:
                 raw_patch = self.backend.propose_json(
@@ -846,6 +891,7 @@ class OntologyEvolverAgent:
                     raise ValueError(f"expected JSON object from backend, got {type(raw_patch).__name__}")
                 patch = EvolutionPatch.model_validate(raw_patch.get("patch", raw_patch))
                 candidate = apply_evolution_patch(base, patch)
+                updated_mapping = apply_adapter_mapping_patch(active_base_mapping, patch)
             except Exception as exc:
                 # P0-1 fix: catch schema/patch errors and feed back into next CEGIS round
                 report = self.crucible.record_parse_failure(
@@ -874,8 +920,10 @@ class OntologyEvolverAgent:
 
             last_patch = patch
             last_blueprint = candidate
+            last_mapping = updated_mapping
             bp_json = candidate.model_dump_json()
             patch_json = patch.model_dump_json()
+            mapping_json = updated_mapping.model_dump_json() if updated_mapping is not None else "{}"
             cases_json = json.dumps(
                 [c.model_dump(mode="json") for c in patch.proposed_eval_cases],
                 ensure_ascii=False,
@@ -893,6 +941,7 @@ class OntologyEvolverAgent:
                         "title": f"Evolve {model_id} {base.version}->{patch.target_version}",
                         "rationale": patch.rationale,
                         "blueprint_json": bp_json,
+                        "adapter_mapping_json": mapping_json,
                         "patch_json": patch_json,
                         "proposed_eval_cases_json": cases_json,
                     },
@@ -907,10 +956,19 @@ class OntologyEvolverAgent:
                         "proposal_id": pid,
                         "rationale": patch.rationale,
                         "blueprint_json": bp_json,
+                        "adapter_mapping_json": mapping_json,
                         "patch_json": patch_json,
                         "proposed_eval_cases_json": cases_json,
                     },
                     self.actor,
+                )
+
+            round_ctx = copy.copy(merged_ctx)
+            round_ctx.adapter_mapping = updated_mapping
+            round_ctx.extra_gate2_errors = list(merged_ctx.extra_gate2_errors)
+            if l2_validation_hook is not None:
+                round_ctx.extra_gate2_errors.extend(
+                    l2_validation_hook(candidate, updated_mapping)
                 )
 
             report = self.crucible.verify_and_record(
@@ -918,7 +976,7 @@ class OntologyEvolverAgent:
                 proposal_id=pid,
                 report_id=rid,
                 candidate=candidate,
-                context=merged_ctx,
+                context=round_ctx,
                 patch=patch,
             )
             last_report = report
@@ -955,4 +1013,80 @@ class OntologyEvolverAgent:
             final_report=last_report,
             candidate_blueprint=last_blueprint,
             patch=last_patch,
+            adapter_mapping=last_mapping,
+        )
+
+
+class OntologyL2ArchitectAgent:
+    """Anthropomorphized 1->N L2 M1 structural & business-rule architect over SymbolicCrucible."""
+
+    persona_name: str = "Ontology L2 Architect (本体结构与业务规则架构师)"
+
+    def __init__(
+        self,
+        *,
+        backend: AbductionBackend,
+        governance: InductionGovernanceService,
+        crucible: SymbolicCrucible | None = None,
+        seed_ontology: SeedOntology | None = None,
+        actor: Actor = EVOLVER_ACTOR,
+    ) -> None:
+        self._evolver = OntologyEvolverAgent(
+            backend=backend,
+            governance=governance,
+            crucible=crucible,
+            seed_ontology=seed_ontology,
+            actor=actor,
+        )
+        self._evolver.persona_name = self.persona_name
+
+    def run_l2_evolution_cycle(
+        self,
+        *,
+        model_id: str,
+        l2_tickets: Sequence[L2EvolutionTicket],
+        crucible_context: CrucibleContext,
+        external_phenomenon_context: Mapping[str, Any] | None = None,
+        base_blueprint: DeclarativeBlueprint | None = None,
+        base_mapping: AdapterMappingSpec | None = None,
+        seed_ontology: SeedOntology | None = None,
+        max_rounds: int = 4,
+        proposal_id: str | None = None,
+        l2_validation_hook: Callable[
+            [DeclarativeBlueprint, AdapterMappingSpec | None], list[str]
+        ] | None = None,
+    ) -> InductionCycleResult:
+        if not l2_tickets:
+            raise ValueError("OntologyL2ArchitectAgent requires at least one L2EvolutionTicket")
+
+        cluster = FrictionClusterSummary(
+            cluster_id=f"L2-STRUCT-{model_id}-{uuid.uuid4().hex[:6]}",
+            signal_kind="L2_CAPABILITY_GAP",
+            action_type=l2_tickets[0].capability_gap,
+            signature="+".join(sorted({t.probe_id for t in l2_tickets})),
+            support_count=max(2, len(l2_tickets)),
+            run_ids=tuple(t.ticket_id for t in l2_tickets),
+            escalated=True,
+            evidences=(),
+        )
+        active_seed = (
+            seed_ontology or crucible_context.seed_ontology or self._evolver.seed_ontology
+        )
+        sys_prompt = build_l2_architect_system_prompt(seed_ontology=active_seed)
+        extra_ctx: dict[str, Any] = {
+            "l2_tickets": [t.to_dict() for t in l2_tickets],
+            "external_phenomenon_context": dict(external_phenomenon_context or {}),
+        }
+        return self._evolver.run_evolution_cycle(
+            model_id=model_id,
+            cluster=cluster,
+            crucible_context=crucible_context,
+            base_blueprint=base_blueprint,
+            base_mapping=base_mapping,
+            seed_ontology=active_seed,
+            max_rounds=max_rounds,
+            proposal_id=proposal_id or f"PROP-L2-{model_id}-{uuid.uuid4().hex[:6]}",
+            system_prompt_override=sys_prompt,
+            extra_prompt_context=extra_ctx,
+            l2_validation_hook=l2_validation_hook,
         )

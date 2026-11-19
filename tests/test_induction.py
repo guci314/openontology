@@ -1346,3 +1346,386 @@ def test_extract_json_object_handles_trailing_extra_data_and_wall_clock_deadline
     dummy_req = urllib.request.Request("https://example.invalid", method="POST")
     with pytest.raises(TimeoutError, match="hard wall-clock deadline"):
         _read_http_body_with_deadline(dummy_req, timeout_sec=1.0)
+
+
+def test_l2_architect_agent_evolves_m1_if_else_and_extra_params() -> None:
+    """Verify if_else value AST, apply_adapter_mapping_patch, and OntologyL2ArchitectAgent with Gate 2 hook."""
+    from open_ontology.induction import (
+        ActionExecutionBinding,
+        AdapterMappingSpec,
+        EntityMappingSpec,
+        FieldTransformSpec,
+        L2EvolutionTicket,
+        OntologyL2ArchitectAgent,
+        apply_adapter_mapping_patch,
+    )
+
+    # 1. Verify 'if_else' AST validation + runtime execution
+    pay_cond = {
+        "op": "le",
+        "left": {"op": "sub", "left": {"ref": "obj.amount_residual"}, "right": {"ref": "param.amount"}},
+        "right": {"lit": 0.0},
+    }
+    if_else_ast = {
+        "op": "if_else",
+        "cond": pay_cond,
+        "then": {"lit": "paid"},
+        "else": {"lit": "partial"},
+    }
+    assert validate_predicate_ast(pay_cond) == 4
+
+    base_bp = DeclarativeBlueprint(
+        model_id="l2_unit_o2c",
+        version="1.0.0",
+        description="Minimal L1 baseline lacking payment_state/amount_residual and wizard protocols.",
+        object_types=[
+            ObjectTypeBlueprint(
+                name="AccountMove",
+                primary_key="record_id",
+                fields=[
+                    FieldSpec(name="record_id", field_type="str", primary_key=True),
+                    FieldSpec(name="state", field_type="str", default="draft"),
+                    FieldSpec(name="amount_total", field_type="float", default=0.0),
+                ],
+                status_field="state",
+                initial_statuses=["draft", "posted"],
+                transitions={"draft": ["posted"], "posted": []},
+            )
+        ],
+        actions=[
+            ActionBlueprint(
+                name="account_move__action_post",
+                allowed_roles=["ai_agent", "steward"],
+                params=[FieldSpec(name="record_id", field_type="str", required=True)],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="must_be_draft",
+                        code="INVALID_STATE",
+                        target_type="AccountMove",
+                        id_param="record_id",
+                        must_hold={"op": "eq", "left": {"ref": "obj.state"}, "right": {"lit": "draft"}},
+                    )
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="AccountMove",
+                        id_param="record_id",
+                        set_fields={"state": {"lit": "posted"}},
+                    )
+                ],
+            )
+        ],
+    )
+    base_mapping = AdapterMappingSpec(
+        mapping_id="l2_unit_o2c_map_v1",
+        source_kind="discovered_erp",
+        entity_mappings=[
+            EntityMappingSpec(
+                source_table="account.move",
+                target_object_type="AccountMove",
+                id_transform=FieldTransformSpec(
+                    target_field="record_id", source_field="id", kind="id_prefix", prefix="INV-"
+                ),
+                field_transforms=[
+                    FieldTransformSpec(target_field="state", source_field="state", kind="direct", default="draft"),
+                    FieldTransformSpec(target_field="amount_total", source_field="amount_total", kind="direct", default=0.0),
+                ],
+            )
+        ],
+        action_bindings=[
+            ActionExecutionBinding(
+                action_name="account_move__action_post",
+                external_table="account.move",
+                external_method="action_post",
+                target_object_type="AccountMove",
+                id_param="record_id",
+                id_prefix="INV-",
+                expected_state_field="state",
+                expected_state_after="posted",
+            )
+        ],
+    )
+
+    m0_objs = [
+        {"object_type": "AccountMove", "data": {"record_id": "INV-1", "state": "draft", "amount_total": 100.0}},
+        {"object_type": "AccountMove", "data": {"record_id": "INV-2", "state": "posted", "amount_total": 100.0}},
+    ]
+
+    with InductionGovernanceService(db_path=":memory:") as gov:
+        # Crystallize v1.0.0 first via Builder
+        def _gen_backend(_s: str, _u: str, _r: int) -> dict[str, Any]:
+            return {"blueprint": base_bp.model_dump(mode="json"), "adapter_mapping": base_mapping.model_dump(mode="json")}
+
+        builder = OntologyBuilderAgent(backend=CallableAbductionBackend(_gen_backend), governance=gov)
+        gen = builder.run_genesis_cycle(
+            model_id="l2_unit_o2c",
+            phenomenon_brief={"tables": ["account.move"]},
+            crucible_context=CrucibleContext(
+                mode="genesis",
+                m0_objects=m0_objs,
+                positive_events=[
+                    ReplayEvent(
+                        name="POS-POST",
+                        action="account_move__action_post",
+                        params={"record_id": "INV-1"},
+                        actor=AI_AGENT,
+                        expected_valid=True,
+                    )
+                ],
+                incident_counterexamples=[
+                    IncidentCounterexample(
+                        name="CX-ALREADY-POSTED",
+                        action="account_move__action_post",
+                        params={"record_id": "INV-2"},
+                        actor=AI_AGENT,
+                        expect_valid=False,
+                        expect_error_code="INVALID_STATE",
+                    )
+                ],
+                default_actor=AI_AGENT,
+            ),
+            max_rounds=1,
+        )
+        assert gen.verified and gen.pending_approval_run_id is not None
+        gov.approve_crystallization(gen.pending_approval_run_id, STEWARD_ACTOR)
+
+        # Round 1 proposes partial patch without protocol_steps (caught by l2_validation_hook); Round 2 fixes it
+        def _l2_backend(_s: str, _u: str, round_idx: int) -> dict[str, Any]:
+            missing_steps = round_idx == 1
+            patch = EvolutionPatch(
+                patch_id="PATCH-L2-UNIT",
+                base_version="1.0.0",
+                target_version="2.0.0",
+                rationale="Add partial payment tracking + transient wizard protocol binding.",
+                add_fields={
+                    "AccountMove": [
+                        FieldSpec(name="amount_residual", field_type="float", default=100.0),
+                        FieldSpec(name="payment_state", field_type="str", default="not_paid"),
+                    ]
+                },
+                add_actions=[
+                    ActionBlueprint(
+                        name="register_invoice_payment",
+                        allowed_roles=["ai_agent", "steward"],
+                        params=[
+                            FieldSpec(name="record_id", field_type="str", required=True),
+                            FieldSpec(name="amount", field_type="float", required=True),
+                        ],
+                        preconditions=[
+                            InvariantRuleSpec(
+                                name="posted_only",
+                                code="INVOICE_NOT_POSTED",
+                                target_type="AccountMove",
+                                id_param="record_id",
+                                must_hold={"op": "eq", "left": {"ref": "obj.state"}, "right": {"lit": "posted"}},
+                            ),
+                            InvariantRuleSpec(
+                                name="positive_within_residual",
+                                code="INVALID_PAYMENT_AMOUNT",
+                                target_type="AccountMove",
+                                id_param="record_id",
+                                must_hold={
+                                    "op": "and",
+                                    "args": [
+                                        {"op": "gt", "left": {"ref": "param.amount"}, "right": {"lit": 0.0}},
+                                        {"op": "le", "left": {"ref": "param.amount"}, "right": {"ref": "obj.amount_residual"}},
+                                    ],
+                                },
+                            ),
+                        ],
+                        mutations=[
+                            ActionMutationSpec(
+                                op="modify",
+                                object_type="AccountMove",
+                                id_param="record_id",
+                                set_fields={
+                                    "amount_residual": {"op": "sub", "left": {"ref": "obj.amount_residual"}, "right": {"ref": "param.amount"}},
+                                    "payment_state": if_else_ast,
+                                },
+                            )
+                        ],
+                    )
+                ],
+                migrations=[
+                    FieldMigrationSpec(object_type="AccountMove", field="amount_residual", op="add_default", default=100.0),
+                    FieldMigrationSpec(object_type="AccountMove", field="payment_state", op="add_default", default="not_paid"),
+                ],
+                update_entity_mappings=[
+                    EntityMappingSpec(
+                        source_table="account.move",
+                        target_object_type="AccountMove",
+                        id_transform=FieldTransformSpec(target_field="record_id", source_field="id", kind="id_prefix", prefix="INV-"),
+                        field_transforms=[
+                            FieldTransformSpec(target_field="state", source_field="state", kind="direct", default="draft"),
+                            FieldTransformSpec(target_field="amount_total", source_field="amount_total", kind="direct", default=0.0),
+                            FieldTransformSpec(target_field="amount_residual", source_field="amount_residual", kind="direct", default=0.0),
+                            FieldTransformSpec(target_field="payment_state", source_field="payment_state", kind="direct", default="not_paid"),
+                        ],
+                    )
+                ],
+                add_action_bindings=[
+                    ActionExecutionBinding(
+                        action_name="register_invoice_payment",
+                        external_table="account.move",
+                        external_method="action_create_payments",
+                        target_object_type="AccountMove",
+                        id_param="record_id",
+                        id_prefix="INV-",
+                        extra_params=[] if missing_steps else ["amount"],
+                    )
+                ],
+                proposed_eval_cases=[
+                    ProposedEvalCase(
+                        name="EVAL-L2-PARTIAL",
+                        description="50% payment yields partial; remaining 50% yields paid.",
+                        actor={"actor_id": "eval:ai_agent", "role": "ai_agent"},
+                        action="register_invoice_payment",
+                        params={"record_id": "INV-EVAL", "amount": 40.0},
+                        setup_objects=[
+                            {
+                                "object_type": "AccountMove",
+                                "data": {
+                                    "record_id": "INV-EVAL",
+                                    "state": "posted",
+                                    "amount_total": 100.0,
+                                    "amount_residual": 100.0,
+                                    "payment_state": "not_paid",
+                                },
+                            }
+                        ],
+                        expect={"valid": True, "requires_approval": False},
+                    )
+                ],
+            )
+            return {"patch": patch.model_dump(mode="json")}
+
+        def _l2_hook(_bp: DeclarativeBlueprint, mp: AdapterMappingSpec | None) -> list[str]:
+            if mp is None:
+                return ["missing adapter_mapping"]
+            pb = mp.get_action_binding("register_invoice_payment")
+            if pb is None or "amount" not in pb.extra_params:
+                return ["register_invoice_payment binding missing required extra_params=['amount']"]
+            return []
+
+        architect = OntologyL2ArchitectAgent(backend=CallableAbductionBackend(_l2_backend), governance=gov)
+        res = architect.run_l2_evolution_cycle(
+            model_id="l2_unit_o2c",
+            l2_tickets=[
+                L2EvolutionTicket(
+                    ticket_id="TKT-T4-1",
+                    probe_id="T4-1",
+                    bucket="T4_escape",
+                    capability_gap="partial_payment_settlement",
+                    title="Partial customer payment",
+                    why_l1_insufficient="Requires parameterized payment registration.",
+                    external_evidence={},
+                    red_test_spec={},
+                )
+            ],
+            external_phenomenon_context={
+                "table": "account.move",
+                "observed_fields": ["amount_residual", "payment_state"],
+            },
+            crucible_context=CrucibleContext(
+                mode="evolution",
+                m0_objects=m0_objs,
+                positive_events=[
+                    ReplayEvent(name="POS-HIST", action="account_move__action_post", params={"record_id": "INV-1"}, actor=AI_AGENT, expected_valid=True),
+                    ReplayEvent(name="POS-PART", action="register_invoice_payment", params={"record_id": "INV-2", "amount": 40.0}, actor=AI_AGENT, expected_valid=True),
+                ],
+                incident_counterexamples=[
+                    IncidentCounterexample(
+                        name="CX-OVERPAY",
+                        action="register_invoice_payment",
+                        params={"record_id": "INV-2", "amount": 200.0},
+                        actor=AI_AGENT,
+                        expect_valid=False,
+                        expect_error_code="INVALID_PAYMENT_AMOUNT",
+                    )
+                ],
+                default_actor=AI_AGENT,
+            ),
+            max_rounds=3,
+            l2_validation_hook=_l2_hook,
+        )
+        assert len(res.rounds) == 2
+        assert res.rounds[0].passed is False
+        assert "gate_2_m0_grounding" in res.rounds[0].failed_gates
+        assert "extra_params" in res.rounds[0].feedback
+        assert res.verified is True and res.pending_approval_run_id is not None
+
+        gov.approve_crystallization(res.pending_approval_run_id, STEWARD_ACTOR)
+        active_bp = gov.get_active_blueprint("l2_unit_o2c")
+        active_mp = gov.get_active_adapter_mapping("l2_unit_o2c")
+        assert active_bp is not None and active_bp.version == "2.0.0"
+        assert active_mp is not None
+        pay_binding = active_mp.get_action_binding("register_invoice_payment")
+        assert pay_binding is not None and pay_binding.extra_params == ["amount"]
+
+        # Runtime check of consecutive 40 + 60 partial->paid if_else evaluation
+        rt = OntologyRuntime(compile_blueprint(active_bp), db_path=":memory:")
+        try:
+            cls = rt.spec.get_object_type("AccountMove")
+            rt.put_object(cls(record_id="INV-RUN", state="posted", amount_total=100.0, amount_residual=100.0, payment_state="not_paid"))
+            rt.submit_action("PAY-1", "register_invoice_payment", {"record_id": "INV-RUN", "amount": 40.0}, AI_AGENT)
+            obj1 = rt.get_object(cls, "INV-RUN", AI_AGENT)
+            assert obj1.amount_residual == pytest.approx(60.0)
+            assert obj1.payment_state == "partial"
+            rt.submit_action("PAY-2", "register_invoice_payment", {"record_id": "INV-RUN", "amount": 60.0}, AI_AGENT)
+            obj2 = rt.get_object(cls, "INV-RUN", AI_AGENT)
+            assert obj2.amount_residual == pytest.approx(0.0)
+            assert obj2.payment_state == "paid"
+        finally:
+            rt.close()
+
+        # Sanity check direct helper apply_adapter_mapping_patch
+        assert res.patch is not None
+        patched_mp = apply_adapter_mapping_patch(base_mapping, res.patch)
+        assert patched_mp is not None and patched_mp.get_action_binding("register_invoice_payment") is not None
+
+
+def test_induction_kernel_zero_psm_or_protocol_smuggling() -> None:
+    """Enforce pure M2 architecture: zero Odoo/vendor/PSM protocol tokens inside open_ontology/induction/."""
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    ind_dir = repo_root / "open_ontology" / "induction"
+    forbidden = (
+        "odoo",
+        "sale.order",
+        "stock.picking",
+        "account.move",
+        "res.partner",
+        "purchase.order",
+        "bottlecrm",
+        "many2one",
+        "m2m_ext_id",
+        "record_m2o",
+        "externalprotocolstep",
+        "prepare_child_quantities",
+        "call_and_follow_transient",
+        "create_and_call_transient",
+        "post_created_document",
+        "context_active_table",
+        "outbox",
+        "writeback",
+        "target_system",
+        "retry_count",
+        "last_error",
+        "lineage",
+    )
+    for py_path in sorted(ind_dir.glob("*.py")):
+        low = py_path.read_text(encoding="utf-8").lower()
+        for tok in forbidden:
+            assert tok not in low, f"PSM / vendor / banned IT token {tok!r} leaked into {py_path.name}"
+
+    if (repo_root / ".git").exists():
+        diff_res = subprocess.run(
+            ["git", "diff", "open_ontology/spec.py", "open_ontology/runtime.py"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert diff_res.stdout == "", f"spec.py / runtime.py must stay unmodified:\n{diff_res.stdout}"

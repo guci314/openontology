@@ -88,7 +88,7 @@ class FieldTransformSpec(BaseModel):
     kind: Literal[
         "direct",
         "id_prefix",
-        "many2one_id",
+        "foreign_key_id",
         "lookup_join",
         "enum_map",
         "scale_int",
@@ -129,6 +129,7 @@ class ActionExecutionBinding(BaseModel):
     expected_state_field: str = ""
     expected_state_after: str = ""
     readback_tables: list[str] = Field(default_factory=list)
+    extra_params: list[str] = Field(default_factory=list)
 
 
 class AdapterMappingSpec(BaseModel):
@@ -199,7 +200,7 @@ def _apply_field_transform(
         if raw is None:
             return copy.deepcopy(tf.default)
         return f"{tf.prefix}{raw}"
-    if tf.kind == "many2one_id":
+    if tf.kind == "foreign_key_id":
         raw = row.get(tf.source_field)
         if raw is None or raw is False:
             return copy.deepcopy(tf.default)
@@ -234,7 +235,7 @@ def _apply_field_transform(
 def toposort_entity_mappings(
     mappings: list[EntityMappingSpec],
 ) -> tuple[list[EntityMappingSpec], list[str]]:
-    """Order entity_mappings so lookup_join and many2one_id parent tables precede dependent tables."""
+    """Order entity_mappings so lookup_join and foreign_key_id parent tables precede dependent tables."""
     idx_by_table: dict[str, list[int]] = defaultdict(list)
     idx_by_prefix: dict[str, list[int]] = defaultdict(list)
     for idx, em in enumerate(mappings):
@@ -266,10 +267,10 @@ def toposort_entity_mappings(
             stack.extend(rev[node])
         return False
 
-    # Soft-order many2one_id parent entities before child entities whenever acyclic
+    # Soft-order foreign_key_id parent entities before child entities whenever acyclic
     for idx, em in enumerate(mappings):
         for tf in em.field_transforms:
-            if tf.kind == "many2one_id" and tf.prefix:
+            if tf.kind == "foreign_key_id" and tf.prefix:
                 for dep_idx in idx_by_prefix.get(tf.prefix, []):
                     if dep_idx != idx and dep_idx not in deps[idx] and not _reachable(idx, dep_idx):
                         deps[idx].add(dep_idx)

@@ -28,14 +28,18 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
 import tempfile
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from open_ontology import Actor, DEVICE_STATE_MISMATCH, LatentSpace, OntologyRuntime
 from open_ontology.induction import (
@@ -304,7 +308,7 @@ def synthesize_from_fde_evidence(
                             FieldTransformSpec(
                                 target_field=f.name,
                                 source_field=f.name,
-                                kind="many2one_id",
+                                kind="foreign_key_id",
                                 prefix=prefix_by_model[f.relation_target],
                                 default=None,
                             )
@@ -325,7 +329,7 @@ def synthesize_from_fde_evidence(
                     FieldTransformSpec(
                         target_field=f.name,
                         source_field=f.name,
-                        kind="many2one_id",
+                        kind="foreign_key_id",
                         prefix=prefix_by_model.get(f.relation_target or "", ""),
                         default="",
                     )
@@ -636,6 +640,30 @@ class HomomorphicExecutionResult:
     observed_state_after: str | None
 
 
+class OdooProtocolStep(BaseModel):
+    """Odoo-specific PSM multi-step execution / transient wizard protocol step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal[
+        "call_method",
+        "prepare_child_quantities",
+        "call_and_follow_transient",
+        "create_and_call_transient",
+        "post_created_document",
+    ]
+    external_table: str = ""
+    method: str = ""
+    transient_method: str = ""
+    fallback_method: str = ""
+    parent_key_field: str = ""
+    source_qty_field: str = ""
+    target_qty_field: str = ""
+    flag_field: str = ""
+    context_active_table: str = ""
+    payload_template: dict[str, Any] = Field(default_factory=dict)
+
+
 class DeclarativeOdooBridge:
     """Generic bidirectional runtime bridge driven purely by crystallized AdapterMappingSpec."""
 
@@ -646,11 +674,15 @@ class DeclarativeOdooBridge:
         adapter_mapping: AdapterMappingSpec,
         sandbox: ProbeSandboxInterface,
         latent_db_path: str | Path,
+        protocol_overrides: Mapping[str, Sequence[OdooProtocolStep]] | None = None,
     ) -> None:
         self.memory_runtime = memory_runtime
         self.adapter_mapping = adapter_mapping
         self.sandbox = sandbox
         self.latent = LatentSpace(memory_runtime, latent_db_path)
+        self.protocol_overrides: dict[str, list[OdooProtocolStep]] = {
+            k: list(v) for k, v in (protocol_overrides or {}).items()
+        }
 
     def close(self) -> None:
         self.latent.close()
@@ -660,6 +692,164 @@ class DeclarativeOdooBridge:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    def execute_external_binding(
+        self,
+        binding: ActionExecutionBinding,
+        ext_id: int,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        """Execute either simple external method or Odoo PSM OdooProtocolStep sequence."""
+        steps = self.protocol_overrides.get(binding.action_name, [])
+        if not steps:
+            return self.sandbox.call_method(binding.external_table, binding.external_method, [ext_id])
+
+        rpc_client = getattr(self.sandbox, "_client", None)
+        if rpc_client is None and hasattr(self.sandbox, "execute_kw"):
+            rpc_client = self.sandbox
+        if rpc_client is None:
+            raise RuntimeError(
+                f"action {binding.action_name!r} uses OdooProtocolStep overrides requiring RPC client"
+            )
+
+        action_params = dict(params or {})
+        m2o_cache: dict[str, Any] | None = None
+
+        def _read_target_record() -> dict[str, Any]:
+            nonlocal m2o_cache
+            if m2o_cache is None:
+                rows = self.sandbox.search_read(
+                    binding.external_table,
+                    [("id", "=", ext_id)],
+                    [],
+                    limit=1,
+                )
+                m2o_cache = dict(rows[0]) if rows else {}
+            return m2o_cache
+
+        def _resolve_val(val: Any) -> Any:
+            if isinstance(val, str):
+                if val == "$ext_id":
+                    return ext_id
+                if val == "$m2m_ext_id":
+                    return [(6, 0, [ext_id])]
+                if val == "$today":
+                    return datetime.date.today().isoformat()
+                if val.startswith("$param."):
+                    pname = val[len("$param.") :]
+                    return action_params.get(pname)
+                if val.startswith("$record_m2o."):
+                    fname = val[len("$record_m2o.") :]
+                    raw = _read_target_record().get(fname)
+                    if isinstance(raw, (list, tuple)) and raw:
+                        return int(raw[0])
+                    if isinstance(raw, int) and not isinstance(raw, bool):
+                        return int(raw)
+                    return None
+                return val
+            if isinstance(val, list):
+                return [_resolve_val(x) for x in val]
+            if isinstance(val, dict):
+                return {k: _resolve_val(v) for k, v in val.items()}
+            return val
+
+        def _resolve_payload(tmpl: dict[str, Any]) -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for k, v in tmpl.items():
+                resolved = _resolve_val(v)
+                if resolved is not None:
+                    out[k] = resolved
+            return out
+
+        last_result: Any = None
+        for step in steps:
+            if step.op == "call_method":
+                tbl = step.external_table or binding.external_table
+                last_result = self.sandbox.call_method(tbl, step.method, [ext_id])
+            elif step.op == "prepare_child_quantities":
+                read_cols = ["id", step.source_qty_field, step.target_qty_field]
+                if step.flag_field and step.flag_field not in read_cols:
+                    read_cols.append(step.flag_field)
+                child_rows = self.sandbox.search_read(
+                    step.external_table,
+                    [(step.parent_key_field, "=", ext_id)],
+                    read_cols,
+                    limit=100,
+                )
+                for crow in child_rows:
+                    cur_qty = crow.get(step.target_qty_field) or 0
+                    vals: dict[str, Any] = {}
+                    if not cur_qty:
+                        vals[step.target_qty_field] = crow.get(step.source_qty_field)
+                    if step.flag_field and (not cur_qty or not crow.get(step.flag_field)):
+                        vals[step.flag_field] = True
+                    if vals:
+                        rpc_client.execute_kw(
+                            step.external_table,
+                            "write",
+                            [[int(crow["id"])], vals],
+                        )
+            elif step.op == "call_and_follow_transient":
+                tbl = step.external_table or binding.external_table
+                res = self.sandbox.call_method(tbl, step.method, [ext_id])
+                last_result = res
+                if isinstance(res, dict) and res.get("res_model"):
+                    wiz_model = str(res["res_model"])
+                    ctx = dict(res.get("context") or {})
+                    payload = _resolve_payload(step.payload_template)
+                    wiz_id = int(rpc_client.execute_kw(wiz_model, "create", [payload], {"context": ctx}))
+                    wiz_method = step.transient_method or step.fallback_method or step.method
+                    last_result = rpc_client.execute_kw(
+                        wiz_model, wiz_method, [[wiz_id]], {"context": ctx}
+                    )
+            elif step.op == "create_and_call_transient":
+                active_tbl = step.context_active_table or binding.external_table
+                ctx = {"active_model": active_tbl, "active_ids": [ext_id]}
+                payload = _resolve_payload(step.payload_template)
+                wiz_id = int(
+                    rpc_client.execute_kw(step.external_table, "create", [payload], {"context": ctx})
+                )
+                primary_method = step.transient_method or step.method
+                try:
+                    last_result = rpc_client.execute_kw(
+                        step.external_table, primary_method, [[wiz_id]], {"context": ctx}
+                    )
+                except Exception:
+                    if step.fallback_method:
+                        last_result = rpc_client.execute_kw(
+                            step.external_table, step.fallback_method, [[wiz_id]], {"context": ctx}
+                        )
+                    else:
+                        raise
+            elif step.op == "post_created_document":
+                doc_tbl = step.external_table or binding.external_table
+                doc_ids: list[int] = []
+                if isinstance(last_result, dict):
+                    if last_result.get("res_id"):
+                        doc_ids.append(int(last_result["res_id"]))
+                    elif isinstance(last_result.get("domain"), list):
+                        for cond in last_result["domain"]:
+                            if isinstance(cond, (list, tuple)) and len(cond) == 3 and cond[0] == "id":
+                                if cond[1] == "=" and isinstance(cond[2], int):
+                                    doc_ids.append(int(cond[2]))
+                                elif cond[1] == "in" and isinstance(cond[2], (list, tuple)):
+                                    doc_ids.extend(int(x) for x in cond[2] if isinstance(x, int))
+                if doc_ids:
+                    if not step.method:
+                        raise ValueError(
+                            "OdooProtocolStep(op='post_created_document') requires explicit step.method"
+                        )
+                    drows = self.sandbox.search_read(
+                        doc_tbl,
+                        [("id", "in", doc_ids), ("state", "=", "draft")],
+                        ["id", "state"],
+                        limit=20,
+                    )
+                    for dr in drows:
+                        self.sandbox.call_method(doc_tbl, step.method, [int(dr["id"])])
+            else:
+                raise ValueError(f"unsupported OdooProtocolStep op {step.op!r}")
+        return last_result
 
     def execute_and_settle(
         self,
@@ -690,15 +880,17 @@ class DeclarativeOdooBridge:
         canonical_id = str(params[binding.id_param])
         ext_id = _parse_ext_id(canonical_id, binding.id_prefix)
 
-        # 2) Execute the real external method via declarative binding (unless testing drift detection)
+        # 2) Execute the real external method or multi-step protocol via declarative binding
         if not skip_external_call_to_simulate_drift:
-            self.sandbox.call_method(binding.external_table, binding.external_method, [ext_id])
+            self.execute_external_binding(binding, ext_id, params)
 
         # 3) Independent readback directly from external system + project via AdapterMappingSpec
         read_fields = list(
             dict.fromkeys(
                 ["id", em.id_transform.source_field]
                 + [tf.source_field for tf in em.field_transforms if tf.source_field]
+                + [fb for tf in em.field_transforms for fb in tf.fallback_fields if fb]
+                + [flt.field for flt in em.row_filters if flt.field]
             )
         )
         raw_rows = self.sandbox.search_read(

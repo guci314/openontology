@@ -725,7 +725,7 @@ def _synthesize_odoo_adapter_mapping(*, clean_filters: bool) -> dict[str, Any]:
                     FieldTransformSpec(
                         target_field="customer",
                         source_field="partner_id",
-                        kind="many2one_id",
+                        kind="foreign_key_id",
                         prefix="CUST-",
                     ),
                     FieldTransformSpec(
@@ -765,7 +765,7 @@ def _synthesize_odoo_adapter_mapping(*, clean_filters: bool) -> dict[str, Any]:
                     FieldTransformSpec(
                         target_field="order",
                         source_field="sale_id",
-                        kind="many2one_id",
+                        kind="foreign_key_id",
                         prefix="SO-",
                     ),
                     FieldTransformSpec(
@@ -807,7 +807,7 @@ def _synthesize_odoo_adapter_mapping(*, clean_filters: bool) -> dict[str, Any]:
                     FieldTransformSpec(
                         target_field="customer",
                         source_field="partner_id",
-                        kind="many2one_id",
+                        kind="foreign_key_id",
                         prefix="CUST-",
                     ),
                     FieldTransformSpec(

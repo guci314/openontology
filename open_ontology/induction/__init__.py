@@ -14,6 +14,7 @@
 from .agents import (
     BUILDER_SYSTEM_PROMPT,
     EVOLVER_SYSTEM_PROMPT,
+    L2_ARCHITECT_SYSTEM_PROMPT,
     AbductionBackend,
     AntigravityCLIAbductionBackend,
     CallableAbductionBackend,
@@ -22,10 +23,12 @@ from .agents import (
     InductionRoundTrace,
     OntologyBuilderAgent,
     OntologyEvolverAgent,
+    OntologyL2ArchitectAgent,
     OpenAICompatibleAbductionBackend,
     OpenRouterAbductionBackend,
     build_builder_system_prompt,
     build_evolver_system_prompt,
+    build_l2_architect_system_prompt,
 )
 from .crucible import (
     CrucibleContext,
@@ -49,6 +52,7 @@ from .dsl import (
     ObjectTypeBlueprint,
     ProposedEvalCase,
     RelationSpec,
+    apply_adapter_mapping_patch,
     apply_evolution_patch,
     blueprint_fingerprint,
     compile_blueprint,
@@ -144,6 +148,7 @@ __all__ = [
     "validate_predicate_ast",
     "eval_predicate",
     "apply_evolution_patch",
+    "apply_adapter_mapping_patch",
     "migrate_m0_snapshot",
     "compile_blueprint",
     "dsl_schema_prompt_guide",
@@ -182,8 +187,10 @@ __all__ = [
     # Anthropomorphized Builder / Evolver agents
     "BUILDER_SYSTEM_PROMPT",
     "EVOLVER_SYSTEM_PROMPT",
+    "L2_ARCHITECT_SYSTEM_PROMPT",
     "build_builder_system_prompt",
     "build_evolver_system_prompt",
+    "build_l2_architect_system_prompt",
     "AbductionBackend",
     "AntigravityCLIAbductionBackend",
     "CallableAbductionBackend",
@@ -194,6 +201,7 @@ __all__ = [
     "InductionCycleResult",
     "OntologyBuilderAgent",
     "OntologyEvolverAgent",
+    "OntologyL2ArchitectAgent",
     # Pluggable domain seed ontology (inductive bias backbone)
     "SeedArchetypeHint",
     "SeedOntology",

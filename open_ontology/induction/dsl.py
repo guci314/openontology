@@ -21,6 +21,7 @@ from ..spec import (
     ObjectType,
     OntologySpec,
 )
+from .phenomenon import ActionExecutionBinding, AdapterMappingSpec, EntityMappingSpec
 from .seed import SeedOntology
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     "validate_predicate_ast",
     "eval_predicate",
     "apply_evolution_patch",
+    "apply_adapter_mapping_patch",
     "migrate_m0_snapshot",
     "compile_blueprint",
     "dsl_schema_prompt_guide",
@@ -301,6 +303,9 @@ class EvolutionPatch(BaseModel):
     update_approver_roles: dict[str, list[str]] = Field(default_factory=dict)
     migrations: list[FieldMigrationSpec] = Field(default_factory=list)
     proposed_eval_cases: list[ProposedEvalCase] = Field(default_factory=list)
+    update_entity_mappings: list[EntityMappingSpec] = Field(default_factory=list)
+    add_action_bindings: list[ActionExecutionBinding] = Field(default_factory=list)
+    update_action_bindings: list[ActionExecutionBinding] = Field(default_factory=list)
 
 
 def blueprint_fingerprint(blueprint: DeclarativeBlueprint | str) -> str:
@@ -393,6 +398,11 @@ def _validate_value_node(node: Any) -> None:
             )
         _validate_value_node(node["left"])
         _validate_value_node(node["right"])
+        return
+    if op == "if_else" and set(node.keys()) == {"op", "cond", "then", "else"}:
+        _validate_expr_node(node["cond"], expect_bool=True)
+        _validate_value_node(node["then"])
+        _validate_value_node(node["else"])
         return
     raise InvariantError(
         f"disallowed value AST keys {sorted(node.keys())}",
@@ -515,6 +525,10 @@ def _eval_value(
                 return lv - rv
             if op == "mul":
                 return lv * rv
+        if op == "if_else" and set(node.keys()) == {"op", "cond", "then", "else"}:
+            if eval_predicate(node["cond"], context, view):
+                return _eval_value(node["then"], context, view)
+            return _eval_value(node["else"], context, view)
     raise InvariantError(f"cannot evaluate value AST node: {node!r}", code="INVALID_PREDICATE_AST")
 
 
@@ -682,6 +696,41 @@ def apply_evolution_patch(
 
     candidate.migrations.extend(copy.deepcopy(patch.migrations))
     return candidate
+
+
+def apply_adapter_mapping_patch(
+    base_mapping: AdapterMappingSpec | None,
+    patch: EvolutionPatch,
+) -> AdapterMappingSpec | None:
+    """Immutably apply L2 entity/action binding updates from an EvolutionPatch onto AdapterMappingSpec."""
+    if (
+        base_mapping is None
+        and not patch.update_entity_mappings
+        and not patch.add_action_bindings
+        and not patch.update_action_bindings
+    ):
+        return None
+    updated = copy.deepcopy(base_mapping) if base_mapping is not None else AdapterMappingSpec()
+
+    em_idx = {em.target_object_type: idx for idx, em in enumerate(updated.entity_mappings)}
+    for new_em in patch.update_entity_mappings:
+        cloned_em = copy.deepcopy(new_em)
+        if new_em.target_object_type in em_idx:
+            updated.entity_mappings[em_idx[new_em.target_object_type]] = cloned_em
+        else:
+            em_idx[new_em.target_object_type] = len(updated.entity_mappings)
+            updated.entity_mappings.append(cloned_em)
+
+    ab_idx = {ab.action_name: idx for idx, ab in enumerate(updated.action_bindings)}
+    for new_ab in (*patch.add_action_bindings, *patch.update_action_bindings):
+        cloned_ab = copy.deepcopy(new_ab)
+        if new_ab.action_name in ab_idx:
+            updated.action_bindings[ab_idx[new_ab.action_name]] = cloned_ab
+        else:
+            ab_idx[new_ab.action_name] = len(updated.action_bindings)
+            updated.action_bindings.append(cloned_ab)
+
+    return updated
 
 
 def migrate_m0_snapshot(
@@ -1222,7 +1271,12 @@ def dsl_schema_prompt_guide(
             "comparison": ["eq", "ne", "lt", "le", "gt", "ge", "in", "not_in (left:{...}, right:{...})"],
             "quantifier": ["exists", "not_exists", "count_eq", "count_ge", "count_le (object_type, where, value?)"],
             "arithmetic": ["add", "sub", "mul (numeric left/right only)"],
-            "values": ['{"ref": "obj.<field> | obj.<rel>.<field> | param.<field> | actor.role | target.<field>"}', '{"lit": <scalar_or_list>}'],
+            "conditional": ["if_else (cond:<predicate>, then:<value>, else:<value>)"],
+            "values": [
+                '{"ref": "obj.<field> | obj.<rel>.<field> | param.<field> | actor.role | target.<field>"}',
+                '{"lit": <scalar_or_list>}',
+                '{"op": "if_else", "cond": {...}, "then": {...}, "else": {...}}',
+            ],
         },
         "quantifier_binding_rule": (
             "Inside exists/not_exists/count_* 'where' clauses, 'obj' refers to the OUTER object being checked, "

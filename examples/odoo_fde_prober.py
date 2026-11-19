@@ -23,7 +23,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from .odoo_dual_erp_demo import (
     DB_NORTH,
@@ -497,6 +497,169 @@ def format_probe_summary(report: ActiveProbeReport) -> str:
             f"{o.status_field}: {o.state_before} -> {o.state_after}{extra}"
         )
     return "\n".join(lines)
+
+
+def discover_transient_wizards(
+    sandbox: ProbeSandboxInterface,
+    related_models: Sequence[str] = (),
+    *,
+    probe_report: ActiveProbeReport | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect Odoo ir.model/ir.model.fields/ir.ui.view for transient wizard & child-line schemas."""
+    wizard_names: list[str] = []
+    wizard_labels: dict[str, str] = {}
+    if probe_report is not None:
+        for obs in probe_report.observations:
+            if obs.wizard_model and obs.wizard_model not in wizard_names:
+                wizard_names.append(obs.wizard_model)
+
+    module_prefixes = {
+        str(rm).split(".")[0] for rm in related_models if str(rm).strip()
+    }
+    generic_wizard_tokens = (
+        "payment.register",
+        "backorder",
+        "reversal",
+        "refund",
+        "advance.payment",
+    )
+    try:
+        rows = sandbox.search_read(
+            "ir.model",
+            [("transient", "=", True)],
+            ["model", "name"],
+            limit=200,
+        )
+        for row in rows:
+            m = str(row.get("model") or "")
+            if not m or m.endswith(".line"):
+                continue
+            prefix = m.split(".")[0]
+            if module_prefixes and prefix not in module_prefixes:
+                continue
+            m_low = m.lower()
+            if not any(tok in m_low for tok in generic_wizard_tokens):
+                continue
+            wizard_labels[m] = str(row.get("name") or m)
+            if m not in wizard_names:
+                wizard_names.append(m)
+    except Exception:
+        pass
+
+    catalog: list[dict[str, Any]] = []
+    for wm in wizard_names:
+        fields_meta: list[dict[str, Any]] = []
+        button_methods: list[str] = []
+        try:
+            frows = sandbox.search_read(
+                "ir.model.fields",
+                [("model", "=", wm), ("store", "=", True)],
+                ["name", "ttype", "relation", "field_description"],
+                limit=40,
+            )
+            for fr in frows:
+                fn = str(fr.get("name") or "")
+                if not fn or fn in ("create_uid", "create_date", "write_uid", "write_date", "id"):
+                    continue
+                fields_meta.append(
+                    {
+                        "name": fn,
+                        "ttype": fr.get("ttype"),
+                        "relation": fr.get("relation") or None,
+                        "label": fr.get("field_description") or "",
+                    }
+                )
+        except Exception:
+            pass
+        try:
+            vrows = sandbox.search_read(
+                "ir.ui.view",
+                [("model", "=", wm), ("type", "=", "form")],
+                ["arch_db"],
+                limit=10,
+            )
+            seen_btn: set[str] = set()
+            for vr in vrows:
+                arch = str(vr.get("arch_db") or "")
+                for pat in (_BUTTON_RE_A, _BUTTON_RE_B):
+                    for m in pat.findall(arch):
+                        if m not in seen_btn:
+                            seen_btn.add(m)
+                            button_methods.append(m)
+        except Exception:
+            pass
+        catalog.append(
+            {
+                "wizard_model": wm,
+                "label": wizard_labels.get(wm, wm),
+                "fields": fields_meta,
+                "button_methods": button_methods,
+            }
+        )
+
+    # Generically inspect one2many child-line models in the discovered domain subgraph
+    rel_list = [str(rm) for rm in related_models if str(rm).strip()]
+    rel_set = set(rel_list)
+    seen_child_pairs: set[tuple[str, str]] = set()
+    if rel_list:
+        try:
+            o2m_rows = sandbox.search_read(
+                "ir.model.fields",
+                [("model", "in", rel_list), ("ttype", "=", "one2many")],
+                ["model", "name", "relation"],
+                limit=80,
+            )
+            for row in o2m_rows:
+                parent_m = str(row.get("model") or "")
+                child_m = str(row.get("relation") or "")
+                o2m_fn = str(row.get("name") or "")
+                if not parent_m or not child_m or child_m in rel_set:
+                    continue
+                if child_m.split(".")[0] != parent_m.split(".")[0]:
+                    continue
+                if child_m.count(".") > 2 or (parent_m, child_m) in seen_child_pairs:
+                    continue
+                try:
+                    cfields = sandbox.search_read(
+                        "ir.model.fields",
+                        [
+                            ("model", "=", child_m),
+                            ("store", "=", True),
+                            ("ttype", "in", ["float", "boolean", "many2one", "selection"]),
+                        ],
+                        ["name", "ttype", "relation", "field_description"],
+                        limit=60,
+                    )
+                except Exception:
+                    continue
+                relevant = [
+                    cf
+                    for cf in cfields
+                    if cf.get("relation") == parent_m
+                    or "qty" in str(cf.get("name") or "").lower()
+                    or "quantity" in str(cf.get("name") or "").lower()
+                    or str(cf.get("name") or "") in ("picked", "state", "price_unit")
+                ]
+                has_qty_or_flag = any(
+                    "qty" in str(cf.get("name") or "").lower()
+                    or "quantity" in str(cf.get("name") or "").lower()
+                    or str(cf.get("name") or "") == "picked"
+                    for cf in relevant
+                )
+                if relevant and has_qty_or_flag:
+                    seen_child_pairs.add((parent_m, child_m))
+                    catalog.append(
+                        {
+                            "child_line_model": child_m,
+                            "parent_model": parent_m,
+                            "one2many_field": o2m_fn,
+                            "fields": relevant,
+                        }
+                    )
+        except Exception:
+            pass
+
+    return catalog
 
 
 def run_live_autonomous_fde_discovery(
