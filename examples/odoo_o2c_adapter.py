@@ -251,6 +251,7 @@ class OdooO2CAdapter:
                 "name",
                 "client_order_ref",
                 "state",
+                "amount_untaxed",
                 "amount_total",
                 "delivery_status",
                 "partner_id",
@@ -258,17 +259,37 @@ class OdooO2CAdapter:
             ],
         )[0]
 
-    def delivery_row(self, canonical_id: str) -> dict[str, Any] | None:
+    def delivery_rows(self, canonical_id: str) -> list[dict[str, Any]]:
         ref = self._ref(canonical_id)
         rows = self.client.search_read(
             "stock.picking",
             [("sale_id", "=", ref.odoo_id), ("state", "!=", "cancel")],
             fields=["id", "name", "state", "origin"],
         )
+        rows.sort(key=lambda row: int(row["id"]))
+        return rows
+
+    def delivery_row(self, canonical_id: str) -> dict[str, Any] | None:
+        rows = self.delivery_rows(canonical_id)
         if not rows:
             return None
-        rows.sort(key=lambda row: int(row["id"]), reverse=True)
-        return rows[0]
+        # Prefer open (not-done) picking if a backorder exists, else latest done picking
+        open_rows = [r for r in rows if r["state"] != "done"]
+        if open_rows:
+            return open_rows[-1]
+        return rows[-1]
+
+    def shipped_qty_for_order(self, canonical_id: str) -> int:
+        rows = self.delivery_rows(canonical_id)
+        done_ids = [int(r["id"]) for r in rows if r["state"] == "done"]
+        if not done_ids:
+            return 0
+        moves = self.client.search_read(
+            "stock.move",
+            [("picking_id", "in", done_ids), ("state", "=", "done")],
+            fields=["id", "quantity"],
+        )
+        return int(round(sum(float(m.get("quantity") or 0.0) for m in moves)))
 
     def invoice_row(self, canonical_id: str) -> dict[str, Any] | None:
         ref = self._ref(canonical_id)
@@ -285,12 +306,43 @@ class OdooO2CAdapter:
                 "name",
                 "state",
                 "payment_state",
+                "amount_untaxed",
                 "amount_total",
                 "amount_residual",
                 "invoice_origin",
                 "journal_id",
             ],
         )
+        if not rows:
+            return None
+        rows.sort(key=lambda row: int(row["id"]), reverse=True)
+        return rows[0]
+
+    def credit_note_row(self, canonical_id: str) -> dict[str, Any] | None:
+        ref = self._ref(canonical_id)
+        rows = self.client.search_read(
+            "account.move",
+            [
+                ("move_type", "=", "out_refund"),
+                ("invoice_origin", "=", ref.odoo_name),
+                ("state", "=", "posted"),
+            ],
+            fields=[
+                "id",
+                "name",
+                "move_type",
+                "state",
+                "amount_total",
+                "invoice_origin",
+                "ref",
+            ],
+        )
+        # Exclude internal time-machine invoice-revert reversals so revert returns order to 'shipped'
+        rows = [
+            r
+            for r in rows
+            if "OpenOntology Time-Machine Revert" not in str(r.get("ref") or "")
+        ]
         if not rows:
             return None
         rows.sort(key=lambda row: int(row["id"]), reverse=True)
@@ -415,14 +467,37 @@ class OdooO2CAdapter:
         for canonical_id in sorted(data.orders):
             ref = data.order(canonical_id)
             order = self.order_row(canonical_id)
-            delivery = self.delivery_row(canonical_id)
+            all_pickings = self.delivery_rows(canonical_id)
+            delivery = all_pickings[-1] if all_pickings else None
             invoice = self.invoice_row(canonical_id)
-            delivery_state = delivery["state"] if delivery else None
+            credit_note = self.credit_note_row(canonical_id)
+
+            has_done_picking = any(p["state"] == "done" for p in all_pickings)
+            has_open_picking = any(p["state"] != "done" for p in all_pickings)
+            if has_done_picking and has_open_picking:
+                delivery_agg_state: str | None = "partial"
+            elif has_done_picking:
+                delivery_agg_state = "done"
+            elif delivery is not None:
+                delivery_agg_state = str(delivery["state"])
+            else:
+                delivery_agg_state = None
+            if order.get("delivery_status") == "partial" and delivery_agg_state is not None:
+                delivery_agg_state = "partial"
+
             order_status = _map_order_status(
-                order["state"], delivery_state, invoice
+                order["state"], delivery_agg_state, invoice, credit_note=credit_note
             )
             order_rows.append(order)
 
+            untaxed_cents = int(round(float(order.get("amount_untaxed") or order["amount_total"]) * 100))
+            total_cents = int(round(float(order["amount_total"]) * 100))
+            tax_cents = max(0, total_cents - untaxed_cents)
+            tax_rate_bps = (
+                int(round(tax_cents * 10_000 / untaxed_cents))
+                if untaxed_cents > 0 and tax_cents > 0
+                else 0
+            )
             sales_orders.append(
                 o2c.SalesOrder(
                     order_id=canonical_id,
@@ -430,41 +505,92 @@ class OdooO2CAdapter:
                     product_summary=ref.product_summary or PRODUCT_NAME,
                     quantity=ref.quantity,
                     unit_price_cents=int(round(ref.unit_price * 100)),
-                    total_cents=int(round(float(order["amount_total"]) * 100)),
+                    tax_rate_bps=tax_rate_bps,
+                    tax_cents=tax_cents,
+                    total_cents=total_cents,
                     status=order_status,
                 ).source_properties()
             )
 
             if delivery is not None:
+                shipped_qty = (
+                    ref.quantity
+                    if delivery_agg_state == "done"
+                    else self.shipped_qty_for_order(canonical_id)
+                )
                 deliveries.append(
                     o2c.Delivery(
                         delivery_id=f"DEL-{canonical_id}",
                         order=canonical_id,
+                        ordered_qty=ref.quantity,
+                        shipped_qty=shipped_qty,
                         status=(
                             "shipped"
-                            if delivery["state"] == "done"
-                            else "pending"
+                            if delivery_agg_state == "done"
+                            else ("partial" if delivery_agg_state == "partial" else "pending")
                         ),
                     ).source_properties()
                 )
 
-            if invoice is not None and invoice["state"] == "posted":
-                paid = (
-                    invoice["payment_state"] in ("paid", "in_payment")
-                    or float(invoice["amount_residual"]) == 0.0
+            if credit_note is not None:
+                cn_cents = int(round(float(credit_note["amount_total"]) * 100))
+                invoices.append(
+                    o2c.Invoice(
+                        invoice_id=f"INV-{canonical_id}",
+                        order=canonical_id,
+                        customer=self.partner_ref,
+                        amount_cents=cn_cents,
+                        tax_cents=tax_cents,
+                        paid_cents=0,
+                        refunded_cents=cn_cents,
+                        status="refunded",
+                    ).to_properties()
+                )
+                vouchers.append(
+                    o2c.ReceivableVoucher(
+                        voucher_id=f"ARV-INV-{canonical_id}",
+                        ledger=o2c.ar_ledger_id(self.partner_ref),
+                        customer=self.partner_ref,
+                        order=canonical_id,
+                        entry_kind="invoice_post",
+                        delta_cents=cn_cents,
+                    ).to_properties()
+                )
+                vouchers.append(
+                    o2c.ReceivableVoucher(
+                        voucher_id=f"ARV-REF-{canonical_id}",
+                        ledger=o2c.ar_ledger_id(self.partner_ref),
+                        customer=self.partner_ref,
+                        order=canonical_id,
+                        entry_kind="credit_note_refund",
+                        delta_cents=-cn_cents,
+                    ).to_properties()
+                )
+            elif invoice is not None and invoice["state"] == "posted":
+                inv_untaxed_cents = int(
+                    round(float(invoice.get("amount_untaxed") or invoice["amount_total"]) * 100)
                 )
                 inv_total_cents = int(round(float(invoice["amount_total"]) * 100))
+                inv_tax_cents = max(0, inv_total_cents - inv_untaxed_cents)
                 inv_residual_cents = int(
                     round(float(invoice["amount_residual"]) * 100)
                 )
                 paid_cents = max(0, inv_total_cents - inv_residual_cents)
+                paid = (
+                    invoice["payment_state"] in ("paid", "in_payment")
+                    or inv_residual_cents == 0
+                )
+                partial = (not paid) and paid_cents > 0
                 invoices.append(
                     o2c.Invoice(
                         invoice_id=f"INV-{canonical_id}",
                         order=canonical_id,
                         customer=self.partner_ref,
                         amount_cents=inv_total_cents,
-                        status="paid" if paid else "posted",
+                        tax_cents=inv_tax_cents,
+                        paid_cents=paid_cents,
+                        refunded_cents=0,
+                        status="paid" if paid else ("partial" if partial else "posted"),
                     ).to_properties()
                 )
                 vouchers.append(
@@ -562,11 +688,24 @@ class OdooO2CAdapter:
         elif action == "confirm_sales_order":
             evidence = self._apply_confirm(run_id, order_key)
         elif action == "ship_order_delivery":
-            evidence = self._apply_ship(run_id, order_key)
+            evidence = self._apply_ship(
+                run_id, order_key, ship_quantity=params.get("ship_quantity")
+            )
         elif action == "issue_and_post_invoice":
             evidence = self._apply_invoice(run_id, order_key)
         elif action == "record_customer_payment":
-            evidence = self._apply_payment(run_id, order_key)
+            evidence = self._apply_payment(
+                run_id,
+                order_key,
+                payment_cents=params.get("payment_cents"),
+                allow_partial=bool(params.get("allow_partial", False)),
+            )
+        elif action == "issue_credit_note_refund":
+            evidence = self._apply_credit_note_refund(
+                run_id,
+                order_key,
+                reason=str(params.get("reason") or "Customer credit note refund"),
+            )
         else:
             raise ValueError(f"unsupported Odoo move action {action!r}")
 
@@ -578,9 +717,12 @@ class OdooO2CAdapter:
         forward_phase = {
             ("create_sales_order", "draft"): -1,
             ("confirm_sales_order", "confirmed"): 0,
+            ("ship_order_delivery", "partially_shipped"): 1,
             ("ship_order_delivery", "shipped"): 1,
             ("issue_and_post_invoice", "invoiced"): 2,
             ("record_customer_payment", "paid"): 3,
+            ("record_customer_payment", None): 3,
+            ("issue_credit_note_refund", "refunded"): 4,
         }
         revert_phase = {
             ("confirm_sales_order", "draft"): 10,
@@ -643,11 +785,24 @@ class OdooO2CAdapter:
             elif action == "confirm_sales_order":
                 item = self._apply_confirm(run_id, order_id)
             elif action == "ship_order_delivery":
-                item = self._apply_ship(run_id, order_id)
+                item = self._apply_ship(
+                    run_id, order_id, ship_quantity=p.get("ship_quantity")
+                )
             elif action == "issue_and_post_invoice":
                 item = self._apply_invoice(run_id, order_id)
+            elif action == "issue_credit_note_refund":
+                item = self._apply_credit_note_refund(
+                    run_id,
+                    order_id,
+                    reason=str(p.get("reason") or "Customer credit note refund"),
+                )
             else:
-                item = self._apply_payment(run_id, order_id)
+                item = self._apply_payment(
+                    run_id,
+                    order_id,
+                    payment_cents=p.get("payment_cents"),
+                    allow_partial=bool(p.get("allow_partial", False)),
+                )
 
             self._seen.add(run_id)
             evidence.append(item)
@@ -767,7 +922,13 @@ class OdooO2CAdapter:
             "picking_name": picking["name"],
         }
 
-    def _apply_ship(self, run_id: str, order_id: str) -> dict[str, Any]:
+    def _apply_ship(
+        self,
+        run_id: str,
+        order_id: str,
+        *,
+        ship_quantity: int | None = None,
+    ) -> dict[str, Any]:
         ref = self._ref(order_id)
         picking = self.delivery_row(order_id)
         if picking is None:
@@ -784,19 +945,25 @@ class OdooO2CAdapter:
                 fields=["id", "product_uom_qty", "quantity", "picked"],
             )
             for move in moves:
+                qty_to_ship = (
+                    min(float(ship_quantity), float(move["product_uom_qty"]))
+                    if ship_quantity is not None
+                    else move["product_uom_qty"]
+                )
                 self.client.write(
                     "stock.move",
                     [int(move["id"])],
                     {
-                        "quantity": move["product_uom_qty"],
+                        "quantity": qty_to_ship,
                         "picked": True,
                     },
                 )
             result = self.client.execute_kw(
                 "stock.picking", "button_validate", [[picking_id]]
             )
-            self._handle_validate_result(result)
-            picking = self.delivery_row(order_id)
+            self._handle_validate_result(result, picking_id=picking_id)
+            validated = self.client.read("stock.picking", [picking_id], ["id", "name", "state"])[0]
+            picking = validated
 
         if picking is None or picking["state"] != "done":
             raise OdooRPCError(
@@ -825,11 +992,13 @@ class OdooO2CAdapter:
                     "product_id",
                     "product_uom_qty",
                     "price_unit",
+                    "tax_ids",
                 ],
             )
             if not lines:
                 raise OdooRPCError(f"{order_id} has no sale.order.line")
             line = lines[0]
+            tax_ids = [int(t) for t in (line.get("tax_ids") or [])]
             invoice_id = self.client.create(
                 "account.move",
                 {
@@ -846,7 +1015,7 @@ class OdooO2CAdapter:
                                 "product_id": line["product_id"][0],
                                 "quantity": line["product_uom_qty"],
                                 "price_unit": line["price_unit"],
-                                "tax_ids": [(6, 0, [])],
+                                "tax_ids": [(6, 0, tax_ids)],
                                 "sale_line_ids": [(6, 0, [line["id"]])],
                             },
                         )
@@ -883,7 +1052,14 @@ class OdooO2CAdapter:
             "amount_total": float(invoice["amount_total"]),
         }
 
-    def _apply_payment(self, run_id: str, order_id: str) -> dict[str, Any]:
+    def _apply_payment(
+        self,
+        run_id: str,
+        order_id: str,
+        *,
+        payment_cents: int | None = None,
+        allow_partial: bool = False,
+    ) -> dict[str, Any]:
         invoice = self.invoice_row(order_id)
         if invoice is None:
             raise OdooRPCError(f"no invoice for {order_id}")
@@ -895,10 +1071,15 @@ class OdooO2CAdapter:
                 "active_model": "account.move",
                 "active_ids": [invoice_id],
             }
+            wiz_vals: dict[str, Any] = {
+                "payment_date": datetime.date.today().isoformat(),
+            }
+            if payment_cents is not None:
+                wiz_vals["amount"] = round(int(payment_cents) / 100.0, 2)
             wizard_id = self.client.execute_kw(
                 "account.payment.register",
                 "create",
-                [{"payment_date": datetime.date.today().isoformat()}],
+                [wiz_vals],
                 {"context": context},
             )
             result = self.client.execute_kw(
@@ -914,13 +1095,18 @@ class OdooO2CAdapter:
         if invoice is None:
             raise OdooRPCError(f"invoice vanished for {order_id}")
         residual = float(invoice["amount_residual"])
-        if residual != 0.0:
+        if not allow_partial:
+            if residual != 0.0:
+                raise OdooRPCError(
+                    f"payment failed for {order_id}: residual={residual}"
+                )
+            if invoice["payment_state"] not in ("paid", "in_payment"):
+                raise OdooRPCError(
+                    f"payment state for {order_id} is {invoice['payment_state']!r}"
+                )
+        elif invoice["payment_state"] not in ("partial", "paid", "in_payment"):
             raise OdooRPCError(
-                f"payment failed for {order_id}: residual={residual}"
-            )
-        if invoice["payment_state"] not in ("paid", "in_payment"):
-            raise OdooRPCError(
-                f"payment state for {order_id} is {invoice['payment_state']!r}"
+                f"partial payment state for {order_id} is {invoice['payment_state']!r}"
             )
         self.data.payments[order_id] = int(
             payment_id or 0
@@ -934,6 +1120,72 @@ class OdooO2CAdapter:
             "payment_id": payment_id,
             "payment_state": invoice["payment_state"],
             "amount_residual": residual,
+        }
+
+    def _apply_credit_note_refund(
+        self,
+        run_id: str,
+        order_id: str,
+        *,
+        reason: str = "Customer credit note refund",
+    ) -> dict[str, Any]:
+        invoice = self.invoice_row(order_id)
+        if invoice is None:
+            existing_cn = self.credit_note_row(order_id)
+            if existing_cn is not None:
+                return {
+                    "run_id": run_id,
+                    "action": "issue_credit_note_refund",
+                    "order_id": order_id,
+                    "credit_note_id": int(existing_cn["id"]),
+                    "credit_note_name": existing_cn["name"],
+                    "credit_note_state": existing_cn["state"],
+                }
+            raise OdooRPCError(f"no invoice to refund for {order_id}")
+        invoice_id = int(invoice["id"])
+        journal_field = invoice.get("journal_id")
+        journal_id = (
+            int(journal_field[0])
+            if isinstance(journal_field, (list, tuple)) and journal_field
+            else None
+        )
+        ctx = {"active_model": "account.move", "active_ids": [invoice_id]}
+        wiz_vals: dict[str, Any] = {
+            "move_ids": [(6, 0, [invoice_id])],
+            "date": datetime.date.today().isoformat(),
+            "reason": reason,
+        }
+        if journal_id is not None:
+            wiz_vals["journal_id"] = journal_id
+        wiz_id = self.client.execute_kw(
+            "account.move.reversal",
+            "create",
+            [wiz_vals],
+            {"context": ctx},
+        )
+        try:
+            rev_res = self.client.execute_kw(
+                "account.move.reversal", "refund_moves", [[wiz_id]], {"context": ctx}
+            )
+        except OdooRPCError:
+            rev_res = self.client.execute_kw(
+                "account.move.reversal", "reverse_moves", [[wiz_id]], {"context": ctx}
+            )
+        if isinstance(rev_res, dict) and rev_res.get("res_id"):
+            cn_id = int(rev_res["res_id"])
+            cn_rows = self.client.read("account.move", [cn_id], ["id", "name", "state", "move_type"])
+            if cn_rows and cn_rows[0]["state"] == "draft":
+                self.client.execute_kw("account.move", "action_post", [[cn_id]])
+        cn = self.credit_note_row(order_id)
+        if cn is None:
+            raise OdooRPCError(f"credit note refund failed for {order_id}")
+        return {
+            "run_id": run_id,
+            "action": "issue_credit_note_refund",
+            "order_id": order_id,
+            "credit_note_id": int(cn["id"]),
+            "credit_note_name": cn["name"],
+            "credit_note_state": cn["state"],
         }
 
     def _apply_revert_confirm(self, run_id: str, order_id: str) -> dict[str, Any]:
@@ -1098,18 +1350,30 @@ class OdooO2CAdapter:
         }
 
     # -- helpers -----------------------------------------------------------
-    def _handle_validate_result(self, result: Any) -> None:
+    def _handle_validate_result(
+        self, result: Any, *, picking_id: int | None = None
+    ) -> None:
         if not isinstance(result, dict):
             return
         model = result.get("res_model")
         res_id = result.get("res_id")
-        if not model or not res_id:
-            return
-        if model in (
+        if model not in (
             "stock.immediate.transfer",
             "stock.backorder.confirmation",
         ):
-            self.client.execute_kw(model, "process", [[res_id]])
+            return
+        ctx = dict(result.get("context") or {})
+        if res_id:
+            self.client.execute_kw(model, "process", [[res_id]], {"context": ctx})
+            return
+        if picking_id is not None and model == "stock.backorder.confirmation":
+            wiz_id = self.client.execute_kw(
+                model,
+                "create",
+                [{"pick_ids": [(6, 0, [picking_id])]}],
+                {"context": ctx},
+            )
+            self.client.execute_kw(model, "process", [[wiz_id]], {"context": ctx})
 
     def odoo_documents(self, canonical_id: str) -> dict[str, Any]:
         order = self.order_row(canonical_id)
@@ -1139,11 +1403,15 @@ def _map_order_status(
     sale_state: str,
     delivery_state: str | None,
     invoice: dict[str, Any] | None,
+    *,
+    credit_note: dict[str, Any] | None = None,
 ) -> str:
     if sale_state == "cancel":
         return "cancelled"
     if sale_state in ("draft", "sent"):
         return "draft"
+    if credit_note is not None and credit_note.get("state") == "posted":
+        return "refunded"
     if invoice is not None and invoice["state"] == "posted":
         if (
             invoice["payment_state"] in ("paid", "in_payment")
@@ -1153,6 +1421,8 @@ def _map_order_status(
         return "invoiced"
     if delivery_state == "done":
         return "shipped"
+    if delivery_state == "partial":
+        return "partially_shipped"
     return "confirmed"
 
 

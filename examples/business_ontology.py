@@ -27,6 +27,8 @@ __all__ = [
     "BalanceLedger",
     "ProcessDocument",
     "EventVoucher",
+    "build_business_seed_ontology",
+    "BUSINESS_SEED_ONTOLOGY",
 ]
 
 spec = OntologySpec()
@@ -210,3 +212,34 @@ spec.display = {
         "Business": "商业核心",
     },
 }
+
+
+def build_business_seed_ontology() -> Any:
+    """将 ``business_ontology`` 封装为可供符号训练器插拔的企业领域种子本体论底座。"""
+    from open_ontology.induction import seed_from_spec
+
+    return seed_from_spec(
+        seed_id="business_ontology",
+        domain_name="Enterprise Business & ERP",
+        base_spec=spec,
+        description=(
+            "企业商业领域通用种子本体：提供 MasterEntity（主数据）、ProcessDocument（状态机单据）、"
+            "BalanceLedger（非负+账证守恒台账）、EventVoucher（只追加不可变凭证）四大原型及其可继承公理。"
+        ),
+        archetype_role_hints={
+            "MasterEntity": ("master_data", "low_frequency_reference", "aggregate_root"),
+            "ProcessDocument": ("lifecycle_state_machine", "workflow_document", "approval_subject"),
+            "BalanceLedger": ("stock_or_balance_accumulator", "voucher_conserved", "non_negative"),
+            "EventVoucher": ("append_only_fact", "ledger_delta_entry", "audit_voucher"),
+        },
+        default_archetype="ObjectType",
+        extra_prior_notes=(
+            "Every BalanceLedger numeric balance field mutated by an action MUST declare "
+            "voucher_delta_rules and emit matching EventVoucher delta records in the same transaction.",
+            "Every ProcessDocument status field MUST follow declared finite-state transitions.",
+            "Every EventVoucher record is append-only and immutable after creation.",
+        ),
+    )
+
+
+BUSINESS_SEED_ONTOLOGY = build_business_seed_ontology()

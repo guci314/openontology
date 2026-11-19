@@ -1060,10 +1060,18 @@ class ApprovalGateAspect:
             raise ObjectNotFoundError(f"action run {run_id!r} not found")
 
         action = runtime.spec.get_action(run["action_type"])
-        if actor.role not in set(action.allowed_roles) | set(action.approver_roles):
+        # 若动作声明了审批角色，时光机回滚属于高危冲正治理动作，仅允许审批角色执行，
+        # 防止普通提交角色（如 ai_agent / sales_rep）绕过审批权单方面撤回已落账记录；
+        # 未声明审批角色的普通动作回退至 allowed_roles。
+        revert_roles = (
+            set(action.approver_roles)
+            if action.approver_roles
+            else set(action.allowed_roles)
+        )
+        if actor.role not in revert_roles:
             raise PermissionDeniedError(
                 f"actor {actor.actor_id!r} role {actor.role!r} may not revert "
-                f"{action.name!r}"
+                f"{action.name!r} (required roles: {sorted(revert_roles)})"
             )
 
         if run["status"] == AUDIT_STATUS_REVERTED:

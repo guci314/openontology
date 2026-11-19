@@ -11,6 +11,14 @@ Public surface::
     )
 """
 
+from .induction import (
+    DeclarativeBlueprint,
+    EvolutionPatch,
+    InductionGovernanceService,
+    OntologyBuilderAgent,
+    OntologyEvolverAgent,
+    SymbolicCrucible,
+)
 from .latent import DEVICE_STATE_MISMATCH, LatentSpace
 from .mpc import (
     MPC_AWAITING_APPROVAL,
@@ -121,6 +129,12 @@ __all__ = [
     "OntologyMCTSPlanner",
     "LatentSpace",
     "DEVICE_STATE_MISMATCH",
+    "DeclarativeBlueprint",
+    "EvolutionPatch",
+    "SymbolicCrucible",
+    "InductionGovernanceService",
+    "OntologyBuilderAgent",
+    "OntologyEvolverAgent",
     "ClosedLoopMPCController",
     "MPCResult",
     "MPCStepRecord",

@@ -50,11 +50,18 @@ except ImportError:
 
 RiskTier = Literal["NORMAL", "WATCHLIST", "BLOCKED"]
 OrderStatus = Literal[
-    "draft", "confirmed", "shipped", "invoiced", "paid", "cancelled"
+    "draft",
+    "confirmed",
+    "partially_shipped",
+    "shipped",
+    "invoiced",
+    "paid",
+    "refunded",
+    "cancelled",
 ]
-DeliveryStatus = Literal["pending", "shipped"]
-InvoiceStatus = Literal["posted", "paid"]
-VoucherKind = Literal["invoice_post", "payment_settlement"]
+DeliveryStatus = Literal["pending", "partial", "shipped"]
+InvoiceStatus = Literal["posted", "partial", "paid", "refunded"]
+VoucherKind = Literal["invoice_post", "payment_settlement", "credit_note_refund"]
 
 
 # ---------------------------------------------------------------------------
@@ -120,16 +127,23 @@ class ReceivableBalance(BalanceLedger):
 
 
 class SalesOrder(ProcessDocument):
-    """销售订单（继承 ProcessDocument · 混合主权）。"""
+    """销售订单（继承 ProcessDocument · 混合主权 · 支持税率与分批发货状态）。"""
 
     __primary_key__ = "order_id"
     __title__ = "order_id"
     __initial_statuses__: ClassVar[tuple[str, ...]] = ("draft",)
+    __non_negative_fields__: ClassVar[tuple[str, ...]] = (
+        "tax_rate_bps",
+        "tax_cents",
+        "total_cents",
+    )
     __transitions__: ClassVar[dict[str, tuple[str, ...]]] = {
         "draft": ("confirmed", "cancelled"),
-        "confirmed": ("shipped", "cancelled"),
+        "confirmed": ("partially_shipped", "shipped", "cancelled"),
+        "partially_shipped": ("partially_shipped", "shipped"),
         "shipped": ("invoiced",),
-        "invoiced": ("paid",),
+        "invoiced": ("paid", "refunded"),
+        "paid": ("refunded",),
     }
     __owned__ = {"account_rep": None, "fulfillment_note": None}
 
@@ -138,6 +152,8 @@ class SalesOrder(ProcessDocument):
     product_summary: str
     quantity: int
     unit_price_cents: int
+    tax_rate_bps: int = 0
+    tax_cents: int = 0
     total_cents: int
     status: OrderStatus = "draft"
     account_rep: str | None = None
@@ -145,30 +161,45 @@ class SalesOrder(ProcessDocument):
 
 
 class Delivery(ProcessDocument):
-    """仓库交货单（继承 ProcessDocument · AutoID 主键）。"""
+    """仓库交货单（继承 ProcessDocument · AutoID 主键 · 支持分批发货进度）。"""
 
     __primary_key__ = "delivery_id"
     __title__ = "delivery_id"
     __initial_statuses__: ClassVar[tuple[str, ...]] = ("pending",)
+    __non_negative_fields__: ClassVar[tuple[str, ...]] = (
+        "ordered_qty",
+        "shipped_qty",
+    )
     __transitions__: ClassVar[dict[str, tuple[str, ...]]] = {
-        "pending": ("shipped",),
+        "pending": ("partial", "shipped"),
+        "partial": ("partial", "shipped"),
     }
     __owned__ = {"carrier_note": None}
 
     delivery_id: AutoID
     order: ObjectProperty[SalesOrder]
+    ordered_qty: int = 0
+    shipped_qty: int = 0
     status: DeliveryStatus = "pending"
     carrier_note: str | None = None
 
 
 class Invoice(ProcessDocument):
-    """应收账款发票（继承 ProcessDocument · 外部源权威 · AutoID 主键）。"""
+    """应收账款发票（继承 ProcessDocument · 外部源权威 · 支持税额/分期收款/红字退款）。"""
 
     __primary_key__ = "invoice_id"
     __title__ = "invoice_id"
     __initial_statuses__: ClassVar[tuple[str, ...]] = ("posted",)
+    __non_negative_fields__: ClassVar[tuple[str, ...]] = (
+        "amount_cents",
+        "tax_cents",
+        "paid_cents",
+        "refunded_cents",
+    )
     __transitions__: ClassVar[dict[str, tuple[str, ...]]] = {
-        "posted": ("paid",),
+        "posted": ("partial", "paid", "refunded"),
+        "partial": ("partial", "paid", "refunded"),
+        "paid": ("refunded",),
     }
     __owned__ = False
 
@@ -176,6 +207,9 @@ class Invoice(ProcessDocument):
     order: ObjectProperty[SalesOrder]
     customer: ObjectProperty[Customer]
     amount_cents: int
+    tax_cents: int = 0
+    paid_cents: int = 0
+    refunded_cents: int = 0
     status: InvoiceStatus = "posted"
 
 
@@ -222,6 +256,7 @@ class CreateOrderParams(BaseModel):
     product_summary: str = "O2C Widget"
     quantity: int
     unit_price_cents: int
+    tax_rate_bps: int = 0
 
 
 class ConfirmOrderParams(BaseModel):
@@ -233,6 +268,7 @@ class ConfirmOrderParams(BaseModel):
 
 class ShipOrderParams(BaseModel):
     order: ObjectProperty[SalesOrder]
+    ship_quantity: int | None = None
 
 
 class InvoiceOrderParams(BaseModel):
@@ -242,6 +278,12 @@ class InvoiceOrderParams(BaseModel):
 class RecordPaymentParams(BaseModel):
     order: ObjectProperty[SalesOrder]
     payment_cents: int
+    allow_partial: bool = False
+
+
+class IssueCreditNoteParams(BaseModel):
+    order: ObjectProperty[SalesOrder]
+    reason: str = "Customer credit note refund"
 
 
 class AnnotateO2CParams(BaseModel):
@@ -359,11 +401,11 @@ def diagnose_o2c_bottlenecks(
                 )
 
         deliveries = deliveries_by_order.get(order.order_id, [])
-        if order.status == "confirmed":
+        if order.status in ("confirmed", "partially_shipped"):
             pending = [
                 delivery
                 for delivery in deliveries
-                if delivery.status == "pending"
+                if delivery.status in ("pending", "partial")
             ]
             if pending:
                 unshipped_confirmed.append(
@@ -386,13 +428,13 @@ def diagnose_o2c_bottlenecks(
             )
 
         for invoice in invoices:
-            if invoice.status == "posted":
+            if invoice.status in ("posted", "partial"):
                 unpaid_invoices.append(
                     {
                         "invoice_id": invoice.invoice_id,
                         "order_id": invoice.order,
                         "customer_id": invoice.customer,
-                        "amount_cents": invoice.amount_cents,
+                        "amount_cents": invoice.amount_cents - invoice.paid_cents,
                     }
                 )
 
@@ -476,7 +518,14 @@ def create_sales_order(ctx: Any, params: CreateOrderParams) -> None:
             "unit_price_cents must be positive",
             code="INVALID_UNIT_PRICE",
         )
+    if params.tax_rate_bps < 0 or params.tax_rate_bps > 10_000:
+        raise InvariantError(
+            "tax_rate_bps must be between 0 and 10000",
+            code="INVALID_TAX_RATE",
+        )
     product_summary = params.product_summary.strip() or "O2C Widget"
+    untaxed_cents = params.quantity * params.unit_price_cents
+    tax_cents = (untaxed_cents * params.tax_rate_bps + 5_000) // 10_000
     ctx.create(
         SalesOrder(
             order_id=order_id,
@@ -484,7 +533,9 @@ def create_sales_order(ctx: Any, params: CreateOrderParams) -> None:
             product_summary=product_summary,
             quantity=params.quantity,
             unit_price_cents=params.unit_price_cents,
-            total_cents=params.quantity * params.unit_price_cents,
+            tax_rate_bps=params.tax_rate_bps,
+            tax_cents=tax_cents,
+            total_cents=untaxed_cents + tax_cents,
             status="draft",
         )
     )
@@ -523,6 +574,8 @@ def confirm_sales_order(ctx: Any, params: ConfirmOrderParams) -> None:
         Delivery(
             delivery_id=f"DEL-{order.order_id}",
             order=order.order_id,
+            ordered_qty=order.quantity,
+            shipped_qty=0,
             status="pending",
         )
     )
@@ -533,11 +586,11 @@ def confirm_sales_order(ctx: Any, params: ConfirmOrderParams) -> None:
     ShipOrderParams,
     allowed_roles=("warehouse", "sales_rep", "ai_agent", "ops_manager"),
     affects_source=True,
-    description="仓库发货：交货单与销售订单同步转为已发货。",
+    description="仓库发货：支持全量出库或按指定数量分批出库（自动追踪补货进度）。",
 )
 def ship_order_delivery(ctx: Any, params: ShipOrderParams) -> None:
     order = ctx.require(SalesOrder, params.order)
-    if order.status != "confirmed":
+    if order.status not in ("confirmed", "partially_shipped"):
         raise InvariantError(
             f"order {order.order_id} is {order.status}, not confirmed",
             code="ORDER_NOT_CONFIRMED",
@@ -548,14 +601,38 @@ def ship_order_delivery(ctx: Any, params: ShipOrderParams) -> None:
             f"order {order.order_id} has no delivery",
             code="DELIVERY_NOT_FOUND",
         )
-    if delivery.status != "pending":
+    if delivery.status == "shipped":
         raise InvariantError(
             f"delivery {delivery.delivery_id} is already {delivery.status}",
             code="ALREADY_SHIPPED",
         )
 
-    ctx.modify(delivery, status="shipped")
-    ctx.modify(order, status="shipped")
+    ordered_qty = delivery.ordered_qty if delivery.ordered_qty > 0 else order.quantity
+    remaining_qty = ordered_qty - delivery.shipped_qty
+    ship_delta = remaining_qty if params.ship_quantity is None else params.ship_quantity
+    if ship_delta <= 0 or ship_delta > remaining_qty:
+        raise InvariantError(
+            f"ship_quantity {ship_delta} out of range (remaining={remaining_qty})",
+            code="INVALID_SHIP_QUANTITY",
+        )
+
+    new_shipped = delivery.shipped_qty + ship_delta
+    if new_shipped < ordered_qty:
+        ctx.modify(
+            delivery,
+            ordered_qty=ordered_qty,
+            shipped_qty=new_shipped,
+            status="partial",
+        )
+        ctx.modify(order, status="partially_shipped")
+    else:
+        ctx.modify(
+            delivery,
+            ordered_qty=ordered_qty,
+            shipped_qty=new_shipped,
+            status="shipped",
+        )
+        ctx.modify(order, status="shipped")
 
 
 @spec.action(
@@ -563,7 +640,7 @@ def ship_order_delivery(ctx: Any, params: ShipOrderParams) -> None:
     InvoiceOrderParams,
     allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
     affects_source=True,
-    description="对已发货订单开具并过账应收发票；未发货严禁开票。",
+    description="对已发货订单开具并过账应收发票（含税总额一致）；未发货严禁开票。",
 )
 def issue_and_post_invoice(ctx: Any, params: InvoiceOrderParams) -> None:
     order = ctx.require(SalesOrder, params.order)
@@ -580,6 +657,9 @@ def issue_and_post_invoice(ctx: Any, params: InvoiceOrderParams) -> None:
             order=order.order_id,
             customer=order.customer,
             amount_cents=order.total_cents,
+            tax_cents=order.tax_cents,
+            paid_cents=0,
+            refunded_cents=0,
             status="posted",
         )
     )
@@ -605,7 +685,7 @@ def issue_and_post_invoice(ctx: Any, params: InvoiceOrderParams) -> None:
     RecordPaymentParams,
     allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
     affects_source=True,
-    description="登记客户收款并核销发票；金额必须与发票精确一致。",
+    description="登记客户收款并核销发票；默认需全额匹配，显式 allow_partial=True 时支持分期收款。",
 )
 def record_customer_payment(ctx: Any, params: RecordPaymentParams) -> None:
     order = ctx.require(SalesOrder, params.order)
@@ -620,28 +700,116 @@ def record_customer_payment(ctx: Any, params: RecordPaymentParams) -> None:
             f"invoice {invoice.invoice_id} is already paid",
             code="INVOICE_ALREADY_PAID",
         )
-    if params.payment_cents != invoice.amount_cents:
+    if invoice.status == "refunded":
         raise InvariantError(
-            f"payment {params.payment_cents} does not match invoice "
-            f"{invoice.amount_cents}",
-            code="PAYMENT_AMOUNT_MISMATCH",
+            f"invoice {invoice.invoice_id} is already refunded",
+            code="INVOICE_ALREADY_REFUNDED",
+        )
+    remaining_cents = invoice.amount_cents - invoice.paid_cents
+    if params.payment_cents <= 0:
+        raise InvariantError(
+            f"payment {params.payment_cents} must be positive",
+            code="INVALID_PAYMENT_AMOUNT",
+        )
+    if not params.allow_partial:
+        if params.payment_cents != remaining_cents:
+            raise InvariantError(
+                f"payment {params.payment_cents} does not match invoice "
+                f"remaining balance {remaining_cents}",
+                code="PAYMENT_AMOUNT_MISMATCH",
+            )
+    elif params.payment_cents > remaining_cents:
+        raise InvariantError(
+            f"payment {params.payment_cents} exceeds remaining balance "
+            f"{remaining_cents}",
+            code="PAYMENT_EXCEEDS_RESIDUAL",
         )
 
     ledger = ctx.require(ReceivableBalance, ar_ledger_id(invoice.customer))
-    ctx.modify(invoice, status="paid")
-    ctx.modify(order, status="paid")
+    new_paid = invoice.paid_cents + params.payment_cents
+    fully_paid = new_paid == invoice.amount_cents
+    ctx.modify(
+        invoice,
+        paid_cents=new_paid,
+        status="paid" if fully_paid else "partial",
+    )
+    if fully_paid:
+        ctx.modify(order, status="paid")
     ctx.modify(
         ledger,
         ar_balance_cents=ledger.ar_balance_cents - params.payment_cents,
     )
+    existing_pay_vouchers = [
+        v
+        for v in ctx.query(ReceivableVoucher)
+        if v.order == order.order_id and v.entry_kind == "payment_settlement"
+    ]
+    voucher_id = (
+        f"ARV-PAY-{order.order_id}"
+        if not existing_pay_vouchers
+        else f"ARV-PAY-{order.order_id}-{len(existing_pay_vouchers) + 1}"
+    )
     ctx.create(
         ReceivableVoucher(
-            voucher_id=f"ARV-PAY-{order.order_id}",
+            voucher_id=voucher_id,
             ledger=ledger.ledger_id,
             customer=invoice.customer,
             order=order.order_id,
             entry_kind="payment_settlement",
             delta_cents=-params.payment_cents,
+        )
+    )
+
+
+def _refund_needs_approval(
+    params: IssueCreditNoteParams, actor: Actor
+) -> bool:
+    return actor.role != "finance_director"
+
+
+@spec.action(
+    "issue_credit_note_refund",
+    IssueCreditNoteParams,
+    allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
+    approver_roles=("finance_director",),
+    approval_rule=_refund_needs_approval,
+    affects_source=True,
+    description="对已过账/部分收款/已收款发票开具红字退款贷项通知单；非财务总监需审批。",
+)
+def issue_credit_note_refund(ctx: Any, params: IssueCreditNoteParams) -> None:
+    order = ctx.require(SalesOrder, params.order)
+    invoice = _find_order_invoice(ctx, order.order_id)
+    if invoice is None:
+        raise InvariantError(
+            f"order {order.order_id} has no invoice",
+            code="INVOICE_NOT_FOUND",
+        )
+    if invoice.status == "refunded":
+        raise InvariantError(
+            f"invoice {invoice.invoice_id} is already refunded",
+            code="INVOICE_ALREADY_REFUNDED",
+        )
+    ledger = ctx.require(ReceivableBalance, ar_ledger_id(invoice.customer))
+    unpaid_residual = max(0, invoice.amount_cents - invoice.paid_cents)
+    ctx.modify(
+        invoice,
+        status="refunded",
+        refunded_cents=invoice.amount_cents,
+    )
+    ctx.modify(order, status="refunded")
+    if unpaid_residual > 0:
+        ctx.modify(
+            ledger,
+            ar_balance_cents=ledger.ar_balance_cents - unpaid_residual,
+        )
+    ctx.create(
+        ReceivableVoucher(
+            voucher_id=f"ARV-REF-{order.order_id}",
+            ledger=ledger.ledger_id,
+            customer=invoice.customer,
+            order=order.order_id,
+            entry_kind="credit_note_refund",
+            delta_cents=-unpaid_residual,
         )
     )
 
@@ -691,12 +859,12 @@ def annotate_o2c_governance(ctx: Any, params: AnnotateO2CParams) -> None:
 @spec.invariant(
     "invoice_requires_shipped_order",
     code="CANNOT_INVOICE_UNSHIPPED_ORDER",
-    description="任何应收账款发票关联的销售订单必须已完成出库（已发货、已开票或已收款）。",
+    description="任何应收账款发票关联的销售订单必须已完成出库（已发货、已开票、已收款或已退款）。",
 )
 def invoice_requires_shipped_order(view: Any) -> bool:
     for inv in view.query(Invoice):
         order = view.get(SalesOrder, inv.order)
-        if order is None or order.status not in ("shipped", "invoiced", "paid"):
+        if order is None or order.status not in ("shipped", "invoiced", "paid", "refunded"):
             return False
     return True
 
@@ -764,6 +932,7 @@ spec.update_display(
             "ship_order_delivery": "仓库确认出库",
             "issue_and_post_invoice": "开具并过账发票",
             "record_customer_payment": "登记收款核销",
+            "issue_credit_note_refund": "开具红字退款贷项通知单",
             "annotate_o2c_governance": "登记风控特批备注",
         },
         "functions": {
@@ -791,6 +960,15 @@ spec.update_display(
             "quantity": "订购数量",
             "unit_price_cents": "商品单价（分）",
             "total_cents": "订单总金额（分）",
+            "tax_rate_bps": "税率（基点）",
+            "tax_cents": "税额（分）",
+            "ordered_qty": "应发数量",
+            "shipped_qty": "已发数量",
+            "ship_quantity": "本次发货数量",
+            "paid_cents": "已收款金额（分）",
+            "refunded_cents": "已退款金额（分）",
+            "allow_partial": "允许分期收款",
+            "reason": "退款原因",
             "account_rep": "客户负责人",
             "fulfillment_note": "履约特批备注",
             "delivery_id": "交货单号",
@@ -803,14 +981,18 @@ spec.update_display(
         "statuses": {
             "draft": "草稿",
             "confirmed": "已确认",
+            "partially_shipped": "部分发货",
             "shipped": "已发货",
             "invoiced": "已开票",
             "paid": "已收款",
+            "refunded": "已退款",
             "cancelled": "已取消",
             "pending": "待发货",
+            "partial": "部分履约",
             "posted": "已过账",
             "invoice_post": "开票记账增加",
             "payment_settlement": "收款核销冲减",
+            "credit_note_refund": "红字退款冲减",
             "NORMAL": "正常",
             "WATCHLIST": "重点关注",
             "BLOCKED": "信用冻结",

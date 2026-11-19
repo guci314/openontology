@@ -439,6 +439,44 @@ def test_revert_rejects_pending_run(runtime):
         action.approval_rule = original
 
 
+def test_revert_requires_approver_role_when_approver_roles_declared(runtime):
+    """动作声明了 approver_roles 时，普通 allowed_roles（如 ops）不得绕过审批权单方面撤回已提交记录。"""
+    # guarded_rename: allowed_roles=('admin', 'ops')? Let's verify using a dedicated governed action.
+    class ControlledNoteParams(BaseModel):
+        account_id: str
+        note: str
+
+    if "controlled_note" not in runtime.spec.actions:
+        @runtime.spec.action(
+            "controlled_note",
+            ControlledNoteParams,
+            allowed_roles=("ops", "admin"),
+            approver_roles=("admin",),
+            affects_source=False,
+        )
+        def _controlled_note(ctx, params: ControlledNoteParams) -> None:
+            acc = ctx.require(Account, params.account_id)
+            ctx.modify(acc, internal_note=params.note)
+
+    run = runtime.submit_action(
+        "RUN-CTRL-1", "controlled_note", {"account_id": "A1", "note": "由ops提交"}, OPS
+    )
+    assert run["status"] == AUDIT_STATUS_COMMITTED
+    assert runtime.get_object(Account, "A1", ADMIN).internal_note == "由ops提交"
+
+    # Non-approver submitter role (ops) MUST be denied revert_action
+    with pytest.raises(PermissionDeniedError):
+        runtime.revert_action("RUN-CTRL-1", "RUN-CTRL-1-REV-OPS", OPS)
+    assert runtime.get_action_run("RUN-CTRL-1")["status"] == AUDIT_STATUS_COMMITTED
+    assert runtime.get_object(Account, "A1", ADMIN).internal_note == "由ops提交"
+
+    # Approver role (admin) succeeds cleanly
+    reverted = runtime.revert_action("RUN-CTRL-1", "RUN-CTRL-1-REV-ADMIN", ADMIN)
+    assert reverted["status"] == AUDIT_STATUS_COMMITTED
+    assert runtime.get_action_run("RUN-CTRL-1")["status"] == AUDIT_STATUS_REVERTED
+    assert runtime.get_object(Account, "A1", ADMIN).internal_note == ""
+
+
 # ---------------------------------------------------------------------------
 # 5. RejectionAuditAspect
 # ---------------------------------------------------------------------------
