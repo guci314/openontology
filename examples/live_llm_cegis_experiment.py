@@ -188,7 +188,7 @@ def run_live_llm_l1_gradient_experiment(
                 external_profile=profile,
                 crucible_context=CrucibleContext(
                     mode="genesis",
-                    replay_factory=build_auto_replay_factory(bundle),
+                    replay_factory=build_auto_replay_factory(bundle, seed_ontology=seed),
                     default_actor=AI_OPS_ACTOR,
                     seed_ontology=seed,
                 ),
@@ -327,7 +327,7 @@ def run_live_llm_l1_gradient_experiment(
                     external_profile=profile,
                     crucible_context=CrucibleContext(
                         mode="genesis",
-                        replay_factory=build_auto_replay_factory(bundle),
+                        replay_factory=build_auto_replay_factory(bundle, seed_ontology=seed),
                         default_actor=AI_OPS_ACTOR,
                         seed_ontology=seed,
                     ),
@@ -1223,7 +1223,7 @@ def run_live_llm_l2_architect_experiment(
         p_unshipped = harness.confirm_order_physically(f_unshipped.order_id)
         inv_unshipped_id = harness.create_draft_invoice_for_order(f_unshipped.order_id)
 
-        inv_em = next(em for em in mapping_v1.entity_mappings if em.source_table == "account.move")
+        inv_em = mapping_v1.get_entity_mapping(post_b.target_object_type)
         pick_em = next(em for em in mapping_v1.entity_mappings if em.source_table == "stock.picking")
         inv_type = inv_em.target_object_type
         inv_pk = inv_em.id_transform.target_field
@@ -1278,8 +1278,9 @@ def run_live_llm_l2_architect_experiment(
                 action=confirm_b.action_name,
                 params={confirm_b.id_param: f"{confirm_b.id_prefix}{f_large.order_id}"},
                 actor=AI_OPS_ACTOR,
-                expect_valid=False,
-                expect_error_code="CREDIT_LIMIT_EXCEEDED_REQUIRES_STEWARD",
+                expect_valid=True,
+                expect_requires_approval=True,
+                expect_error_code=None,
             ),
             IncidentCounterexample(
                 name="HIST-CX-UNSHIPPED-POST",
@@ -1302,9 +1303,9 @@ def run_live_llm_l2_architect_experiment(
                 ],
                 "nl_policy_and_friction_requirements": [
                     "Keep existing L1 guardrails & existing fields intact (do NOT re-add fields already present in base_blueprint).",
-                    "Ensure a delivery validation action exists on StockPicking (if absent from base_blueprint, add validate_delivery_order: assigned -> done, bound to external_table='stock.picking', external_method='button_validate').",
-                    "Add M1 action register_invoice_payment on AccountMove (id param + float extra param) supporting 50% partial and 100% full settlement: reject draft invoices, amount <= 0, or amount > amount_residual; update amount_residual and use 'if_else' for payment_state ('paid' if residual - amount <= 0 else 'partial'). Bind via account.move external_method='action_create_payments' with extra_params naming the amount parameter.",
-                    "Add M1 action issue_credit_note_refund on AccountMove restricted to steward/admin (or requiring steward approval when actor is ai_agent): require state=='posted' and payment_state!='reversed'; set payment_state='reversed' and amount_residual=0.0; bind via account.move external_method='refund_moves' (keep any optional reason param required=False).",
+                    f"Ensure a delivery validation action exists on {pick_type} (if absent from base_blueprint, add validate_delivery_order: assigned -> done, bound to external_table='stock.picking', external_method='button_validate').",
+                    f"Add M1 action register_invoice_payment on {inv_type} (id param + float extra param) supporting 50% partial and 100% full settlement: reject draft invoices, amount <= 0, or amount > amount_residual; update amount_residual and use 'if_else' for payment_state ('paid' if residual - amount <= 0 else 'partial'). Bind via account.move external_method='action_create_payments' with extra_params naming the amount parameter.",
+                    f"Add M1 action issue_credit_note_refund on {inv_type} restricted to steward/admin (or requiring steward approval when actor is ai_agent): require state=='posted' and payment_state!='reversed'; set payment_state='reversed' and amount_residual=0.0; bind via account.move external_method='refund_moves' (keep any optional reason param required=False).",
                 ],
             },
             "observed_transitions": wizard_effects,
@@ -1318,7 +1319,10 @@ def run_live_llm_l2_architect_experiment(
             errs: list[str] = []
             if candidate_mapping is None:
                 return ["AdapterMappingSpec must be updated for L2 capabilities."]
-            c_inv_em = next((e for e in candidate_mapping.entity_mappings if e.source_table == "account.move"), None)
+            c_inv_em = next(
+                (e for e in candidate_mapping.entity_mappings if e.target_object_type == inv_type),
+                None,
+            ) or next((e for e in candidate_mapping.entity_mappings if e.source_table == "account.move"), None)
             if c_inv_em is None:
                 return ["Missing EntityMappingSpec for account.move."]
             tf_names = {tf.target_field for tf in c_inv_em.field_transforms}
@@ -1367,19 +1371,25 @@ def run_live_llm_l2_architect_experiment(
             try:
                 inv_cls = spec.get_object_type(inv_type)
                 pick_cls = spec.get_object_type(pick_type)
+                def _pick_kwargs(**kw: Any) -> dict[str, Any]:
+                    return {k: v for k, v in kw.items() if k in pick_cls.model_fields}
+
+                def _inv_kwargs(**kw: Any) -> dict[str, Any]:
+                    return {k: v for k, v in kw.items() if k in inv_cls.model_fields}
+
                 rt.put_object(
                     pick_cls(
-                        **{
+                        **_pick_kwargs(**{
                             pick_pk: f"{pick_em.id_transform.prefix}901",
                             "state": "assigned",
                             "name": "WH/L2/901",
                             "origin": "SO-L2",
-                        }
+                        })
                     )
                 )
                 rt.put_object(
                     inv_cls(
-                        **{
+                        **_inv_kwargs(**{
                             inv_pk: f"{inv_em.id_transform.prefix}901",
                             "state": "posted",
                             "name": "INV/L2/901",
@@ -1388,12 +1398,12 @@ def run_live_llm_l2_architect_experiment(
                             "amount_total": 20000.0,
                             "amount_residual": 20000.0,
                             "payment_state": "not_paid",
-                        }
+                        })
                     )
                 )
                 rt.put_object(
                     inv_cls(
-                        **{
+                        **_inv_kwargs(**{
                             inv_pk: f"{inv_em.id_transform.prefix}902",
                             "state": "posted",
                             "name": "INV/L2/902",
@@ -1402,12 +1412,12 @@ def run_live_llm_l2_architect_experiment(
                             "amount_total": 20000.0,
                             "amount_residual": 20000.0,
                             "payment_state": "not_paid",
-                        }
+                        })
                     )
                 )
                 rt.put_object(
                     inv_cls(
-                        **{
+                        **_inv_kwargs(**{
                             inv_pk: f"{inv_em.id_transform.prefix}903",
                             "state": "draft",
                             "name": "INV/L2/903",
@@ -1416,7 +1426,7 @@ def run_live_llm_l2_architect_experiment(
                             "amount_total": 20000.0,
                             "amount_residual": 20000.0,
                             "payment_state": "not_paid",
-                        }
+                        })
                     )
                 )
 
@@ -1558,7 +1568,7 @@ def run_live_llm_l2_architect_experiment(
                     external_profile=profile,
                     crucible_context=CrucibleContext(
                         mode="genesis",
-                        replay_factory=build_auto_replay_factory(bundle),
+                        replay_factory=build_auto_replay_factory(bundle, seed_ontology=seed),
                         default_actor=AI_OPS_ACTOR,
                         seed_ontology=seed,
                     ),

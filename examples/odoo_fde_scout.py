@@ -242,6 +242,7 @@ class FieldSignal:
     relation_target: str | None = None
     selection_values: tuple[str, ...] = ()
     tracked_transitions: int = 0
+    selection_labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -842,7 +843,9 @@ class OdooFDEScout:
                         continue
                     seen_measure_vectors[vec] = fname
 
-                sel_keys = tuple(p[0] for p in sel_map.get(fname, []))
+                sel_pairs = sel_map.get(fname, [])
+                sel_keys = tuple(p[0] for p in sel_pairs if len(p) >= 1)
+                sel_labels = {str(p[0]): str(p[1]) for p in sel_pairs if len(p) >= 2}
                 sig = FieldSignal(
                     name=fname,
                     label=str(sf.get("field_description") or fname),
@@ -854,6 +857,7 @@ class OdooFDEScout:
                     relation_target=str(sf["relation"]) if ttype == "many2one" and sf.get("relation") else None,
                     selection_values=sel_keys,
                     tracked_transitions=tr_cnt,
+                    selection_labels=sel_labels,
                 )
                 priority = (
                     (10.0 if fname in ("id", "name") else 0.0)

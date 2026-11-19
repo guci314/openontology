@@ -23,6 +23,7 @@ import argparse
 import copy
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -120,8 +121,11 @@ def _log(msg: str) -> None:
     print(f"[blind-crm] {msg}", file=sys.stderr, flush=True)
 
 
+_CATEGORICAL_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_ ]{0,20}$")
+
+
 def scout_bottlecrm_sqlite(db_path: Path) -> dict[str, Any]:
-    """Read-only SQLite metadata + sample extractor across all 118 Django-CRM tables."""
+    """Unsupervised, zero-hardcoding SQLite metadata + relational subgraph scout."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -134,24 +138,47 @@ def scout_bottlecrm_sqlite(db_path: Path) -> dict[str, Any]:
         domain_tables = [
             t for t in all_tables if not t.startswith("django_") and not t.startswith("auth_")
         ]
-        target_tables = ["accounts", "opportunity", "case"]
+
+        cols_by_table: dict[str, list[Any]] = {}
+        fks_by_table: dict[str, list[dict[str, str]]] = {}
+        row_count_by_table: dict[str, int] = {}
+        raw_total_cols = 0
+        for tbl in domain_tables:
+            cols = conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()
+            cols_by_table[tbl] = cols
+            raw_total_cols += len(cols)
+            fks = conn.execute(f'PRAGMA foreign_key_list("{tbl}")').fetchall()
+            fks_by_table[tbl] = [
+                {"from_table": tbl, "from_col": str(fk["from"]), "to_table": str(fk["table"])}
+                for fk in fks
+            ]
+            row_count_by_table[tbl] = int(conn.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0])
+
+        # Unsupervised core entity subgraph: populated multi-row tables connected by non-self FKs
+        multi_row_tables = {t for t in domain_tables if row_count_by_table[t] >= 2}
+        multi_degree: dict[str, int] = {t: 0 for t in multi_row_tables}
+        for tbl in multi_row_tables:
+            for fk in fks_by_table[tbl]:
+                tgt = fk["to_table"]
+                if tgt in multi_row_tables and tgt != tbl:
+                    multi_degree[tbl] += 1
+                    multi_degree[tgt] += 1
+        core_tables = sorted(t for t, deg in multi_degree.items() if deg >= 1)
+        core_set = set(core_tables)
+        core_fk_targets = {
+            fk["to_table"] for tbl in core_tables for fk in fks_by_table[tbl] if fk["to_table"] != tbl
+        }
+
         entities: list[ExternalEntityProfile] = []
         raw_rows_by_table: dict[str, list[dict[str, Any]]] = {}
         fk_edges: list[dict[str, str]] = []
-        raw_total_cols = 0
 
-        for tbl in domain_tables:
-            cols = conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()
-            raw_total_cols += len(cols)
-            if tbl not in target_tables:
-                continue
-            fks = conn.execute(f'PRAGMA foreign_key_list("{tbl}")').fetchall()
-            fk_by_col = {str(fk["from"]): str(fk["table"]) for fk in fks}
-            for fk in fks:
-                if str(fk["table"]) in target_tables:
-                    fk_edges.append(
-                        {"from_table": tbl, "from_col": str(fk["from"]), "to_table": str(fk["table"])}
-                    )
+        for tbl in core_tables:
+            cols = cols_by_table[tbl]
+            fk_by_col = {fk["from_col"]: fk["to_table"] for fk in fks_by_table[tbl]}
+            for fk in fks_by_table[tbl]:
+                if fk["to_table"] in core_set:
+                    fk_edges.append(dict(fk))
             rows = [dict(r) for r in conn.execute(f'SELECT * FROM "{tbl}" ORDER BY rowid').fetchall()]
             raw_rows_by_table[tbl] = rows
 
@@ -165,12 +192,20 @@ def scout_bottlecrm_sqlite(db_path: Path) -> dict[str, Any]:
                     rtype = "float"
                 else:
                     rtype = "string"
-                vals = [
-                    str(r[cname])
-                    for r in rows
-                    if r.get(cname) is not None and str(r.get(cname)).strip() != ""
-                ]
-                enums = sorted(set(vals)) if cname in ("stage", "status", "priority", "case_type", "industry") else []
+                enums: list[str] = []
+                if rtype == "string" and int(c["pk"] or 0) == 0 and cname not in fk_by_col:
+                    vals = [
+                        str(r[cname])
+                        for r in rows
+                        if r.get(cname) is not None and str(r.get(cname)).strip() != ""
+                    ]
+                    distinct = sorted(set(vals))
+                    if (
+                        1 <= len(distinct) <= 10
+                        and all(_CATEGORICAL_TOKEN_RE.match(v) for v in distinct)
+                        and (len(distinct) < len(rows) or all(" " not in v for v in distinct))
+                    ):
+                        enums = distinct
                 fields.append(
                     ExternalFieldProfile(
                         name=cname,
@@ -189,10 +224,21 @@ def scout_bottlecrm_sqlite(db_path: Path) -> dict[str, Any]:
                 )
             )
 
-        stages = [
-            str(r["code"])
-            for r in conn.execute("SELECT code FROM opportunity_pipeline_stage ORDER BY \"order\"").fetchall()
-        ]
+        # Unsupervised discovery of secondary multi-row vocabulary/code lookup tables
+        discovered_lookup_codes: dict[str, list[str]] = {}
+        for tbl in sorted(multi_row_tables - core_set):
+            col_names = {str(c["name"]) for c in cols_by_table[tbl]}
+            tbl_fk_targets = {fk["to_table"] for fk in fks_by_table[tbl]}
+            if "code" in col_names and (tbl_fk_targets & core_fk_targets):
+                order_col = '"order"' if "order" in col_names else "rowid"
+                codes = [
+                    str(r[0])
+                    for r in conn.execute(f'SELECT code FROM "{tbl}" ORDER BY {order_col}').fetchall()
+                    if r[0] is not None and str(r[0]).strip() != ""
+                ]
+                if codes:
+                    discovered_lookup_codes[tbl] = codes
+
         profile = ExternalPhenomenonProfile(
             source_kind="discovered_crm",
             source_locator="discovered://crm",
@@ -206,10 +252,34 @@ def scout_bottlecrm_sqlite(db_path: Path) -> dict[str, Any]:
             "profile": profile,
             "raw_rows_by_table": raw_rows_by_table,
             "fk_edges": fk_edges,
-            "opportunity_stages": stages,
+            "discovered_lookup_codes": discovered_lookup_codes,
         }
     finally:
         conn.close()
+
+
+def build_blind_crm_genesis_requirement_doc() -> str:
+    """Build schema-free natural-language Genesis task brief without leaking column/table/action hints."""
+    return (
+        "All discovered entity schemas, structural foreign-key edges, lookup vocabularies, and sample rows "
+        "are ALREADY provided in phenomenon_brief and external_profile below. Do NOT invoke any shell, file, "
+        "search, or external tools; respond with pure JSON in a single turn.\n\n"
+        "Synthesize a clean, semantically purified 0->1 DeclarativeBlueprint and complete bidirectional "
+        "AdapterMappingSpec grounded on the SeedOntology:\n"
+        "1. Map each discovered master and workflow entity in external_profile into clean PascalCase "
+        "ObjectTypeBlueprints inheriting MasterEntity or ProcessDocument.\n"
+        "2. Actively prune technical audit timestamps, user/tenant routing pointers, UI layout ordering, "
+        "custom-field blobs, SLA timers, and merge/sync metadata columns, retaining only business-meaningful "
+        "identifiers, foreign keys, monetary measures, priorities, and lifecycle states.\n"
+        "3. Provide complete AdapterMappingSpec:\n"
+        "   - Use kind='id_prefix' transforms on primary keys with distinct short prefixes per entity type, "
+        "and align every foreign_key_id prefix with its target master entity prefix.\n"
+        "   - Preserve discovered source enum values directly (kind='direct') without remapping.\n"
+        "   - In this initial v1.0.0 Genesis, synthesize mechanical forward lifecycle actions for closing deals "
+        "(won or lost) and resolving support tickets for standard operational roles, reserving enterprise policy "
+        "guardrails for Act 2 evolution.\n"
+        "4. Emit self-contained ProposedEvalCase checks using synthetic setup_objects."
+    )
 
 
 def _build_sqlite_genesis_replay_factory(
@@ -788,33 +858,7 @@ def run_blind_crm_induction_benchmark(
     opp_rows = {r["name"]: r for r in raw_rows_by_table["opportunity"]}
     case_rows = {r["name"]: r for r in raw_rows_by_table["case"]}
 
-    req_doc = (
-        "All external schema fields, foreign-key edges, and M0 sample rows are ALREADY provided in "
-        "phenomenon_brief and external_profile below. Do NOT invoke any shell, file, search, or external tools; "
-        "respond with pure JSON in a single turn.\n\n"
-        "Synthesize a clean, semantically purified 0->1 L1 DeclarativeBlueprint (and complete bidirectional "
-        "AdapterMappingSpec) for the discovered CRM phenomenon above, grounded on the SeedOntology.\n"
-        "Requirements:\n"
-        "1. Map the 3 core populated CRM entities ('accounts', 'opportunity', 'case') into clean domain "
-        "PascalCase ObjectTypeBlueprints (e.g. Account, Opportunity, SupportCase) inheriting MasterEntity / "
-        "ProcessDocument.\n"
-        "2. Actively prune ORM, audit, UI, and SLA metadata noise columns (e.g. created_at, updated_at, "
-        "created_by_id, updated_by_id, org_id, kanban_order, custom_fields, alt_thread_ids, sla_paused_at, "
-        "sla_paused_seconds, is_sample, merge_record, escalation_count, source_detail, source_ref).\n"
-        "3. Provide complete AdapterMappingSpec:\n"
-        "   - Every mapped entity's id_transform MUST use kind='id_prefix' on source_field='id' with distinct "
-        "prefixes (e.g. 'ACCT-', 'OPP-', 'CASE-'). Keep optional/nullable string fields required=False with defaults.\n"
-        "   - Foreign keys 'account_id' on Opportunity and SupportCase MUST use kind='foreign_key_id' with "
-        "the exact same prefix as Account ('ACCT-').\n"
-        "   - On ProcessDocument entities, use kind='direct' raw enum strings without remapping: Opportunity includes "
-        "'amount' (float) and 'stage' in ['PROSPECTING','QUALIFICATION','PROPOSAL','NEGOTIATION','CLOSED_WON','CLOSED_LOST']; "
-        "SupportCase includes 'priority' (['High','Medium','Urgent']) and 'status' in ['New','In Progress','Resolved','Closed'].\n"
-        "   - In this initial v1.0.0 Genesis, synthesize ONLY mechanical forward lifecycle transitions "
-        "(win_opportunity -> stage='CLOSED_WON', close_lost_opportunity -> stage='CLOSED_LOST', "
-        "resolve_support_case -> status='Resolved') with allowed_roles=['ai_agent','ops','steward','admin'] and no "
-        "enterprise policy approval gates yet (enterprise governance policies will evolve in Act 2).\n"
-        "4. Emit self-contained ProposedEvalCase checks using synthetic setup_objects."
-    )
+    req_doc = build_blind_crm_genesis_requirement_doc()
 
     with InductionGovernanceService(db_path=":memory:") as gov:
         _log(f"Act 1 (Genesis): inducing BottleCRM ontology v1.0.0 with {model_label}")
@@ -830,7 +874,7 @@ def run_blind_crm_induction_benchmark(
             phenomenon_brief={
                 "discovered_entities": [e.table_name for e in profile.entities],
                 "discovered_relations": scout_info["fk_edges"],
-                "opportunity_pipeline_stages": scout_info["opportunity_stages"],
+                "discovered_lookup_codes": scout_info["discovered_lookup_codes"],
             },
             requirement_doc=req_doc,
             external_profile=profile,
@@ -893,9 +937,10 @@ def run_blind_crm_induction_benchmark(
                     signature="critical_open_case_blocker",
                     params={win_b.id_param: acme_opp_cid},
                     summary=(
-                        f"PROVENANCE=nl_policy_and_friction: ai_agent must NOT close-won {win_b.action_name} "
-                        f"on an opportunity whose parent account has any SupportCase with priority in ['High','Urgent'] "
-                        f"and status not in ['Resolved','Closed'] (blocking {acme_opp_cid}, while allowing {nw_opp_cid} whose case is Medium)."
+                        f"Enterprise Sales Governance Policy: automated agents must not mark a deal closed-won "
+                        f"({win_b.action_name}) while the linked customer still has an active unresolved urgent or "
+                        f"high-priority support ticket open (blocked on {acme_opp_cid}, while allowing {nw_opp_cid} "
+                        f"whose open ticket is only medium priority)."
                     ),
                     error_code="ACCOUNT_HAS_OPEN_CRITICAL_CASE",
                 ),
@@ -907,10 +952,9 @@ def run_blind_crm_induction_benchmark(
                     signature="high_value_loss_authority",
                     params={lost_b.id_param: south_opp_cid},
                     summary=(
-                        f"PROVENANCE=nl_policy_and_friction: ai_agent must NOT {lost_b.action_name} when "
-                        f"opportunity amount > 100000; enforce via action precondition requiring "
-                        f"actor.role in ['steward', 'admin'] when opportunity amount > 100000 "
-                        f"(blocking {south_opp_cid} amount=260000 for ai_agent, allowing steward)."
+                        f"Enterprise Revenue Loss Control Policy: automated agents must not mark a deal closed-lost "
+                        f"({lost_b.action_name}) when commercial deal value exceeds 100,000; high-value losses require "
+                        f"human steward or admin authority (blocked {south_opp_cid} valued at 260,000 for ai_agent, allowed for steward)."
                     ),
                     error_code="HIGH_VALUE_LOSS_REQUIRES_STEWARD",
                 ),

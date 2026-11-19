@@ -66,8 +66,9 @@ def test_autonomous_pipeline_end_to_end_offline_synthetic_clinic_erp() -> None:
 
     cryst = out["crystallized_ontology"]
     assert cryst["crucible_gates_passed"] is True
-    assert set(cryst["object_types"]) == {"ClinicPatient", "ClinicVisit", "ClinicBill"}
-    assert "clinic_visit__do_confirm_visit" in cryst["actions"]
+    assert set(cryst["object_types"]) == {"Patient", "ClinicVisit", "PatientBill", "InternalAdj"}
+    assert "confirm_visit" in cryst["actions"]
+    assert all("__" not in a for a in cryst["actions"])
     assert cryst["gate_3_metrics"]["positive_rate"] == 1.0
     assert cryst["gate_3_metrics"]["negative_rate"] == 1.0
 
@@ -81,6 +82,87 @@ def test_autonomous_pipeline_end_to_end_offline_synthetic_clinic_erp() -> None:
     assert drift is not None
     assert drift["mismatch_caught"] is True
     assert drift["error_code"] == "DEVICE_STATE_MISMATCH"
+
+
+def test_autonomous_synthesis_promotes_joins_prunes_ui_noise_and_compiles_approval_rule() -> None:
+    from open_ontology import OntologyRuntime
+    from open_ontology.induction import compile_blueprint, project_external_phenomenon
+    from examples.business_ontology import build_business_seed_ontology
+    from examples.odoo_fde_autonomous_pipeline import (
+        AI_OPS_ACTOR,
+        build_auto_replay_factory,
+        build_closed_phenomenon_profile,
+        synthesize_from_fde_evidence,
+    )
+    from examples.odoo_fde_prober import OdooActiveProber
+    from examples.odoo_fde_scout import OdooFDEScout
+
+    base_ro = _SyntheticOdooMock()
+    base_ro.tables["ir.model.fields"].append(
+        {
+            "id": 199,
+            "model": "clinic.patient",
+            "name": "can_image_1024_be_zoomed",
+            "field_description": "Can Image 1024 Be Zoomed",
+            "ttype": "boolean",
+            "relation": False,
+            "store": True,
+            "required": False,
+            "readonly": False,
+        }
+    )
+    base_ro.tables["clinic.patient"][0]["can_image_1024_be_zoomed"] = True
+    base_ro.tables["clinic.patient"][1]["can_image_1024_be_zoomed"] = False
+    base_ro.tables["clinic.visit"].append(
+        {"id": 14, "name": "VST-005", "patient_id": [2, "Bob"], "state": "draft", "total_amount": 150.0}
+    )
+
+    sandbox = _SyntheticProbeSandbox(base_ro)
+    scout_report = OdooFDEScout(base_ro, source_locator="mock://clinic_unit", max_models=5).scout()
+    profile = build_closed_phenomenon_profile(scout_report, client=base_ro)
+    probe_report = OdooActiveProber(sandbox, sandbox_db="mock_clone_unit").probe(scout_report)
+
+    seed = build_business_seed_ontology()
+    bundle = synthesize_from_fde_evidence(
+        scout_report,
+        probe_report,
+        profile=profile,
+        seed_ontology=seed,
+        model_id="clinic_approval_test",
+        apply_gray_zone_approval_rules=True,
+    )
+    ot_map = {ot.name: ot for ot in bundle.blueprint.object_types}
+    assert "can_image_1024_be_zoomed" not in {f.name for f in ot_map["Patient"].fields}
+    pb_ot = ot_map["PatientBill"]
+    assert any(r.field == "clinic_visit" and r.target_type == "ClinicVisit" for r in pb_ot.relations)
+    assert "visit_origin" not in {f.name for f in pb_ot.fields}
+
+    compiled = compile_blueprint(bundle.blueprint, seed_ontology=seed)
+    projected, proj_errors = project_external_phenomenon(profile, bundle.adapter_mapping)
+    assert proj_errors == []
+
+    # Verify build_auto_replay_factory emits both normal and approval-gated ReplayEvents when applicable
+    pos_events, _ = build_auto_replay_factory(bundle, seed_ontology=seed)(projected)
+    assert any(ev.expected_requires_approval for ev in pos_events)
+
+    rt = OntologyRuntime(compiled, db_path=":memory:")
+    try:
+        order_rank = {name: i for i, name in enumerate(compiled.object_types)}
+        for entry in sorted(projected, key=lambda e: order_rank.get(e["object_type"], 999)):
+            cls = compiled.get_object_type(entry["object_type"])
+            rt.put_object(cls(**entry["data"]))
+
+        visit_cls = compiled.get_object_type("ClinicVisit")
+        over_limit = next(v for v in rt.query_objects(visit_cls, AI_OPS_ACTOR) if v.state == "draft" and float(v.total_amount) > 500.0)
+        within_limit = next(v for v in rt.query_objects(visit_cls, AI_OPS_ACTOR) if v.state == "draft" and float(v.total_amount) <= 500.0)
+
+        res_over = rt.submit_action("SYNTH-OVER", "confirm_visit", {"record_id": over_limit.record_id}, AI_OPS_ACTOR)
+        assert res_over["status"] == "PENDING_APPROVAL"
+
+        res_ok = rt.submit_action("SYNTH-OK", "confirm_visit", {"record_id": within_limit.record_id}, AI_OPS_ACTOR)
+        assert res_ok["status"] == "COMMITTED"
+    finally:
+        rt.close()
 
 
 def test_autonomous_pipeline_live_odoo19_step1_and_step2_zero_leak() -> None:
@@ -122,7 +204,9 @@ def test_autonomous_pipeline_live_odoo19_step1_and_step2_zero_leak() -> None:
 
     cryst = out["crystallized_ontology"]
     assert cryst["crucible_gates_passed"] is True
-    assert {"SaleOrder", "StockPicking", "AccountMove", "ResPartner"}.issubset(set(cryst["object_types"]))
+    assert {"Contact", "SalesOrder", "Transfer", "CustomerInvoice", "JournalEntry"}.issubset(set(cryst["object_types"]))
+    assert {"ResPartner", "SaleOrder", "StockPicking", "AccountMove"}.isdisjoint(set(cryst["object_types"]))
+    assert all("__" not in a for a in cryst["actions"])
     assert cryst["gate_3_metrics"]["positive_total"] >= 3
     assert cryst["gate_3_metrics"]["negative_total"] >= 2
     assert cryst["gate_3_metrics"]["positive_rate"] == 1.0

@@ -278,6 +278,42 @@ class OfflineOdooPhysicalWorld:
                     "amount_residual": 10_000.0,
                     "partner_id": [1, "Seed Customer A"],
                 },
+                33: {
+                    "id": 33,
+                    "name": "JE/2026/00033",
+                    "move_type": "entry",
+                    "state": "posted",
+                    "payment_state": "not_paid",
+                    "invoice_origin": False,
+                    "amount_untaxed": 5_000.0,
+                    "amount_total": 5_000.0,
+                    "amount_residual": 0.0,
+                    "partner_id": False,
+                },
+                34: {
+                    "id": 34,
+                    "name": "JE/2026/00034",
+                    "move_type": "entry",
+                    "state": "posted",
+                    "payment_state": "not_paid",
+                    "invoice_origin": False,
+                    "amount_untaxed": 5_000.0,
+                    "amount_total": 5_000.0,
+                    "amount_residual": 0.0,
+                    "partner_id": False,
+                },
+                35: {
+                    "id": 35,
+                    "name": "JE/2026/00035",
+                    "move_type": "entry",
+                    "state": "posted",
+                    "payment_state": "not_paid",
+                    "invoice_origin": False,
+                    "amount_untaxed": 5_000.0,
+                    "amount_total": 5_000.0,
+                    "amount_residual": 0.0,
+                    "partner_id": False,
+                },
             },
         }
         self._models_meta = [
@@ -442,7 +478,11 @@ class OfflineOdooPhysicalWorld:
             ("sale.order", "state"): [["draft", "Quotation"], ["sale", "Sales Order"], ["cancel", "Cancelled"]],
             ("sale.order", "delivery_status"): [["pending", "Not Delivered"], ["partial", "Partially Delivered"], ["full", "Fully Delivered"]],
             ("stock.picking", "state"): [["draft", "Draft"], ["assigned", "Ready"], ["done", "Done"], ["cancel", "Cancelled"]],
-            ("account.move", "move_type"): [["out_invoice", "Customer Invoice"], ["out_refund", "Credit Note"]],
+            ("account.move", "move_type"): [
+                ["out_invoice", "Customer Invoice"],
+                ["out_refund", "Credit Note"],
+                ["entry", "Journal Entry"],
+            ],
             ("account.move", "state"): [["draft", "Draft"], ["posted", "Posted"], ["cancel", "Cancelled"]],
             ("account.move", "payment_state"): [["not_paid", "Not Paid"], ["partial", "Partially Paid"], ["paid", "Paid"]],
         }
@@ -1654,7 +1694,7 @@ def build_odoo_o2c_l2_protocol_map(
 
     has_l2_financial_actions = pay_b is not None or refund_b is not None
     if validate_b is not None and (
-        has_l2_financial_actions or validate_b.action_name != "stock_picking__button_validate"
+        has_l2_financial_actions or validate_b.action_name == "validate_delivery_order"
     ):
         protocols[validate_b.action_name] = [
             OdooProtocolStep(
@@ -2491,6 +2531,106 @@ def evaluate_autonomous_fde_regime(
 # ---------------------------------------------------------------------------
 # 5. L1 Evolution Closure (Scorecard v1.0 Failures -> OntologyEvolverAgent -> v1.1)
 # ---------------------------------------------------------------------------
+def _build_l1_updated_confirm_and_post_actions(
+    *,
+    base_blueprint: DeclarativeBlueprint,
+    confirm_action_name: str,
+    post_action_name: str,
+    order_type: str,
+    inv_type: str,
+    pick_type: str,
+    partner_type: str | None = None,
+    confirm_id_param: str = "record_id",
+    post_id_param: str = "record_id",
+) -> tuple[ActionBlueprint, ActionBlueprint]:
+    """Attach L1 Stage-1 approval_rule on order confirmation + shipped-delivery precondition on invoicing."""
+    ot_by_name = {ot.name: ot for ot in base_blueprint.object_types}
+    order_ot = ot_by_name[order_type]
+    inv_ot = ot_by_name[inv_type]
+    pick_ot = ot_by_name[pick_type]
+
+    partner_rel = (
+        next((r.field for r in order_ot.relations if partner_type and r.target_type == partner_type), None)
+        or next((r.field for r in order_ot.relations if r.field == "partner_id"), None)
+        or (order_ot.relations[0].field if order_ot.relations else "partner_id")
+    )
+    inv_order_rel = next((r.field for r in inv_ot.relations if r.target_type == order_type), None)
+    pick_order_rel = next((r.field for r in pick_ot.relations if r.target_type == order_type), None)
+    inv_has_move_type = any(f.name == "move_type" for f in inv_ot.fields)
+
+    base_actions = {a.name: copy.deepcopy(a) for a in base_blueprint.actions}
+    confirm_act = base_actions[confirm_action_name]
+    confirm_act.approver_roles = ["steward", "admin"]
+    confirm_act.approval_target_type = order_type
+    confirm_act.approval_id_param = confirm_id_param
+    confirm_act.approval_rule = {
+        "op": "and",
+        "args": [
+            {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
+            {"op": "gt", "left": {"ref": f"obj.{partner_rel}.credit_limit"}, "right": {"lit": 0}},
+            {"op": "gt", "left": {"ref": "obj.amount_total"}, "right": {"ref": f"obj.{partner_rel}.credit_limit"}},
+        ],
+    }
+
+    when_args: list[dict[str, Any]] = []
+    if inv_has_move_type:
+        when_args.append({"op": "eq", "left": {"ref": "obj.move_type"}, "right": {"lit": "out_invoice"}})
+    if inv_order_rel is not None:
+        when_args.extend([
+            {"op": "ne", "left": {"ref": f"obj.{inv_order_rel}"}, "right": {"lit": None}},
+            {"op": "ne", "left": {"ref": f"obj.{inv_order_rel}"}, "right": {"lit": ""}},
+            {
+                "op": "exists",
+                "object_type": order_type,
+                "where": {"op": "eq", "left": {"ref": "target.record_id"}, "right": {"ref": f"obj.{inv_order_rel}"}},
+            },
+        ])
+        pick_order_match = (
+            {"op": "eq", "left": {"ref": f"target.{pick_order_rel}"}, "right": {"ref": f"obj.{inv_order_rel}"}}
+            if pick_order_rel is not None
+            else {"op": "eq", "left": {"ref": "target.origin"}, "right": {"ref": f"obj.{inv_order_rel}.name"}}
+        )
+    else:
+        when_args.extend([
+            {"op": "ne", "left": {"ref": "obj.invoice_origin"}, "right": {"lit": None}},
+            {"op": "ne", "left": {"ref": "obj.invoice_origin"}, "right": {"lit": ""}},
+            {
+                "op": "exists",
+                "object_type": order_type,
+                "where": {"op": "eq", "left": {"ref": "target.name"}, "right": {"ref": "obj.invoice_origin"}},
+            },
+        ])
+        pick_order_match = (
+            {"op": "eq", "left": {"ref": f"target.{pick_order_rel}.name"}, "right": {"ref": "obj.invoice_origin"}}
+            if pick_order_rel is not None
+            else {"op": "eq", "left": {"ref": "target.origin"}, "right": {"ref": "obj.invoice_origin"}}
+        )
+
+    post_act = base_actions[post_action_name]
+    post_act.preconditions.append(
+        InvariantRuleSpec(
+            name="invoice_origin_order_must_be_shipped",
+            code="CANNOT_INVOICE_UNSHIPPED_ORDER",
+            target_type=inv_type,
+            id_param=post_id_param,
+            when={"op": "and", "args": when_args},
+            must_hold={
+                "op": "exists",
+                "object_type": pick_type,
+                "where": {
+                    "op": "and",
+                    "args": [
+                        pick_order_match,
+                        {"op": "eq", "left": {"ref": "target.state"}, "right": {"lit": "done"}},
+                    ],
+                },
+            },
+            description=f"Customer invoices linked to a {order_type} cannot be posted until a {pick_type} for that order is done.",
+        )
+    )
+    return confirm_act, post_act
+
+
 def evolve_autonomous_ontology_from_utility_gaps(
     *,
     governance: InductionGovernanceService,
@@ -2503,96 +2643,79 @@ def evolve_autonomous_ontology_from_utility_gaps(
     post_action_name: str,
     t2_1_record_id: str,
     t2_2_record_id: str,
+    base_mapping: AdapterMappingSpec | None = None,
     seed_ontology: SeedOntology | None = None,
 ) -> tuple[DeclarativeBlueprint, dict[str, Any]]:
     """Feed L1 failure package from Utility Evaluator into OntologyEvolverAgent + 5-Gate Crucible."""
     assert routing_v1.l1_repair_candidates, "expected at least one L1 repair candidate from v1.0 evaluation"
     l1_pkg = routing_v1.l1_repair_candidates[0]
 
-    # Build fresh evolved action blueprints preserving all existing preconditions/mutations + adding L1 guardrails
-    base_actions = {a.name: copy.deepcopy(a) for a in base_blueprint.actions}
-    updated_actions: list[ActionBlueprint] = []
-
-    confirm_act = base_actions[confirm_action_name]
-    confirm_act.preconditions.append(
-        InvariantRuleSpec(
-            name="credit_limit_requires_steward_role",
-            code="CREDIT_LIMIT_EXCEEDED_REQUIRES_STEWARD",
-            target_type="SaleOrder",
-            id_param="record_id",
-            when={
-                "op": "and",
-                "args": [
-                    {"op": "gt", "left": {"ref": "obj.partner_id.credit_limit"}, "right": {"lit": 0}},
-                    {"op": "gt", "left": {"ref": "obj.amount_total"}, "right": {"ref": "obj.partner_id.credit_limit"}},
-                ],
-            },
-            must_hold={
-                "op": "eq",
-                "left": {"ref": "actor.role"},
-                "right": {"lit": "steward"},
-            },
-            description="Orders exceeding customer credit_limit require steward authority to confirm.",
-        )
+    confirm_b = _find_binding(base_mapping, table="sale.order", method_substr="confirm") if base_mapping is not None else None
+    post_b = _find_binding(base_mapping, table="account.move", method_substr="post") if base_mapping is not None else None
+    base_actions_map = {a.name: a for a in base_blueprint.actions}
+    order_type = (
+        confirm_b.target_object_type
+        if confirm_b is not None
+        else next((m.object_type for m in base_actions_map[confirm_action_name].mutations if m.object_type), "SalesOrder")
     )
-    updated_actions.append(confirm_act)
-
-    post_act = base_actions[post_action_name]
-    post_act.preconditions.append(
-        InvariantRuleSpec(
-            name="invoice_origin_order_must_be_shipped",
-            code="CANNOT_INVOICE_UNSHIPPED_ORDER",
-            target_type="AccountMove",
-            id_param="record_id",
-            when={
-                "op": "and",
-                "args": [
-                    {"op": "eq", "left": {"ref": "obj.move_type"}, "right": {"lit": "out_invoice"}},
-                    {"op": "ne", "left": {"ref": "obj.invoice_origin"}, "right": {"lit": ""}},
-                    {
-                        "op": "exists",
-                        "object_type": "SaleOrder",
-                        "where": {"op": "eq", "left": {"ref": "target.name"}, "right": {"ref": "obj.invoice_origin"}},
-                    },
-                ],
-            },
-            must_hold={
-                "op": "exists",
-                "object_type": "StockPicking",
-                "where": {
-                    "op": "and",
-                    "args": [
-                        {"op": "eq", "left": {"ref": "target.origin"}, "right": {"ref": "obj.invoice_origin"}},
-                        {"op": "eq", "left": {"ref": "target.state"}, "right": {"lit": "done"}},
-                    ],
-                },
-            },
-            description="Customer invoices linked to a sales order cannot be posted until a StockPicking for that origin is done.",
-        )
+    inv_type = (
+        post_b.target_object_type
+        if post_b is not None
+        else next((m.object_type for m in base_actions_map[post_action_name].mutations if m.object_type), "CustomerInvoice")
     )
-    updated_actions.append(post_act)
+    pick_type = (
+        next((em.target_object_type for em in base_mapping.entity_mappings if em.source_table == "stock.picking"), None)
+        if base_mapping is not None
+        else None
+    ) or next(
+        (
+            ot.name
+            for ot in base_blueprint.object_types
+            if ot.name not in (order_type, inv_type) and any(r.target_type == order_type for r in ot.relations)
+        ),
+        "Transfer",
+    )
+    partner_type = (
+        next((em.target_object_type for em in base_mapping.entity_mappings if em.source_table == "res.partner"), None)
+        if base_mapping is not None
+        else None
+    )
+    confirm_id_param = confirm_b.id_param if confirm_b is not None else "record_id"
+    post_id_param = post_b.id_param if post_b is not None else "record_id"
+
+    confirm_act, post_act = _build_l1_updated_confirm_and_post_actions(
+        base_blueprint=base_blueprint,
+        confirm_action_name=confirm_action_name,
+        post_action_name=post_action_name,
+        order_type=order_type,
+        inv_type=inv_type,
+        pick_type=pick_type,
+        partner_type=partner_type,
+        confirm_id_param=confirm_id_param,
+        post_id_param=post_id_param,
+    )
 
     patch = EvolutionPatch(
         base_version=base_blueprint.version,
         target_version="1.1.0",
         rationale=(
             "Utility evaluator T2-1 & T2-2 exposed dirty external writes on unapproved over-credit-limit "
-            "orders and unshipped invoices; patch adds relational L1 preconditions without expanding C_agent."
+            "orders and unshipped invoices; patch adds L1 approval_rule and relational precondition without expanding C_agent."
         ),
-        update_actions=updated_actions,
+        update_actions=[confirm_act, post_act],
         proposed_eval_cases=[
             {
-                "name": "golden_block_over_credit_order_confirmation",
+                "name": "golden_require_approval_over_credit_order_confirmation",
                 "action": confirm_action_name,
-                "params": {"record_id": t2_1_record_id},
+                "params": {confirm_id_param: t2_1_record_id},
                 "actor": {"actor_id": "eval:ai_agent", "role": "ai_agent"},
-                "expect_valid": False,
-                "expect_error_code": "CREDIT_LIMIT_EXCEEDED_REQUIRES_STEWARD",
+                "expect_valid": True,
+                "expect_requires_approval": True,
             },
             {
                 "name": "golden_block_unshipped_invoice_posting",
                 "action": post_action_name,
-                "params": {"record_id": t2_2_record_id},
+                "params": {post_id_param: t2_2_record_id},
                 "actor": {"actor_id": "eval:ai_agent", "role": "ai_agent"},
                 "expect_valid": False,
                 "expect_error_code": "CANNOT_INVOICE_UNSHIPPED_ORDER",
@@ -2649,69 +2772,28 @@ def build_reference_l1_patch_for_autonomous_v1(
     confirm_b = _find_binding(base_mapping, table="sale.order", method_substr="confirm")
     post_b = _find_binding(base_mapping, table="account.move", method_substr="post")
     assert confirm_b is not None and post_b is not None
-    order_em = next(em for em in base_mapping.entity_mappings if em.source_table == "sale.order")
-    inv_em = next(em for em in base_mapping.entity_mappings if em.source_table == "account.move")
+    order_em = base_mapping.get_entity_mapping(confirm_b.target_object_type)
+    inv_em = base_mapping.get_entity_mapping(post_b.target_object_type)
     pick_em = next(em for em in base_mapping.entity_mappings if em.source_table == "stock.picking")
+    partner_em = next((em for em in base_mapping.entity_mappings if em.source_table == "res.partner"), None)
 
-    action_by_name = {a.name: a for a in base_blueprint.actions}
-    confirm_act = copy.deepcopy(action_by_name[confirm_b.action_name])
-    confirm_act.preconditions.append(
-        InvariantRuleSpec(
-            name="credit_limit_requires_steward_role",
-            code="CREDIT_LIMIT_EXCEEDED_REQUIRES_STEWARD",
-            target_type=order_em.target_object_type,
-            id_param=confirm_b.id_param,
-            when={
-                "op": "and",
-                "args": [
-                    {"op": "gt", "left": {"ref": "obj.partner_id.credit_limit"}, "right": {"lit": 0}},
-                    {"op": "gt", "left": {"ref": "obj.amount_total"}, "right": {"ref": "obj.partner_id.credit_limit"}},
-                ],
-            },
-            must_hold={"op": "eq", "left": {"ref": "actor.role"}, "right": {"lit": "steward"}},
-            description="Orders exceeding customer credit_limit require steward authority to confirm.",
-        )
-    )
-
-    post_act = copy.deepcopy(action_by_name[post_b.action_name])
-    post_act.preconditions.append(
-        InvariantRuleSpec(
-            name="invoice_origin_order_must_be_shipped",
-            code="CANNOT_INVOICE_UNSHIPPED_ORDER",
-            target_type=inv_em.target_object_type,
-            id_param=post_b.id_param,
-            when={
-                "op": "and",
-                "args": [
-                    {"op": "eq", "left": {"ref": "obj.move_type"}, "right": {"lit": "out_invoice"}},
-                    {"op": "ne", "left": {"ref": "obj.invoice_origin"}, "right": {"lit": ""}},
-                    {
-                        "op": "exists",
-                        "object_type": order_em.target_object_type,
-                        "where": {"op": "eq", "left": {"ref": "target.name"}, "right": {"ref": "obj.invoice_origin"}},
-                    },
-                ],
-            },
-            must_hold={
-                "op": "exists",
-                "object_type": pick_em.target_object_type,
-                "where": {
-                    "op": "and",
-                    "args": [
-                        {"op": "eq", "left": {"ref": "target.origin"}, "right": {"ref": "obj.invoice_origin"}},
-                        {"op": "eq", "left": {"ref": "target.state"}, "right": {"lit": "done"}},
-                    ],
-                },
-            },
-            description="Customer invoices linked to a sales order cannot be posted until a StockPicking for that origin is done.",
-        )
+    confirm_act, post_act = _build_l1_updated_confirm_and_post_actions(
+        base_blueprint=base_blueprint,
+        confirm_action_name=confirm_b.action_name,
+        post_action_name=post_b.action_name,
+        order_type=order_em.target_object_type,
+        inv_type=inv_em.target_object_type,
+        pick_type=pick_em.target_object_type,
+        partner_type=(partner_em.target_object_type if partner_em is not None else None),
+        confirm_id_param=confirm_b.id_param,
+        post_id_param=post_b.id_param,
     )
 
     return EvolutionPatch(
         patch_id="PATCH-O2C-L1-REF",
         base_version=base_blueprint.version,
         target_version=target_version,
-        rationale="Add L1 relational credit-limit and shipped-delivery guardrails.",
+        rationale="Add L1 Stage-1 approval_rule and relational shipped-delivery guardrails.",
         update_actions=[confirm_act, post_act],
     )
 
@@ -2723,7 +2805,12 @@ def build_reference_l2_patch_for_autonomous_v11(
     target_version: str = "2.0.0",
 ) -> EvolutionPatch:
     """Build a declarative L2 structural + transient-protocol EvolutionPatch (v1.x -> v2.0.0)."""
-    inv_em = next(em for em in base_mapping.entity_mappings if em.source_table == "account.move")
+    post_b = _find_binding(base_mapping, table="account.move", method_substr="post")
+    inv_em = (
+        base_mapping.get_entity_mapping(post_b.target_object_type)
+        if post_b is not None
+        else next(em for em in base_mapping.entity_mappings if em.source_table == "account.move")
+    )
     pick_em = next(em for em in base_mapping.entity_mappings if em.source_table == "stock.picking")
     inv_type = inv_em.target_object_type
     inv_pk = inv_em.id_transform.target_field
@@ -3778,7 +3865,7 @@ def _run_benchmark_core(
             external_profile=profile,
             crucible_context=CrucibleContext(
                 mode="genesis",
-                replay_factory=build_auto_replay_factory(bundle),
+                replay_factory=build_auto_replay_factory(bundle, seed_ontology=active_seed),
                 default_actor=AI_OPS_ACTOR,
                 seed_ontology=active_seed,
             ),
@@ -3877,8 +3964,9 @@ def _run_benchmark_core(
                         action=cx.action,
                         params={confirm_b.id_param: t21_cid},
                         actor=cx.actor,
-                        expect_valid=False,
-                        expect_error_code="CREDIT_LIMIT_EXCEEDED_REQUIRES_STEWARD",
+                        expect_valid=True,
+                        expect_requires_approval=True,
+                        expect_error_code=None,
                     )
                 )
             elif cx.name == "CX-T2-2":
@@ -3940,6 +4028,7 @@ def _run_benchmark_core(
             post_action_name=post_b.action_name,
             t2_1_record_id=t21_cid,
             t2_2_record_id=t22_cid,
+            base_mapping=mapping_v1,
             seed_ontology=active_seed,
         )
 

@@ -25,9 +25,10 @@ from typing import Any, Callable, Iterator, Literal, Sequence
 
 from pydantic import BaseModel, Field
 
+from .model_views import describe_tbox, resolve_scoped_names
 from .query import ObjectSet
 from .runtime import OntologyRuntime, SimulationResult
-from .spec import ActionDef, Actor, InvariantError, OntologySpec, PermissionDeniedError
+from .spec import ActionDef, Actor, InvariantError, OntologySpec, PermissionDeniedError, ScopedViewSpec
 
 __all__ = [
     "export_llm_tools",
@@ -97,11 +98,28 @@ def _params_schema(params_cls: type[BaseModel]) -> dict[str, Any]:
     return schema
 
 
-def export_llm_tools(spec: OntologySpec) -> list[dict[str, Any]]:
-    """Export every registered function/action as an LLM tool declaration."""
+def export_llm_tools(
+    spec: OntologySpec,
+    *,
+    actor: Actor | None = None,
+    role: str | None = None,
+    view: str | ScopedViewSpec | None = None,
+    view_tags: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Export registered function/action tools, optionally narrowed by actor/role/ScopedViewSpec."""
+    scoped = resolve_scoped_names(
+        spec,
+        actor=actor,
+        role=role,
+        view=view,
+        view_tags=view_tags,
+        public_only=True,
+    )
     tools: list[dict[str, Any]] = []
 
     for fn in spec.functions.values():
+        if fn.name not in scoped["functions"]:
+            continue
         tools.append(
             {
                 "type": "function",
@@ -116,7 +134,7 @@ def export_llm_tools(spec: OntologySpec) -> list[dict[str, Any]]:
         )
 
     for action in spec.actions.values():
-        if action.visibility == "private":
+        if action.name not in scoped["actions"]:
             continue
         tools.append(
             {
@@ -159,9 +177,20 @@ class AIPAgentExecutor:
         emit_ui_artifact{kind, title, payload, artifact_id?}
     """
 
-    def __init__(self, runtime: OntologyRuntime, actor: Actor) -> None:
+    def __init__(
+        self,
+        runtime: OntologyRuntime,
+        actor: Actor,
+        *,
+        view: str | ScopedViewSpec | None = None,
+        view_tags: Sequence[str] | None = None,
+        enforce_view_scope: bool = True,
+    ) -> None:
         self.runtime = runtime
         self.actor = actor
+        self.view = view
+        self.view_tags = tuple(view_tags) if view_tags is not None else None
+        self.enforce_view_scope = bool(enforce_view_scope)
         self._artifacts: list[UIArtifact] = []
 
     # -- artifact helpers --------------------------------------------------
@@ -303,15 +332,60 @@ class AIPAgentExecutor:
         )
 
     # -- introspection -----------------------------------------------------
+    def _has_explicit_scope(self) -> bool:
+        return (self.view is not None or self.view_tags is not None) and self.enforce_view_scope
+
+    def _scoped_names(self) -> dict[str, set[str]]:
+        return resolve_scoped_names(
+            self.runtime.spec,
+            actor=self.actor,
+            view=self.view,
+            view_tags=self.view_tags,
+            public_only=True,
+        )
+
+    def _require_scoped_object_type(self, object_type: str) -> None:
+        if not self._has_explicit_scope():
+            return
+        if object_type not in self._scoped_names()["object_types"]:
+            raise PermissionDeniedError(
+                f"object type {object_type!r} is outside the active scoped view"
+            )
+
+    def _require_scoped_function(self, function_name: str) -> None:
+        if not self._has_explicit_scope():
+            return
+        if function_name not in self._scoped_names()["functions"]:
+            raise PermissionDeniedError(
+                f"function {function_name!r} is outside the active scoped view"
+            )
+
     def tools(self) -> list[dict[str, Any]]:
-        return export_llm_tools(self.runtime.spec)
+        return export_llm_tools(
+            self.runtime.spec,
+            actor=self.actor,
+            view=self.view,
+            view_tags=self.view_tags,
+        )
+
+    def describe_tbox(self) -> dict[str, Any]:
+        return describe_tbox(
+            self.runtime.spec,
+            actor=self.actor,
+            view=self.view,
+            view_tags=self.view_tags,
+        )
 
     def _require_public_action(self, action_name: str) -> ActionDef:
-        """拒绝 Agent 访问或调用 ``visibility='private'`` 的内部动作。"""
+        """拒绝 Agent 访问或调用 ``visibility='private'`` 或超出当前 Scoped View 的动作。"""
         action = self.runtime.spec.get_action(action_name)
         if action.visibility == "private":
             raise PermissionDeniedError(
                 f"action {action_name!r} is private and cannot be invoked by agents"
+            )
+        if self._has_explicit_scope() and action_name not in self._scoped_names()["actions"]:
+            raise PermissionDeniedError(
+                f"action {action_name!r} is outside the active scoped view"
             )
         return action
 
@@ -325,6 +399,7 @@ class AIPAgentExecutor:
 
         if tool_name == "query_objects":
             cls = self.runtime.spec.get_object_type(args["object_type"])
+            self._require_scoped_object_type(cls.__name__)
             objects = self.runtime.query_objects(
                 cls, self.actor, args.get("filters")
             )
@@ -336,12 +411,15 @@ class AIPAgentExecutor:
 
         if tool_name == "get_object":
             cls = self.runtime.spec.get_object_type(args["object_type"])
+            self._require_scoped_object_type(cls.__name__)
             obj = self.runtime.get_object(cls, args["object_id"], self.actor)
             return {"object": obj.model_dump(mode="json")}
 
         if tool_name == "get_linked":
             source_cls = self.runtime.spec.get_object_type(args["source_type"])
             target_cls = self.runtime.spec.get_object_type(args["target_type"])
+            self._require_scoped_object_type(source_cls.__name__)
+            self._require_scoped_object_type(target_cls.__name__)
             source = self.runtime.get_object(
                 source_cls, args["source_id"], self.actor
             )
@@ -355,6 +433,7 @@ class AIPAgentExecutor:
 
         if tool_name == "pivot":
             cls = self.runtime.spec.get_object_type(args["object_type"])
+            self._require_scoped_object_type(cls.__name__)
             if "ids" in args:
                 source_objects = [
                     self.runtime.get_object(cls, object_id, self.actor)
@@ -371,6 +450,7 @@ class AIPAgentExecutor:
                 self.actor,
                 args.get("direction"),
             )
+            self._require_scoped_object_type(result.object_type)
             return {
                 "object_type": result.object_type,
                 "count": len(result),
@@ -380,6 +460,7 @@ class AIPAgentExecutor:
 
         if tool_name == "aggregate":
             cls = self.runtime.spec.get_object_type(args["object_type"])
+            self._require_scoped_object_type(cls.__name__)
             source_set = self.runtime.search_set(
                 cls, self.actor, args.get("filters")
             )
@@ -391,6 +472,7 @@ class AIPAgentExecutor:
             return agg.to_dict()
 
         if tool_name == "call_function":
+            self._require_scoped_function(args["name"])
             result = self.runtime.call_function(
                 args["name"], args.get("params"), self.actor
             )
@@ -444,6 +526,7 @@ class AIPAgentExecutor:
             return {"ok": True, "artifact": artifact.model_dump(mode="json")}
 
         if tool_name in self.runtime.spec.functions:
+            self._require_scoped_function(tool_name)
             result = self.runtime.call_function(tool_name, args, self.actor)
             return {"ok": True, "result": result}
 
@@ -532,6 +615,12 @@ class AIPAgentExecutor:
         value_function = args.get("value_function")
         if not value_function:
             raise ValueError("plan_mcts requires a 'value_function' name")
+        self._require_scoped_function(str(value_function))
+        for cand_seq in table:
+            if isinstance(cand_seq, list):
+                for step in cand_seq:
+                    if isinstance(step, dict) and "action" in step:
+                        self._require_public_action(str(step["action"]))
 
         result = self.runtime.plan_mcts(
             self.actor,

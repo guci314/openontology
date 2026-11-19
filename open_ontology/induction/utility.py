@@ -25,9 +25,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 
+from ..model_views import resolve_scoped_names
 from ..osdk import export_llm_tools
 from ..runtime import OntologyRuntime
-from ..spec import Actor, OntologySpec
+from ..spec import Actor, OntologySpec, ScopedViewSpec
 from .crucible import IncidentCounterexample
 from .friction import FrictionClusterSummary, FrictionEvidence
 
@@ -103,12 +104,34 @@ def measure_agent_complexity(
     raw_external_entity_count: int | None = None,
     raw_external_field_count: int | None = None,
     reference_token_budget: int = 25_000,
+    actor: Actor | None = None,
+    role: str | None = None,
+    view: str | ScopedViewSpec | None = None,
+    view_tags: Sequence[str] | None = None,
 ) -> AgentComplexityMetrics:
     """Measure exact OSDK tool + object schema footprint exposed to an Agent."""
-    tools = export_llm_tools(spec)
+    scoped = resolve_scoped_names(
+        spec,
+        actor=actor,
+        role=role,
+        view=view,
+        view_tags=view_tags,
+        public_only=True,
+    )
+    tools = export_llm_tools(
+        spec,
+        actor=actor,
+        role=role,
+        view=view,
+        view_tags=view_tags,
+    )
     object_schemas: dict[str, Any] = {}
     exposed_field_count = 0
+    scoped_obj_count = 0
     for name, cls in sorted(spec.object_types.items()):
+        if name not in scoped["object_types"]:
+            continue
+        scoped_obj_count += 1
         schema = cls.model_json_schema()
         object_schemas[name] = schema
         exposed_field_count += len(cls.model_fields)
@@ -121,8 +144,8 @@ def measure_agent_complexity(
     chars = len(serialized)
     tokens_est = max(1, math.ceil(chars / 4))
 
-    exposed_actions = sum(1 for a in spec.actions.values() if a.visibility != "private")
-    exposed_functions = len(spec.functions)
+    exposed_actions = len(scoped["actions"])
+    exposed_functions = len(scoped["functions"])
     compression_ratio: float | None = None
     if raw_external_field_count and raw_external_field_count > 0:
         compression_ratio = exposed_field_count / raw_external_field_count
@@ -130,7 +153,7 @@ def measure_agent_complexity(
     norm_c = min(1.0, tokens_est / max(1, reference_token_budget))
     return AgentComplexityMetrics(
         regime_name=regime_name,
-        object_type_count=len(spec.object_types),
+        object_type_count=scoped_obj_count,
         exposed_field_count=exposed_field_count,
         exposed_action_count=exposed_actions,
         exposed_function_count=exposed_functions,

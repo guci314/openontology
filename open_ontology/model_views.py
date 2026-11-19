@@ -21,18 +21,21 @@ from __future__ import annotations
 import json
 import types as _types
 from enum import Enum
-from typing import Any, Literal, Union, get_args, get_origin
+from typing import Any, Literal, Sequence, Union, get_args, get_origin
 
 from pydantic.fields import FieldInfo
 
 from .spec import (
+    Actor,
     ObjectType,
     OntologySpec,
+    PermissionDeniedError,
+    ScopedViewSpec,
     extract_auto_id_meta,
     extract_object_property_meta,
 )
 
-__all__ = ["describe_tbox", "describe_behavior", "describe_openapi"]
+__all__ = ["resolve_scoped_names", "describe_tbox", "describe_behavior", "describe_openapi"]
 
 _MISSING = object()
 
@@ -157,13 +160,145 @@ def _describe_field(
     return row
 
 
+def resolve_scoped_names(
+    spec: OntologySpec,
+    *,
+    actor: Actor | None = None,
+    role: str | None = None,
+    view: str | ScopedViewSpec | None = None,
+    view_tags: Sequence[str] | None = None,
+    include_reachable_objects: bool | None = None,
+    public_only: bool = True,
+) -> dict[str, set[str]]:
+    """Resolve visible object types, actions, and functions under an optional Scoped OSDK View."""
+    if actor is None and role is None and view is None and view_tags is None:
+        return {
+            "object_types": set(spec.object_types),
+            "actions": {
+                n
+                for n, a in spec.actions.items()
+                if not public_only or a.visibility != "private"
+            },
+            "functions": set(spec.functions),
+        }
+
+    view_spec = spec.get_view(view) if isinstance(view, str) else view
+    eff_role = actor.role if actor is not None else role
+    if (
+        view_spec is not None
+        and view_spec.roles
+        and eff_role is not None
+        and eff_role not in view_spec.roles
+    ):
+        raise PermissionDeniedError(
+            f"role {eff_role!r} is not permitted for view {view_spec.name!r}"
+        )
+
+    eff_tags = set(view_tags or ()) | (
+        set(view_spec.view_tags) if view_spec is not None else set()
+    )
+
+    visible_actions: set[str] = set()
+    for name, action in spec.actions.items():
+        if public_only and action.visibility == "private":
+            continue
+        if eff_role is not None:
+            allowed = set(action.allowed_roles)
+            if not public_only:
+                allowed |= set(action.approver_roles)
+            if allowed and eff_role not in allowed:
+                continue
+        if view_spec is not None and view_spec.actions:
+            if name not in view_spec.actions:
+                continue
+        elif eff_tags:
+            if not (set(action.view_tags) & eff_tags):
+                continue
+        visible_actions.add(name)
+
+    visible_functions: set[str] = set()
+    for name, fn in spec.functions.items():
+        if view_spec is not None and view_spec.functions:
+            if name not in view_spec.functions:
+                continue
+        elif eff_tags:
+            if not (set(fn.view_tags) & eff_tags):
+                continue
+        visible_functions.add(name)
+
+    seed_types: set[str] = set()
+    explicit_obj_scope = False
+    if view_spec is not None and view_spec.object_types:
+        seed_types |= set(view_spec.object_types) & set(spec.object_types)
+        explicit_obj_scope = True
+    if eff_tags:
+        for ot_name, cls in spec.object_types.items():
+            if set(getattr(cls, "__view_tags__", ()) or ()) & eff_tags:
+                seed_types.add(ot_name)
+        explicit_obj_scope = True
+
+    if (eff_tags or eff_role is not None) and not (
+        view_spec is not None and view_spec.object_types and not eff_tags
+    ):
+        action_derived: set[str] = set()
+        for act_name in visible_actions:
+            act = spec.actions[act_name]
+            for ot_name in act.touched_object_types:
+                if ot_name in spec.object_types:
+                    action_derived.add(ot_name)
+            for info in getattr(act.params, "model_fields", {}).values():
+                meta = extract_object_property_meta(info)
+                if meta is not None and meta[0] in spec.object_types:
+                    action_derived.add(meta[0])
+        if action_derived:
+            seed_types |= action_derived
+            explicit_obj_scope = True
+
+    if not explicit_obj_scope:
+        visible_objects = set(spec.object_types)
+    else:
+        reach = (
+            view_spec.include_reachable_objects
+            if view_spec is not None and include_reachable_objects is None
+            else (True if include_reachable_objects is None else bool(include_reachable_objects))
+        )
+        visible_objects = set(seed_types)
+        if reach:
+            for prop in spec.object_properties.values():
+                if prop.domain in seed_types and prop.range in spec.object_types:
+                    visible_objects.add(prop.range)
+
+    return {
+        "object_types": visible_objects,
+        "actions": visible_actions,
+        "functions": visible_functions,
+    }
+
+
 # ---------------------------------------------------------------------------
 # TBox: structural declarations only
 # ---------------------------------------------------------------------------
-def describe_tbox(spec: OntologySpec) -> dict[str, Any]:
+def describe_tbox(
+    spec: OntologySpec,
+    *,
+    actor: Actor | None = None,
+    role: str | None = None,
+    view: str | ScopedViewSpec | None = None,
+    view_tags: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """Structural, JSON-serializable view of the spec's declarations."""
+    scoped = resolve_scoped_names(
+        spec,
+        actor=actor,
+        role=role,
+        view=view,
+        view_tags=view_tags,
+    )
+    scoped_types = scoped["object_types"]
     object_types: list[dict[str, Any]] = []
     for name, cls in spec.object_types.items():  # declaration order
+        if name not in scoped_types:
+            continue
         owned_fields = _owned_field_names(cls)
         masked = getattr(cls, "__masked_fields__", {}) or {}
         fields = []
@@ -196,20 +331,28 @@ def describe_tbox(spec: OntologySpec) -> dict[str, Any]:
             }
         )
 
-    interfaces = [
-        {
-            "name": decl.name,
-            "required_fields": list(decl.required_fields),
-            "description": decl.description,
-            "implementations": [
-                cls.__name__ for cls in spec.object_types_for_interface(decl)
-            ],
-        }
-        for decl in sorted(spec.interfaces.values(), key=lambda d: d.name)
-    ]
+    interfaces = []
+    for decl in sorted(spec.interfaces.values(), key=lambda d: d.name):
+        impls = [
+            cls.__name__
+            for cls in spec.object_types_for_interface(decl)
+            if cls.__name__ in scoped_types
+        ]
+        if (actor is not None or role is not None or view is not None or view_tags is not None) and not impls:
+            continue
+        interfaces.append(
+            {
+                "name": decl.name,
+                "required_fields": list(decl.required_fields),
+                "description": decl.description,
+                "implementations": impls,
+            }
+        )
 
     object_properties = []
     for decl in sorted(spec.object_properties.values(), key=lambda d: d.name):
+        if decl.domain not in scoped_types:
+            continue
         prop_row: dict[str, Any] = {
             "name": decl.name,
             "domain": decl.domain,
@@ -306,12 +449,31 @@ def _describe_roles(spec: OntologySpec) -> list[dict[str, Any]]:
     return result
 
 
-def describe_behavior(spec: OntologySpec) -> dict[str, Any]:
+def describe_behavior(
+    spec: OntologySpec,
+    *,
+    actor: Actor | None = None,
+    role: str | None = None,
+    view: str | ScopedViewSpec | None = None,
+    view_tags: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """Action / function / automation / role contracts declared on the spec."""
+    scoped = resolve_scoped_names(
+        spec,
+        actor=actor,
+        role=role,
+        view=view,
+        view_tags=view_tags,
+        public_only=False,
+    )
+    scoped_types = scoped["object_types"]
+    scoped_actions = scoped["actions"]
+    scoped_functions = scoped["functions"]
     return {
         "functions": [
             {"name": fn.name, "description": fn.description}
             for fn in sorted(spec.functions.values(), key=lambda d: d.name)
+            if fn.name in scoped_functions
         ],
         "actions": [
             {
@@ -324,6 +486,7 @@ def describe_behavior(spec: OntologySpec) -> dict[str, Any]:
                 "params": _enrich_params_schema(action.params),
             }
             for action in sorted(spec.actions.values(), key=lambda d: d.name)
+            if action.name in scoped_actions
         ],
         "automations": [
             {
@@ -332,6 +495,7 @@ def describe_behavior(spec: OntologySpec) -> dict[str, Any]:
                 "description": decl.description,
             }
             for decl in sorted(spec.automations.values(), key=lambda d: d.name)
+            if decl.watch_object_type in scoped_types
         ],
         "roles": _describe_roles(spec),
     }

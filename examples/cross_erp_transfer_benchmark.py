@@ -157,20 +157,23 @@ def _evaluate_south_m0_grounding(
         }
 
         def _fetch(tbl: str) -> None:
-            em = next((e for e in adapter_mapping.entity_mappings if e.source_table == tbl), None)
-            if em is None:
+            ems = [e for e in adapter_mapping.entity_mappings if e.source_table == tbl]
+            if not ems:
                 return
             ids = sorted(ids_by_table.get(tbl, set()))
             if not ids:
                 return
-            fields = list(
-                dict.fromkeys(
-                    ["id", em.id_transform.source_field]
-                    + [tf.source_field for tf in em.field_transforms if tf.source_field]
-                    + [fb for tf in em.field_transforms for fb in tf.fallback_fields if fb]
-                    + [flt.field for flt in em.row_filters if flt.field]
-                )
-            )
+            field_list: list[str] = ["id"]
+            for em in ems:
+                field_list.append(em.id_transform.source_field)
+                field_list.extend(tf.source_field for tf in em.field_transforms if tf.source_field)
+                field_list.extend(fb for tf in em.field_transforms for fb in tf.fallback_fields if fb)
+                field_list.extend(flt.field for flt in em.row_filters if flt.field)
+            for any_em in adapter_mapping.entity_mappings:
+                for tf in any_em.field_transforms:
+                    if tf.kind == "lookup_join" and tf.lookup_table == tbl and tf.lookup_key_field:
+                        field_list.append(tf.lookup_key_field)
+            fields = list(dict.fromkeys(field_list))
             missing_ids = [i for i in ids if i not in rows_by_table.get(tbl, {})]
             if missing_ids:
                 fetched = client.search_read(tbl, [("id", "in", missing_ids)], fields, limit=len(missing_ids))

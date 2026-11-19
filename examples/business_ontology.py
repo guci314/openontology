@@ -234,6 +234,11 @@ def build_business_seed_ontology() -> Any:
         },
         default_archetype="ObjectType",
         extra_prior_notes=(
+            "Cohesive Decision Domain Principle: one accounting entity / unified synchronous control loop maps to one unified OntologySpec, anchored by an explicit AccountingEntity dimension for balance conservation.",
+            "Multi-entity group coordination models AccountingEntity as a first-class ledger/scope dimension inside the unified ontology instead of splitting isolated specs.",
+            "Internal non-financial collaboration domains without shared pre-write guardrails belong in separate lightweight ontology specs.",
+            "Anti-God-Object discipline: anchor shared counterparties and materials in lean MasterEntity types (e.g., Party + CustomerRole/SupplierRole facets) rather than wide 100-column tables.",
+            "Expose role/context-filtered ScopedViewSpec projections to downstream agents to keep C_agent small without fracturing synchronous invariants.",
             "Every BalanceLedger numeric balance field mutated by an action MUST declare "
             "voucher_delta_rules and emit matching EventVoucher delta records in the same transaction.",
             "Every ProcessDocument status field MUST follow declared finite-state transitions.",

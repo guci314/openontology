@@ -478,4 +478,6 @@ def test_autonomous_fde_pipeline_grounds_on_business_seed_ontology() -> None:
         "ProcessDocument",
     }
     assert "ProcessDocument" in cryst["object_superclasses"]["ClinicVisit"]
-    assert "MasterEntity" in cryst["object_superclasses"]["ClinicPatient"]
+    assert "ProcessDocument" in cryst["object_superclasses"]["PatientBill"]
+    assert "ProcessDocument" in cryst["object_superclasses"]["InternalAdj"]
+    assert "MasterEntity" in cryst["object_superclasses"]["Patient"]

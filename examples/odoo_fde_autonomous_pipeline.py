@@ -71,6 +71,7 @@ from open_ontology.induction import (
     OpenAICompatibleAbductionBackend,
     RelationSpec,
     ReplayEvent,
+    RowFilterSpec,
     STEWARD_ACTOR,
     SeedOntology,
     SymbolicCrucible,
@@ -103,6 +104,113 @@ STEWARD_OPS_ACTOR = Actor(actor_id="human:ops-steward", role="steward", clearanc
 # ---------------------------------------------------------------------------
 # Generic Naming & Type Coercion Helpers (Zero Domain Hardcoding)
 # ---------------------------------------------------------------------------
+_NON_SINGULAR_WORDS = frozenset({"sales", "status", "ops", "goods", "series", "species"})
+_UI_NOISE_SUBSTRINGS = (
+    "image",
+    "avatar",
+    "zoom",
+    "kanban",
+    "ribbon",
+    "tooltip",
+    "color_index",
+    "website_",
+    "portal_",
+    "my_activity",
+    "activity_",
+)
+_UI_NOISE_EXACT = frozenset({"color", "access_token", "icon", "sequence", "parent_path"})
+
+
+def _singularize_word(word: str) -> str:
+    lw = word.lower()
+    if lw in _NON_SINGULAR_WORDS or len(word) <= 3:
+        return word
+    if lw.endswith("ies") and len(word) > 4:
+        return word[:-3] + ("y" if word[-4].islower() else "Y")
+    if lw.endswith(("ses", "xes", "ches", "shes")) and len(word) > 4:
+        return word[:-2]
+    if lw.endswith("s") and not lw.endswith(("ss", "us", "is")):
+        return word[:-1]
+    return word
+
+
+def _label_to_pascal(label: str, fallback_model: str) -> str:
+    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", label or "") if t]
+    if not tokens:
+        tokens = [t for t in re.split(r"[._-]+", fallback_model) if t]
+    if not tokens:
+        return "Entity"
+    tokens[-1] = _singularize_word(tokens[-1])
+    out = "".join(tok[:1].upper() + tok[1:] for tok in tokens)
+    if out and out[0].isdigit():
+        out = "Entity" + out
+    return out or "Entity"
+
+
+def _camel_to_snake(name: str) -> str:
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    s2 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1)
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", s2).strip("_").lower()
+    return cleaned or "entity"
+
+
+def _pascal_to_prefix(ot_name: str, used_prefixes: set[str]) -> str:
+    base = _camel_to_snake(ot_name).upper()
+    cand = f"{base}-"
+    idx = 2
+    while cand in used_prefixes:
+        cand = f"{base}_{idx}-"
+        idx += 1
+    used_prefixes.add(cand)
+    return cand
+
+
+def _clean_method_verb(method: str) -> str:
+    verb = re.sub(r"^(?:action|button|do)_+", "", method.strip())
+    return _model_to_snake(verb or method)
+
+
+def _semantic_action_name(
+    method: str,
+    target_ot_name: str,
+    state_after: str,
+    multiple_dests: bool,
+    used_names: set[str],
+) -> str:
+    verb = _clean_method_verb(method)
+    ot_snake = _camel_to_snake(target_ot_name)
+    if "_" in verb:
+        base = verb
+    else:
+        base = f"{verb}_{ot_snake}"
+    if multiple_dests:
+        base = f"{base}_to_{_model_to_snake(state_after)}"
+    cand = base
+    idx = 2
+    while cand in used_names:
+        cand = f"{base}_{idx}"
+        idx += 1
+    used_names.add(cand)
+    return cand
+
+
+def _is_ui_presentation_noise_field(fname: str) -> bool:
+    fl = fname.lower()
+    if (
+        fl in _UI_NOISE_EXACT
+        or fl.endswith(("_html", "_icon", "_normalized"))
+        or fl.startswith("property_")
+    ):
+        return True
+    return any(tok in fl for tok in _UI_NOISE_SUBSTRINGS)
+
+
+def _non_redundant_description(field_name: str, label: str) -> str:
+    if not label:
+        return ""
+    return "" if _model_to_snake(label) == field_name.lower() else label
+
+
 def _model_to_pascal(model_name: str) -> str:
     parts = [p for p in re.split(r"[._-]+", model_name) if p]
     return "".join(p[:1].upper() + p[1:] for p in parts) or "Entity"
@@ -232,6 +340,40 @@ class SynthesizedBundle:
     reversal_actions: tuple[str, ...]
 
 
+def _select_primary_polymorphic_split(
+    dm: DiscoveredModel,
+    polymorphics: Sequence[Any],
+    sample_rows: Sequence[dict[str, Any]],
+) -> tuple[Any | None, list[tuple[str, str]]]:
+    """Select at most one structural ProcessDocument subtype discriminator + branches from metadata."""
+    if dm.suggested_archetype != "ProcessDocument" or not sample_rows:
+        return None, []
+    min_branch_count = 3 if len(sample_rows) >= 20 else 2
+    field_by_name = {f.name: f for f in dm.retained_fields}
+
+    candidates: list[tuple[tuple[int, float], Any, list[tuple[str, str]]]] = []
+    for poly in polymorphics:
+        if poly.model != dm.model:
+            continue
+        f_sig = field_by_name.get(poly.field_name)
+        label_map = dict(getattr(f_sig, "selection_labels", {}) or {}) if f_sig else {}
+        branches: list[tuple[str, str]] = []
+        for raw_val, cnt in sorted(poly.value_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            if cnt < min_branch_count:
+                continue
+            human_lbl = label_map.get(raw_val) or raw_val.replace("_", " ").title()
+            branches.append((raw_val, human_lbl))
+        if len(branches) < 2:
+            continue
+        candidates.append(((len(poly.divergent_columns), float(poly.nullity_divergence_score)), poly, branches))
+
+    if not candidates:
+        return None, []
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, best_poly, best_branches = candidates[0]
+    return best_poly, best_branches
+
+
 def synthesize_from_fde_evidence(
     scout_report: FDEScoutReport,
     probe_report: ActiveProbeReport,
@@ -240,13 +382,12 @@ def synthesize_from_fde_evidence(
     seed_ontology: SeedOntology | None = None,
     model_id: str = "discovered_erp_ontology",
     version: str = "1.0.0",
+    apply_gray_zone_approval_rules: bool = False,
 ) -> SynthesizedBundle:
-    """Autonomously synthesize DeclarativeBlueprint + bidirectional AdapterMappingSpec from FDE evidence."""
+    """Autonomously synthesize semantically purified Blueprint + AdapterMappingSpec from FDE evidence."""
     active_seed = seed_ontology or build_business_seed_ontology()
     allowed_archetypes = set(active_seed.archetype_names())
     dm_by_name: dict[str, DiscoveredModel] = {dm.model: dm for dm in scout_report.discovered_models}
-    pascal_by_model = {dm.model: _model_to_pascal(dm.model) for dm in scout_report.discovered_models}
-    prefix_by_model = {dm.model: _model_id_prefix(dm.model) for dm in scout_report.discovered_models}
     rows_by_table = {e.table_name: e.sample_rows for e in profile.entities}
     present_ids_by_model = {
         e.table_name: {r.get("id") for r in e.sample_rows if r.get("id") is not None}
@@ -264,20 +405,106 @@ def synthesize_from_fde_evidence(
             if m:
                 reversal_transitions_by_model[sm.model].add((m.group(1), m.group(2)))
 
-    # Order discovered models so MasterEntity / parent targets precede ProcessDocuments
+    # Plan semantic entity blueprints (preserving single entities & splitting polymorphic tables)
+    @dataclass(frozen=True)
+    class _EntityPlan:
+        dm: DiscoveredModel
+        ot_name: str
+        prefix: str
+        display_label: str
+        row_filters: tuple[RowFilterSpec, ...]
+        branch_rows: tuple[dict[str, Any], ...]
+        discriminator_field: str | None
+        is_split_branch: bool
+
     def _model_sort_key(dm: DiscoveredModel) -> tuple[int, str]:
         rank = 0 if dm.suggested_archetype == "MasterEntity" else (1 if dm.suggested_archetype == "ObjectType" else 2)
         return (rank, dm.model)
 
     ordered_dms = sorted(scout_report.discovered_models, key=_model_sort_key)
+    used_ot_names: set[str] = set()
+    used_prefixes: set[str] = set()
+    entity_plans: list[_EntityPlan] = []
+    plans_by_model: dict[str, list[_EntityPlan]] = defaultdict(list)
+
+    for dm in ordered_dms:
+        raw_rows = list(rows_by_table.get(dm.model, []))
+        poly, split_branches = _select_primary_polymorphic_split(
+            dm,
+            scout_report.polymorphic_discriminators,
+            raw_rows,
+        )
+        if poly is not None and split_branches:
+            for disc_val, human_lbl in split_branches:
+                base_pascal = _label_to_pascal(human_lbl, dm.model)
+                ot_name = base_pascal
+                idx = 2
+                while ot_name in used_ot_names:
+                    ot_name = f"{base_pascal}{idx}"
+                    idx += 1
+                used_ot_names.add(ot_name)
+                prefix = _pascal_to_prefix(ot_name, used_prefixes)
+                sub_rows = tuple(r for r in raw_rows if str(r.get(poly.field_name)) == disc_val)
+                plan = _EntityPlan(
+                    dm=dm,
+                    ot_name=ot_name,
+                    prefix=prefix,
+                    display_label=human_lbl,
+                    row_filters=(RowFilterSpec(field=poly.field_name, op="eq", value=disc_val),),
+                    branch_rows=sub_rows,
+                    discriminator_field=poly.field_name,
+                    is_split_branch=True,
+                )
+                entity_plans.append(plan)
+                plans_by_model[dm.model].append(plan)
+        else:
+            base_pascal = _label_to_pascal(dm.label, dm.model)
+            ot_name = base_pascal
+            idx = 2
+            while ot_name in used_ot_names:
+                ot_name = f"{base_pascal}{idx}"
+                idx += 1
+            used_ot_names.add(ot_name)
+            prefix = _pascal_to_prefix(ot_name, used_prefixes)
+            plan = _EntityPlan(
+                dm=dm,
+                ot_name=ot_name,
+                prefix=prefix,
+                display_label=dm.label or ot_name,
+                row_filters=(),
+                branch_rows=tuple(raw_rows),
+                discriminator_field=None,
+                is_split_branch=False,
+            )
+            entity_plans.append(plan)
+            plans_by_model[dm.model].append(plan)
+
+    single_target_plan_by_model: dict[str, _EntityPlan] = {
+        mname: plist[0] for mname, plist in plans_by_model.items() if len(plist) == 1
+    }
+
+    # Pre-index inferred_string_join candidates per source model
+    inferred_joins_by_model: dict[str, list[Any]] = defaultdict(list)
+    for rel in scout_report.discovered_relations:
+        if rel.kind == "inferred_string_join" and rel.target_model in single_target_plan_by_model:
+            inferred_joins_by_model[rel.source_model].append(rel)
 
     object_types: list[ObjectTypeBlueprint] = []
     entity_mappings: list[EntityMappingSpec] = []
+    explicit_rel_field_by_model_target: dict[tuple[str, str], str] = {}
+    branch_rel_counts: dict[str, int] = {}
 
-    for dm in ordered_dms:
-        ot_name = pascal_by_model[dm.model]
-        prefix = prefix_by_model[dm.model]
-        sample_rows = rows_by_table.get(dm.model, [])
+    for ep in entity_plans:
+        dm = ep.dm
+        ot_name = ep.ot_name
+        prefix = ep.prefix
+        sample_rows = list(ep.branch_rows)
+
+        probed_status_fields = {
+            o.status_field for o in probe_report.observations if o.model == dm.model and o.status_field
+        }
+        sm = sm_by_model.get(dm.model)
+        status_field = sm.field_name if sm is not None else (next(iter(probed_status_fields), "status"))
 
         fields: list[FieldSpec] = [
             FieldSpec(name="record_id", field_type="str", primary_key=True, required=True)
@@ -286,27 +513,59 @@ def synthesize_from_fde_evidence(
         transforms: list[FieldTransformSpec] = []
         drop_missing_refs: list[str] = []
         used_names: set[str] = {"record_id"}
+        explicit_targets_covered: dict[str, float] = {}
 
+        # Detect which explicit many2one fields will be promoted cleanly
+        retained_names = {f.name for f in dm.retained_fields}
         for f in dm.retained_fields:
             if f.name == "id" or f.name in used_names:
                 continue
+            if ep.discriminator_field and f.name == ep.discriminator_field:
+                continue  # Constant discriminator value on this split branch
+            if f.name not in probed_status_fields and f.name != status_field and _is_ui_presentation_noise_field(f.name):
+                continue
+
+            # For split branches, prune columns that are 100% null or 0-bit constant within this branch
+            if ep.is_split_branch and f.name not in ("name", status_field) and f.name not in probed_status_fields and sample_rows:
+                non_null_in_branch = sum(
+                    1 for r in sample_rows if r.get(f.name) is not None and r.get(f.name) is not False and r.get(f.name) != ""
+                )
+                if non_null_in_branch == 0:
+                    continue
+                if (
+                    len(sample_rows) >= 2
+                    and f.ttype != "many2one"
+                    and f.role not in ("measure", "limit_or_policy_attr")
+                ):
+                    distinct_vals = {
+                        repr(None if (r.get(f.name) is False and f.ttype != "boolean") else r.get(f.name))
+                        for r in sample_rows
+                    }
+                    if len(distinct_vals) <= 1:
+                        continue
+
             if f.ttype == "many2one":
-                if f.relation_target in pascal_by_model and f.relation_target != dm.model:
+                if f.relation_target in single_target_plan_by_model and f.relation_target != dm.model:
+                    tgt_plan = single_target_plan_by_model[f.relation_target]
                     tgt_ids = present_ids_by_model.get(f.relation_target, set())
                     has_unresolved = False
+                    non_null_cnt = 0
                     for r in sample_rows:
                         raw = r.get(f.name)
                         pid = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
-                        if isinstance(pid, int) and not isinstance(pid, bool) and pid not in tgt_ids:
-                            has_unresolved = True
-                            break
+                        if isinstance(pid, int) and not isinstance(pid, bool):
+                            non_null_cnt += 1
+                            if pid not in tgt_ids:
+                                has_unresolved = True
+                                break
                     if not has_unresolved:
+                        fill_rate = non_null_cnt / max(1, len(sample_rows))
                         relations.append(
                             RelationSpec(
                                 field=f.name,
-                                target_type=pascal_by_model[f.relation_target],
+                                target_type=tgt_plan.ot_name,
                                 required=False,
-                                description=f.label,
+                                description=_non_redundant_description(f.name, f.label),
                             )
                         )
                         transforms.append(
@@ -314,20 +573,26 @@ def synthesize_from_fde_evidence(
                                 target_field=f.name,
                                 source_field=f.name,
                                 kind="foreign_key_id",
-                                prefix=prefix_by_model[f.relation_target],
+                                prefix=tgt_plan.prefix,
                                 default=None,
                             )
                         )
                         used_names.add(f.name)
+                        explicit_rel_field_by_model_target[(ot_name, f.relation_target)] = f.name
+                        explicit_targets_covered[tgt_plan.ot_name] = max(
+                            explicit_targets_covered.get(tgt_plan.ot_name, 0.0),
+                            fill_rate,
+                        )
                         continue
-                # Self-referential or out-of-subgraph many2one: extract clean ID string, never raw [id, name] list
+                # Self-referential or unresolved-target many2one: extract clean ID string
+                tgt_plan_opt = single_target_plan_by_model.get(f.relation_target or "")
                 fields.append(
                     FieldSpec(
                         name=f.name,
                         field_type="str",
                         default="",
                         required=False,
-                        description=f.label,
+                        description=_non_redundant_description(f.name, f.label),
                     )
                 )
                 transforms.append(
@@ -335,47 +600,118 @@ def synthesize_from_fde_evidence(
                         target_field=f.name,
                         source_field=f.name,
                         kind="foreign_key_id",
-                        prefix=prefix_by_model.get(f.relation_target or "", ""),
+                        prefix=tgt_plan_opt.prefix if tgt_plan_opt is not None else "",
                         default="",
                     )
                 )
                 used_names.add(f.name)
-            else:
-                ftype = _ttype_to_field_type(f.ttype)
-                default_val = _default_for_field_type(ftype)
-                is_non_neg = False
-                if ftype in ("int", "float") and f.role in ("measure", "limit_or_policy_attr"):
-                    observed_nums = [
-                        r.get(f.name)
-                        for r in sample_rows
-                        if isinstance(r.get(f.name), (int, float)) and not isinstance(r.get(f.name), bool)
-                    ]
-                    if observed_nums and all(v >= 0 for v in observed_nums):
-                        is_non_neg = True
-                fields.append(
-                    FieldSpec(
-                        name=f.name,
-                        field_type=ftype,  # type: ignore[arg-type]
-                        default=default_val,
-                        required=False,
-                        non_negative=is_non_neg,
-                        description=f.label,
-                    )
+                continue
+
+            # If this char field is a discovered inferred_string_join, evaluate promotion after scalar loop
+            ftype = _ttype_to_field_type(f.ttype)
+            default_val = _default_for_field_type(ftype)
+            is_non_neg = False
+            if ftype in ("int", "float") and f.role in ("measure", "limit_or_policy_attr"):
+                observed_nums = [
+                    r.get(f.name)
+                    for r in sample_rows
+                    if isinstance(r.get(f.name), (int, float)) and not isinstance(r.get(f.name), bool)
+                ]
+                if observed_nums and all(v >= 0 for v in observed_nums):
+                    is_non_neg = True
+            fields.append(
+                FieldSpec(
+                    name=f.name,
+                    field_type=ftype,  # type: ignore[arg-type]
+                    default=default_val,
+                    required=False,
+                    non_negative=is_non_neg,
+                    description=_non_redundant_description(f.name, f.label),
                 )
-                transforms.append(
-                    FieldTransformSpec(
-                        target_field=f.name,
-                        source_field=f.name,
-                        kind="direct",
-                        default=default_val,
-                    )
+            )
+            transforms.append(
+                FieldTransformSpec(
+                    target_field=f.name,
+                    source_field=f.name,
+                    kind="direct",
+                    default=default_val,
                 )
-                used_names.add(f.name)
+            )
+            used_names.add(f.name)
+
+        def _drop_redundant_raw_join_field(src_field: str) -> None:
+            nonlocal fields, transforms
+            if (
+                src_field in (status_field, "name", "record_id")
+                or src_field in probed_status_fields
+            ):
+                return
+            fields = [fl for fl in fields if fl.name != src_field]
+            transforms = [
+                tf
+                for tf in transforms
+                if not (tf.kind == "direct" and tf.target_field == src_field)
+            ]
+            used_names.discard(src_field)
+
+        # Promote populated inferred_string_join fields -> formal ObjectProperty (RelationSpec + lookup_join)
+        promoted_join_targets: set[str] = set()
+        for rel in sorted(inferred_joins_by_model.get(dm.model, []), key=lambda r: (-r.confidence, r.source_field)):
+            tgt_plan = single_target_plan_by_model.get(rel.target_model)
+            if tgt_plan is None or tgt_plan.ot_name == ot_name:
+                continue
+            if tgt_plan.ot_name in promoted_join_targets:
+                continue
+            if sample_rows:
+                non_null_join = sum(
+                    1
+                    for r in sample_rows
+                    if r.get(rel.source_field) not in (None, False, "")
+                )
+                if non_null_join == 0:
+                    continue
+                # Avoid duplicate ObjectProperty when an explicit FK already covers the same target
+                existing_cov = explicit_targets_covered.get(tgt_plan.ot_name, 0.0)
+                if existing_cov > 0.0 and rel.target_model != dm.model:
+                    _drop_redundant_raw_join_field(rel.source_field)
+                    continue
+            rel_field = _camel_to_snake(tgt_plan.ot_name)
+            src_sig = next((f for f in dm.retained_fields if f.name == rel.source_field), None)
+            can_drop_raw = (
+                rel.source_field not in (status_field, "name", "record_id")
+                and rel.source_field not in probed_status_fields
+            )
+            candidate_used = used_names - ({rel.source_field} if can_drop_raw else set())
+            if rel_field in candidate_used:
+                rel_field = f"linked_{rel_field}"
+            if rel_field in candidate_used:
+                continue
+            _drop_redundant_raw_join_field(rel.source_field)
+            relations.append(
+                RelationSpec(
+                    field=rel_field,
+                    target_type=tgt_plan.ot_name,
+                    required=False,
+                    description=_non_redundant_description(
+                        rel_field,
+                        src_sig.label if src_sig is not None else "",
+                    ),
+                )
+            )
+            transforms.append(
+                FieldTransformSpec(
+                    target_field=rel_field,
+                    source_field=rel.source_field,
+                    kind="lookup_join",
+                    lookup_table=rel.target_model,
+                    lookup_key_field=rel.target_field,
+                    default=None,
+                )
+            )
+            used_names.add(rel_field)
+            promoted_join_targets.add(tgt_plan.ot_name)
 
         # Ensure Probe 3's probed status_field is always included even if not in top-k
-        probed_status_fields = {
-            o.status_field for o in probe_report.observations if o.model == dm.model and o.status_field
-        }
         for sf_name in sorted(probed_status_fields):
             if sf_name not in used_names:
                 fields.append(FieldSpec(name=sf_name, field_type="str", default=""))
@@ -383,8 +719,6 @@ def synthesize_from_fde_evidence(
                 used_names.add(sf_name)
 
         # Build FSM transitions strictly from Probe 2 mined traces + Probe 3 proven transitions
-        sm = sm_by_model.get(dm.model)
-        status_field = sm.field_name if sm is not None else (next(iter(probed_status_fields), "status"))
         transitions_map: dict[str, set[str]] = defaultdict(set)
         if sm is not None:
             for edge in sm.edges:
@@ -399,6 +733,7 @@ def synthesize_from_fde_evidence(
             if dm.suggested_archetype in allowed_archetypes
             else active_seed.default_archetype
         )
+        branch_rel_counts[ot_name] = len(relations)
         object_types.append(
             ObjectTypeBlueprint(
                 name=ot_name,
@@ -410,7 +745,7 @@ def synthesize_from_fde_evidence(
                 status_field=status_field,
                 initial_statuses=None,
                 transitions={k: sorted(v) for k, v in sorted(transitions_map.items())},
-                display_label=dm.label,
+                display_label=ep.display_label,
             )
         )
         entity_mappings.append(
@@ -423,15 +758,23 @@ def synthesize_from_fde_evidence(
                     kind="id_prefix",
                     prefix=prefix,
                 ),
+                row_filters=list(ep.row_filters),
                 field_transforms=transforms,
                 drop_if_missing_refs=drop_missing_refs,
             )
         )
 
-    # Synthesize governed Actions + ActionExecutionBindings purely from Probe 3 causal observations
+    # Index gray-zone cross-entity limit rules by model (optional at 0->1 or when enabled)
+    limit_findings_by_model: dict[str, list[Any]] = defaultdict(list)
+    if apply_gray_zone_approval_rules:
+        for ef in scout_report.epistemic_findings:
+            if ef.kind == "CROSS_ENTITY_LIMIT_EXCEEDANCE_CONTRADICTION":
+                limit_findings_by_model[ef.model].append(ef)
+
+    # Synthesize governed verb-noun Actions + ActionExecutionBindings purely from Probe 3 causal observations
     grouped_transitions: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
     for obs in probe_report.causal_transitions():
-        if obs.model not in pascal_by_model:
+        if obs.model not in plans_by_model:
             continue
         if obs.state_before == obs.state_after:
             continue
@@ -439,22 +782,33 @@ def synthesize_from_fde_evidence(
             obs.state_before
         )
 
-    # Check if a (model, method) maps to multiple distinct state_after values
     after_states_by_mm: dict[tuple[str, str], set[str]] = defaultdict(set)
     for m, meth, _sf, sa in grouped_transitions:
         after_states_by_mm[(m, meth)].add(sa)
 
+    ot_by_name = {ot.name: ot for ot in object_types}
+
+    def _pick_action_plan(model_name: str, status_fld: str, valid_befores: set[str]) -> _EntityPlan:
+        plist = plans_by_model[model_name]
+        if len(plist) == 1:
+            return plist[0]
+        # Pick split branch with probed pre-state rows, richest relations, and highest row support
+        def _score(ep: _EntityPlan) -> tuple[int, int, int]:
+            has_before = sum(1 for r in ep.branch_rows if str(r.get(status_fld)) in valid_befores)
+            return (1 if has_before > 0 else 0, branch_rel_counts.get(ep.ot_name, 0), len(ep.branch_rows))
+
+        return max(plist, key=_score)
+
     actions: list[ActionBlueprint] = []
     action_bindings: list[ActionExecutionBinding] = []
     reversal_action_names: list[str] = []
+    used_action_names: set[str] = set()
 
     for (m, meth, sf, sa), valid_befores in sorted(grouped_transitions.items()):
-        ot_name = pascal_by_model[m]
-        snake_m = _model_to_snake(m)
-        if len(after_states_by_mm[(m, meth)]) == 1:
-            act_name = f"{snake_m}__{meth}"
-        else:
-            act_name = f"{snake_m}__{meth}_to_{_model_to_snake(sa)}"
+        target_plan = _pick_action_plan(m, sf, valid_befores)
+        ot_name = target_plan.ot_name
+        multiple_dests = len(after_states_by_mm[(m, meth)]) > 1
+        act_name = _semantic_action_name(meth, ot_name, sa, multiple_dests, used_action_names)
 
         # Check if any edge of this action is flagged as a reversal/cancellation gray zone by Probe 2
         rev_pairs = reversal_transitions_by_model.get(m, set())
@@ -462,6 +816,8 @@ def synthesize_from_fde_evidence(
             kw in meth.lower() or kw in sa.lower() for kw in ("cancel", "reverse", "draft")
         )
         approval_rule: dict[str, Any] | None = None
+        approval_target_type: str | None = None
+        approval_id_param: str | None = None
         if is_reversal:
             reversal_action_names.append(act_name)
             approval_rule = {
@@ -469,18 +825,43 @@ def synthesize_from_fde_evidence(
                 "left": {"ref": "actor.role"},
                 "right": {"lit": "steward"},
             }
+        elif apply_gray_zone_approval_rules and limit_findings_by_model.get(m):
+            target_ot = ot_by_name[ot_name]
+            target_fields = {f.name for f in target_ot.fields}
+            target_rels = {r.field: r for r in target_ot.relations}
+            for ef in limit_findings_by_model[m]:
+                m_fld = str(ef.evidence.get("measure_field") or "")
+                p_rel = str(ef.evidence.get("parent_relation") or "")
+                p_lim_full = str(ef.evidence.get("parent_limit_field") or "")
+                lim_fld = p_lim_full.split(".")[-1] if p_lim_full else ""
+                if m_fld in target_fields and p_rel in target_rels and lim_fld:
+                    rel_target_ot = ot_by_name.get(target_rels[p_rel].target_type)
+                    if rel_target_ot is not None and any(f.name == lim_fld for f in rel_target_ot.fields):
+                        approval_target_type = ot_name
+                        approval_id_param = "record_id"
+                        approval_rule = {
+                            "op": "and",
+                            "args": [
+                                {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
+                                {"op": "gt", "left": {"ref": f"obj.{p_rel}.{lim_fld}"}, "right": {"lit": 0}},
+                                {"op": "gt", "left": {"ref": f"obj.{m_fld}"}, "right": {"ref": f"obj.{p_rel}.{lim_fld}"}},
+                            ],
+                        }
+                        break
 
         code = f"INVALID_STATE_FOR_{meth.upper()}"
         actions.append(
             ActionBlueprint(
                 name=act_name,
                 description=(
-                    f"Autonomously induced action from Probe 3: {m}.{meth} "
+                    f"Autonomously induced action from Probe 3: {target_plan.display_label} {meth} "
                     f"({sorted(valid_befores)} -> {sa})."
                 ),
                 allowed_roles=["ai_agent", "ops", "steward", "admin"],
                 approver_roles=["steward", "admin"],
                 approval_rule=approval_rule,
+                approval_target_type=approval_target_type,
+                approval_id_param=approval_id_param,
                 affects_source=True,
                 params=[FieldSpec(name="record_id", field_type="str", required=True)],
                 preconditions=[
@@ -505,7 +886,7 @@ def synthesize_from_fde_evidence(
                         set_fields={sf: {"lit": sa}},
                     )
                 ],
-                display_label=f"{dm_by_name[m].label}: {meth}",
+                display_label=f"{target_plan.display_label}: {_clean_method_verb(meth)}",
             )
         )
         action_bindings.append(
@@ -515,7 +896,7 @@ def synthesize_from_fde_evidence(
                 external_method=meth,
                 target_object_type=ot_name,
                 id_param="record_id",
-                id_prefix=prefix_by_model[m],
+                id_prefix=target_plan.prefix,
                 expected_state_field=sf,
                 expected_state_after=sa,
                 readback_tables=[m],
@@ -551,6 +932,8 @@ def synthesize_from_fde_evidence(
 
 def build_auto_replay_factory(
     bundle: SynthesizedBundle,
+    *,
+    seed_ontology: SeedOntology | None = None,
 ) -> Any:
     """Derive Gate 3 positive & negative ReplayEvents purely from Probe 3 causal + native-error evidence."""
     binding_by_mm: dict[tuple[str, str], ActionExecutionBinding] = {}
@@ -558,70 +941,147 @@ def build_auto_replay_factory(
         binding_by_mm[(b.external_table, b.external_method)] = b
     reversal_set = set(bundle.reversal_actions)
     valid_states_by_action: dict[str, set[str]] = {}
+    approval_actions: set[str] = set()
     for act in bundle.blueprint.actions:
+        if act.approval_rule is not None and act.name not in reversal_set:
+            approval_actions.add(act.name)
         for pre in act.preconditions:
             right = pre.must_hold.get("right", {})
             if isinstance(right, dict) and isinstance(right.get("lit"), list):
                 valid_states_by_action[act.name] = set(right["lit"])
+
+    compiled_for_approval = (
+        compile_blueprint(
+            bundle.blueprint,
+            seed_ontology=seed_ontology or build_business_seed_ontology(),
+        )
+        if approval_actions
+        else None
+    )
 
     def _factory(projected_m0: list[dict[str, Any]]) -> tuple[list[ReplayEvent], list[ReplayEvent]]:
         by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in projected_m0:
             by_type[row["object_type"]].append(row["data"])
 
+        sim_rt: OntologyRuntime | None = None
+        if compiled_for_approval is not None:
+            sim_rt = OntologyRuntime(compiled_for_approval, db_path=":memory:")
+            order_rank = {name: i for i, name in enumerate(compiled_for_approval.object_types)}
+            for entry in sorted(projected_m0, key=lambda e: order_rank.get(e["object_type"], 999)):
+                cls = compiled_for_approval.get_object_type(entry["object_type"])
+                sim_rt.put_object(cls(**entry["data"]))
+
         pos: list[ReplayEvent] = []
         neg: list[ReplayEvent] = []
-        seen_pos: set[tuple[str, str]] = set()
+        seen_pos: set[tuple[str, str, bool]] = set()
         seen_neg: set[tuple[str, str]] = set()
 
-        for obs in bundle.action_probe_evidence:
-            binding = binding_by_mm.get((obs.model, obs.method))
-            if binding is None:
-                continue
-            candidates = by_type.get(binding.target_object_type, [])
-            if obs.outcome == "TRANSITION" and obs.state_before != obs.state_after:
-                key = (binding.action_name, obs.state_before)
-                if key in seen_pos:
+        try:
+            for obs in bundle.action_probe_evidence:
+                binding = binding_by_mm.get((obs.model, obs.method))
+                if binding is None:
                     continue
-                matched = next(
-                    (c for c in candidates if str(c.get(obs.status_field)) == obs.state_before),
-                    None,
-                )
-                if matched is not None:
-                    seen_pos.add(key)
-                    pos.append(
-                        ReplayEvent(
-                            name=f"auto_pos_{binding.action_name}_from_{obs.state_before}",
-                            action=binding.action_name,
-                            params={binding.id_param: matched["record_id"]},
-                            actor=AI_OPS_ACTOR,
-                            expected_valid=True,
-                            expected_requires_approval=(binding.action_name in reversal_set),
+                candidates = by_type.get(binding.target_object_type, [])
+                if obs.outcome == "TRANSITION" and obs.state_before != obs.state_after:
+                    state_matches = [
+                        c for c in candidates if str(c.get(obs.status_field)) == obs.state_before
+                    ]
+                    if not state_matches:
+                        continue
+                    if sim_rt is not None and binding.action_name in approval_actions:
+                        for cand in state_matches:
+                            sim = sim_rt.simulate_action(
+                                binding.action_name,
+                                {binding.id_param: cand["record_id"]},
+                                actor=AI_OPS_ACTOR,
+                            )
+                            if not sim.valid:
+                                continue
+                            key = (binding.action_name, obs.state_before, sim.requires_approval)
+                            if key in seen_pos:
+                                continue
+                            seen_pos.add(key)
+                            ev_prefix = (
+                                "auto_pos_approval"
+                                if sim.requires_approval
+                                else "auto_pos"
+                            )
+                            pos.append(
+                                ReplayEvent(
+                                    name=f"{ev_prefix}_{binding.action_name}_from_{obs.state_before}",
+                                    action=binding.action_name,
+                                    params={binding.id_param: cand["record_id"]},
+                                    actor=AI_OPS_ACTOR,
+                                    expected_valid=True,
+                                    expected_requires_approval=sim.requires_approval,
+                                )
+                            )
+                    else:
+                        req_appr = binding.action_name in reversal_set
+                        key = (binding.action_name, obs.state_before, req_appr)
+                        if key in seen_pos:
+                            continue
+                        seen_pos.add(key)
+                        pos.append(
+                            ReplayEvent(
+                                name=f"auto_pos_{binding.action_name}_from_{obs.state_before}",
+                                action=binding.action_name,
+                                params={binding.id_param: state_matches[0]["record_id"]},
+                                actor=AI_OPS_ACTOR,
+                                expected_valid=True,
+                                expected_requires_approval=req_appr,
+                            )
                         )
+                elif obs.outcome == "NATIVE_ERROR":
+                    allowed = valid_states_by_action.get(binding.action_name, set())
+                    if obs.state_before in allowed:
+                        continue
+                    key = (binding.action_name, obs.state_before)
+                    if key in seen_neg:
+                        continue
+                    matched = next(
+                        (c for c in candidates if str(c.get(obs.status_field)) == obs.state_before),
+                        None,
                     )
-            elif obs.outcome == "NATIVE_ERROR":
-                allowed = valid_states_by_action.get(binding.action_name, set())
-                if obs.state_before in allowed:
-                    continue
-                key = (binding.action_name, obs.state_before)
-                if key in seen_neg:
-                    continue
-                matched = next(
-                    (c for c in candidates if str(c.get(obs.status_field)) == obs.state_before),
-                    None,
-                )
-                if matched is not None:
-                    seen_neg.add(key)
-                    neg.append(
-                        ReplayEvent(
-                            name=f"auto_neg_{binding.action_name}_from_{obs.state_before}",
-                            action=binding.action_name,
-                            params={binding.id_param: matched["record_id"]},
-                            actor=AI_OPS_ACTOR,
-                            expected_valid=False,
-                            expected_error_code=f"INVALID_STATE_FOR_{obs.method.upper()}",
+                    if matched is not None:
+                        seen_neg.add(key)
+                        neg.append(
+                            ReplayEvent(
+                                name=f"auto_neg_{binding.action_name}_from_{obs.state_before}",
+                                action=binding.action_name,
+                                params={binding.id_param: matched["record_id"]},
+                                actor=AI_OPS_ACTOR,
+                                expected_valid=False,
+                                expected_error_code=f"INVALID_STATE_FOR_{obs.method.upper()}",
+                            )
                         )
-                    )
+                    elif candidates:
+                        synth_id = f"{binding.id_prefix}NEG-{binding.action_name}-{obs.state_before}"
+                        seen_neg.add(key)
+                        neg.append(
+                            ReplayEvent(
+                                name=f"auto_neg_{binding.action_name}_from_{obs.state_before}",
+                                action=binding.action_name,
+                                params={binding.id_param: synth_id},
+                                actor=AI_OPS_ACTOR,
+                                expected_valid=False,
+                                expected_error_code=f"INVALID_STATE_FOR_{obs.method.upper()}",
+                                setup_objects=(
+                                    {
+                                        "object_type": binding.target_object_type,
+                                        "data": {
+                                            **candidates[0],
+                                            "record_id": synth_id,
+                                            obs.status_field: obs.state_before,
+                                        },
+                                    },
+                                ),
+                            )
+                        )
+        finally:
+            if sim_rt is not None:
+                sim_rt.close()
         return pos, neg
 
     return _factory
@@ -1099,7 +1559,7 @@ def run_autonomous_fde_end_to_end(
         )
         crucible_ctx = CrucibleContext(
             mode="genesis",
-            replay_factory=build_auto_replay_factory(bundle),
+            replay_factory=build_auto_replay_factory(bundle, seed_ontology=active_seed),
             default_actor=AI_OPS_ACTOR,
             seed_ontology=active_seed,
         )

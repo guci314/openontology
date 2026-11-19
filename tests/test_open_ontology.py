@@ -1454,6 +1454,8 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
         "visibility",
         "post_approval",
         "description",
+        "view_tags",
+        "touched_object_types",
     }
     with pytest.raises(TypeError):
         cc.spec.action("forbidden_action", cc.RerouteParams, writeback_target="x")

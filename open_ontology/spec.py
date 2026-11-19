@@ -41,6 +41,7 @@ __all__ = [
     "ObjectProperty",
     "InterfaceType",
     "RoleDef",
+    "ScopedViewSpec",
     "FunctionDef",
     "ActionDef",
     "AutomationDef",
@@ -212,6 +213,8 @@ class ObjectType(BaseModel):
     __abstract__: ClassVar[bool] = False
     #: 只追加不可变事实标记：一旦 create 落库，禁止后续 Action update/delete（时光机冲正除外）。
     __append_only__: ClassVar[bool] = False
+    #: 可选声明式视图标签，用于 Scoped OSDK View 按上下文投影裁剪。
+    __view_tags__: ClassVar[tuple[str, ...]] = ()
     #: 从字段 ``ObjectProperty[...]`` 注解自动提取的关系索引（按类型隔离）。
     __object_properties__: ClassVar[dict[str, "ObjectProperty"]] = {}
 
@@ -511,6 +514,25 @@ class RoleDef(BaseModel):
     description: str = ""
 
 
+class ScopedViewSpec(BaseModel):
+    """Declarative consumption-layer projection (Scoped OSDK View) over an OntologySpec.
+
+    Constrains which object types, actions, and functions a downstream consumer
+    role or bounded context sees while preserving full underlying spec invariants.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    description: str = ""
+    roles: tuple[str, ...] = ()
+    view_tags: tuple[str, ...] = ()
+    object_types: tuple[str, ...] = ()
+    actions: tuple[str, ...] = ()
+    functions: tuple[str, ...] = ()
+    include_reachable_objects: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Function / action declarations
 # ---------------------------------------------------------------------------
@@ -524,6 +546,7 @@ class FunctionDef(BaseModel):
     handler: Any  # Callable[[EditBatch, BaseModel], Any]
     description: str = ""
     read_only: bool = True
+    view_tags: tuple[str, ...] = ()
 
 
 class ActionDef(BaseModel):
@@ -541,6 +564,8 @@ class ActionDef(BaseModel):
     visibility: Literal["public", "private"] = "public"
     post_approval: Any = None  # optional Callable[[EditBatch, BaseModel], None]
     description: str = ""
+    view_tags: tuple[str, ...] = ()
+    touched_object_types: tuple[str, ...] = ()
 
     def requires_approval(
         self,
@@ -719,6 +744,7 @@ class OntologySpec:
         self.object_properties: dict[str, ObjectProperty] = {}
         self.interfaces: dict[str, InterfaceType] = {}
         self.roles: dict[str, RoleDef] = {}
+        self.views: dict[str, ScopedViewSpec] = {}
         self.functions: dict[str, FunctionDef] = {}
         self.actions: dict[str, ActionDef] = {}
         self.automations: dict[str, AutomationDef] = {}
@@ -745,6 +771,7 @@ class OntologySpec:
         _merge_spec_registry(self.object_properties, parent.object_properties, kind="object property")
         _merge_spec_registry(self.interfaces, parent.interfaces, kind="interface")
         _merge_spec_registry(self.roles, parent.roles, kind="role")
+        _merge_spec_registry(self.views, parent.views, kind="view")
         _merge_spec_registry(self.invariants, parent.invariants, kind="invariant")
         _merge_spec_registry(
             self.transition_invariants,
@@ -1018,6 +1045,38 @@ class OntologySpec:
             if name in (getattr(cls, "__interfaces__", ()) or ())
         ]
 
+    # -- scoped views ------------------------------------------------------
+    def register_view(self, view: ScopedViewSpec) -> ScopedViewSpec:
+        """Register a declarative Scoped OSDK View over this ontology spec."""
+        clean = view.name.strip()
+        if not clean:
+            raise ValueError("view name must not be empty")
+        self._validate_roles(view.roles, context=f"view {clean!r} roles")
+        for ot_name in view.object_types:
+            if ot_name not in self.object_types:
+                raise UnknownObjectTypeError(
+                    f"view {clean!r} references unknown object type {ot_name!r}"
+                )
+        for act_name in view.actions:
+            if act_name not in self.actions:
+                raise ActionNotFoundError(
+                    f"view {clean!r} references unknown action {act_name!r}"
+                )
+        for fn_name in view.functions:
+            if fn_name not in self.functions:
+                raise FunctionNotFoundError(
+                    f"view {clean!r} references unknown function {fn_name!r}"
+                )
+        if clean != view.name:
+            view = view.model_copy(update={"name": clean})
+        self.views[clean] = view
+        return view
+
+    def get_view(self, name: str) -> ScopedViewSpec:
+        if name not in self.views:
+            raise OpenOntologyError(f"unknown view: {name!r}")
+        return self.views[name]
+
     # -- automations -------------------------------------------------------
     def automation(
         self,
@@ -1134,6 +1193,7 @@ class OntologySpec:
         name: str,
         params: type[BaseModel],
         description: str = "",
+        view_tags: Iterable[str] = (),
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         _validate_params(params, name)
         self._rebuild_model(params)
@@ -1144,6 +1204,7 @@ class OntologySpec:
                 params=params,
                 handler=handler,
                 description=description or (handler.__doc__ or "").strip(),
+                view_tags=tuple(view_tags),
             )
             return handler
 
@@ -1166,6 +1227,8 @@ class OntologySpec:
         affects_source: bool = True,
         visibility: Literal["public", "private"] = "public",
         post_approval: Callable[[Any, Any], None] | None = None,
+        view_tags: Iterable[str] = (),
+        touched_object_types: Iterable[str] = (),
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         if self.read_only_source and affects_source:
             raise GovernanceViolationError(
@@ -1189,6 +1252,8 @@ class OntologySpec:
                 visibility=visibility,
                 post_approval=post_approval,
                 description=description or (handler.__doc__ or "").strip(),
+                view_tags=tuple(view_tags),
+                touched_object_types=tuple(touched_object_types),
             )
             return handler
 
@@ -1206,6 +1271,7 @@ class OntologySpec:
             "object_properties": sorted(self.object_properties),
             "interfaces": sorted(self.interfaces),
             "roles": sorted(self.roles),
+            "views": sorted(self.views),
             "functions": sorted(self.functions),
             "actions": sorted(self.actions),
             "automations": sorted(self.automations),

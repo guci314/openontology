@@ -20,6 +20,7 @@ from ..spec import (
     ObjectProperty,
     ObjectType,
     OntologySpec,
+    ScopedViewSpec,
 )
 from .phenomenon import ActionExecutionBinding, AdapterMappingSpec, EntityMappingSpec
 from .seed import SeedOntology
@@ -32,6 +33,7 @@ __all__ = [
     "InvariantRuleSpec",
     "ActionMutationSpec",
     "ActionBlueprint",
+    "ScopedViewBlueprint",
     "DeclarativeBlueprint",
     "EvalActorSpec",
     "EvalExpectationSpec",
@@ -153,6 +155,7 @@ class ObjectTypeBlueprint(BaseModel):
     initial_statuses: list[str] | None = None
     transitions: dict[str, list[str]] = Field(default_factory=dict)
     voucher_delta_rules: dict[str, tuple[str, str, str]] = Field(default_factory=dict)
+    view_tags: list[str] = Field(default_factory=list)
     display_label: str = ""
 
 
@@ -203,7 +206,21 @@ class ActionBlueprint(BaseModel):
     params: list[FieldSpec] = Field(default_factory=list)
     preconditions: list[InvariantRuleSpec] = Field(default_factory=list)
     mutations: list[ActionMutationSpec] = Field(default_factory=list)
+    view_tags: list[str] = Field(default_factory=list)
     display_label: str = ""
+
+
+class ScopedViewBlueprint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str = ""
+    roles: list[str] = Field(default_factory=list)
+    view_tags: list[str] = Field(default_factory=list)
+    object_types: list[str] = Field(default_factory=list)
+    actions: list[str] = Field(default_factory=list)
+    functions: list[str] = Field(default_factory=list)
+    include_reachable_objects: bool = True
 
 
 class DeclarativeBlueprint(BaseModel):
@@ -217,6 +234,7 @@ class DeclarativeBlueprint(BaseModel):
     actions: list[ActionBlueprint] = Field(default_factory=list)
     invariants: list[InvariantRuleSpec] = Field(default_factory=list)
     migrations: list[FieldMigrationSpec] = Field(default_factory=list)
+    views: list[ScopedViewBlueprint] = Field(default_factory=list)
     display: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
@@ -300,6 +318,8 @@ class EvolutionPatch(BaseModel):
     remove_invariants: list[str] = Field(default_factory=list)
     update_approval_rules: dict[str, dict[str, Any]] = Field(default_factory=dict)
     update_approver_roles: dict[str, list[str]] = Field(default_factory=dict)
+    add_views: list[ScopedViewBlueprint] = Field(default_factory=list)
+    update_views: list[ScopedViewBlueprint] = Field(default_factory=list)
     migrations: list[FieldMigrationSpec] = Field(default_factory=list)
     proposed_eval_cases: list[ProposedEvalCase] = Field(default_factory=list)
     update_entity_mappings: list[EntityMappingSpec] = Field(default_factory=list)
@@ -1101,7 +1121,57 @@ def apply_evolution_patch(
                     )
                     existing_drops.add((ot_name, fname))
 
+    valid_ot_names = {ot.name for ot in candidate.object_types}
+    valid_act_names = {act.name for act in candidate.actions}
+    view_by_name = {v.name: idx for idx, v in enumerate(candidate.views)}
+    for new_view in patch.add_views:
+        _validate_scoped_view_bp(new_view, valid_ot_names=valid_ot_names, valid_act_names=valid_act_names)
+        if new_view.name in view_by_name:
+            raise InvariantError(
+                f"scoped view {new_view.name!r} already exists",
+                code="INVALID_SCOPED_VIEW",
+            )
+        candidate.views.append(copy.deepcopy(new_view))
+        view_by_name[new_view.name] = len(candidate.views) - 1
+    for upd_view in patch.update_views:
+        _validate_scoped_view_bp(upd_view, valid_ot_names=valid_ot_names, valid_act_names=valid_act_names)
+        if upd_view.name not in view_by_name:
+            raise InvariantError(
+                f"patch updates unknown scoped view {upd_view.name!r}",
+                code="INVALID_SCOPED_VIEW",
+            )
+        candidate.views[view_by_name[upd_view.name]] = copy.deepcopy(upd_view)
+
     return candidate
+
+
+def _validate_scoped_view_bp(
+    view_bp: ScopedViewBlueprint,
+    *,
+    valid_ot_names: set[str] | frozenset[str],
+    valid_act_names: set[str] | frozenset[str],
+    valid_fn_names: set[str] | frozenset[str] | None = None,
+) -> None:
+    _assert_safe_identifier(view_bp.name, "scoped view name")
+    for ot_name in view_bp.object_types:
+        if ot_name not in valid_ot_names:
+            raise InvariantError(
+                f"scoped view {view_bp.name!r} references unknown object type {ot_name!r}",
+                code="INVALID_SCOPED_VIEW",
+            )
+    for act_name in view_bp.actions:
+        if act_name not in valid_act_names:
+            raise InvariantError(
+                f"scoped view {view_bp.name!r} references unknown action {act_name!r}",
+                code="INVALID_SCOPED_VIEW",
+            )
+    if valid_fn_names is not None:
+        for fn_name in view_bp.functions:
+            if fn_name not in valid_fn_names:
+                raise InvariantError(
+                    f"scoped view {view_bp.name!r} references unknown function {fn_name!r}",
+                    code="INVALID_SCOPED_VIEW",
+                )
 
 
 def apply_adapter_mapping_patch(
@@ -1340,6 +1410,8 @@ def compile_blueprint(
             cls.__voucher_delta_rules__ = {k: tuple(v) for k, v in ot.voucher_delta_rules.items()}
         if masked_fields:
             cls.__masked_fields__ = masked_fields
+        if ot.view_tags:
+            cls.__view_tags__ = tuple(ot.view_tags)
 
         spec.object_type(cls)
         created_classes[ot.name] = cls
@@ -1788,6 +1860,11 @@ def compile_blueprint(
 
             return _handler
 
+        touched_types = {mut.object_type for mut in act.mutations} | {
+            pre.target_type for pre in act.preconditions
+        }
+        if act.approval_target_type is not None:
+            touched_types.add(act.approval_target_type)
         spec.action(
             act.name,
             params_cls,
@@ -1796,9 +1873,34 @@ def compile_blueprint(
             approval_rule=approval_fn,
             affects_source=act.affects_source,
             description=act.description,
+            view_tags=tuple(act.view_tags),
+            touched_object_types=tuple(sorted(touched_types)),
         )(_make_action_handler(act, subject_cls, subject_id_param))
         if act.display_label:
             action_display[act.name] = act.display_label
+
+    valid_ot_names = set(spec.object_types.keys())
+    valid_act_names = set(spec.actions.keys())
+    valid_fn_names = set(spec.functions.keys())
+    for view_bp in blueprint.views:
+        _validate_scoped_view_bp(
+            view_bp,
+            valid_ot_names=valid_ot_names,
+            valid_act_names=valid_act_names,
+            valid_fn_names=valid_fn_names,
+        )
+        spec.register_view(
+            ScopedViewSpec(
+                name=view_bp.name,
+                description=view_bp.description,
+                roles=tuple(view_bp.roles),
+                view_tags=tuple(view_bp.view_tags),
+                object_types=tuple(view_bp.object_types),
+                actions=tuple(view_bp.actions),
+                functions=tuple(view_bp.functions),
+                include_reachable_objects=view_bp.include_reachable_objects,
+            )
+        )
 
     spec.update_display(
         {
