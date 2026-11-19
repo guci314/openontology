@@ -531,8 +531,9 @@ def test_catalog_carries_runtimes_and_dual_device_registry(base):
     default = runtimes["rt-default-memory"]
     assert default["storage_kind"] == "memory"
     assert default["db_uri"] == "sqlite://:memory:"
-    assert len(default["aspects"]) == 7
+    assert len(default["aspects"]) == 8
     assert "IdleAwareCallbackAspect" in default["aspects"]
+    assert "HomomorphicSettlementAspect" in default["aspects"]
 
     coldchain = runtimes["rt-coldchain-wave3"]
     assert coldchain["storage_kind"] == "sqlite"
@@ -598,7 +599,7 @@ def test_fork_registers_its_own_runtime_and_devices(base):
     forked_runtime = runtimes[f"rt-{new_id}"]
     assert forked_runtime["storage_kind"] == "memory"  # 克隆沙盘纯内存
     assert forked_runtime["instance_ids"] == [new_id]
-    assert len(forked_runtime["aspects"]) == 7
+    assert len(forked_runtime["aspects"]) == 8
 
     devices = _get(base, "/api/devices")
     cloned = [

@@ -1,16 +1,16 @@
-"""投资人路演演播室 #1：裸 MCP（开环对照组） vs OpenOntology 三看板（W_real · W_mem · W_lat + 飞书）。
+"""投资人路演演播室 #1：裸 MCP（开环对照组） vs OpenOntology 三看板（W_real · W_mem · 审批/MPC + 飞书）。
 
 特性：
-1. 完全复用已冻结的 ``open_ontology`` 内核（``LatentSpace``、``ClosedLoopMPCController``、
-   ``OntologyRuntime``）与现有 ``OdooO2CAdapter``、``FeishuOpenAPIClient``；
+1. 完全复用 ``open_ontology`` 内核（``OntologyRuntime`` 统一闭环同态结算、``ClosedLoopMPCController``、
+   ``SourceBridge``）与现有 ``OdooO2CAdapter``、``FeishuOpenAPIClient``；
 2. 独立 Odoo 客户隔离（``O2C-INVESTOR-3BOARDS`` 与 ``O2C-INVESTOR-BARE-MCP``），
    绝对不触碰 ``:8789`` / ``O2C-CUST-001`` / ``O2C-SO-001`` / ``O2C-SO-002``；
 3. 只从 ``--profile-dir`` 读取飞书凭据与目标群/用户，绝不劫持 WebSocket 长连接，
    绝不在任何 API、HTML、日志或元数据中回显 ``FEISHU_APP_SECRET``；
-4. 四幕连续闭环剧场：
+4. 四幕连续闭环剧场（零 ``w_lat.sqlite3`` 持久队列）：
    - 第一幕：全知之眼对齐（$W_{real} \\to W_{mem}$）+ 未出库强开票拦截；
-   - 第二幕：撒谎执行器穿帮 + ``DEVICE_STATE_MISMATCH`` 读回否决与 ``rebase()``；
-   - 第三幕：超授信挂起（$W_{lat}$）+ 真实飞书 ``o2c业财助手`` 审批推卡 + 回调落盘；
+   - 第二幕：撒谎执行器穿帮 + ``DEVICE_STATE_MISMATCH`` 独立回读否决与零幻觉保护；
+   - 第三幕：超授信挂起（``PENDING_APPROVAL`` 仅存 ``W_mem``）+ 真实飞书 ``o2c业财助手`` 审批推卡 + 回调核销；
    - 第四幕：``ClosedLoopMPCController`` 滚动求解 + 首次故障重规划自愈直至实收清零。
 """
 
@@ -38,11 +38,12 @@ from open_ontology import (
     CandidateAction,
     ClosedLoopMPCController,
     DEVICE_STATE_MISMATCH,
+    DeviceStateMismatchError,
     GovernanceViolationError,
     InvariantError,
-    LatentSpace,
     MPC_GOAL_REACHED,
     OntologyRuntime,
+    SourceBridge,
 )
 
 from . import o2c_ontology as o2c
@@ -418,7 +419,6 @@ class ThreeBoardsStudioApp:
         self._feishu_transport = feishu_transport
 
         self.mem_db_path = self.state_dir / "w_mem.sqlite3"
-        self.lat_db_path = self.state_dir / "w_lat.sqlite3"
         self.meta_path = self.state_dir / "studio_meta.json"
         self._lock = threading.RLock()
 
@@ -426,7 +426,6 @@ class ThreeBoardsStudioApp:
         self._injected_bare_client = bare_client
 
         self.memory_runtime: OntologyRuntime | None = None
-        self.latent: LatentSpace | None = None
         self.adapter: OdooO2CAdapter | None = None
         self.bare_runtime: OntologyRuntime | None = None
         self.bare_adapter: OdooO2CAdapter | None = None
@@ -479,9 +478,6 @@ class ThreeBoardsStudioApp:
 
     # -- lifecycle & persistence ------------------------------------------
     def _close_stores(self) -> None:
-        if self.latent is not None:
-            self.latent.close()
-            self.latent = None
         if self.memory_runtime is not None:
             self.memory_runtime.close()
             self.memory_runtime = None
@@ -544,8 +540,9 @@ class ThreeBoardsStudioApp:
         self.meta["timeline"] = items[-24:]
 
     def _open_stores(self) -> None:
-        self.memory_runtime = OntologyRuntime(o2c.spec, db_path=self.mem_db_path)
-        self.latent = self.memory_runtime.open_latent_space(self.lat_db_path)
+        self.memory_runtime = OntologyRuntime(
+            o2c.spec, db_path=self.mem_db_path, world_mode="coupled"
+        )
         self.adapter = OdooO2CAdapter(
             self.memory_runtime,
             client=self._injected_client,
@@ -554,6 +551,7 @@ class ThreeBoardsStudioApp:
             order_seeds=self.order_seeds,
             credit_limit_cents=CREDIT_LIMIT_CENTS,
         )
+        self.adapter.bind_coupled(allow_source_revert=True)
         self.bare_runtime = OntologyRuntime(o2c.spec)
         self.bare_adapter = OdooO2CAdapter(
             self.bare_runtime,
@@ -566,11 +564,7 @@ class ThreeBoardsStudioApp:
 
     def _init_or_rehydrate(self) -> None:
         with self._lock:
-            if (
-                self.mem_db_path.is_file()
-                and self.lat_db_path.is_file()
-                and self.meta_path.is_file()
-            ):
+            if self.mem_db_path.is_file() and self.meta_path.is_file():
                 try:
                     loaded_meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
                 except Exception:
@@ -592,10 +586,10 @@ class ThreeBoardsStudioApp:
             self.reset()
 
     def reset(self) -> dict[str, Any]:
-        """重建隔离客户与双边草稿订单，并清空持久化记忆与隐空间重开演播。"""
+        """重建隔离客户与双边草稿订单，并清空持久化记忆与重开演播。"""
         with self._lock:
             self._close_stores()
-            for db_file in (self.mem_db_path, self.lat_db_path):
+            for db_file in (self.mem_db_path,):
                 if db_file.exists():
                     db_file.unlink()
                 for suffix in ("-wal", "-shm"):
@@ -604,10 +598,9 @@ class ThreeBoardsStudioApp:
                         sidecar.unlink()
             self.meta = self._default_meta()
             self._open_stores()
-            assert self.adapter is not None and self.bare_adapter is not None and self.latent is not None
+            assert self.adapter is not None and self.bare_adapter is not None
             self.adapter.seed_odoo()
             self.adapter.sync_from_odoo()
-            self.latent.rebase()
             self.bare_adapter.seed_odoo()
             self._push_timeline(
                 "INIT",
@@ -619,14 +612,13 @@ class ThreeBoardsStudioApp:
             return self.state_snapshot()
 
     # -- helpers -----------------------------------------------------------
-    def _ensure_ready(self) -> tuple[OntologyRuntime, LatentSpace, OdooO2CAdapter, OdooO2CAdapter]:
+    def _ensure_ready(self) -> tuple[OntologyRuntime, OdooO2CAdapter, OdooO2CAdapter]:
         assert (
             self.memory_runtime is not None
-            and self.latent is not None
             and self.adapter is not None
             and self.bare_adapter is not None
         )
-        return self.memory_runtime, self.latent, self.adapter, self.bare_adapter
+        return self.memory_runtime, self.adapter, self.bare_adapter
 
     def _safe_odoo_docs(self, adapter: OdooO2CAdapter, order_id: str) -> dict[str, Any]:
         try:
@@ -685,7 +677,7 @@ class ThreeBoardsStudioApp:
     def run_act_1(self) -> dict[str, Any]:
         """第一幕：W_real -> W_mem 一致性对齐 + 未出库强行开票拦截 + 合法确认首单。"""
         with self._lock:
-            rt, latent, adapter, bare_adapter = self._ensure_ready()
+            rt, adapter, bare_adapter = self._ensure_ready()
 
             # 1) 对照组：裸 MCP 无本体规则、直接调 Odoo RPC action_confirm 后强行 _create_invoices
             assert bare_adapter.data is not None
@@ -728,18 +720,16 @@ class ThreeBoardsStudioApp:
                 real_docs=bare_docs,
             )
 
-            # 2) 实验组：W_real -> W_mem 全景快照对齐并基线同步进 W_lat
+            # 2) 实验组：W_real -> W_mem 全景快照对齐
             sync_info = adapter.sync_from_odoo()
-            if not latent.pending_moves() and not latent.awaiting_approval_moves():
-                latent.rebase()
 
-            # 3) W_lat 预演“未出库强行开票” -> 立即在隐空间拦截，Odoo 零脏写
+            # 3) 前置不变量拦截“未出库强行开票” -> Phase B 不触发，Odoo 零脏写
             blocked_run_id = self._next_run_id("3B-BLOCK")
             blocked_error_code = "INVARIANT_VIOLATION"
             blocked_error_msg = ""
             if rt.get_action_run(blocked_run_id) is None:
                 try:
-                    latent.stage_move(
+                    rt.submit_action(
                         blocked_run_id,
                         "issue_and_post_invoice",
                         {"order": self.order_1},
@@ -751,21 +741,20 @@ class ThreeBoardsStudioApp:
 
             docs_after_block = self._safe_odoo_docs(adapter, self.order_1)
 
-            # 4) 合法动作：在 W_lat 预演 confirm_sales_order -> 写 Odoo -> 读回结算进 W_mem
+            # 4) 合法动作：统一闭环确认 confirm_sales_order -> 写 Odoo -> 读回核验提交进 W_mem
             confirm_run_id: str | None = None
             odoo_evidence: dict[str, Any] | None = None
             settled_status = self._order_mem_status(self.order_1)
             if settled_status == "draft":
                 confirm_run_id = self._next_run_id("3B-CONF1")
-                move = latent.stage_move(
+                settled = rt.submit_action(
                     confirm_run_id,
                     "confirm_sales_order",
                     {"order": self.order_1},
                     o2c.AI_AGENT,
                 )
-                odoo_evidence = adapter.execute_move(move)
-                readback = adapter.build_readback_snapshot()
-                settled = latent.settle_move(confirm_run_id, readback_objects=readback)
+                ev_list = adapter.get_run_evidence(confirm_run_id)
+                odoo_evidence = ev_list[0] if ev_list else None
                 settled_status = str(settled["status"])
 
             docs_1 = self._safe_odoo_docs(adapter, self.order_1)
@@ -806,9 +795,9 @@ class ThreeBoardsStudioApp:
 
     # -- Act 2 -------------------------------------------------------------
     def run_act_2(self) -> dict[str, Any]:
-        """第二幕：撒谎执行器穿帮 + DEVICE_STATE_MISMATCH 读回否决 + rebase() 零幻觉。"""
+        """第二幕：撒谎执行器穿帮 + DEVICE_STATE_MISMATCH 独立回读否决与零幻觉保护。"""
         with self._lock:
-            rt, latent, adapter, bare_adapter = self._ensure_ready()
+            rt, adapter, bare_adapter = self._ensure_ready()
             if self._order_mem_status(self.order_1) == "draft":
                 self.run_act_1()
 
@@ -832,41 +821,57 @@ class ThreeBoardsStudioApp:
                 real_docs=bare_docs_real,
             )
 
-            # 2) 实验组：W_lat 暂存出库 -> 撒谎执行器声称成功但不操作 Odoo -> 真实读回否决 + rebase
-            if latent.pending_moves():
-                raise GovernanceViolationError("unexpected pending move before Act 2")
+            # 2) 实验组：临时换入“撒谎执行器”模拟外部未操作 Odoo -> 统一管线独立回读否决
             lie_run_id = self._next_run_id("3B-LIE")
-            staged_move = latent.stage_move(
-                lie_run_id,
-                "ship_order_delivery",
-                {"order": self.order_1},
-                o2c.WAREHOUSE,
-            )
-            # 刻意不调 adapter.execute_move(staged_move)，模拟外部执行器撒谎
             lying_actuator_claim = {
                 "ok": True,
                 "claimed_action": "ship_order_delivery",
                 "claimed_status": "shipped",
                 "note": "fake success payload ignored by OpenOntology",
             }
-            readback = adapter.build_readback_snapshot()
-            settled = latent.settle_move(lie_run_id, readback_objects=readback)
+            sim_preview = rt.simulate_action(
+                "ship_order_delivery", {"order": self.order_1}, o2c.WAREHOUSE
+            )
+            rt.bind_source_bridge(
+                SourceBridge(
+                    actuate=lambda _mv: dict(lying_actuator_claim),
+                    observe=adapter.build_readback_snapshot,
+                    allow_source_revert=True,
+                ),
+                world_mode="coupled",
+            )
+            settled: dict[str, Any]
+            try:
+                settled = rt.submit_action(
+                    lie_run_id,
+                    "ship_order_delivery",
+                    {"order": self.order_1},
+                    o2c.WAREHOUSE,
+                )
+            except DeviceStateMismatchError as exc:
+                settled = exc.run or rt.get_action_run(lie_run_id) or {
+                    "run_id": lie_run_id,
+                    "status": "REJECTED",
+                    "error_code": exc.code,
+                    "error_message": str(exc),
+                }
+            finally:
+                adapter.bind_coupled(allow_source_revert=True)
 
             docs_1 = self._safe_odoo_docs(adapter, self.order_1)
             mem_status_after = self._order_mem_status(self.order_1)
-            pending_after = latent.pending_moves()
 
             act2_summary = {
                 "ok": True,
                 "act": 2,
                 "run_id": lie_run_id,
-                "staged_diff": staged_move.get("object_diff"),
+                "staged_diff": sim_preview.diff.to_dict(),
                 "lying_actuator_claim": lying_actuator_claim,
                 "settled_status": settled["status"],
                 "error_code": settled.get("error_code"),
                 "error_message": settled.get("error_message"),
                 "mem_status_after": mem_status_after,
-                "rebased_pending_count": len(pending_after),
+                "rebased_pending_count": 0,
                 "odoo_docs": docs_1,
                 "bare_mcp": {
                     "order_id": self.bare_order,
@@ -881,7 +886,7 @@ class ThreeBoardsStudioApp:
                 "ACT 2",
                 f"抓获撒谎执行器：{settled.get('error_code')}",
                 f"执行器谎称 {self.order_1} 已出库，读回 Odoo 真实 picking 为 {docs_1.get('delivery_state')}，"
-                f"W_lat 自动拒绝（W_mem 保持 {mem_status_after}，零幻觉）并完成 rebase。",
+                f"闭环核验当场拒绝（W_mem 保持 {mem_status_after}，零幻觉）。",
                 "warn",
             )
             self._save_meta()
@@ -889,11 +894,11 @@ class ThreeBoardsStudioApp:
 
     # -- Act 3 & Feishu approval -------------------------------------------
     def run_act_3(self) -> dict[str, Any]:
-        """第三幕：O2C-3B-SO-002 超授信挂起在 W_lat，并向飞书 o2c业财助手推送真实审批卡。"""
+        """第三幕：O2C-3B-SO-002 超授信挂起为 PENDING_APPROVAL，并向飞书推送审批卡。"""
         with self._lock:
-            rt, latent, adapter, bare_adapter = self._ensure_ready()
+            rt, adapter, bare_adapter = self._ensure_ready()
 
-            existing_awaiting = latent.awaiting_approval_moves()
+            existing_awaiting = rt.list_action_runs(status="PENDING_APPROVAL")
             target_move = next(
                 (
                     mv
@@ -909,7 +914,7 @@ class ThreeBoardsStudioApp:
                         f"{self.order_2} is already {mem_status_2!r}; reset studio to replay Act 3"
                     )
                 run_id = self._next_run_id("3B-APPR")
-                target_move = latent.stage_move(
+                target_move = rt.submit_action(
                     run_id,
                     "confirm_sales_order",
                     {"order": self.order_2},
@@ -1020,11 +1025,11 @@ class ThreeBoardsStudioApp:
     ) -> dict[str, Any]:
         """签批或驳回 Act 3 挂起动作，同步执行 Odoo 19 写入并回读结算至 W_mem。"""
         with self._lock:
-            rt, latent, adapter, _bare = self._ensure_ready()
+            rt, adapter, _bare = self._ensure_ready()
             card_meta = dict(self.meta.get("feishu_card") or {})
             target_run_id = str(run_id or card_meta.get("run_id") or "").strip()
             if not target_run_id:
-                awaiting = latent.awaiting_approval_moves()
+                awaiting = rt.list_action_runs(status="PENDING_APPROVAL")
                 if awaiting:
                     target_run_id = str(awaiting[0]["run_id"])
             if not target_run_id:
@@ -1060,16 +1065,15 @@ class ThreeBoardsStudioApp:
             director = self._resolve_director_actor(operator_open_id)
             odoo_evidence: dict[str, Any] | None = None
             if op == "approve":
-                move = latent.approve_move(target_run_id, director)
-                odoo_evidence = adapter.execute_move(move)
-                readback = adapter.build_readback_snapshot()
-                final_run = latent.settle_move(target_run_id, readback_objects=readback)
+                final_run = rt.approve_action(target_run_id, director)
+                ev_list = adapter.get_run_evidence(target_run_id)
+                odoo_evidence = ev_list[0] if ev_list else None
                 final_status = str(final_run["status"])
                 toast_msg = (
                     f"已批准 {self.order_2} 并正式写入真实 Odoo 19（状态：{_cn(final_status)}）"
                 )
             elif op == "reject":
-                final_run = latent.reject_move(
+                final_run = rt.reject_action(
                     target_run_id, director, reason="财务总监驳回超授信放行申请"
                 )
                 final_status = str(final_run["status"])
@@ -1175,7 +1179,7 @@ class ThreeBoardsStudioApp:
     def run_act_4(self, *, inject_first_ship_drift: bool = True) -> dict[str, Any]:
         """第四幕：ClosedLoopMPCController + MCTS 滚动规划，自动从漂移故障自愈并闭环收款。"""
         with self._lock:
-            rt, latent, adapter, bare_adapter = self._ensure_ready()
+            rt, adapter, bare_adapter = self._ensure_ready()
 
             def _goal_fn(check_rt: OntologyRuntime) -> bool:
                 order_obj = check_rt.get_object(o2c.SalesOrder, self.order_1, _SYSTEM_ACTOR)
@@ -1236,12 +1240,10 @@ class ThreeBoardsStudioApp:
 
             drift_state = {"fired": False}
             exec_logs: list[dict[str, Any]] = []
-            # 若存在 Act 3 尚未签批的挂起单（且未走完 Act 3），注意 ClosedLoopMPCController
-            # 会检测 awaiting_approval_moves()；因此若 order_1 已经待执行且无阻塞挂起，可直接运行。
-            # 若用户直接点 Act 4 且 Act 3 尚未决断，先把 Act 3 留存待批提示或仅在无冲突时运行：
-            if latent.awaiting_approval_moves():
+            pending_approvals = rt.list_action_runs(status="PENDING_APPROVAL")
+            if pending_approvals:
                 raise GovernanceViolationError(
-                    f"W_lat 中尚有待签批动作 {latent.awaiting_approval_moves()[0]['run_id']}，"
+                    f"尚有待签批动作 {pending_approvals[0]['run_id']}，"
                     "请先在飞书或演播室完成第三幕签批再启动第四幕 MPC 收口。"
                 )
 
@@ -1270,23 +1272,26 @@ class ThreeBoardsStudioApp:
                 )
                 return evidence
 
-            controller = ClosedLoopMPCController(
-                latent,
-                o2c.AI_AGENT,
-                goal_fn=_goal_fn,
-                candidate_generator=_candidates,
-                value_fn=_value_fn,
-                simulations=24,
-                horizon=4,
-                value_scale=100.0,
-                seed=17,
-                act_fn=_act_fn,
-                observe_fn=adapter.build_readback_snapshot,
-                max_steps=12,
-                max_replans=3,
-                run_id_prefix=f"3B-MPC-{self.meta.get('seq', 0) + 1}",
-            )
-            mpc_result = controller.run()
+            try:
+                controller = ClosedLoopMPCController(
+                    rt,
+                    o2c.AI_AGENT,
+                    goal_fn=_goal_fn,
+                    candidate_generator=_candidates,
+                    value_fn=_value_fn,
+                    simulations=24,
+                    horizon=4,
+                    value_scale=100.0,
+                    seed=17,
+                    act_fn=_act_fn,
+                    observe_fn=adapter.build_readback_snapshot,
+                    max_steps=12,
+                    max_replans=3,
+                    run_id_prefix=f"3B-MPC-{self.meta.get('seq', 0) + 1}",
+                )
+                mpc_result = controller.run()
+            finally:
+                adapter.bind_coupled(allow_source_revert=True)
             self.meta["seq"] = int(self.meta.get("seq", 0)) + max(1, len(mpc_result.trajectory))
 
             docs_1 = self._safe_odoo_docs(adapter, self.order_1)
@@ -1338,9 +1343,9 @@ class ThreeBoardsStudioApp:
 
     # -- State snapshot for Web UI & tests ---------------------------------
     def state_snapshot(self) -> dict[str, Any]:
-        """生成零密钥泄露的三看板全维实时快照（W_real / W_mem / W_lat + Bare MCP + Feishu）。"""
+        """生成零密钥泄露的三看板全维实时快照（W_real / W_mem / 审批态 + Bare MCP + Feishu）。"""
         with self._lock:
-            rt, latent, adapter, bare_adapter = self._ensure_ready()
+            rt, adapter, bare_adapter = self._ensure_ready()
 
             cust = rt.get_object(o2c.Customer, self.partner_ref, _SYSTEM_ACTOR)
             ar_cents = o2c.get_customer_ar_balance(rt, self.partner_ref, _SYSTEM_ACTOR)
@@ -1394,23 +1399,14 @@ class ThreeBoardsStudioApp:
                 for r in runs[-12:]
             ]
 
-            pending_moves = [
-                {
-                    "run_id": mv["run_id"],
-                    "action_type": mv["action_type"],
-                    "params": mv.get("params"),
-                    "approved_by": mv.get("approved_by"),
-                    "affects_source": mv.get("affects_source"),
-                }
-                for mv in latent.pending_moves()
-            ]
+            pending_moves: list[dict[str, Any]] = []
             awaiting_moves = [
                 {
                     "run_id": mv["run_id"],
                     "action_type": mv["action_type"],
                     "params": mv.get("params"),
                 }
-                for mv in latent.awaiting_approval_moves()
+                for mv in rt.list_action_runs(status="PENDING_APPROVAL")
             ]
 
             snapshot = {
@@ -1456,7 +1452,7 @@ class ThreeBoardsStudioApp:
                     "recent_runs": recent_runs,
                 },
                 "w_lat": {
-                    "db_path": str(self.lat_db_path),
+                    "db_path": None,
                     "pending_count": len(pending_moves),
                     "pending_moves": pending_moves,
                     "awaiting_approval_count": len(awaiting_moves),

@@ -624,9 +624,10 @@ def test_kernel_delegates_to_aspects_not_reimplements():
 
 def test_aspects_module_is_self_contained():
     """切面模块不许反过来 import 内核运行时（避免循环依赖）。"""
-    text = (ROOT / "open_ontology" / "aspects.py").read_text(encoding="utf-8")
-    assert "from .runtime import" not in text
-    assert "import open_ontology.runtime" not in text
+    for mod in ("aspects.py", "settlement.py"):
+        text = (ROOT / "open_ontology" / mod).read_text(encoding="utf-8")
+        assert "from .runtime import" not in text
+        assert "import open_ontology.runtime" not in text
 
 
 def test_runtime_line_budget():
@@ -641,7 +642,7 @@ def test_runtime_line_budget():
 # 8. 微内核隐喻：四类模块的物理边界
 # ---------------------------------------------------------------------------
 MICROKERNEL_MODULES = ("spec.py", "sandbox.py", "runtime.py", "query.py")
-ASPECT_MODULES = ("aspects.py",)
+ASPECT_MODULES = ("aspects.py", "settlement.py")
 DRIVER_MODULES = ("ingestion.py",)
 
 

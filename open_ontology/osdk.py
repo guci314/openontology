@@ -1014,6 +1014,9 @@ def _build_sdk_session(
                     )
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
+                err_code = getattr(exc, "code", None)
+                if err_code:
+                    result["error_code"] = err_code
             _record_call({"name": tool_name, "arguments": raw_args})
             return json.dumps(result, ensure_ascii=False)
 

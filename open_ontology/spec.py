@@ -121,6 +121,10 @@ class ConcurrencyConflictError(OpenOntologyError):
 class GovernanceViolationError(OpenOntologyError):
     """Raised when the physical write gate or authority boundary rejects a write."""
 
+    def __init__(self, message: str, code: str | None = None) -> None:
+        self.code = code
+        super().__init__(message)
+
 
 class ReindexConflictError(OpenOntologyError):
     """Raised when a snapshot reindex would orphan an ontology-owned patch."""

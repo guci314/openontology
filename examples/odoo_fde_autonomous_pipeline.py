@@ -13,10 +13,10 @@
    双向 ``AdapterMappingSpec``（含 ``ActionExecutionBinding``）与自动推导的 Gate 3 正负考卷；
    交由 ``OntologyBuilderAgent``（可接真实 LLM 润色，默认零剧本确定性合成基线）通过
    ``SymbolicCrucible`` 五关证伪并经 ``Steward`` 审批结晶落盘。
-4. **第二步 · 通用双向桥接 + ``LatentSpace`` 同态回读核销**：
+4. **第二步 · 通用双向桥接 + 闭环同态回读核销**：
    ``DeclarativeOdooBridge`` 加载结晶产出的 ``OntologySpec`` 与双向 ``AdapterMappingSpec``，
-   在隔离克隆 Odoo 沙箱上执行：
-   ``LatentSpace.stage_move`` → 真实调用目标系统方法 → 独立只读回读并经映射投影 → ``LatentSpace.settle_move``，
+   在隔离克隆 Odoo 沙箱上通过 ``OntologyRuntime(world_mode="coupled", source_bridge=...)`` 执行：
+   ``:memory:`` 反事实预测 → 真实调用目标系统方法 → 独立只读回读并经映射投影 → 同态回读核销，
    实地验证同态交换律 ``φ(T_x(x_t, u_t)) == T_y(φ(x_t), a_t)``（``COMMITTED``），并同时验证外部状态漂移时
    精准触发 ``REJECTED (DEVICE_STATE_MISMATCH)`` 且实然世界零污染。
 
@@ -32,7 +32,6 @@ import datetime
 import json
 import os
 import re
-import tempfile
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -41,7 +40,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from open_ontology import Actor, DEVICE_STATE_MISMATCH, LatentSpace, OntologyRuntime
+from open_ontology import (
+    Actor,
+    DEVICE_STATE_MISMATCH,
+    DeviceStateMismatchError,
+    OntologyRuntime,
+    SourceBridge,
+)
 from open_ontology.induction import (
     AbductionBackend,
     ActionBlueprint,
@@ -622,7 +627,7 @@ def build_auto_replay_factory(
 
 
 # ---------------------------------------------------------------------------
-# 3. Step 2: Generic Bidirectional Odoo Bridge + LatentSpace Homomorphic Settlement
+# 3. Step 2: Generic Bidirectional Odoo Bridge + Homomorphic Settlement
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HomomorphicExecutionResult:
@@ -673,25 +678,89 @@ class DeclarativeOdooBridge:
         memory_runtime: OntologyRuntime,
         adapter_mapping: AdapterMappingSpec,
         sandbox: ProbeSandboxInterface,
-        latent_db_path: str | Path,
         protocol_overrides: Mapping[str, Sequence[OdooProtocolStep]] | None = None,
+        lookup_index: Mapping[tuple[str, str, str], str] | None = None,
     ) -> None:
         self.memory_runtime = memory_runtime
         self.adapter_mapping = adapter_mapping
         self.sandbox = sandbox
-        self.latent = LatentSpace(memory_runtime, latent_db_path)
         self.protocol_overrides: dict[str, list[OdooProtocolStep]] = {
             k: list(v) for k, v in (protocol_overrides or {}).items()
         }
+        self.lookup_index: Mapping[tuple[str, str, str], str] | None = lookup_index
+        self._last_observed_by_run: dict[str, dict[str, Any]] = {}
+        self._prev_world_mode = memory_runtime.world_mode
+        self._prev_source_bridge = memory_runtime.source_bridge
+        self._default_bridge = self.make_source_bridge()
+        self.memory_runtime.bind_source_bridge(self._default_bridge, world_mode="coupled")
 
     def close(self) -> None:
-        self.latent.close()
+        self.memory_runtime.bind_source_bridge(
+            self._prev_source_bridge,
+            world_mode=self._prev_world_mode,
+        )
 
     def __enter__(self) -> "DeclarativeOdooBridge":
         return self
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    def make_source_bridge(
+        self,
+        *,
+        skip_external_call_to_simulate_drift: bool = False,
+    ) -> SourceBridge:
+        def _resolve_target(move: dict[str, Any]) -> tuple[ActionExecutionBinding, int, dict[str, Any]]:
+            action_name = str(move["action_type"])
+            params = dict(move.get("params") or {})
+            binding = self.adapter_mapping.get_action_binding(action_name)
+            if binding is None:
+                raise ValueError(f"no ActionExecutionBinding registered for {action_name!r}")
+            canonical_id = str(params[binding.id_param])
+            ext_id = _parse_ext_id(canonical_id, binding.id_prefix)
+            return binding, ext_id, params
+
+        def _actuate(move: dict[str, Any]) -> Any:
+            if skip_external_call_to_simulate_drift:
+                return None
+            binding, ext_id, params = _resolve_target(move)
+            return self.execute_external_binding(binding, ext_id, params)
+
+        def _observe(move: dict[str, Any]) -> dict[str, Any]:
+            binding, ext_id, _params = _resolve_target(move)
+            em = self.adapter_mapping.get_entity_mapping(binding.target_object_type)
+            if em is None:
+                raise ValueError(f"no EntityMappingSpec registered for {binding.target_object_type!r}")
+            read_fields = list(
+                dict.fromkeys(
+                    ["id", em.id_transform.source_field]
+                    + [tf.source_field for tf in em.field_transforms if tf.source_field]
+                    + [fb for tf in em.field_transforms for fb in tf.fallback_fields if fb]
+                    + [flt.field for flt in em.row_filters if flt.field]
+                )
+            )
+            raw_rows = self.sandbox.search_read(
+                binding.external_table,
+                [("id", "=", ext_id)],
+                read_fields,
+                limit=1,
+            )
+            if not raw_rows:
+                raise RuntimeError(
+                    f"independent readback could not find {binding.external_table}:{ext_id}"
+                )
+            projected_row = project_single_record(em, raw_rows[0], lookup_index=self.lookup_index)
+            run_id = str(move.get("run_id") or "")
+            if run_id:
+                self._last_observed_by_run[run_id] = dict(projected_row)
+            return {binding.target_object_type: [projected_row]}
+
+        return SourceBridge(actuate=_actuate, observe=_observe)
+
+    def get_last_observed(self, run_id: str) -> dict[str, Any] | None:
+        row = self._last_observed_by_run.get(run_id)
+        return dict(row) if row is not None else None
 
     def execute_external_binding(
         self,
@@ -868,54 +937,45 @@ class DeclarativeOdooBridge:
         if em is None:
             raise ValueError(f"no EntityMappingSpec registered for {binding.target_object_type!r}")
 
-        # 1) Stage move inside persistent LatentSpace (zero writes to memory_runtime)
-        staged = self.latent.stage_move(run_id, action_name, params, actor)
-        staged_status = str(staged["status"])
-        if staged_status == "PENDING_APPROVAL":
-            if approver is None:
-                raise RuntimeError(f"move {run_id!r} requires approval and no approver was supplied")
-            staged = self.latent.approve_move(run_id, approver)
-            staged_status = str(staged["status"])
-
         canonical_id = str(params[binding.id_param])
         ext_id = _parse_ext_id(canonical_id, binding.id_prefix)
+        staged_status = "PENDING_EXECUTION"
 
-        # 2) Execute the real external method or multi-step protocol via declarative binding
-        if not skip_external_call_to_simulate_drift:
-            self.execute_external_binding(binding, ext_id, params)
+        if skip_external_call_to_simulate_drift:
+            self.memory_runtime.bind_source_bridge(
+                self.make_source_bridge(skip_external_call_to_simulate_drift=True),
+                world_mode="coupled",
+            )
+        try:
+            try:
+                run = self.memory_runtime.submit_action(run_id, action_name, params, actor)
+                staged_status = str(run["status"])
+                if staged_status == "PENDING_APPROVAL":
+                    if approver is None:
+                        raise RuntimeError(
+                            f"move {run_id!r} requires approval and no approver was supplied"
+                        )
+                    run = self.memory_runtime.approve_action(run_id, approver)
+                settled_status = str(run["status"])
+                error_code = run.get("error_code")
+                projected_row = self.get_last_observed(run_id) or {}
+            except DeviceStateMismatchError as exc:
+                settled_status = "REJECTED"
+                error_code = exc.code or DEVICE_STATE_MISMATCH
+                obs_rows = (exc.readback_objects or {}).get(binding.target_object_type) or []
+                projected_row = dict(obs_rows[0]) if obs_rows else (self.get_last_observed(run_id) or {})
+        finally:
+            if skip_external_call_to_simulate_drift:
+                self.memory_runtime.bind_source_bridge(
+                    self._default_bridge,
+                    world_mode="coupled",
+                )
 
-        # 3) Independent readback directly from external system + project via AdapterMappingSpec
-        read_fields = list(
-            dict.fromkeys(
-                ["id", em.id_transform.source_field]
-                + [tf.source_field for tf in em.field_transforms if tf.source_field]
-                + [fb for tf in em.field_transforms for fb in tf.fallback_fields if fb]
-                + [flt.field for flt in em.row_filters if flt.field]
-            )
-        )
-        raw_rows = self.sandbox.search_read(
-            binding.external_table,
-            [("id", "=", ext_id)],
-            read_fields,
-            limit=1,
-        )
-        if not raw_rows:
-            raise RuntimeError(
-                f"independent readback could not find {binding.external_table}:{ext_id}"
-            )
-        projected_row = project_single_record(em, raw_rows[0])
         observed_after = (
             str(projected_row.get(binding.expected_state_field))
-            if binding.expected_state_field
+            if binding.expected_state_field and binding.expected_state_field in projected_row
             else None
         )
-
-        # 4) Settle in LatentSpace: verifies φ(T_x(x_t, u_t)) == T_y(φ(x_t), a_t)
-        settled = self.latent.settle_move(
-            run_id,
-            readback_objects={binding.target_object_type: [projected_row]},
-        )
-        settled_status = str(settled["status"])
         return HomomorphicExecutionResult(
             run_id=run_id,
             action_name=action_name,
@@ -926,14 +986,14 @@ class DeclarativeOdooBridge:
             staged_status=staged_status,
             settled_status=settled_status,
             homomorphic_match=(settled_status == "COMMITTED"),
-            error_code=settled.get("error_code"),
+            error_code=error_code,
             expected_state_after=binding.expected_state_after,
             observed_state_after=observed_after,
         )
 
 
 # ---------------------------------------------------------------------------
-# 4. Full Unified Pipeline (Probe 1+2 -> Probe 3 -> Builder + 5-Gate Crucible -> Bidirectional LatentSpace)
+# 4. Full Unified Pipeline (Probe 1+2 -> Probe 3 -> Builder + 5-Gate Crucible -> Bidirectional Coupled Settlement)
 # ---------------------------------------------------------------------------
 def _select_synthesizer_backend(bundle: SynthesizedBundle, *, use_live_llm: bool) -> tuple[AbductionBackend, str]:
     if use_live_llm:
@@ -1074,87 +1134,84 @@ def run_autonomous_fde_end_to_end(
             homomorphic_results: list[HomomorphicExecutionResult] = []
             drift_result: HomomorphicExecutionResult | None = None
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                latent_path = Path(tmpdir) / "autonomous_latent.sqlite3"
-                with DeclarativeOdooBridge(
-                    memory_runtime=memory_rt,
-                    adapter_mapping=active_mapping,
-                    sandbox=sandbox_client,
-                    latent_db_path=latent_path,
-                ) as bridge:
-                    # Pick up to 2 forward actions with available live records on the sandbox
-                    used_records: set[tuple[str, str]] = set()
-                    for binding in active_mapping.action_bindings:
-                        if len(homomorphic_results) >= 2:
-                            break
-                        act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
-                        if act_def.approval_rule is not None:
-                            continue  # prefer clean forward actions first
-                        valid_befores: set[str] = set()
-                        for pre in act_def.preconditions:
-                            r_lit = pre.must_hold.get("right", {}).get("lit")
-                            if isinstance(r_lit, list):
-                                valid_befores.update(str(x) for x in r_lit)
-                        # Find a real record currently in one of valid_befores in memory_rt
-                        cls = compiled_spec.get_object_type(binding.target_object_type)
-                        objs = memory_rt.query_objects(cls, AI_OPS_ACTOR)
-                        target_obj = next(
-                            (
-                                o
-                                for o in objs
-                                if str(getattr(o, binding.expected_state_field, "")) in valid_befores
-                                and (binding.target_object_type, o.primary_key_value()) not in used_records
-                            ),
-                            None,
-                        )
-                        if target_obj is None:
-                            continue
-                        used_records.add((binding.target_object_type, target_obj.primary_key_value()))
-                        res = bridge.execute_and_settle(
-                            run_id=f"HOMO-{len(homomorphic_results) + 1}",
-                            action_name=binding.action_name,
-                            params={binding.id_param: target_obj.primary_key_value()},
-                            actor=AI_OPS_ACTOR,
-                        )
-                        homomorphic_results.append(res)
+            with DeclarativeOdooBridge(
+                memory_runtime=memory_rt,
+                adapter_mapping=active_mapping,
+                sandbox=sandbox_client,
+            ) as bridge:
+                # Pick up to 2 forward actions with available live records on the sandbox
+                used_records: set[tuple[str, str]] = set()
+                for binding in active_mapping.action_bindings:
+                    if len(homomorphic_results) >= 2:
+                        break
+                    act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
+                    if act_def.approval_rule is not None:
+                        continue  # prefer clean forward actions first
+                    valid_befores: set[str] = set()
+                    for pre in act_def.preconditions:
+                        r_lit = pre.must_hold.get("right", {}).get("lit")
+                        if isinstance(r_lit, list):
+                            valid_befores.update(str(x) for x in r_lit)
+                    # Find a real record currently in one of valid_befores in memory_rt
+                    cls = compiled_spec.get_object_type(binding.target_object_type)
+                    objs = memory_rt.query_objects(cls, AI_OPS_ACTOR)
+                    target_obj = next(
+                        (
+                            o
+                            for o in objs
+                            if str(getattr(o, binding.expected_state_field, "")) in valid_befores
+                            and (binding.target_object_type, o.primary_key_value()) not in used_records
+                        ),
+                        None,
+                    )
+                    if target_obj is None:
+                        continue
+                    used_records.add((binding.target_object_type, target_obj.primary_key_value()))
+                    res = bridge.execute_and_settle(
+                        run_id=f"HOMO-{len(homomorphic_results) + 1}",
+                        action_name=binding.action_name,
+                        params={binding.id_param: target_obj.primary_key_value()},
+                        actor=AI_OPS_ACTOR,
+                    )
+                    homomorphic_results.append(res)
 
-                    # Also prove DEVICE_STATE_MISMATCH protection on a live record when external drifts
-                    for binding in active_mapping.action_bindings:
-                        act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
-                        if act_def.approval_rule is not None:
-                            continue
-                        valid_befores = set()
-                        for pre in act_def.preconditions:
-                            r_lit = pre.must_hold.get("right", {}).get("lit")
-                            if isinstance(r_lit, list):
-                                valid_befores.update(str(x) for x in r_lit)
-                        cls = compiled_spec.get_object_type(binding.target_object_type)
-                        objs = memory_rt.query_objects(cls, AI_OPS_ACTOR)
-                        drift_obj = next(
-                            (
-                                o
-                                for o in objs
-                                if str(getattr(o, binding.expected_state_field, "")) in valid_befores
-                                and (binding.target_object_type, o.primary_key_value()) not in used_records
-                            ),
-                            None,
+                # Also prove DEVICE_STATE_MISMATCH protection on a live record when external drifts
+                for binding in active_mapping.action_bindings:
+                    act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
+                    if act_def.approval_rule is not None:
+                        continue
+                    valid_befores = set()
+                    for pre in act_def.preconditions:
+                        r_lit = pre.must_hold.get("right", {}).get("lit")
+                        if isinstance(r_lit, list):
+                            valid_befores.update(str(x) for x in r_lit)
+                    cls = compiled_spec.get_object_type(binding.target_object_type)
+                    objs = memory_rt.query_objects(cls, AI_OPS_ACTOR)
+                    drift_obj = next(
+                        (
+                            o
+                            for o in objs
+                            if str(getattr(o, binding.expected_state_field, "")) in valid_befores
+                            and (binding.target_object_type, o.primary_key_value()) not in used_records
+                        ),
+                        None,
+                    )
+                    if drift_obj is not None:
+                        fp_before_drift = memory_rt.state_fingerprint()
+                        drift_result = bridge.execute_and_settle(
+                            run_id="HOMO-DRIFT-CHECK",
+                            action_name=binding.action_name,
+                            params={binding.id_param: drift_obj.primary_key_value()},
+                            actor=AI_OPS_ACTOR,
+                            skip_external_call_to_simulate_drift=True,
                         )
-                        if drift_obj is not None:
-                            fp_before_drift = memory_rt.state_fingerprint()
-                            drift_result = bridge.execute_and_settle(
-                                run_id="HOMO-DRIFT-CHECK",
-                                action_name=binding.action_name,
-                                params={binding.id_param: drift_obj.primary_key_value()},
-                                actor=AI_OPS_ACTOR,
-                                skip_external_call_to_simulate_drift=True,
-                            )
-                            fp_after_drift = memory_rt.state_fingerprint()
-                            assert fp_after_drift["versions"] == fp_before_drift["versions"]
-                            assert fp_after_drift["objects"] == fp_before_drift["objects"]
-                            assert fp_after_drift["links"] == fp_before_drift["links"]
-                            assert fp_after_drift["overlay"] == fp_before_drift["overlay"]
-                            assert fp_after_drift["runs"] == fp_before_drift["runs"] + 1
-                            break
+                        fp_after_drift = memory_rt.state_fingerprint()
+                        assert fp_after_drift["versions"] == fp_before_drift["versions"]
+                        assert fp_after_drift["objects"] == fp_before_drift["objects"]
+                        assert fp_after_drift["links"] == fp_before_drift["links"]
+                        assert fp_after_drift["overlay"] == fp_before_drift["overlay"]
+                        assert fp_after_drift["runs"] == fp_before_drift["runs"] + 1
+                        break
 
             return {
                 "source_locator": source_locator,

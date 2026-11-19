@@ -144,7 +144,7 @@ _DEFAULT_DOC_FILES: dict[str, tuple[str, str, str]] = {
     ),
 }
 
-#: 七大全景治理切面（Core 之上的系统调用切面层）。
+#: 八大全景治理切面（Core 之上的系统调用切面层）。
 RUNTIME_ASPECTS = [
     "ColumnMaskingAspect",
     "SecurityAndAuthorityAspect",
@@ -153,6 +153,7 @@ RUNTIME_ASPECTS = [
     "RejectionAuditAspect",
     "AutomationReflexAspect",
     "IdleAwareCallbackAspect",
+    "HomomorphicSettlementAspect",
 ]
 
 
@@ -3637,8 +3638,13 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             "application/json; charset=utf-8",
         )
 
-    def _error(self, status: int, message: str) -> None:
-        self._send_json(status, {"ok": False, "error": message})
+    def _error(
+        self, status: int, message: str, *, error_code: str | None = None
+    ) -> None:
+        payload: dict[str, Any] = {"ok": False, "error": message}
+        if error_code:
+            payload["error_code"] = error_code
+        self._send_json(status, payload)
 
     def _resolve_request_actor(
         self,
@@ -3866,7 +3872,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             try:
                 _topology_model_id(query)
             except OpenOntologyError as exc:
-                self._error(400, str(exc))
+                self._error(400, str(exc), error_code=getattr(exc, "code", None))
                 return
             self._send(
                 200,
@@ -4112,7 +4118,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             ) as exc:
                 self._error(404, str(exc))
             except OpenOntologyError as exc:
-                self._error(400, str(exc))
+                self._error(400, str(exc), error_code=getattr(exc, "code", None))
             except Exception as exc:  # pragma: no cover - defensive boundary
                 self._error(500, str(exc))
 
@@ -4152,7 +4158,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             ) as exc:
                 self._error(404, str(exc))
             except OpenOntologyError as exc:
-                self._error(400, str(exc))
+                self._error(400, str(exc), error_code=getattr(exc, "code", None))
             except ValueError as exc:
                 self._error(400, str(exc))
             except Exception as exc:  # pragma: no cover - defensive boundary
@@ -4470,7 +4476,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             except (KeyError, ObjectNotFoundError) as exc:
                 self._error(404, str(exc))
             except OpenOntologyError as exc:
-                self._error(400, str(exc))
+                self._error(400, str(exc), error_code=getattr(exc, "code", None))
             except ValueError as exc:
                 self._error(400, str(exc))
             except Exception as exc:  # pragma: no cover - defensive boundary
@@ -4898,6 +4904,8 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
         if entry.unplug_fn is None:
             raise ValueError(f"instance {entry.instance_id!r} does not support unplug")
         result = entry.unplug_fn()
+        if entry.runtime.world_mode == "coupled":
+            entry.runtime.bind_source_bridge(None, world_mode="standalone")
         for connector in entry.connectors:
             connector.status = "UNPLUGGED"
         self._send_json(

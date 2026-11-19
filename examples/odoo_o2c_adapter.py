@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from open_ontology import Actor, InvariantError, OntologyRuntime
+from open_ontology import Actor, InvariantError, OntologyRuntime, SourceBridge
 
 from .odoo_dual_erp_demo import (
     DB_NORTH,
@@ -99,6 +99,7 @@ class OdooO2CAdapter:
             for run in runtime.list_action_runs()
             if run["status"] != "PENDING_APPROVAL"
         }
+        self._evidence_by_run: dict[str, dict[str, Any]] = {}
 
     # -- seeding -----------------------------------------------------------
     def _get_or_create_partner(self) -> int:
@@ -640,9 +641,28 @@ class OdooO2CAdapter:
         return payload, order_rows
 
     def build_readback_snapshot(self) -> dict[str, list[dict[str, Any]]]:
-        """从真实 Odoo 19 构造供 LatentSpace.settle_move 使用的多表状态读回。"""
+        """从真实 Odoo 19 构造供 HomomorphicSettlementAspect 使用的多表状态读回。"""
         payload, _ = self._collect_readback()
         return payload
+
+    def get_run_evidence(self, run_id: str) -> list[dict[str, Any]]:
+        """返回指定 run_id 已落账执行的真实 Odoo 单据回执（列表形态供卡片网关消费）。"""
+        item = self._evidence_by_run.get(run_id)
+        return [dict(item)] if item is not None else []
+
+    def make_source_bridge(self, *, allow_source_revert: bool = True) -> SourceBridge:
+        """构造绑定当前适配器读写双通道的受治理 ``SourceBridge``。"""
+        return SourceBridge(
+            actuate=self.execute_move,
+            observe=self.build_readback_snapshot,
+            allow_source_revert=allow_source_revert,
+        )
+
+    def bind_coupled(self, *, allow_source_revert: bool = True) -> SourceBridge:
+        """将关联 ``OntologyRuntime`` 切换为强耦合闭环模式并挂载 ``SourceBridge``。"""
+        bridge = self.make_source_bridge(allow_source_revert=allow_source_revert)
+        self.runtime.bind_source_bridge(bridge, world_mode="coupled")
+        return bridge
 
     # -- upward snapshot ---------------------------------------------------
     def sync_from_odoo(self) -> dict[str, Any]:
@@ -665,7 +685,7 @@ class OdooO2CAdapter:
         }
 
     def execute_move(self, move: dict[str, Any]) -> dict[str, Any]:
-        """Dispatch a LatentSpace pending move into real Odoo and return execution evidence."""
+        """Dispatch a coupled move envelope into real Odoo and return execution evidence."""
         if self.data is None:
             raise RuntimeError("seed_odoo() must be called first")
         run_id = str(move["run_id"])
@@ -710,6 +730,7 @@ class OdooO2CAdapter:
             raise ValueError(f"unsupported Odoo move action {action!r}")
 
         self._seen.add(run_id)
+        self._evidence_by_run[run_id] = dict(evidence)
         return evidence
 
     # -- downward writeback ------------------------------------------------

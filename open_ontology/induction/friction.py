@@ -6,8 +6,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
-from ..latent import DEVICE_STATE_MISMATCH
 from ..runtime import OntologyRuntime
+from ..settlement import DEVICE_STATE_MISMATCH
 
 __all__ = [
     "FrictionEvidence",

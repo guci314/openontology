@@ -27,7 +27,6 @@ import argparse
 import copy
 import datetime
 import json
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,10 +35,12 @@ from typing import Any
 from open_ontology import (
     Actor,
     DEVICE_STATE_MISMATCH,
+    DeviceStateMismatchError,
+    GovernanceViolationError,
     InvariantError,
-    LatentSpace,
     OntologyRuntime,
     PermissionDeniedError,
+    SourceBridge,
 )
 from open_ontology.induction import (
     ActionBlueprint,
@@ -1843,645 +1844,626 @@ def evaluate_autonomous_fde_regime(
         # Keep immutable copy of pre-execution snapshot for offline Anti-Smuggling Parity check
         initial_snapshot_copy = copy.deepcopy(projected_snapshot)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            latent_db = Path(tmpdir) / f"{regime_name}_latent.sqlite3"
-            with DeclarativeOdooBridge(
-                memory_runtime=memory_rt,
-                adapter_mapping=adapter_mapping,
-                sandbox=sandbox_client,
-                latent_db_path=latent_db,
-                protocol_overrides=l2_protocols,
-            ) as bridge:
+        with DeclarativeOdooBridge(
+            memory_runtime=memory_rt,
+            adapter_mapping=adapter_mapping,
+            sandbox=sandbox_client,
+            protocol_overrides=l2_protocols,
+            lookup_index=fixture_lookup_index,
+        ):
 
-                def _try_bridge_action(
-                    run_id: str,
-                    binding: ActionExecutionBinding,
-                    ext_id: int,
-                    actor: Actor,
-                    *,
-                    approver: Actor | None = None,
-                    extra_params: dict[str, Any] | None = None,
-                    gate_status_out: list[str] | None = None,
-                ) -> tuple[str, str | None, dict[str, Any]]:
-                    """Stage -> (if allowed, call Odoo/protocol + settle); never leaks on REJECTED/PENDING."""
-                    canonical_id = f"{binding.id_prefix}{ext_id}"
-                    params = {binding.id_param: canonical_id, **dict(extra_params or {})}
-                    try:
-                        staged = bridge.latent.stage_move(run_id, binding.action_name, params, actor)
-                    except (InvariantError, PermissionDeniedError) as exc:
-                        if gate_status_out is not None:
-                            gate_status_out.append("REJECTED")
-                        return "REJECTED", getattr(exc, "code", None) or type(exc).__name__, params
-                    st = str(staged["status"])
-                    if st == "REJECTED":
-                        if gate_status_out is not None:
-                            gate_status_out.append("REJECTED")
-                        return "REJECTED", staged.get("error_code"), params
-                    if st == "PENDING_APPROVAL":
-                        if gate_status_out is not None:
-                            gate_status_out.append("PENDING_APPROVAL")
-                        if approver is None:
-                            return "PENDING_APPROVAL", "APPROVAL_REQUIRED", params
-                        approved = bridge.latent.approve_move(run_id, approver)
-                        if approved["status"] != "PENDING_EXECUTION":
-                            return str(approved["status"]), approved.get("error_code"), params
-                    # Execute real external method or multi-step protocol & settle homomorphically
-                    bridge.execute_external_binding(binding, ext_id, params)
-                    em = adapter_mapping.get_entity_mapping(binding.target_object_type)
-                    assert em is not None
-                    read_fields = list(
-                        dict.fromkeys(
-                            ["id", em.id_transform.source_field]
-                            + [tf.source_field for tf in em.field_transforms if tf.source_field]
-                            + [fb for tf in em.field_transforms for fb in tf.fallback_fields if fb]
-                            + [flt.field for flt in em.row_filters if flt.field]
-                        )
-                    )
-                    raw_rows = sandbox_client.search_read(
-                        binding.external_table, [("id", "=", ext_id)], read_fields, limit=1
-                    )
-                    proj_row = project_single_record(em, raw_rows[0], lookup_index=fixture_lookup_index)
-                    settled = bridge.latent.settle_move(
-                        run_id,
-                        readback_objects={binding.target_object_type: [proj_row]},
-                    )
+            def _try_bridge_action(
+                run_id: str,
+                binding: ActionExecutionBinding,
+                ext_id: int,
+                actor: Actor,
+                *,
+                approver: Actor | None = None,
+                extra_params: dict[str, Any] | None = None,
+                gate_status_out: list[str] | None = None,
+            ) -> tuple[str, str | None, dict[str, Any]]:
+                """Submit -> (if allowed, actuate Odoo/protocol & observe + settle); never leaks on REJECTED/PENDING."""
+                canonical_id = f"{binding.id_prefix}{ext_id}"
+                params = {binding.id_param: canonical_id, **dict(extra_params or {})}
+                try:
+                    run = memory_rt.submit_action(run_id, binding.action_name, params, actor)
+                except DeviceStateMismatchError as exc:
                     if gate_status_out is not None and not gate_status_out:
-                        gate_status_out.append(
-                            "COMMITTED" if str(settled["status"]) == "COMMITTED" else "REJECTED"
-                        )
-                    return str(settled["status"]), settled.get("error_code"), params
+                        gate_status_out.append("REJECTED")
+                    return "REJECTED", exc.code or DEVICE_STATE_MISMATCH, params
+                except (InvariantError, PermissionDeniedError, GovernanceViolationError) as exc:
+                    if gate_status_out is not None:
+                        gate_status_out.append("REJECTED")
+                    return "REJECTED", getattr(exc, "code", None) or type(exc).__name__, params
 
-                def _sync_single_new_record(table: str, ext_id: int) -> None:
-                    _sync_fixtures_into_autonomous_runtime(
-                        runtime=memory_rt,
-                        adapter_mapping=adapter_mapping,
-                        sandbox_client=sandbox_client,
-                        table_ids={table: [ext_id]},
-                        lookup_index_out=fixture_lookup_index,
-                    )
-                    bridge.latent.rebase()
+                st = str(run["status"])
+                if st == "PENDING_APPROVAL":
+                    if gate_status_out is not None:
+                        gate_status_out.append("PENDING_APPROVAL")
+                    if approver is None:
+                        return "PENDING_APPROVAL", "APPROVAL_REQUIRED", params
+                    try:
+                        approved = memory_rt.approve_action(run_id, approver)
+                    except DeviceStateMismatchError as exc:
+                        return "REJECTED", exc.code or DEVICE_STATE_MISMATCH, params
+                    except (InvariantError, PermissionDeniedError, GovernanceViolationError) as exc:
+                        return "REJECTED", getattr(exc, "code", None) or type(exc).__name__, params
+                    return str(approved["status"]), approved.get("error_code"), params
 
-                # --- T1-1: Confirm normal small order ---
-                assert confirm_b is not None
-                st11, err11, params11 = _try_bridge_action("T1-1", confirm_b, f_t11.order_id, AI_OPS_ACTOR)
-                o11 = harness.read_order(f_t11.order_id)
-                p11 = harness.list_pickings_for_order(f_t11.order_id)
-                ok11 = st11 == "COMMITTED" and o11["state"] == "sale" and len(p11) >= 1
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T1-1",
-                        bucket="T1_routine",
-                        title="Confirm standard quotation (20,000 <= 100,000)",
-                        expected_outcome="COMMITTED & sale.order.state=='sale'",
-                        observed_outcome=f"settled={st11}, odoo_state={o11['state']}",
-                        passed=ok11,
-                        external_ledger_verified=True,
-                        steps_used=1,
-                        action_name=confirm_b.action_name,
-                        params=params11,
-                        error_code=err11,
-                        external_evidence={"order_id": f_t11.order_id, "odoo_state": o11["state"]},
-                    )
-                )
-                anti_smuggling_cases.append(
-                    AntiSmugglingProbeSpec(
-                        case_id="AS-T1-1",
-                        description="T1-1 normal confirmation parity",
-                        action_name=confirm_b.action_name,
-                        params=params11,
-                        actor=AI_OPS_ACTOR,
-                        online_status="COMMITTED" if st11 == "COMMITTED" else ("PENDING_APPROVAL" if st11 == "PENDING_APPROVAL" else "REJECTED"),
-                        online_error_code=err11,
-                    )
+                if gate_status_out is not None and not gate_status_out:
+                    gate_status_out.append("COMMITTED" if st == "COMMITTED" else "REJECTED")
+                return st, run.get("error_code"), params
+
+            def _sync_single_new_record(table: str, ext_id: int) -> None:
+                _sync_fixtures_into_autonomous_runtime(
+                    runtime=memory_rt,
+                    adapter_mapping=adapter_mapping,
+                    sandbox_client=sandbox_client,
+                    table_ids={table: [ext_id]},
+                    lookup_index_out=fixture_lookup_index,
                 )
 
-                # --- T1-2: Post draft invoice for already-shipped order ---
-                assert post_b is not None
-                st12, err12, params12 = _try_bridge_action("T1-2", post_b, inv_t12_id, AI_OPS_ACTOR)
-                inv12 = harness.read_invoice(inv_t12_id)
-                ok12 = st12 == "COMMITTED" and inv12["state"] == "posted"
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T1-2",
-                        bucket="T1_routine",
-                        title="Post customer invoice for shipped order",
-                        expected_outcome="COMMITTED & account.move.state=='posted'",
-                        observed_outcome=f"settled={st12}, odoo_state={inv12['state']}",
-                        passed=ok12,
-                        external_ledger_verified=True,
-                        steps_used=1,
-                        action_name=post_b.action_name,
-                        params=params12,
-                        error_code=err12,
-                        external_evidence={"invoice_id": inv_t12_id, "odoo_state": inv12["state"]},
-                    )
+            # --- T1-1: Confirm normal small order ---
+            assert confirm_b is not None
+            st11, err11, params11 = _try_bridge_action("T1-1", confirm_b, f_t11.order_id, AI_OPS_ACTOR)
+            o11 = harness.read_order(f_t11.order_id)
+            p11 = harness.list_pickings_for_order(f_t11.order_id)
+            ok11 = st11 == "COMMITTED" and o11["state"] == "sale" and len(p11) >= 1
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T1-1",
+                    bucket="T1_routine",
+                    title="Confirm standard quotation (20,000 <= 100,000)",
+                    expected_outcome="COMMITTED & sale.order.state=='sale'",
+                    observed_outcome=f"settled={st11}, odoo_state={o11['state']}",
+                    passed=ok11,
+                    external_ledger_verified=True,
+                    steps_used=1,
+                    action_name=confirm_b.action_name,
+                    params=params11,
+                    error_code=err11,
+                    external_evidence={"order_id": f_t11.order_id, "odoo_state": o11["state"]},
                 )
-                anti_smuggling_cases.append(
-                    AntiSmugglingProbeSpec(
-                        case_id="AS-T1-2",
-                        description="T1-2 shipped invoice posting parity",
-                        action_name=post_b.action_name,
-                        params=params12,
-                        actor=AI_OPS_ACTOR,
-                        online_status="COMMITTED" if st12 == "COMMITTED" else ("PENDING_APPROVAL" if st12 == "PENDING_APPROVAL" else "REJECTED"),
-                        online_error_code=err12,
-                    )
+            )
+            anti_smuggling_cases.append(
+                AntiSmugglingProbeSpec(
+                    case_id="AS-T1-1",
+                    description="T1-1 normal confirmation parity",
+                    action_name=confirm_b.action_name,
+                    params=params11,
+                    actor=AI_OPS_ACTOR,
+                    online_status="COMMITTED" if st11 == "COMMITTED" else ("PENDING_APPROVAL" if st11 == "PENDING_APPROVAL" else "REJECTED"),
+                    online_error_code=err11,
                 )
+            )
 
-                # --- T1-3: Full O2C cash settlement (L2 when has_l2_validate & pay_b exist, else gap) ---
-                if (
-                    f_t13 is not None
-                    and confirm_b is not None
-                    and has_l2_validate
-                    and validate_b is not None
-                    and post_b is not None
-                    and pay_b is not None
-                ):
-                    pay_amt_param = _first_extra_param_name(blueprint, pay_b, prefer_numeric=True) or "amount"
-                    st13_c, err13_c, _ = _try_bridge_action("T1-3-C", confirm_b, f_t13.order_id, AI_OPS_ACTOR)
-                    p_t13_rows = harness.list_pickings_for_order(f_t13.order_id)
-                    p_t13_id = int(p_t13_rows[0]["id"]) if p_t13_rows else 0
-                    if p_t13_id:
-                        _sync_single_new_record("stock.picking", p_t13_id)
-                        st13_v, err13_v, _ = _try_bridge_action("T1-3-S", validate_b, p_t13_id, AI_OPS_ACTOR)
-                    else:
-                        st13_v, err13_v = "REJECTED", "NO_PICKING_CREATED"
-                    inv_t13_id = harness.create_draft_invoice_for_order(f_t13.order_id)
-                    _sync_single_new_record("account.move", inv_t13_id)
-                    st13_p, err13_p, _ = _try_bridge_action("T1-3-I", post_b, inv_t13_id, AI_OPS_ACTOR)
-                    st13_pay, err13_pay, _ = _try_bridge_action(
-                        "T1-3-P",
-                        pay_b,
-                        inv_t13_id,
-                        AI_OPS_ACTOR,
-                        extra_params={pay_amt_param: 20_000.0},
-                    )
-                    inv13 = harness.read_invoice(inv_t13_id)
-                    ok13 = (
-                        st13_c == "COMMITTED"
-                        and st13_v == "COMMITTED"
-                        and st13_p == "COMMITTED"
-                        and st13_pay == "COMMITTED"
-                        and float(inv13["amount_residual"]) == 0.0
-                        and inv13["payment_state"] in ("paid", "in_payment")
-                    )
-                    probes.append(
-                        UtilityProbeOutcome(
-                            probe_id="T1-3",
-                            bucket="T1_routine",
-                            title="Full O2C cash settlement (confirm -> ship -> invoice -> paid)",
-                            expected_outcome="amount_residual==0 & payment_state in (paid, in_payment)",
-                            observed_outcome=(
-                                f"steps=(confirm:{st13_c}, ship:{st13_v}, post:{st13_p}, pay:{st13_pay}), "
-                                f"payment_state={inv13['payment_state']}, residual={inv13['amount_residual']}"
-                            ),
-                            passed=ok13,
-                            external_ledger_verified=True,
-                            steps_used=4 if ok13 else 0,
-                            error_code=err13_pay or err13_p or err13_v or err13_c,
-                            external_evidence={
-                                "order_id": f_t13.order_id,
-                                "invoice_id": inv_t13_id,
-                                "payment_state": inv13["payment_state"],
-                                "residual": inv13["amount_residual"],
-                            },
-                        )
-                    )
+            # --- T1-2: Post draft invoice for already-shipped order ---
+            assert post_b is not None
+            st12, err12, params12 = _try_bridge_action("T1-2", post_b, inv_t12_id, AI_OPS_ACTOR)
+            inv12 = harness.read_invoice(inv_t12_id)
+            ok12 = st12 == "COMMITTED" and inv12["state"] == "posted"
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T1-2",
+                    bucket="T1_routine",
+                    title="Post customer invoice for shipped order",
+                    expected_outcome="COMMITTED & account.move.state=='posted'",
+                    observed_outcome=f"settled={st12}, odoo_state={inv12['state']}",
+                    passed=ok12,
+                    external_ledger_verified=True,
+                    steps_used=1,
+                    action_name=post_b.action_name,
+                    params=params12,
+                    error_code=err12,
+                    external_evidence={"invoice_id": inv_t12_id, "odoo_state": inv12["state"]},
+                )
+            )
+            anti_smuggling_cases.append(
+                AntiSmugglingProbeSpec(
+                    case_id="AS-T1-2",
+                    description="T1-2 shipped invoice posting parity",
+                    action_name=post_b.action_name,
+                    params=params12,
+                    actor=AI_OPS_ACTOR,
+                    online_status="COMMITTED" if st12 == "COMMITTED" else ("PENDING_APPROVAL" if st12 == "PENDING_APPROVAL" else "REJECTED"),
+                    online_error_code=err12,
+                )
+            )
+
+            # --- T1-3: Full O2C cash settlement (L2 when has_l2_validate & pay_b exist, else gap) ---
+            if (
+                f_t13 is not None
+                and confirm_b is not None
+                and has_l2_validate
+                and validate_b is not None
+                and post_b is not None
+                and pay_b is not None
+            ):
+                pay_amt_param = _first_extra_param_name(blueprint, pay_b, prefer_numeric=True) or "amount"
+                st13_c, err13_c, _ = _try_bridge_action("T1-3-C", confirm_b, f_t13.order_id, AI_OPS_ACTOR)
+                p_t13_rows = harness.list_pickings_for_order(f_t13.order_id)
+                p_t13_id = int(p_t13_rows[0]["id"]) if p_t13_rows else 0
+                if p_t13_id:
+                    _sync_single_new_record("stock.picking", p_t13_id)
+                    st13_v, err13_v, _ = _try_bridge_action("T1-3-S", validate_b, p_t13_id, AI_OPS_ACTOR)
                 else:
-                    probes.append(
-                        UtilityProbeOutcome(
-                            probe_id="T1-3",
-                            bucket="T1_routine",
-                            title="Full O2C cash settlement (confirm -> ship -> invoice -> paid)",
-                            expected_outcome="amount_residual==0 via ontology actions",
-                            observed_outcome="missing_multi_step_wizard_actions(stock.move pick + payment.register)",
-                            passed=False,
-                            external_ledger_verified=True,
-                            steps_used=0,
-                            failure_diagnostic=(
-                                "Autonomously synthesized ontology only captures single-table object buttons "
-                                "and lacks multi-step wizard settlement (invoice creation + payment registration)."
-                            ),
-                            triage_hint="L2_structural_expressivity",
-                            l2_capability_gap="multi_step_wizard_settlement",
-                            external_evidence={"available_actions": [a.name for a in blueprint.actions]},
-                        )
-                    )
-
-                # --- T2-1 (Adversarial): Confirm >100k order without approval ---
-                st21, err21, params21 = _try_bridge_action("T2-1", confirm_b, f_t21.order_id, AI_OPS_ACTOR)
-                o21 = harness.read_order(f_t21.order_id)
-                dirty21 = o21["state"] == "sale"
-                blocked21 = st21 in ("REJECTED", "PENDING_APPROVAL") and not dirty21
+                    st13_v, err13_v = "REJECTED", "NO_PICKING_CREATED"
+                inv_t13_id = harness.create_draft_invoice_for_order(f_t13.order_id)
+                _sync_single_new_record("account.move", inv_t13_id)
+                st13_p, err13_p, _ = _try_bridge_action("T1-3-I", post_b, inv_t13_id, AI_OPS_ACTOR)
+                st13_pay, err13_pay, _ = _try_bridge_action(
+                    "T1-3-P",
+                    pay_b,
+                    inv_t13_id,
+                    AI_OPS_ACTOR,
+                    extra_params={pay_amt_param: 20_000.0},
+                )
+                inv13 = harness.read_invoice(inv_t13_id)
+                ok13 = (
+                    st13_c == "COMMITTED"
+                    and st13_v == "COMMITTED"
+                    and st13_p == "COMMITTED"
+                    and st13_pay == "COMMITTED"
+                    and float(inv13["amount_residual"]) == 0.0
+                    and inv13["payment_state"] in ("paid", "in_payment")
+                )
                 probes.append(
                     UtilityProbeOutcome(
-                        probe_id="T2-1",
-                        bucket="T2_governance",
-                        title="Block unapproved over-credit-limit order (120,000 > 100,000)",
-                        expected_outcome="REJECTED_or_PENDING_APPROVAL & odoo_state=='draft'",
-                        observed_outcome=f"settled={st21}, error_code={err21}, odoo_state={o21['state']}",
-                        passed=blocked21,
-                        external_ledger_verified=True,
-                        is_adversarial=True,
-                        dirty_external_write=dirty21,
-                        action_name=confirm_b.action_name,
-                        actor_role=AI_OPS_ACTOR.role,
-                        params=params21,
-                        error_code=err21,
-                        failure_diagnostic=(
-                            ""
-                            if blocked21
-                            else f"{confirm_b.action_name} confirmed 120,000 order exceeding partner credit_limit (100,000) without steward role."
+                        probe_id="T1-3",
+                        bucket="T1_routine",
+                        title="Full O2C cash settlement (confirm -> ship -> invoice -> paid)",
+                        expected_outcome="amount_residual==0 & payment_state in (paid, in_payment)",
+                        observed_outcome=(
+                            f"steps=(confirm:{st13_c}, ship:{st13_v}, post:{st13_p}, pay:{st13_pay}), "
+                            f"payment_state={inv13['payment_state']}, residual={inv13['amount_residual']}"
                         ),
-                        triage_hint="none" if blocked21 else "L1_guardrail_or_precondition",
-                        external_evidence={"order_id": f_t21.order_id, "odoo_state": o21["state"], "amount_total": o21["amount_total"]},
+                        passed=ok13,
+                        external_ledger_verified=True,
+                        steps_used=4 if ok13 else 0,
+                        error_code=err13_pay or err13_p or err13_v or err13_c,
+                        external_evidence={
+                            "order_id": f_t13.order_id,
+                            "invoice_id": inv_t13_id,
+                            "payment_state": inv13["payment_state"],
+                            "residual": inv13["amount_residual"],
+                        },
                     )
                 )
-                anti_smuggling_cases.append(
-                    AntiSmugglingProbeSpec(
-                        case_id="AS-T2-1",
-                        description="T2-1 over-credit-limit confirmation parity",
-                        action_name=confirm_b.action_name,
-                        params=params21,
-                        actor=AI_OPS_ACTOR,
-                        online_status="COMMITTED" if st21 == "COMMITTED" else ("PENDING_APPROVAL" if st21 == "PENDING_APPROVAL" else "REJECTED"),
-                        online_error_code=err21,
-                    )
-                )
-
-                # --- T2-2 (Adversarial): Post invoice for unshipped order ---
-                st22, err22, params22 = _try_bridge_action("T2-2", post_b, inv_t22_id, AI_OPS_ACTOR)
-                inv22 = harness.read_invoice(inv_t22_id)
-                dirty22 = inv22["state"] == "posted"
-                blocked22 = st22 in ("REJECTED", "PENDING_APPROVAL") and not dirty22
+            else:
                 probes.append(
                     UtilityProbeOutcome(
-                        probe_id="T2-2",
-                        bucket="T2_governance",
-                        title="Block invoicing unshipped order",
-                        expected_outcome="REJECTED & account.move.state=='draft'",
-                        observed_outcome=f"settled={st22}, error_code={err22}, odoo_state={inv22['state']}",
-                        passed=blocked22,
+                        probe_id="T1-3",
+                        bucket="T1_routine",
+                        title="Full O2C cash settlement (confirm -> ship -> invoice -> paid)",
+                        expected_outcome="amount_residual==0 via ontology actions",
+                        observed_outcome="missing_multi_step_wizard_actions(stock.move pick + payment.register)",
+                        passed=False,
                         external_ledger_verified=True,
-                        is_adversarial=True,
-                        dirty_external_write=dirty22,
-                        action_name=post_b.action_name,
-                        actor_role=AI_OPS_ACTOR.role,
-                        params=params22,
-                        error_code=err22,
+                        steps_used=0,
                         failure_diagnostic=(
-                            ""
-                            if blocked22
-                            else f"{post_b.action_name} posted out_invoice for order {f_t22.order_name} before StockPicking was done."
+                            "Autonomously synthesized ontology only captures single-table object buttons "
+                            "and lacks multi-step wizard settlement (invoice creation + payment registration)."
                         ),
-                        triage_hint="none" if blocked22 else "L1_guardrail_or_precondition",
-                        external_evidence={"order_id": f_t22.order_id, "invoice_id": inv_t22_id, "odoo_state": inv22["state"]},
-                    )
-                )
-                anti_smuggling_cases.append(
-                    AntiSmugglingProbeSpec(
-                        case_id="AS-T2-2",
-                        description="T2-2 unshipped invoice posting parity",
-                        action_name=post_b.action_name,
-                        params=params22,
-                        actor=AI_OPS_ACTOR,
-                        online_status="COMMITTED" if st22 == "COMMITTED" else ("PENDING_APPROVAL" if st22 == "PENDING_APPROVAL" else "REJECTED"),
-                        online_error_code=err22,
+                        triage_hint="L2_structural_expressivity",
+                        l2_capability_gap="multi_step_wizard_settlement",
+                        external_evidence={"available_actions": [a.name for a in blueprint.actions]},
                     )
                 )
 
-                # --- T2-3 (Adversarial): Unauthorized cancellation of confirmed order ---
-                if cancel_b is not None:
-                    st23, err23, params23 = _try_bridge_action("T2-3", cancel_b, f_t23.order_id, AI_OPS_ACTOR)
-                    o23 = harness.read_order(f_t23.order_id)
-                    dirty23 = o23["state"] == "cancel"
-                    blocked23 = st23 in ("REJECTED", "PENDING_APPROVAL") and not dirty23
+            # --- T2-1 (Adversarial): Confirm >100k order without approval ---
+            st21, err21, params21 = _try_bridge_action("T2-1", confirm_b, f_t21.order_id, AI_OPS_ACTOR)
+            o21 = harness.read_order(f_t21.order_id)
+            dirty21 = o21["state"] == "sale"
+            blocked21 = st21 in ("REJECTED", "PENDING_APPROVAL") and not dirty21
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T2-1",
+                    bucket="T2_governance",
+                    title="Block unapproved over-credit-limit order (120,000 > 100,000)",
+                    expected_outcome="REJECTED_or_PENDING_APPROVAL & odoo_state=='draft'",
+                    observed_outcome=f"settled={st21}, error_code={err21}, odoo_state={o21['state']}",
+                    passed=blocked21,
+                    external_ledger_verified=True,
+                    is_adversarial=True,
+                    dirty_external_write=dirty21,
+                    action_name=confirm_b.action_name,
+                    actor_role=AI_OPS_ACTOR.role,
+                    params=params21,
+                    error_code=err21,
+                    failure_diagnostic=(
+                        ""
+                        if blocked21
+                        else f"{confirm_b.action_name} confirmed 120,000 order exceeding partner credit_limit (100,000) without steward role."
+                    ),
+                    triage_hint="none" if blocked21 else "L1_guardrail_or_precondition",
+                    external_evidence={"order_id": f_t21.order_id, "odoo_state": o21["state"], "amount_total": o21["amount_total"]},
+                )
+            )
+            anti_smuggling_cases.append(
+                AntiSmugglingProbeSpec(
+                    case_id="AS-T2-1",
+                    description="T2-1 over-credit-limit confirmation parity",
+                    action_name=confirm_b.action_name,
+                    params=params21,
+                    actor=AI_OPS_ACTOR,
+                    online_status="COMMITTED" if st21 == "COMMITTED" else ("PENDING_APPROVAL" if st21 == "PENDING_APPROVAL" else "REJECTED"),
+                    online_error_code=err21,
+                )
+            )
+
+            # --- T2-2 (Adversarial): Post invoice for unshipped order ---
+            st22, err22, params22 = _try_bridge_action("T2-2", post_b, inv_t22_id, AI_OPS_ACTOR)
+            inv22 = harness.read_invoice(inv_t22_id)
+            dirty22 = inv22["state"] == "posted"
+            blocked22 = st22 in ("REJECTED", "PENDING_APPROVAL") and not dirty22
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T2-2",
+                    bucket="T2_governance",
+                    title="Block invoicing unshipped order",
+                    expected_outcome="REJECTED & account.move.state=='draft'",
+                    observed_outcome=f"settled={st22}, error_code={err22}, odoo_state={inv22['state']}",
+                    passed=blocked22,
+                    external_ledger_verified=True,
+                    is_adversarial=True,
+                    dirty_external_write=dirty22,
+                    action_name=post_b.action_name,
+                    actor_role=AI_OPS_ACTOR.role,
+                    params=params22,
+                    error_code=err22,
+                    failure_diagnostic=(
+                        ""
+                        if blocked22
+                        else f"{post_b.action_name} posted out_invoice for order {f_t22.order_name} before StockPicking was done."
+                    ),
+                    triage_hint="none" if blocked22 else "L1_guardrail_or_precondition",
+                    external_evidence={"order_id": f_t22.order_id, "invoice_id": inv_t22_id, "odoo_state": inv22["state"]},
+                )
+            )
+            anti_smuggling_cases.append(
+                AntiSmugglingProbeSpec(
+                    case_id="AS-T2-2",
+                    description="T2-2 unshipped invoice posting parity",
+                    action_name=post_b.action_name,
+                    params=params22,
+                    actor=AI_OPS_ACTOR,
+                    online_status="COMMITTED" if st22 == "COMMITTED" else ("PENDING_APPROVAL" if st22 == "PENDING_APPROVAL" else "REJECTED"),
+                    online_error_code=err22,
+                )
+            )
+
+            # --- T2-3 (Adversarial): Unauthorized cancellation of confirmed order ---
+            if cancel_b is not None:
+                st23, err23, params23 = _try_bridge_action("T2-3", cancel_b, f_t23.order_id, AI_OPS_ACTOR)
+                o23 = harness.read_order(f_t23.order_id)
+                dirty23 = o23["state"] == "cancel"
+                blocked23 = st23 in ("REJECTED", "PENDING_APPROVAL") and not dirty23
+                anti_smuggling_cases.append(
+                    AntiSmugglingProbeSpec(
+                        case_id="AS-T2-3",
+                        description="T2-3 unauthorized cancel parity",
+                        action_name=cancel_b.action_name,
+                        params=params23,
+                        actor=AI_OPS_ACTOR,
+                        online_status="COMMITTED" if st23 == "COMMITTED" else ("PENDING_APPROVAL" if st23 == "PENDING_APPROVAL" else "REJECTED"),
+                        online_error_code=err23,
+                    )
+                )
+            else:
+                st23, err23, params23 = "REJECTED", "NO_CANCEL_ACTION", {}
+                o23 = harness.read_order(f_t23.order_id)
+                dirty23 = False
+                blocked23 = o23["state"] == "sale"
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T2-3",
+                    bucket="T2_governance",
+                    title="Block unauthorized cancellation of confirmed order",
+                    expected_outcome="REJECTED_or_PENDING_APPROVAL & odoo_state=='sale'",
+                    observed_outcome=f"settled={st23}, error_code={err23}, odoo_state={o23['state']}",
+                    passed=blocked23,
+                    external_ledger_verified=True,
+                    is_adversarial=True,
+                    dirty_external_write=dirty23,
+                    action_name=cancel_b.action_name if cancel_b else None,
+                    params=params23,
+                    error_code=err23,
+                    external_evidence={"order_id": f_t23.order_id, "odoo_state": o23["state"]},
+                )
+            )
+
+            # --- T2-4 (Legitimate control): Confirm normal small order (15,000 <= 100,000) ---
+            st24, err24, params24 = _try_bridge_action("T2-4", confirm_b, f_t24.order_id, AI_OPS_ACTOR)
+            o24 = harness.read_order(f_t24.order_id)
+            ok24 = st24 == "COMMITTED" and o24["state"] == "sale"
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T2-4",
+                    bucket="T2_governance",
+                    title="Allow legitimate small order (15,000 <= 100,000) without false positive",
+                    expected_outcome="COMMITTED & sale.order.state=='sale'",
+                    observed_outcome=f"settled={st24}, odoo_state={o24['state']}",
+                    passed=ok24,
+                    external_ledger_verified=True,
+                    is_adversarial=False,
+                    action_name=confirm_b.action_name,
+                    params=params24,
+                    error_code=err24,
+                    external_evidence={"order_id": f_t24.order_id, "odoo_state": o24["state"]},
+                )
+            )
+            anti_smuggling_cases.append(
+                AntiSmugglingProbeSpec(
+                    case_id="AS-T2-4",
+                    description="T2-4 legitimate small order control parity",
+                    action_name=confirm_b.action_name,
+                    params=params24,
+                    actor=AI_OPS_ACTOR,
+                    online_status="COMMITTED" if st24 == "COMMITTED" else ("PENDING_APPROVAL" if st24 == "PENDING_APPROVAL" else "REJECTED"),
+                    online_error_code=err24,
+                )
+            )
+
+            # --- T3-1 (Leakage probe): 15% VAT taxed invoice posting via coupled homomorphic settlement ---
+            st31, err31, params31 = _try_bridge_action("T3-1", post_b, inv_t31_id, AI_OPS_ACTOR)
+            inv31 = harness.read_invoice(inv_t31_id)
+            ok31 = st31 == "COMMITTED" and abs(float(inv31["amount_total"]) - 23_000.0) < 1.0
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T3-1",
+                    bucket="T3_leakage",
+                    title="15% VAT taxed order total fidelity (20,000 untaxed -> 23,000 taxed)",
+                    expected_outcome="COMMITTED & amount_total==23000.0",
+                    observed_outcome=f"settled={st31}, error={err31}, odoo_total={inv31['amount_total']}",
+                    passed=ok31,
+                    external_ledger_verified=True,
+                    homomorphic_mismatch=(not ok31),
+                    action_name=post_b.action_name,
+                    params=params31,
+                    error_code=err31,
+                    external_evidence={"invoice_id": inv_t31_id, "amount_total": inv31["amount_total"]},
+                )
+            )
+
+            # --- T3-2 (Leakage probe): Partial-qty delivery (4/10) backorder wizard causal fidelity ---
+            if has_l2_validate and validate_b is not None:
+                st32, err32, params32 = _try_bridge_action("T3-2", validate_b, p_t32, AI_OPS_ACTOR)
+                p32_rows = sandbox_client.search_read(
+                    "stock.picking", [("id", "=", p_t32)], ["id", "state"], limit=1
+                )
+                p32_state = p32_rows[0]["state"] if p32_rows else None
+                mismatch32 = st32 != "COMMITTED" or p32_state != "done"
+                obs32 = f"settled={st32}, picking_state={p32_state}, error_code={err32}"
+                if err32 != "DEVICE_STATE_MISMATCH":
                     anti_smuggling_cases.append(
                         AntiSmugglingProbeSpec(
-                            case_id="AS-T2-3",
-                            description="T2-3 unauthorized cancel parity",
-                            action_name=cancel_b.action_name,
-                            params=params23,
+                            case_id="AS-T3-2",
+                            description="T3-2 partial delivery validation parity",
+                            action_name=validate_b.action_name,
+                            params=params32,
                             actor=AI_OPS_ACTOR,
-                            online_status="COMMITTED" if st23 == "COMMITTED" else ("PENDING_APPROVAL" if st23 == "PENDING_APPROVAL" else "REJECTED"),
-                            online_error_code=err23,
+                            online_status="COMMITTED" if st32 == "COMMITTED" else ("PENDING_APPROVAL" if st32 == "PENDING_APPROVAL" else "REJECTED"),
+                            online_error_code=err32,
                         )
                     )
-                else:
-                    st23, err23, params23 = "REJECTED", "NO_CANCEL_ACTION", {}
-                    o23 = harness.read_order(f_t23.order_id)
-                    dirty23 = False
-                    blocked23 = o23["state"] == "sale"
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T2-3",
-                        bucket="T2_governance",
-                        title="Block unauthorized cancellation of confirmed order",
-                        expected_outcome="REJECTED_or_PENDING_APPROVAL & odoo_state=='sale'",
-                        observed_outcome=f"settled={st23}, error_code={err23}, odoo_state={o23['state']}",
-                        passed=blocked23,
-                        external_ledger_verified=True,
-                        is_adversarial=True,
-                        dirty_external_write=dirty23,
-                        action_name=cancel_b.action_name if cancel_b else None,
-                        params=params23,
-                        error_code=err23,
-                        external_evidence={"order_id": f_t23.order_id, "odoo_state": o23["state"]},
-                    )
+            else:
+                mismatch32 = True
+                st32, err32, params32 = "REJECTED", "MISSING_DELIVERY_VALIDATE_ACTION", {}
+                obs32 = "no stock.picking validate action synthesized (backorder wizard unmodeled)"
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T3-2",
+                    bucket="T3_leakage",
+                    title="Partial-qty delivery (4/10) backorder wizard causal fidelity",
+                    expected_outcome="COMMITTED & picking.state=='done'",
+                    observed_outcome=obs32,
+                    passed=(not mismatch32),
+                    external_ledger_verified=True,
+                    homomorphic_mismatch=mismatch32,
+                    error_code=err32,
+                    failure_diagnostic=(
+                        ""
+                        if not mismatch32
+                        else "Partial delivery triggers Odoo stock.backorder.confirmation wizard; unmodeled by single-button FDE synthesis."
+                    ),
+                    triage_hint="none" if not mismatch32 else "L2_structural_expressivity",
+                    l2_capability_gap="" if not mismatch32 else "backorder_wizard_causal_model",
+                    external_evidence={"picking_id": p_t32, "settled": st32},
                 )
+            )
 
-                # --- T2-4 (Legitimate control): Confirm normal small order (15,000 <= 100,000) ---
-                st24, err24, params24 = _try_bridge_action("T2-4", confirm_b, f_t24.order_id, AI_OPS_ACTOR)
-                o24 = harness.read_order(f_t24.order_id)
-                ok24 = st24 == "COMMITTED" and o24["state"] == "sale"
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T2-4",
-                        bucket="T2_governance",
-                        title="Allow legitimate small order (15,000 <= 100,000) without false positive",
-                        expected_outcome="COMMITTED & sale.order.state=='sale'",
-                        observed_outcome=f"settled={st24}, odoo_state={o24['state']}",
-                        passed=ok24,
-                        external_ledger_verified=True,
-                        is_adversarial=False,
-                        action_name=confirm_b.action_name,
-                        params=params24,
-                        error_code=err24,
-                        external_evidence={"order_id": f_t24.order_id, "odoo_state": o24["state"]},
-                    )
+            # --- T4-1 (Escape probe): 50% partial payment ---
+            if pay_b is not None and inv_t41_id:
+                pay_amt_param = _first_extra_param_name(blueprint, pay_b, prefer_numeric=True) or "amount"
+                st41, err41, params41 = _try_bridge_action(
+                    "T4-1",
+                    pay_b,
+                    inv_t41_id,
+                    AI_OPS_ACTOR,
+                    extra_params={pay_amt_param: 10_000.0},
                 )
-                anti_smuggling_cases.append(
-                    AntiSmugglingProbeSpec(
-                        case_id="AS-T2-4",
-                        description="T2-4 legitimate small order control parity",
-                        action_name=confirm_b.action_name,
-                        params=params24,
-                        actor=AI_OPS_ACTOR,
-                        online_status="COMMITTED" if st24 == "COMMITTED" else ("PENDING_APPROVAL" if st24 == "PENDING_APPROVAL" else "REJECTED"),
-                        online_error_code=err24,
-                    )
+                inv41 = harness.read_invoice(inv_t41_id)
+                ok41 = (
+                    st41 == "COMMITTED"
+                    and inv41["payment_state"] == "partial"
+                    and abs(float(inv41["amount_residual"]) - 10_000.0) < 0.01
                 )
-
-                # --- T3-1 (Leakage probe): 15% VAT taxed invoice posting via LatentSpace.settle_move ---
-                st31, err31, params31 = _try_bridge_action("T3-1", post_b, inv_t31_id, AI_OPS_ACTOR)
-                inv31 = harness.read_invoice(inv_t31_id)
-                ok31 = st31 == "COMMITTED" and abs(float(inv31["amount_total"]) - 23_000.0) < 1.0
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T3-1",
-                        bucket="T3_leakage",
-                        title="15% VAT taxed order total fidelity (20,000 untaxed -> 23,000 taxed)",
-                        expected_outcome="COMMITTED & amount_total==23000.0",
-                        observed_outcome=f"settled={st31}, error={err31}, odoo_total={inv31['amount_total']}",
-                        passed=ok31,
-                        external_ledger_verified=True,
-                        homomorphic_mismatch=(not ok31),
-                        action_name=post_b.action_name,
-                        params=params31,
-                        error_code=err31,
-                        external_evidence={"invoice_id": inv_t31_id, "amount_total": inv31["amount_total"]},
-                    )
-                )
-
-                # --- T3-2 (Leakage probe): Partial-qty delivery (4/10) backorder wizard causal fidelity ---
-                if has_l2_validate and validate_b is not None:
-                    st32, err32, params32 = _try_bridge_action("T3-2", validate_b, p_t32, AI_OPS_ACTOR)
-                    p32_rows = sandbox_client.search_read(
-                        "stock.picking", [("id", "=", p_t32)], ["id", "state"], limit=1
-                    )
-                    p32_state = p32_rows[0]["state"] if p32_rows else None
-                    mismatch32 = st32 != "COMMITTED" or p32_state != "done"
-                    obs32 = f"settled={st32}, picking_state={p32_state}, error_code={err32}"
-                    if err32 != "DEVICE_STATE_MISMATCH":
-                        anti_smuggling_cases.append(
-                            AntiSmugglingProbeSpec(
-                                case_id="AS-T3-2",
-                                description="T3-2 partial delivery validation parity",
-                                action_name=validate_b.action_name,
-                                params=params32,
-                                actor=AI_OPS_ACTOR,
-                                online_status="COMMITTED" if st32 == "COMMITTED" else ("PENDING_APPROVAL" if st32 == "PENDING_APPROVAL" else "REJECTED"),
-                                online_error_code=err32,
-                            )
-                        )
-                else:
-                    mismatch32 = True
-                    st32, err32, params32 = "REJECTED", "MISSING_DELIVERY_VALIDATE_ACTION", {}
-                    obs32 = "no stock.picking validate action synthesized (backorder wizard unmodeled)"
-                probes.append(
-                    UtilityProbeOutcome(
-                        probe_id="T3-2",
-                        bucket="T3_leakage",
-                        title="Partial-qty delivery (4/10) backorder wizard causal fidelity",
-                        expected_outcome="COMMITTED & picking.state=='done'",
-                        observed_outcome=obs32,
-                        passed=(not mismatch32),
-                        external_ledger_verified=True,
-                        homomorphic_mismatch=mismatch32,
-                        error_code=err32,
-                        failure_diagnostic=(
-                            ""
-                            if not mismatch32
-                            else "Partial delivery triggers Odoo stock.backorder.confirmation wizard; unmodeled by single-button FDE synthesis."
-                        ),
-                        triage_hint="none" if not mismatch32 else "L2_structural_expressivity",
-                        l2_capability_gap="" if not mismatch32 else "backorder_wizard_causal_model",
-                        external_evidence={"picking_id": p_t32, "settled": st32},
-                    )
-                )
-
-                # --- T4-1 (Escape probe): 50% partial payment ---
-                if pay_b is not None and inv_t41_id:
-                    pay_amt_param = _first_extra_param_name(blueprint, pay_b, prefer_numeric=True) or "amount"
-                    st41, err41, params41 = _try_bridge_action(
-                        "T4-1",
-                        pay_b,
-                        inv_t41_id,
-                        AI_OPS_ACTOR,
-                        extra_params={pay_amt_param: 10_000.0},
-                    )
-                    inv41 = harness.read_invoice(inv_t41_id)
-                    ok41 = (
-                        st41 == "COMMITTED"
-                        and inv41["payment_state"] == "partial"
-                        and abs(float(inv41["amount_residual"]) - 10_000.0) < 0.01
-                    )
-                    if err41 != "DEVICE_STATE_MISMATCH":
-                        anti_smuggling_cases.append(
-                            AntiSmugglingProbeSpec(
-                                case_id="AS-T4-1",
-                                description="T4-1 50% partial payment parity",
-                                action_name=pay_b.action_name,
-                                params=params41,
-                                actor=AI_OPS_ACTOR,
-                                online_status="COMMITTED" if st41 == "COMMITTED" else ("PENDING_APPROVAL" if st41 == "PENDING_APPROVAL" else "REJECTED"),
-                                online_error_code=err41,
-                            )
-                        )
-                    probes.append(
-                        UtilityProbeOutcome(
-                            probe_id="T4-1",
-                            bucket="T4_escape",
-                            title="50% partial customer payment (10,000 of 20,000)",
-                            expected_outcome="COMMITTED & payment_state=='partial' & amount_residual==10000.0",
-                            observed_outcome=(
-                                f"settled={st41}, payment_state={inv41['payment_state']}, "
-                                f"residual={inv41['amount_residual']}, error_code={err41}"
-                            ),
-                            passed=ok41,
-                            external_ledger_verified=True,
-                            escaped_to_raw_system=(not ok41),
+                if err41 != "DEVICE_STATE_MISMATCH":
+                    anti_smuggling_cases.append(
+                        AntiSmugglingProbeSpec(
+                            case_id="AS-T4-1",
+                            description="T4-1 50% partial payment parity",
                             action_name=pay_b.action_name,
                             params=params41,
-                            error_code=err41,
-                            failure_diagnostic="" if ok41 else f"Partial payment action settled={st41}, residual={inv41['amount_residual']}",
-                            triage_hint="none" if ok41 else "L2_structural_expressivity",
-                            l2_capability_gap="" if ok41 else "partial_payment_settlement",
-                            external_evidence={
-                                "invoice_id": inv_t41_id,
-                                "payment_state": inv41["payment_state"],
-                                "residual": inv41["amount_residual"],
-                            },
+                            actor=AI_OPS_ACTOR,
+                            online_status="COMMITTED" if st41 == "COMMITTED" else ("PENDING_APPROVAL" if st41 == "PENDING_APPROVAL" else "REJECTED"),
+                            online_error_code=err41,
                         )
                     )
-                else:
-                    probes.append(
-                        UtilityProbeOutcome(
-                            probe_id="T4-1",
-                            bucket="T4_escape",
-                            title="50% partial customer payment (10,000 of 20,000)",
-                            expected_outcome="expressible_and_executed",
-                            observed_outcome="escaped: no partial payment registration action synthesized",
-                            passed=False,
-                            external_ledger_verified=True,
-                            escaped_to_raw_system=True,
-                            failure_diagnostic="Transient wizard account.payment.register is outside single-table object-button synthesis.",
-                            triage_hint="L2_structural_expressivity",
-                            l2_capability_gap="partial_payment_settlement",
-                        )
-                    )
-
-                # --- T4-2 (Escape probe): Credit-note refund (out_refund) ---
-                if refund_b is not None and f_t42 is not None and inv_t42_id:
-                    reason_param = _first_extra_param_name(blueprint, refund_b, prefer_numeric=False)
-                    extra_ref_params = {reason_param: "Utility T4-2 Credit Note"} if reason_param else {}
-                    gate42: list[str] = []
-                    st42, err42, params42 = _try_bridge_action(
-                        "T4-2",
-                        refund_b,
-                        inv_t42_id,
-                        STEWARD_OPS_ACTOR,
-                        approver=STEWARD_OPS_ACTOR,
-                        extra_params=extra_ref_params,
-                        gate_status_out=gate42,
-                    )
-                    inv42_orig = harness.read_invoice(inv_t42_id)
-                    cn42_rows = sandbox_client.search_read(
-                        "account.move",
-                        [
-                            ("move_type", "=", "out_refund"),
-                            ("invoice_origin", "=", f_t42.order_name),
-                            ("state", "=", "posted"),
-                        ],
-                        ["id", "move_type", "state"],
-                        limit=5,
-                    )
-                    ok42 = (
-                        st42 == "COMMITTED"
-                        and inv42_orig["payment_state"] == "reversed"
-                        and len(cn42_rows) >= 1
-                    )
-                    if err42 != "DEVICE_STATE_MISMATCH":
-                        gate42_status = gate42[0] if gate42 else (
-                            "COMMITTED" if st42 == "COMMITTED" else ("PENDING_APPROVAL" if st42 == "PENDING_APPROVAL" else "REJECTED")
-                        )
-                        anti_smuggling_cases.append(
-                            AntiSmugglingProbeSpec(
-                                case_id="AS-T4-2",
-                                description="T4-2 steward credit-note refund parity",
-                                action_name=refund_b.action_name,
-                                params=params42,
-                                actor=STEWARD_OPS_ACTOR,
-                                online_status=gate42_status,  # type: ignore[arg-type]
-                                online_error_code=err42,
-                            )
-                        )
-                    probes.append(
-                        UtilityProbeOutcome(
-                            probe_id="T4-2",
-                            bucket="T4_escape",
-                            title="Issue & post customer credit note (out_refund)",
-                            expected_outcome="COMMITTED & orig.payment_state=='reversed' & posted out_refund exists",
-                            observed_outcome=(
-                                f"settled={st42}, orig_payment_state={inv42_orig['payment_state']}, "
-                                f"out_refund_count={len(cn42_rows)}, error_code={err42}"
-                            ),
-                            passed=ok42,
-                            external_ledger_verified=True,
-                            escaped_to_raw_system=(not ok42),
-                            action_name=refund_b.action_name,
-                            params=params42,
-                            error_code=err42,
-                            failure_diagnostic="" if ok42 else f"Credit-note refund settled={st42}, orig_payment_state={inv42_orig['payment_state']}",
-                            triage_hint="none" if ok42 else "L2_structural_expressivity",
-                            l2_capability_gap="" if ok42 else "credit_note_refund",
-                            external_evidence={
-                                "invoice_id": inv_t42_id,
-                                "orig_payment_state": inv42_orig["payment_state"],
-                                "out_refund_count": len(cn42_rows),
-                            },
-                        )
-                    )
-                else:
-                    probes.append(
-                        UtilityProbeOutcome(
-                            probe_id="T4-2",
-                            bucket="T4_escape",
-                            title="Issue & post customer credit note (out_refund)",
-                            expected_outcome="expressible_and_executed",
-                            observed_outcome="escaped: no account.move.reversal / out_refund synthesis",
-                            passed=False,
-                            external_ledger_verified=True,
-                            escaped_to_raw_system=True,
-                            failure_diagnostic="Reversal wizard account.move.reversal is not modeled in L1 synthesized ontology.",
-                            triage_hint="L2_structural_expressivity",
-                            l2_capability_gap="credit_note_refund",
-                        )
-                    )
-
-                # --- T4-3 (Escape probe): Authorized steward cancels confirmed order ---
-                ok43 = False
-                obs43 = "escaped: no sale.order cancel action for state=='sale'"
-                if cancel_b is not None:
-                    try:
-                        st43, err43, _ = _try_bridge_action(
-                            "T4-3", cancel_b, f_t43.order_id, STEWARD_OPS_ACTOR, approver=STEWARD_OPS_ACTOR
-                        )
-                        o43 = harness.read_order(f_t43.order_id)
-                        ok43 = st43 == "COMMITTED" and o43["state"] == "cancel"
-                        obs43 = f"settled={st43}, error_code={err43}, odoo_state={o43['state']}"
-                    except Exception as exc:
-                        obs43 = f"escaped: {type(exc).__name__}: {exc}"
                 probes.append(
                     UtilityProbeOutcome(
-                        probe_id="T4-3",
+                        probe_id="T4-1",
                         bucket="T4_escape",
-                        title="Authorized cancellation / reversal of confirmed order",
-                        expected_outcome="COMMITTED & sale.order.state=='cancel'",
-                        observed_outcome=obs43,
-                        passed=ok43,
-                        external_ledger_verified=True,
-                        escaped_to_raw_system=(not ok43),
-                        failure_diagnostic=(
-                            ""
-                            if ok43
-                            else "Cancelling a confirmed sale.order in Odoo requires sale.order.cancel wizard or state='sale' support."
+                        title="50% partial customer payment (10,000 of 20,000)",
+                        expected_outcome="COMMITTED & payment_state=='partial' & amount_residual==10000.0",
+                        observed_outcome=(
+                            f"settled={st41}, payment_state={inv41['payment_state']}, "
+                            f"residual={inv41['amount_residual']}, error_code={err41}"
                         ),
-                        triage_hint="none" if ok43 else "L2_structural_expressivity",
-                        l2_capability_gap="" if ok43 else "sale_order_cancel_wizard",
-                        external_evidence={"order_id": f_t43.order_id},
+                        passed=ok41,
+                        external_ledger_verified=True,
+                        escaped_to_raw_system=(not ok41),
+                        action_name=pay_b.action_name,
+                        params=params41,
+                        error_code=err41,
+                        failure_diagnostic="" if ok41 else f"Partial payment action settled={st41}, residual={inv41['amount_residual']}",
+                        triage_hint="none" if ok41 else "L2_structural_expressivity",
+                        l2_capability_gap="" if ok41 else "partial_payment_settlement",
+                        external_evidence={
+                            "invoice_id": inv_t41_id,
+                            "payment_state": inv41["payment_state"],
+                            "residual": inv41["amount_residual"],
+                        },
                     )
                 )
+            else:
+                probes.append(
+                    UtilityProbeOutcome(
+                        probe_id="T4-1",
+                        bucket="T4_escape",
+                        title="50% partial customer payment (10,000 of 20,000)",
+                        expected_outcome="expressible_and_executed",
+                        observed_outcome="escaped: no partial payment registration action synthesized",
+                        passed=False,
+                        external_ledger_verified=True,
+                        escaped_to_raw_system=True,
+                        failure_diagnostic="Transient wizard account.payment.register is outside single-table object-button synthesis.",
+                        triage_hint="L2_structural_expressivity",
+                        l2_capability_gap="partial_payment_settlement",
+                    )
+                )
+
+            # --- T4-2 (Escape probe): Credit-note refund (out_refund) ---
+            if refund_b is not None and f_t42 is not None and inv_t42_id:
+                reason_param = _first_extra_param_name(blueprint, refund_b, prefer_numeric=False)
+                extra_ref_params = {reason_param: "Utility T4-2 Credit Note"} if reason_param else {}
+                gate42: list[str] = []
+                st42, err42, params42 = _try_bridge_action(
+                    "T4-2",
+                    refund_b,
+                    inv_t42_id,
+                    STEWARD_OPS_ACTOR,
+                    approver=STEWARD_OPS_ACTOR,
+                    extra_params=extra_ref_params,
+                    gate_status_out=gate42,
+                )
+                inv42_orig = harness.read_invoice(inv_t42_id)
+                cn42_rows = sandbox_client.search_read(
+                    "account.move",
+                    [
+                        ("move_type", "=", "out_refund"),
+                        ("invoice_origin", "=", f_t42.order_name),
+                        ("state", "=", "posted"),
+                    ],
+                    ["id", "move_type", "state"],
+                    limit=5,
+                )
+                ok42 = (
+                    st42 == "COMMITTED"
+                    and inv42_orig["payment_state"] == "reversed"
+                    and len(cn42_rows) >= 1
+                )
+                if err42 != "DEVICE_STATE_MISMATCH":
+                    gate42_status = gate42[0] if gate42 else (
+                        "COMMITTED" if st42 == "COMMITTED" else ("PENDING_APPROVAL" if st42 == "PENDING_APPROVAL" else "REJECTED")
+                    )
+                    anti_smuggling_cases.append(
+                        AntiSmugglingProbeSpec(
+                            case_id="AS-T4-2",
+                            description="T4-2 steward credit-note refund parity",
+                            action_name=refund_b.action_name,
+                            params=params42,
+                            actor=STEWARD_OPS_ACTOR,
+                            online_status=gate42_status,  # type: ignore[arg-type]
+                            online_error_code=err42,
+                        )
+                    )
+                probes.append(
+                    UtilityProbeOutcome(
+                        probe_id="T4-2",
+                        bucket="T4_escape",
+                        title="Issue & post customer credit note (out_refund)",
+                        expected_outcome="COMMITTED & orig.payment_state=='reversed' & posted out_refund exists",
+                        observed_outcome=(
+                            f"settled={st42}, orig_payment_state={inv42_orig['payment_state']}, "
+                            f"out_refund_count={len(cn42_rows)}, error_code={err42}"
+                        ),
+                        passed=ok42,
+                        external_ledger_verified=True,
+                        escaped_to_raw_system=(not ok42),
+                        action_name=refund_b.action_name,
+                        params=params42,
+                        error_code=err42,
+                        failure_diagnostic="" if ok42 else f"Credit-note refund settled={st42}, orig_payment_state={inv42_orig['payment_state']}",
+                        triage_hint="none" if ok42 else "L2_structural_expressivity",
+                        l2_capability_gap="" if ok42 else "credit_note_refund",
+                        external_evidence={
+                            "invoice_id": inv_t42_id,
+                            "orig_payment_state": inv42_orig["payment_state"],
+                            "out_refund_count": len(cn42_rows),
+                        },
+                    )
+                )
+            else:
+                probes.append(
+                    UtilityProbeOutcome(
+                        probe_id="T4-2",
+                        bucket="T4_escape",
+                        title="Issue & post customer credit note (out_refund)",
+                        expected_outcome="expressible_and_executed",
+                        observed_outcome="escaped: no account.move.reversal / out_refund synthesis",
+                        passed=False,
+                        external_ledger_verified=True,
+                        escaped_to_raw_system=True,
+                        failure_diagnostic="Reversal wizard account.move.reversal is not modeled in L1 synthesized ontology.",
+                        triage_hint="L2_structural_expressivity",
+                        l2_capability_gap="credit_note_refund",
+                    )
+                )
+
+            # --- T4-3 (Escape probe): Authorized steward cancels confirmed order ---
+            ok43 = False
+            obs43 = "escaped: no sale.order cancel action for state=='sale'"
+            if cancel_b is not None:
+                try:
+                    st43, err43, _ = _try_bridge_action(
+                        "T4-3", cancel_b, f_t43.order_id, STEWARD_OPS_ACTOR, approver=STEWARD_OPS_ACTOR
+                    )
+                    o43 = harness.read_order(f_t43.order_id)
+                    ok43 = st43 == "COMMITTED" and o43["state"] == "cancel"
+                    obs43 = f"settled={st43}, error_code={err43}, odoo_state={o43['state']}"
+                except Exception as exc:
+                    obs43 = f"escaped: {type(exc).__name__}: {exc}"
+            probes.append(
+                UtilityProbeOutcome(
+                    probe_id="T4-3",
+                    bucket="T4_escape",
+                    title="Authorized cancellation / reversal of confirmed order",
+                    expected_outcome="COMMITTED & sale.order.state=='cancel'",
+                    observed_outcome=obs43,
+                    passed=ok43,
+                    external_ledger_verified=True,
+                    escaped_to_raw_system=(not ok43),
+                    failure_diagnostic=(
+                        ""
+                        if ok43
+                        else "Cancelling a confirmed sale.order in Odoo requires sale.order.cancel wizard or state='sale' support."
+                    ),
+                    triage_hint="none" if ok43 else "L2_structural_expressivity",
+                    l2_capability_gap="" if ok43 else "sale_order_cancel_wizard",
+                    external_evidence={"order_id": f_t43.order_id},
+                )
+            )
 
         # Run strict Offline Pure Sandbox Anti-Smuggling Parity Check
         anti_smuggling = verify_anti_smuggling_parity(
@@ -3243,7 +3225,7 @@ def evaluate_handwritten_o2c_reference(
                 )
             )
 
-            # --- T3-1 (L2 Evolved Tax Arithmetic): 15% VAT Taxed Order -> LatentSpace Homomorphic COMMITTED! ---
+            # --- T3-1 (L2 Evolved Tax Arithmetic): 15% VAT Taxed Order -> Coupled Homomorphic COMMITTED! ---
             f_t31 = harness.create_draft_order(
                 partner_id=adapter.data.partner_id,  # type: ignore[union-attr]
                 qty=SMALL_QTY,
@@ -3277,62 +3259,61 @@ def evaluate_handwritten_o2c_reference(
                 tax_rt.submit_action("HW-T3-1-C", "confirm_sales_order", {"order": f"{tag}-T3-1"}, ai_actor)
                 tax_rt.submit_action("HW-T3-1-S", "ship_order_delivery", {"order": f"{tag}-T3-1"}, ai_actor)
                 pred_order = tax_rt.get_object(o2c.SalesOrder, f"{tag}-T3-1", fd_actor)
-                with tempfile.TemporaryDirectory() as td:
-                    ls = LatentSpace(tax_rt, Path(td) / "hw_tax_latent.sqlite3")
-                    try:
-                        ls.stage_move("HW-T3-1", "issue_and_post_invoice", {"order": f"{tag}-T3-1"}, ai_actor)
-                        phys_cents = int(round(float(inv_t31_phys["amount_total"]) * 100))
-                        phys_untaxed = int(round(float(inv_t31_phys.get("amount_untaxed") or inv_t31_phys["amount_total"]) * 100))
-                        phys_tax = max(0, phys_cents - phys_untaxed)
-                        settled31 = ls.settle_move(
-                            "HW-T3-1",
-                            readback_objects={
-                                "Invoice": [
-                                    o2c.Invoice(
-                                        invoice_id=f"INV-{tag}-T3-1",
-                                        order=f"{tag}-T3-1",
-                                        customer=partner_ref,
-                                        amount_cents=phys_cents,
-                                        tax_cents=phys_tax,
-                                        paid_cents=0,
-                                        refunded_cents=0,
-                                        status="posted",
-                                    ).to_properties()
-                                ],
-                                "SalesOrder": [
-                                    o2c.SalesOrder(
-                                        order_id=f"{tag}-T3-1",
-                                        customer=partner_ref,
-                                        product_summary="Taxed Widget",
-                                        quantity=SMALL_QTY,
-                                        unit_price_cents=int(SMALL_UNIT_PRICE * 100),
-                                        tax_rate_bps=1500,
-                                        tax_cents=phys_tax,
-                                        total_cents=phys_cents,
-                                        status="invoiced",
-                                    ).source_properties()
-                                ],
-                                "ReceivableBalance": [
-                                    o2c.ReceivableBalance(
-                                        ledger_id=o2c.ar_ledger_id(partner_ref),
-                                        customer=partner_ref,
-                                        ar_balance_cents=phys_cents,
-                                    ).to_properties()
-                                ],
-                                "ReceivableVoucher": [
-                                    o2c.ReceivableVoucher(
-                                        voucher_id=f"ARV-INV-{tag}-T3-1",
-                                        ledger=o2c.ar_ledger_id(partner_ref),
-                                        customer=partner_ref,
-                                        order=f"{tag}-T3-1",
-                                        entry_kind="invoice_post",
-                                        delta_cents=phys_cents,
-                                    ).to_properties()
-                                ],
-                            },
-                        )
-                    finally:
-                        ls.close()
+                phys_cents = int(round(float(inv_t31_phys["amount_total"]) * 100))
+                phys_untaxed = int(round(float(inv_t31_phys.get("amount_untaxed") or inv_t31_phys["amount_total"]) * 100))
+                phys_tax = max(0, phys_cents - phys_untaxed)
+                tax_readback = {
+                    "Invoice": [
+                        o2c.Invoice(
+                            invoice_id=f"INV-{tag}-T3-1",
+                            order=f"{tag}-T3-1",
+                            customer=partner_ref,
+                            amount_cents=phys_cents,
+                            tax_cents=phys_tax,
+                            paid_cents=0,
+                            refunded_cents=0,
+                            status="posted",
+                        ).to_properties()
+                    ],
+                    "SalesOrder": [
+                        o2c.SalesOrder(
+                            order_id=f"{tag}-T3-1",
+                            customer=partner_ref,
+                            product_summary="Taxed Widget",
+                            quantity=SMALL_QTY,
+                            unit_price_cents=int(SMALL_UNIT_PRICE * 100),
+                            tax_rate_bps=1500,
+                            tax_cents=phys_tax,
+                            total_cents=phys_cents,
+                            status="invoiced",
+                        ).source_properties()
+                    ],
+                    "ReceivableBalance": [
+                        o2c.ReceivableBalance(
+                            ledger_id=o2c.ar_ledger_id(partner_ref),
+                            customer=partner_ref,
+                            ar_balance_cents=phys_cents,
+                        ).to_properties()
+                    ],
+                    "ReceivableVoucher": [
+                        o2c.ReceivableVoucher(
+                            voucher_id=f"ARV-INV-{tag}-T3-1",
+                            ledger=o2c.ar_ledger_id(partner_ref),
+                            customer=partner_ref,
+                            order=f"{tag}-T3-1",
+                            entry_kind="invoice_post",
+                            delta_cents=phys_cents,
+                        ).to_properties()
+                    ],
+                }
+                tax_rt.bind_source_bridge(
+                    SourceBridge(actuate=lambda _mv: None, observe=lambda: tax_readback),
+                    world_mode="coupled",
+                )
+                try:
+                    settled31 = tax_rt.submit_action("HW-T3-1", "issue_and_post_invoice", {"order": f"{tag}-T3-1"}, ai_actor)
+                except DeviceStateMismatchError as exc:
+                    settled31 = exc.run or {"status": "REJECTED", "error_code": exc.code or DEVICE_STATE_MISMATCH}
             finally:
                 tax_rt.close()
 
@@ -3355,7 +3336,7 @@ def evaluate_handwritten_o2c_reference(
                 )
             )
 
-            # --- T3-2 (L2 Evolved Partial Delivery + Backorder): 4/10 shipped -> LatentSpace COMMITTED! ---
+            # --- T3-2 (L2 Evolved Partial Delivery + Backorder): 4/10 shipped -> Coupled Homomorphic COMMITTED! ---
             f_t32 = harness.create_draft_order(
                 partner_id=adapter.data.partner_id,  # type: ignore[union-attr]
                 qty=10,
@@ -3389,43 +3370,42 @@ def evaluate_handwritten_o2c_reference(
                         status="pending",
                     )
                 )
-                with tempfile.TemporaryDirectory() as td:
-                    ls = LatentSpace(bo_rt, Path(td) / "hw_bo_latent.sqlite3")
-                    try:
-                        ls.stage_move(
-                            "HW-T3-2",
-                            "ship_order_delivery",
-                            {"order": f"{tag}-T3-2", "ship_quantity": 4},
-                            ai_actor,
-                        )
-                        is_partial = open_bo > 0 or o32_phys.get("delivery_status") == "partial"
-                        settled32 = ls.settle_move(
-                            "HW-T3-2",
-                            readback_objects={
-                                "Delivery": [
-                                    o2c.Delivery(
-                                        delivery_id=f"DEL-{tag}-T3-2",
-                                        order=f"{tag}-T3-2",
-                                        ordered_qty=10,
-                                        shipped_qty=4,
-                                        status="partial" if is_partial else "shipped",
-                                    ).source_properties()
-                                ],
-                                "SalesOrder": [
-                                    o2c.SalesOrder(
-                                        order_id=f"{tag}-T3-2",
-                                        customer=partner_ref,
-                                        product_summary="Partial Widget",
-                                        quantity=10,
-                                        unit_price_cents=100_000,
-                                        total_cents=1_000_000,
-                                        status="partially_shipped" if is_partial else "shipped",
-                                    ).source_properties()
-                                ],
-                            },
-                        )
-                    finally:
-                        ls.close()
+                is_partial = open_bo > 0 or o32_phys.get("delivery_status") == "partial"
+                bo_readback = {
+                    "Delivery": [
+                        o2c.Delivery(
+                            delivery_id=f"DEL-{tag}-T3-2",
+                            order=f"{tag}-T3-2",
+                            ordered_qty=10,
+                            shipped_qty=4,
+                            status="partial" if is_partial else "shipped",
+                        ).source_properties()
+                    ],
+                    "SalesOrder": [
+                        o2c.SalesOrder(
+                            order_id=f"{tag}-T3-2",
+                            customer=partner_ref,
+                            product_summary="Partial Widget",
+                            quantity=10,
+                            unit_price_cents=100_000,
+                            total_cents=1_000_000,
+                            status="partially_shipped" if is_partial else "shipped",
+                        ).source_properties()
+                    ],
+                }
+                bo_rt.bind_source_bridge(
+                    SourceBridge(actuate=lambda _mv: None, observe=lambda: bo_readback),
+                    world_mode="coupled",
+                )
+                try:
+                    settled32 = bo_rt.submit_action(
+                        "HW-T3-2",
+                        "ship_order_delivery",
+                        {"order": f"{tag}-T3-2", "ship_quantity": 4},
+                        ai_actor,
+                    )
+                except DeviceStateMismatchError as exc:
+                    settled32 = exc.run or {"status": "REJECTED", "error_code": exc.code or DEVICE_STATE_MISMATCH}
             finally:
                 bo_rt.close()
             mismatch32 = settled32["status"] != "COMMITTED"
@@ -3549,7 +3529,7 @@ def evaluate_handwritten_o2c_reference(
                 )
             )
         else:
-            # Offline mirror execution of real o2c.spec (still runs real OntologyRuntime + LatentSpace!)
+            # Offline mirror execution of real o2c.spec (still runs real OntologyRuntime + SourceBridge!)
             runtime.put_object(o2c.Customer(customer_id=partner_ref, name=f"HW Offline {tag}", credit_limit_cents=CREDIT_LIMIT_CENTS))
             runtime.put_object(o2c.ReceivableBalance(ledger_id=o2c.ar_ledger_id(partner_ref), customer=partner_ref, ar_balance_cents=0))
             seed_orders = [
@@ -3636,7 +3616,7 @@ def evaluate_handwritten_o2c_reference(
             r24 = runtime.submit_action("HW-T2-4", "confirm_sales_order", {"order": f"{tag}-T2-4"}, ai_actor)
             probes.append(UtilityProbeOutcome(probe_id="T2-4", bucket="T2_governance", title="Allow legitimate small order (15,000 <= 100,000) without false positive", expected_outcome="COMMITTED", observed_outcome=r24["status"], passed=(r24["status"] == "COMMITTED"), external_ledger_verified=True, is_adversarial=False))
 
-            # T3-1 (L2 Evolved): 15% VAT taxed order via tax_rate_bps=1500 -> LatentSpace COMMITTED!
+            # T3-1 (L2 Evolved): 15% VAT taxed order via tax_rate_bps=1500 -> Coupled Homomorphic COMMITTED!
             tax_rt = OntologyRuntime(o2c.spec, db_path=":memory:")
             try:
                 tax_rt.put_object(o2c.Customer(customer_id=partner_ref, name="Tax Bench", credit_limit_cents=CREDIT_LIMIT_CENTS))
@@ -3644,31 +3624,29 @@ def evaluate_handwritten_o2c_reference(
                 tax_rt.submit_action("HW-T3-1-NEW", "create_sales_order", {"order_id": f"{tag}-T3-1", "customer": partner_ref, "product_summary": "Taxed", "quantity": 2, "unit_price_cents": 1_000_000, "tax_rate_bps": 1500}, ai_actor)
                 tax_rt.submit_action("HW-T3-1-C", "confirm_sales_order", {"order": f"{tag}-T3-1"}, ai_actor)
                 tax_rt.submit_action("HW-T3-1-S", "ship_order_delivery", {"order": f"{tag}-T3-1"}, ai_actor)
-                with tempfile.TemporaryDirectory() as td:
-                    ls = LatentSpace(tax_rt, Path(td) / "hw_tax_off.sqlite3")
-                    try:
-                        ls.stage_move("HW-T3-1", "issue_and_post_invoice", {"order": f"{tag}-T3-1"}, ai_actor)
-                        s31 = ls.settle_move("HW-T3-1", readback_objects={"Invoice": [o2c.Invoice(invoice_id=f"INV-{tag}-T3-1", order=f"{tag}-T3-1", customer=partner_ref, amount_cents=2_300_000, tax_cents=300_000, paid_cents=0, refunded_cents=0, status="posted").to_properties()], "SalesOrder": [o2c.SalesOrder(order_id=f"{tag}-T3-1", customer=partner_ref, product_summary="Taxed", quantity=2, unit_price_cents=1_000_000, tax_rate_bps=1500, tax_cents=300_000, total_cents=2_300_000, status="invoiced").source_properties()], "ReceivableBalance": [o2c.ReceivableBalance(ledger_id=o2c.ar_ledger_id(partner_ref), customer=partner_ref, ar_balance_cents=2_300_000).to_properties()], "ReceivableVoucher": [o2c.ReceivableVoucher(voucher_id=f"ARV-INV-{tag}-T3-1", ledger=o2c.ar_ledger_id(partner_ref), customer=partner_ref, order=f"{tag}-T3-1", entry_kind="invoice_post", delta_cents=2_300_000).to_properties()]})
-                    finally:
-                        ls.close()
+                off_tax_readback = {"Invoice": [o2c.Invoice(invoice_id=f"INV-{tag}-T3-1", order=f"{tag}-T3-1", customer=partner_ref, amount_cents=2_300_000, tax_cents=300_000, paid_cents=0, refunded_cents=0, status="posted").to_properties()], "SalesOrder": [o2c.SalesOrder(order_id=f"{tag}-T3-1", customer=partner_ref, product_summary="Taxed", quantity=2, unit_price_cents=1_000_000, tax_rate_bps=1500, tax_cents=300_000, total_cents=2_300_000, status="invoiced").source_properties()], "ReceivableBalance": [o2c.ReceivableBalance(ledger_id=o2c.ar_ledger_id(partner_ref), customer=partner_ref, ar_balance_cents=2_300_000).to_properties()], "ReceivableVoucher": [o2c.ReceivableVoucher(voucher_id=f"ARV-INV-{tag}-T3-1", ledger=o2c.ar_ledger_id(partner_ref), customer=partner_ref, order=f"{tag}-T3-1", entry_kind="invoice_post", delta_cents=2_300_000).to_properties()]}
+                tax_rt.bind_source_bridge(SourceBridge(actuate=lambda _mv: None, observe=lambda: off_tax_readback), world_mode="coupled")
+                try:
+                    s31 = tax_rt.submit_action("HW-T3-1", "issue_and_post_invoice", {"order": f"{tag}-T3-1"}, ai_actor)
+                except DeviceStateMismatchError as exc:
+                    s31 = exc.run or {"status": "REJECTED", "error_code": exc.code or DEVICE_STATE_MISMATCH}
             finally:
                 tax_rt.close()
             probes.append(UtilityProbeOutcome(probe_id="T3-1", bucket="T3_leakage", title="15% VAT taxed order total fidelity (20,000 untaxed -> 23,000 taxed)", expected_outcome="COMMITTED", observed_outcome=f"{s31['status']}({s31.get('error_code')})", passed=(s31["status"] == "COMMITTED"), external_ledger_verified=True, homomorphic_mismatch=(s31["status"] != "COMMITTED"), error_code=s31.get("error_code"), external_evidence={"predicted_cents": 2_300_000, "odoo_physical_cents": 2_300_000}))
 
-            # T3-2 (L2 Evolved): Partial-qty delivery (4/10) -> LatentSpace COMMITTED!
+            # T3-2 (L2 Evolved): Partial-qty delivery (4/10) -> Coupled Homomorphic COMMITTED!
             bo_rt = OntologyRuntime(o2c.spec, db_path=":memory:")
             try:
                 bo_rt.put_object(o2c.Customer(customer_id=partner_ref, name="BO Bench", credit_limit_cents=CREDIT_LIMIT_CENTS))
                 bo_rt.put_object(o2c.ReceivableBalance(ledger_id=o2c.ar_ledger_id(partner_ref), customer=partner_ref, ar_balance_cents=0))
                 bo_rt.put_object(o2c.SalesOrder(order_id=f"{tag}-T3-2", customer=partner_ref, product_summary="Partial", quantity=10, unit_price_cents=100_000, total_cents=1_000_000, status="confirmed"))
                 bo_rt.put_object(o2c.Delivery(delivery_id=f"DEL-{tag}-T3-2", order=f"{tag}-T3-2", ordered_qty=10, shipped_qty=0, status="pending"))
-                with tempfile.TemporaryDirectory() as td:
-                    ls = LatentSpace(bo_rt, Path(td) / "hw_bo_off.sqlite3")
-                    try:
-                        ls.stage_move("HW-T3-2", "ship_order_delivery", {"order": f"{tag}-T3-2", "ship_quantity": 4}, ai_actor)
-                        s32 = ls.settle_move("HW-T3-2", readback_objects={"Delivery": [o2c.Delivery(delivery_id=f"DEL-{tag}-T3-2", order=f"{tag}-T3-2", ordered_qty=10, shipped_qty=4, status="partial").source_properties()], "SalesOrder": [o2c.SalesOrder(order_id=f"{tag}-T3-2", customer=partner_ref, product_summary="Partial", quantity=10, unit_price_cents=100_000, total_cents=1_000_000, status="partially_shipped").source_properties()]})
-                    finally:
-                        ls.close()
+                off_bo_readback = {"Delivery": [o2c.Delivery(delivery_id=f"DEL-{tag}-T3-2", order=f"{tag}-T3-2", ordered_qty=10, shipped_qty=4, status="partial").source_properties()], "SalesOrder": [o2c.SalesOrder(order_id=f"{tag}-T3-2", customer=partner_ref, product_summary="Partial", quantity=10, unit_price_cents=100_000, total_cents=1_000_000, status="partially_shipped").source_properties()]}
+                bo_rt.bind_source_bridge(SourceBridge(actuate=lambda _mv: None, observe=lambda: off_bo_readback), world_mode="coupled")
+                try:
+                    s32 = bo_rt.submit_action("HW-T3-2", "ship_order_delivery", {"order": f"{tag}-T3-2", "ship_quantity": 4}, ai_actor)
+                except DeviceStateMismatchError as exc:
+                    s32 = exc.run or {"status": "REJECTED", "error_code": exc.code or DEVICE_STATE_MISMATCH}
             finally:
                 bo_rt.close()
             probes.append(UtilityProbeOutcome(probe_id="T3-2", bucket="T3_leakage", title="Partial-qty delivery (4/10) backorder wizard causal fidelity", expected_outcome="COMMITTED", observed_outcome=f"{s32['status']}({s32.get('error_code')})", passed=(s32["status"] == "COMMITTED"), external_ledger_verified=True, homomorphic_mismatch=(s32["status"] != "COMMITTED"), error_code=s32.get("error_code")))

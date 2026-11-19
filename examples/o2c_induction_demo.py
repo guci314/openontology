@@ -26,11 +26,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
-from open_ontology import Actor, LatentSpace, OntologyRuntime
+from open_ontology import Actor, DeviceStateMismatchError, OntologyRuntime, SourceBridge
 from open_ontology.induction import (
     AbductionBackend,
     ActionBlueprint,
@@ -552,29 +551,32 @@ def run_o2c_induction_demo(*, offline: bool = True) -> dict[str, Any]:
                 prod_rt.put_object(cls(**item["data"]))
 
             # 2a) 偶发单点噪声：1 次外部回读 DEVICE_STATE_MISMATCH（不应唤醒 Evolver）
-            with tempfile.TemporaryDirectory() as tmpdir:
-                latent_path = Path(tmpdir) / "latent_o2c.sqlite3"
-                with LatentSpace(prod_rt, latent_path) as latent:
-                    latent.stage_move(
-                        "NOISE-MISMATCH-1",
-                        "confirm_sales_order",
-                        {"order_id": "SO-SMALL-01", "order_amount": 20000},
-                        AI_AGENT,
-                    )
-                    # 外部 ERP 回读仍为 draft（模拟偶发网络超时未落库）
-                    latent.settle_move(
-                        "NOISE-MISMATCH-1",
-                        readback_objects={
-                            "SalesOrder": [
-                                {
-                                    "order_id": "SO-SMALL-01",
-                                    "customer": "CUST-APPLE",
-                                    "amount": 20000,
-                                    "status": "draft",
-                                }
-                            ]
-                        },
-                    )
+            prod_rt.bind_source_bridge(
+                SourceBridge(
+                    actuate=lambda _mv: {"ok": True},
+                    observe=lambda: {
+                        "SalesOrder": [
+                            {
+                                "order_id": "SO-SMALL-01",
+                                "customer": "CUST-APPLE",
+                                "amount": 20000,
+                                "status": "draft",
+                            }
+                        ]
+                    },
+                ),
+                world_mode="coupled",
+            )
+            try:
+                prod_rt.submit_action(
+                    "NOISE-MISMATCH-1",
+                    "confirm_sales_order",
+                    {"order_id": "SO-SMALL-01", "order_amount": 20000},
+                    AI_AGENT,
+                )
+            except DeviceStateMismatchError:
+                pass
+            prod_rt.bind_source_bridge(None, world_mode="standalone")
 
             # 2b) 系统性规则漏洞：ai_agent 连续确认 2 笔超 10 万大单，财务总监事后紧急冲正
             prod_rt.submit_action(

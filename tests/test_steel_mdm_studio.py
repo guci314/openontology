@@ -27,6 +27,7 @@ def test_steel_mdm_five_acts_restart_and_http_roundtrip(tmp_path: Path):
     try:
         # 初始重置后：老 ERP 源表绝无 canonical_spec_id 列，4 散码均未归并
         init_state = app.state_snapshot()
+        assert not (state_dir / "w_lat.sqlite3").exists()
         assert len(init_state["w_real"]["skus"]) == 4
         assert all("canonical_spec_id" not in row for row in init_state["w_real"]["skus"])
         assert all(s["canonical_spec_id"] is None for s in init_state["w_mem"]["skus"])
@@ -137,6 +138,7 @@ def test_steel_mdm_five_acts_restart_and_http_roundtrip(tmp_path: Path):
         assert dec["status"] == "COMMITTED"
         assert dec["spec_c_exists_in_mem"] is True
         after_appr = app2.state_snapshot()
+        assert not (state_dir / "w_lat.sqlite3").exists()
         assert after_appr["w_lat"]["awaiting_approval_count"] == 0
         assert any(sp["spec_id"] == "SPEC-C" for sp in after_appr["w_mem"]["specs"])
         assert any(sk["sku_id"] == "ERP-SKU-9102" for sk in after_appr["w_real"]["skus"])

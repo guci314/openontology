@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +34,12 @@ from examples.o2c_induction_demo import (
 )
 from open_ontology import (
     Actor,
+    DeviceStateMismatchError,
     InvariantError,
-    LatentSpace,
     ObjectNotFoundError,
     OntologyRuntime,
     PermissionDeniedError,
+    SourceBridge,
 )
 from open_ontology.induction import (
     ActionBlueprint,
@@ -430,27 +430,30 @@ def test_friction_collector_filters_single_noise_and_escalates_systemic_reverts(
             rt.put_object(spec.get_object_type(row["object_type"])(**row["data"]))
 
         # 单次偶发 DEVICE_STATE_MISMATCH
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with LatentSpace(rt, Path(tmpdir) / "latent.sqlite3") as latent:
-                latent.stage_move(
-                    "MISMATCH-1",
-                    "confirm_sales_order",
-                    {"order_id": "SO-SMALL-01", "order_amount": 20000},
-                    AI_AGENT,
-                )
-                latent.settle_move(
-                    "MISMATCH-1",
-                    readback_objects={
-                        "SalesOrder": [
-                            {
-                                "order_id": "SO-SMALL-01",
-                                "customer": "CUST-APPLE",
-                                "amount": 20000,
-                                "status": "draft",
-                            }
-                        ]
-                    },
-                )
+        rt.bind_source_bridge(
+            SourceBridge(
+                actuate=lambda _mv: {"ok": True},
+                observe=lambda: {
+                    "SalesOrder": [
+                        {
+                            "order_id": "SO-SMALL-01",
+                            "customer": "CUST-APPLE",
+                            "amount": 20000,
+                            "status": "draft",
+                        }
+                    ]
+                },
+            ),
+            world_mode="coupled",
+        )
+        with pytest.raises(DeviceStateMismatchError):
+            rt.submit_action(
+                "MISMATCH-1",
+                "confirm_sales_order",
+                {"order_id": "SO-SMALL-01", "order_amount": 20000},
+                AI_AGENT,
+            )
+        rt.bind_source_bridge(None, world_mode="standalone")
 
         # 2 次系统性回滚
         rt.submit_action("R1", "confirm_sales_order", {"order_id": "SO-BIG-01", "order_amount": 150000}, AI_AGENT)
@@ -1722,10 +1725,14 @@ def test_induction_kernel_zero_psm_or_protocol_smuggling() -> None:
 
     if (repo_root / ".git").exists():
         diff_res = subprocess.run(
-            ["git", "diff", "open_ontology/spec.py", "open_ontology/runtime.py"],
+            ["git", "diff", "open_ontology/schema.sql"],
             cwd=repo_root,
             check=True,
             capture_output=True,
             text=True,
         )
-        assert diff_res.stdout == "", f"spec.py / runtime.py must stay unmodified:\n{diff_res.stdout}"
+        assert diff_res.stdout == "", f"open_ontology/schema.sql must stay unmodified:\n{diff_res.stdout}"
+    runtime_lines = len(
+        (repo_root / "open_ontology" / "runtime.py").read_text(encoding="utf-8").splitlines()
+    )
+    assert runtime_lines <= 1400, f"runtime.py exceeded 1400 lines ({runtime_lines})"

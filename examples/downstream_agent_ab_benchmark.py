@@ -33,6 +33,8 @@ from typing import Any, Callable
 
 from open_ontology import (
     AIPAgentExecutor,
+    DeviceStateMismatchError,
+    GovernanceViolationError,
     InvariantError,
     OntologyRuntime,
     PermissionDeniedError,
@@ -48,7 +50,6 @@ from open_ontology.induction import (
     compile_blueprint,
     measure_agent_complexity,
     measure_raw_external_complexity,
-    project_single_record,
 )
 
 from .business_ontology import build_business_seed_ontology
@@ -57,7 +58,6 @@ from .odoo_dual_erp_demo import DB_NORTH, _jsonrpc
 from .odoo_fde_autonomous_pipeline import (
     AI_OPS_ACTOR,
     DeclarativeOdooBridge,
-    _parse_ext_id,
     build_closed_phenomenon_profile,
     synthesize_from_fde_evidence,
 )
@@ -421,8 +421,6 @@ def _make_ontology_arm_runner(
     )
 
     rt = OntologyRuntime(compiled_spec, db_path=":memory:")
-    tmpdir_obj = tempfile.TemporaryDirectory()
-    latent_path = Path(tmpdir_obj.name) / f"{sc.scenario_id}_latent.sqlite3"
     table_ids: dict[str, list[int]] = {
         "res.partner": [sc.order.partner_id],
         "sale.order": [sc.order.order_id],
@@ -446,18 +444,17 @@ def _make_ontology_arm_runner(
         memory_runtime=rt,
         adapter_mapping=adapter_mapping,
         sandbox=sandbox_client,
-        latent_db_path=latent_path,
         protocol_overrides=l2_protocols,
+        lookup_index=lookup_idx,
     )
     step_counter = [0]
 
     def _cleanup() -> None:
         bridge.close()
         rt.close()
-        tmpdir_obj.cleanup()
 
     def _exec_tool(tool: str, args: dict[str, Any]) -> dict[str, Any]:
-        executor = AIPAgentExecutor(bridge.latent.latent_runtime, AI_OPS_ACTOR)
+        executor = AIPAgentExecutor(rt, AI_OPS_ACTOR)
         if tool in ("query_objects", "get_object", "simulate_action"):
             try:
                 return {"ok": True, **executor.dispatch(tool, args)}
@@ -468,21 +465,26 @@ def _make_ontology_arm_runner(
             act_name = str(args.get("action") or "")
             params = dict(args.get("params") or {})
             run_id = f"AB-{sc.scenario_id}-{step_counter[0]}-{uuid.uuid4().hex[:5]}"
-            binding = adapter_mapping.get_action_binding(act_name)
-            if binding is None:
+            if adapter_mapping.get_action_binding(act_name) is None:
                 return {"ok": False, "status": "REJECTED", "error_code": "UNKNOWN_ACTION"}
             try:
-                staged = bridge.latent.stage_move(run_id, act_name, params, AI_OPS_ACTOR)
-            except (InvariantError, PermissionDeniedError) as exc:
+                run = rt.submit_action(run_id, act_name, params, AI_OPS_ACTOR)
+            except DeviceStateMismatchError as exc:
+                return {
+                    "ok": False,
+                    "status": "REJECTED",
+                    "error_code": exc.code or "DEVICE_STATE_MISMATCH",
+                    "message": str(exc),
+                    "updated_object": bridge.get_last_observed(run_id),
+                }
+            except (InvariantError, PermissionDeniedError, GovernanceViolationError) as exc:
                 return {
                     "ok": False,
                     "status": "REJECTED",
                     "error_code": getattr(exc, "code", None) or type(exc).__name__,
                     "message": str(exc),
                 }
-            st = str(staged["status"])
-            if st == "REJECTED":
-                return {"ok": False, "status": "REJECTED", "error_code": staged.get("error_code")}
+            st = str(run["status"])
             if st == "PENDING_APPROVAL":
                 return {
                     "ok": False,
@@ -490,31 +492,11 @@ def _make_ontology_arm_runner(
                     "error_code": "APPROVAL_REQUIRED",
                     "message": "Action requires Steward approval; external ERP remains untouched.",
                 }
-            ext_id = _parse_ext_id(str(params[binding.id_param]), binding.id_prefix)
-            bridge.execute_external_binding(binding, ext_id, params)
-            em = adapter_mapping.get_entity_mapping(binding.target_object_type)
-            assert em is not None
-            read_fields = list(
-                dict.fromkeys(
-                    ["id", em.id_transform.source_field]
-                    + [tf.source_field for tf in em.field_transforms if tf.source_field]
-                    + [fb for tf in em.field_transforms for fb in tf.fallback_fields if fb]
-                    + [flt.field for flt in em.row_filters if flt.field]
-                )
-            )
-            raw_rows = sandbox_client.search_read(
-                binding.external_table, [("id", "=", ext_id)], read_fields, limit=1
-            )
-            proj_row = project_single_record(em, raw_rows[0], lookup_index=lookup_idx)
-            settled = bridge.latent.settle_move(
-                run_id,
-                readback_objects={binding.target_object_type: [proj_row]},
-            )
             return {
-                "ok": str(settled["status"]) == "COMMITTED",
-                "status": str(settled["status"]),
-                "error_code": settled.get("error_code"),
-                "updated_object": proj_row,
+                "ok": st == "COMMITTED",
+                "status": st,
+                "error_code": run.get("error_code"),
+                "updated_object": bridge.get_last_observed(run_id),
             }
         if tool == "finish":
             return {"ok": True, "finished": True, "summary": args.get("summary", "")}

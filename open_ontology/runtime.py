@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,6 +42,12 @@ from .aspects import (
 from .ingestion import SnapshotIngestionDriver, parse_mdo_rows
 from .query import AggregationResult, AggregationRow, ObjectSet
 from .sandbox import EditBatch, LoadedObject, ObjectDiff
+from .settlement import (
+    HomomorphicSettlementAspect,
+    SourceBridge,
+    VALID_WORLD_MODES,
+    WorldMode,
+)
 from .spec import (
     ActionDef,
     Actor,
@@ -54,7 +61,7 @@ from .spec import (
     PermissionDeniedError,
 )
 
-__all__ = ["OntologyRuntime", "SimulationResult", "SCHEMA_PATH"]
+__all__ = ["OntologyRuntime", "SimulationResult", "SCHEMA_PATH", "WorldMode", "SourceBridge"]
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 _CORE_SCHEMA_TABLES = frozenset(
@@ -122,9 +129,26 @@ class OntologyRuntime:
         self,
         spec: OntologySpec,
         db_path: str | Path = ":memory:",
+        *,
+        world_mode: WorldMode | None = None,
+        source_bridge: SourceBridge | None = None,
     ) -> None:
         self.spec = spec
         self.db_path = str(db_path)
+        resolved_mode: WorldMode = (
+            world_mode if world_mode is not None else ("coupled" if source_bridge is not None else "standalone")
+        )
+        if resolved_mode not in VALID_WORLD_MODES:
+            raise ValueError(f"unsupported world_mode {resolved_mode!r}; expected one of {VALID_WORLD_MODES}")
+        if resolved_mode == "counterfactual":
+            if self.db_path != ":memory:":
+                raise ValueError("counterfactual world_mode requires db_path=':memory:'")
+            if source_bridge is not None:
+                raise GovernanceViolationError("counterfactual world cannot bind a SourceBridge")
+        self._world_mode: WorldMode = resolved_mode
+        self._source_bridge: SourceBridge | None = source_bridge
+        self._inflight_lock = threading.Lock()
+        self._inflight_runs: set[str] = set()
         self._conn = sqlite3.connect(
             self.db_path,
             isolation_level=None,  # explicit BEGIN/COMMIT
@@ -181,17 +205,39 @@ class OntologyRuntime:
 
     # -- parallel-universe sandbox ----------------------------------------
     def fork(self) -> "OntologyRuntime":
-        """把整个 runtime 克隆成一个完全独立的内存沙盘。
-
-        SQLite 原生 ``Connection.backup()`` 一次性复制
-        ``ontology_registry`` / ``ontology_objects`` / ``ontology_links`` /
-        ``ontology_overlay`` / ``ontology_action_runs`` 以及写门禁状态，
-        耗时是毫秒级。分叉支持嵌套（``fork1.fork()``），任何在 fork 上的
-        写入对母体 100% 零污染。
-        """
-        fork = OntologyRuntime(self.spec, db_path=":memory:")
+        """把整个 runtime 克隆成一个纯内存、物理绝缘的反事实沙盘（``world_mode='counterfactual'``）。"""
+        fork = OntologyRuntime(
+            self.spec, db_path=":memory:", world_mode="counterfactual", source_bridge=None
+        )
         self._conn.backup(fork._conn)
         return fork
+
+    @property
+    def world_mode(self) -> WorldMode:
+        return self._world_mode
+
+    @property
+    def source_bridge(self) -> SourceBridge | None:
+        return self._source_bridge
+
+    def bind_source_bridge(
+        self,
+        bridge: SourceBridge | None,
+        *,
+        world_mode: WorldMode | None = None,
+    ) -> None:
+        """在非反事实世界中绑定或解绑外部 ``SourceBridge``。"""
+        if self._world_mode == "counterfactual":
+            raise GovernanceViolationError("cannot bind SourceBridge onto counterfactual world")
+        target_mode: WorldMode = (
+            world_mode if world_mode is not None else ("coupled" if bridge is not None else "standalone")
+        )
+        if target_mode == "counterfactual":
+            raise ValueError("cannot transition an existing runtime into counterfactual world_mode")
+        if target_mode not in VALID_WORLD_MODES:
+            raise ValueError(f"unsupported world_mode {target_mode!r}")
+        self._source_bridge = bridge
+        self._world_mode = target_mode
 
     def state_fingerprint(self) -> dict[str, Any]:
         """结构化世界状态指纹，用于验证沙盘推演前后主库零污染。"""
@@ -220,12 +266,6 @@ class OntologyRuntime:
 
         with OntologyMCTSPlanner(self, actor, **kwargs) as planner:
             return planner.search()
-
-    def open_latent_space(self, db_path: str | Path) -> Any:
-        """快捷入口：基于持久化同构 6 表库打开或初始化 ``LatentSpace``。"""
-        from .latent import LatentSpace
-
-        return LatentSpace(self, db_path)
 
     # -- transactions ------------------------------------------------------
     @contextmanager
@@ -1155,28 +1195,16 @@ class OntologyRuntime:
                 self._notify_run_event(actor, pending_run)
             return pending_run  # type: ignore[return-value]
 
-        with self._write_gate() as conn:
-            self._verify_read_versions(conn, read_versions)
-            self._apply_diff(conn, diff)
-            self.check_invariants()
-            self.check_transition_invariants(diff)
-            self._insert_run(
-                conn,
-                run_id=run_id,
-                action=action,
-                actor=actor,
-                params_json=params_json,
-                status=_COMMITTED,
-                read_versions=read_versions,
-                diff=diff,
-                approved_by=None,
-            )
-        committed_run = self.get_action_run(run_id)
-        if auto_trigger:
-            self.evaluate_automations(actor)
-        if committed_run is not None:
-            self._notify_post_commit(actor, committed_run)
-        return committed_run  # type: ignore[return-value]
+        return HomomorphicSettlementAspect.settle_submission(
+            self,
+            run_id=run_id,
+            action=action,
+            actor=actor,
+            params_json=params_json,
+            read_versions=read_versions,
+            diff=diff,
+            auto_trigger=auto_trigger,
+        )
 
     # -- approve & reject --------------------------------------------------
     def approve_action(self, run_id: str, approver: Actor) -> dict[str, Any]:

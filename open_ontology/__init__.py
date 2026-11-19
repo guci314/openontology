@@ -19,7 +19,15 @@ from .induction import (
     OntologyEvolverAgent,
     SymbolicCrucible,
 )
-from .latent import DEVICE_STATE_MISMATCH, LatentSpace
+from .settlement import (
+    DEVICE_STATE_MISMATCH,
+    SOURCE_REVERT_FORBIDDEN,
+    UNBOUND_SOURCE_BRIDGE,
+    DeviceStateMismatchError,
+    HomomorphicSettlementAspect,
+    SourceBridge,
+    WorldMode,
+)
 from .mpc import (
     MPC_AWAITING_APPROVAL,
     MPC_GOAL_REACHED,
@@ -127,8 +135,13 @@ __all__ = [
     "MCTSPlanResult",
     "RootActionStat",
     "OntologyMCTSPlanner",
-    "LatentSpace",
+    "WorldMode",
+    "SourceBridge",
+    "HomomorphicSettlementAspect",
+    "DeviceStateMismatchError",
     "DEVICE_STATE_MISMATCH",
+    "UNBOUND_SOURCE_BRIDGE",
+    "SOURCE_REVERT_FORBIDDEN",
     "DeclarativeBlueprint",
     "EvolutionPatch",
     "SymbolicCrucible",

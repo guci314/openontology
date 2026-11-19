@@ -184,6 +184,7 @@ def test_registry_type_json_carries_aggregate_root_but_object_values_do_not():
                 "title",
                 "security_tag_fields",
                 "aggregate_root",
+                "append_only",
                 "schema",
             }
             assert meta["name"] == cls.__name__

@@ -30,7 +30,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from open_ontology import Actor, InvariantError, LatentSpace, OntologyRuntime, PermissionDeniedError
+from open_ontology import (
+    Actor,
+    GovernanceViolationError,
+    InvariantError,
+    OntologyRuntime,
+    PermissionDeniedError,
+    SourceBridge,
+)
 from open_ontology.induction import (
     ActionBlueprint,
     ActionExecutionBinding,
@@ -645,13 +652,11 @@ def _sqlite_homomorphic_settlement_check(
         shutil.copy2(source_sqlite, tmp_db)
         conn = sqlite3.connect(tmp_db)
         conn.row_factory = sqlite3.Row
-        rt = OntologyRuntime(spec, db_path=":memory:")
-        latent = LatentSpace(rt, Path(tmpdir) / "crm_latent.sqlite3")
+        rt = OntologyRuntime(spec, db_path=":memory:", world_mode="coupled")
         try:
             for item in projected:
                 cls = spec.get_object_type(item["object_type"])
                 rt.put_object(cls(**item["data"]))
-            latent.rebase()
 
             def _try_crm_action(
                 run_id: str,
@@ -663,21 +668,40 @@ def _sqlite_homomorphic_settlement_check(
                 new_val: str,
             ) -> tuple[str, str | None, str]:
                 cid = f"{binding.id_prefix}{raw_uuid}"
+
+                def _actuate(_mv: dict[str, Any]) -> None:
+                    conn.execute(
+                        f'UPDATE "{binding.external_table}" SET "{col_name}"=? WHERE id=?',
+                        (new_val, raw_uuid),
+                    )
+                    conn.commit()
+
+                def _observe(_mv: dict[str, Any]) -> dict[str, Any]:
+                    raw_after = dict(
+                        conn.execute(
+                            f'SELECT * FROM "{binding.external_table}" WHERE id=?',
+                            (raw_uuid,),
+                        ).fetchone()
+                    )
+                    proj_after = project_single_record(em, raw_after)
+                    return {binding.target_object_type: [proj_after]}
+
+                rt.bind_source_bridge(SourceBridge(actuate=_actuate, observe=_observe), world_mode="coupled")
                 try:
-                    staged = latent.stage_move(run_id, binding.action_name, {binding.id_param: cid}, actor)
-                except (InvariantError, PermissionDeniedError) as exc:
-                    db_val = str(conn.execute(f'SELECT "{col_name}" FROM "{binding.external_table}" WHERE id=?', (raw_uuid,)).fetchone()[0])
-                    return "REJECTED", getattr(exc, "code", None) or type(exc).__name__, db_val
-                st = str(staged["status"])
-                if st in ("REJECTED", "PENDING_APPROVAL"):
-                    db_val = str(conn.execute(f'SELECT "{col_name}" FROM "{binding.external_table}" WHERE id=?', (raw_uuid,)).fetchone()[0])
-                    return st, staged.get("error_code"), db_val
-                conn.execute(f'UPDATE "{binding.external_table}" SET "{col_name}"=? WHERE id=?', (new_val, raw_uuid))
-                conn.commit()
-                raw_after = dict(conn.execute(f'SELECT * FROM "{binding.external_table}" WHERE id=?', (raw_uuid,)).fetchone())
-                proj_after = project_single_record(em, raw_after)
-                settled = latent.settle_move(run_id, readback_objects={binding.target_object_type: [proj_after]})
-                return str(settled["status"]), settled.get("error_code"), str(raw_after[col_name])
+                    run = rt.submit_action(run_id, binding.action_name, {binding.id_param: cid}, actor)
+                    status = str(run["status"])
+                    err_code = run.get("error_code")
+                except (InvariantError, PermissionDeniedError, GovernanceViolationError) as exc:
+                    status = "REJECTED"
+                    err_code = getattr(exc, "code", None) or type(exc).__name__
+
+                db_val = str(
+                    conn.execute(
+                        f'SELECT "{col_name}" FROM "{binding.external_table}" WHERE id=?',
+                        (raw_uuid,),
+                    ).fetchone()[0]
+                )
+                return status, err_code, db_val
 
             # 1. Adversarial: ai_agent tries to win Acme deal while Acme High support case is open -> MUST BLOCK & 0 SQLite write
             st_acme_blk, err_acme_blk, db_acme_blk = _try_crm_action(
@@ -732,7 +756,6 @@ def _sqlite_homomorphic_settlement_check(
                 },
             }
         finally:
-            latent.close()
             rt.close()
             conn.close()
 

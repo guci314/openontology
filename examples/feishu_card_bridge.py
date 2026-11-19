@@ -1001,12 +1001,22 @@ class FeishuApprovalGateway:
                         "status": "CONFLICT",
                         "error_code": "CONCURRENCY_CONFLICT",
                     }
-                except (PermissionDeniedError, GovernanceViolationError) as exc:
-                    return {"toast": {"type": "error", "content": str(exc)}}
+                except (InvariantError, PermissionDeniedError, GovernanceViolationError) as exc:
+                    err_code = getattr(exc, "code", None)
+                    return {
+                        "toast": {"type": "error", "content": str(exc)},
+                        **({"error_code": err_code} if err_code else {}),
+                    }
                 finally:
                     self._suppress_event_run_ids.discard(run_id)
 
                 evidence = self.adapter.process_new_runs() if self.adapter is not None else []
+                if (
+                    not evidence
+                    and self.adapter is not None
+                    and hasattr(self.adapter, "get_run_evidence")
+                ):
+                    evidence = self.adapter.get_run_evidence(committed["run_id"])
                 rec = self._upsert_card(committed, push_if_new=False, erp_evidence=evidence)
                 return {
                     "toast": {"type": "success", "content": "已签批并同步写入真实 ERP"},
@@ -1054,6 +1064,12 @@ class FeishuApprovalGateway:
                 self._suppress_event_run_ids.discard(revert_run_id)
 
             evidence = self.adapter.process_new_runs() if self.adapter is not None else []
+            if (
+                not evidence
+                and self.adapter is not None
+                and hasattr(self.adapter, "get_run_evidence")
+            ):
+                evidence = self.adapter.get_run_evidence(revert_run["run_id"])
             original_after = self.runtime.get_action_run(run_id) or run
             rec = self._upsert_card(
                 original_after,

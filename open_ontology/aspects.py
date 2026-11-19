@@ -949,51 +949,10 @@ class ApprovalGateAspect:
 
     @staticmethod
     def approve_action(runtime: Any, run_id: str, approver: Actor) -> dict[str, Any]:
-        """批准一张挂起单：校验审批角色 + 重新比对版本 + 原子落盘。"""
-        run = runtime.get_action_run(run_id)
-        if run is None:
-            raise ObjectNotFoundError(f"action run {run_id!r} not found")
-        if run["status"] != AUDIT_STATUS_PENDING:
-            raise GovernanceViolationError(
-                f"action run {run_id!r} is {run['status']}, not PENDING_APPROVAL"
-            )
+        """批准一张挂起单：委托给 :class:`HomomorphicSettlementAspect` 完成三阶段核验结算。"""
+        from .settlement import HomomorphicSettlementAspect
 
-        action = runtime.spec.get_action(run["action_type"])
-        if approver.role not in action.approver_roles:
-            raise PermissionDeniedError(
-                f"actor {approver.actor_id!r} role {approver.role!r} may not approve "
-                f"{action.name!r}; required one of {list(action.approver_roles)}"
-            )
-
-        read_versions = dict(run["read_versions"])
-        diff = ObjectDiff.from_dict(run["object_diff"])
-
-        with runtime._write_gate() as conn:
-            IdempotencyAndOCCAspect.verify_read_versions(conn, read_versions)
-            runtime._apply_diff(conn, diff)
-            runtime.check_invariants()
-            check_trans = getattr(runtime, "check_transition_invariants", None)
-            if callable(check_trans):
-                check_trans(diff)
-            conn.execute(
-                """
-                UPDATE ontology_action_runs
-                SET status = ?, approved_by = ?, executed_at = ?
-                WHERE run_id = ? AND status = ?
-                """,
-                (
-                    AUDIT_STATUS_COMMITTED,
-                    approver.actor_id,
-                    runtime._utcnow(),
-                    run_id,
-                    AUDIT_STATUS_PENDING,
-                ),
-            )
-        committed = runtime.get_action_run(run_id)
-        notify = getattr(runtime, "_notify_post_commit", None)
-        if committed is not None and callable(notify):
-            notify(approver, committed)
-        return committed  # type: ignore[return-value]
+        return HomomorphicSettlementAspect.settle_approval(runtime, run_id, approver)
 
     @staticmethod
     def reject_action(
@@ -1050,88 +1009,12 @@ class ApprovalGateAspect:
         revert_run_id: str,
         actor: Actor,
     ) -> dict[str, Any]:
-        """时光机回滚：取原 diff 的逆向补丁，整体撤回并追加一条回滚记录。"""
-        existing = runtime.get_action_run(revert_run_id)
-        if existing is not None:
-            return existing
+        """时光机回滚：委托给 :class:`HomomorphicSettlementAspect` 完成逆向补丁核验提交。"""
+        from .settlement import HomomorphicSettlementAspect
 
-        run = runtime.get_action_run(run_id)
-        if run is None:
-            raise ObjectNotFoundError(f"action run {run_id!r} not found")
-
-        action = runtime.spec.get_action(run["action_type"])
-        # 若动作声明了审批角色，时光机回滚属于高危冲正治理动作，仅允许审批角色执行，
-        # 防止普通提交角色（如 ai_agent / sales_rep）绕过审批权单方面撤回已落账记录；
-        # 未声明审批角色的普通动作回退至 allowed_roles。
-        revert_roles = (
-            set(action.approver_roles)
-            if action.approver_roles
-            else set(action.allowed_roles)
+        return HomomorphicSettlementAspect.settle_revert(
+            runtime, run_id, revert_run_id, actor
         )
-        if actor.role not in revert_roles:
-            raise PermissionDeniedError(
-                f"actor {actor.actor_id!r} role {actor.role!r} may not revert "
-                f"{action.name!r} (required roles: {sorted(revert_roles)})"
-            )
-
-        if run["status"] == AUDIT_STATUS_REVERTED:
-            raise GovernanceViolationError(f"action run {run_id!r} was already reverted")
-        if run["status"] != AUDIT_STATUS_COMMITTED:
-            raise GovernanceViolationError(
-                f"action run {run_id!r} is {run['status']}; only COMMITTED runs can revert"
-            )
-
-        original_diff = ObjectDiff.from_dict(run["object_diff"])
-        inverted = original_diff.inverted()
-
-        # 记录回滚将要触碰的每个对象的当前版本。
-        revert_read_versions: dict[str, int] = {}
-        for change in inverted.object_changes:
-            row = runtime._conn.execute(
-                """
-                SELECT version FROM ontology_objects
-                WHERE object_type = ? AND object_id = ?
-                """,
-                (change.object_type, change.object_id),
-            ).fetchone()
-            if row is not None:
-                revert_read_versions[
-                    f"{change.object_type}:{change.object_id}"
-                ] = int(row["version"])
-
-        with runtime._write_gate() as conn:
-            runtime._apply_diff(conn, inverted)
-            runtime.check_invariants()
-            conn.execute(
-                """
-                UPDATE ontology_action_runs
-                SET status = ?, reverted_by_run_id = ?
-                WHERE run_id = ? AND status = ?
-                """,
-                (
-                    AUDIT_STATUS_REVERTED,
-                    revert_run_id,
-                    run_id,
-                    AUDIT_STATUS_COMMITTED,
-                ),
-            )
-            insert_action_run(
-                runtime,
-                conn,
-                run_id=revert_run_id,
-                action=action,
-                actor=actor,
-                params_json=run["params"],
-                status=AUDIT_STATUS_COMMITTED,
-                read_versions=revert_read_versions,
-                diff=inverted,
-                approved_by=None,
-            )
-        committed = runtime.get_action_run(revert_run_id)
-        notify = getattr(runtime, "_notify_post_commit", None)
-        if committed is not None and callable(notify):
-            notify(actor, committed)
-        return committed  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------

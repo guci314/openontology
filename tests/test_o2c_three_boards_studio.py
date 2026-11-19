@@ -123,6 +123,7 @@ def test_studio_acts_1_to_4_restart_and_feishu_forward_real_odoo(tmp_path: Path)
 
     try:
         init_snap = app.state_snapshot()
+        assert not (state_dir / "w_lat.sqlite3").exists()
         assert secret_val not in json.dumps(init_snap, ensure_ascii=False)
         assert secret_val not in render_studio_html(init_snap)
         assert secret_val not in (state_dir / "studio_meta.json").read_text(encoding="utf-8")
@@ -224,6 +225,7 @@ def test_studio_acts_1_to_4_restart_and_feishu_forward_real_odoo(tmp_path: Path)
         assert not (unused_8789 / "o2c_erp.sqlite3").exists()
 
         after_cb = app2.state_snapshot()
+        assert not (state_dir / "w_lat.sqlite3").exists()
         assert after_cb["w_lat"]["awaiting_approval_count"] == 0
         assert after_cb["w_real"]["orders"][1]["odoo_order_state"] == "sale"
         assert after_cb["w_mem"]["orders"][1]["mem_status"] == "confirmed"

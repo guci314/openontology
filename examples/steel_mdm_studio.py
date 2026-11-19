@@ -3,8 +3,8 @@
 架构严格零改表破局：
 - W_real (`legacy_erp.json`)：老 ERP 源表仅含 Manufacturer 与混乱 ContractSKU（无规格列、无 MaterialSpec/MaterialLot）；
 - W_mem (`w_mem.sqlite3`)：OntologyRuntime 记忆棋盘 + `ontology_overlay` 属性级寄生层 + 三正交边高维批次桶；
-- W_lat (`w_lat.sqlite3`)：持久 LatentSpace 增量建码双硬护栏（UNMAPPED_PHYSICAL_SPEC / SPEC_QUALITY_MISMATCH）
-  与新物理品种审批隔离队列；
+- 统一闭环同态结算：OntologyRuntime + SourceBridge 增量建码双硬护栏（UNMAPPED_PHYSICAL_SPEC / SPEC_QUALITY_MISMATCH）
+  与新物理品种审批隔离（PENDING_APPROVAL 存 W_mem，零 w_lat.sqlite3）；
 - 三视角恒等账本：reconcile_multi_view_ledger + ObjectSet/pivot/aggregate + 1 秒时光机无损冲正。
 
 严禁修改 open_ontology/ 与 examples/steel_mdm_demo.py，仅做兼容只读导入与驱动。
@@ -28,8 +28,8 @@ from open_ontology import (
     Actor,
     GovernanceViolationError,
     InvariantError,
-    LatentSpace,
     OntologyRuntime,
+    SourceBridge,
 )
 
 from . import steel_mdm_demo as mdm
@@ -277,12 +277,10 @@ class SteelMDMStudioApp:
 
         self.legacy_erp_path = self.state_dir / "legacy_erp.json"
         self.mem_db_path = self.state_dir / "w_mem.sqlite3"
-        self.lat_db_path = self.state_dir / "w_lat.sqlite3"
         self.meta_path = self.state_dir / "studio_meta.json"
 
         self._lock = threading.RLock()
         self.memory_runtime: OntologyRuntime | None = None
-        self.latent: LatentSpace | None = None
         self.legacy_erp: dict[str, Any] = {}
         self.meta: dict[str, Any] = {}
 
@@ -290,9 +288,6 @@ class SteelMDMStudioApp:
 
     # -- Store & Meta Persistence -----------------------------------------
     def _close_stores(self) -> None:
-        if self.latent is not None:
-            self.latent.close()
-            self.latent = None
         if self.memory_runtime is not None:
             self.memory_runtime.close()
             self.memory_runtime = None
@@ -363,16 +358,37 @@ class SteelMDMStudioApp:
         acts[act_key] = payload
         self.meta["acts"] = acts
 
+    def _make_source_bridge(self) -> SourceBridge:
+        def _actuate(move: dict[str, Any]) -> dict[str, Any]:
+            if move.get("action_type") == "register_contract_sku":
+                params = move.get("params") or {}
+                if move.get("is_revert"):
+                    sku_id = str(params.get("sku_id") or "")
+                    if sku_id:
+                        self._remove_legacy_sku_source(sku_id)
+                else:
+                    self._upsert_legacy_sku_source(params)
+            return {"ok": True}
+
+        return SourceBridge(
+            actuate=_actuate,
+            observe=self._legacy_snapshot_payload,
+            allow_source_revert=True,
+        )
+
     def _open_stores(self) -> None:
-        self.memory_runtime = OntologyRuntime(mdm.spec, db_path=self.mem_db_path)
-        self.latent = self.memory_runtime.open_latent_space(self.lat_db_path)
+        self.memory_runtime = OntologyRuntime(
+            mdm.spec,
+            db_path=self.mem_db_path,
+            world_mode="coupled",
+            source_bridge=self._make_source_bridge(),
+        )
 
     def _init_or_rehydrate(self) -> None:
         with self._lock:
             if (
                 self.legacy_erp_path.is_file()
                 and self.mem_db_path.is_file()
-                and self.lat_db_path.is_file()
                 and self.meta_path.is_file()
             ):
                 try:
@@ -390,7 +406,7 @@ class SteelMDMStudioApp:
         """重置演播台：还原老 ERP 4 个未归并脏散码与基础规格库。"""
         with self._lock:
             self._close_stores()
-            for db_file in (self.mem_db_path, self.lat_db_path):
+            for db_file in (self.mem_db_path,):
                 if db_file.exists():
                     db_file.unlink()
                 for suffix in ("-wal", "-shm"):
@@ -402,7 +418,8 @@ class SteelMDMStudioApp:
             self.meta = self._default_meta()
             self._save_legacy_erp()
 
-            self.memory_runtime = OntologyRuntime(mdm.spec, db_path=self.mem_db_path)
+            self._open_stores()
+            assert self.memory_runtime is not None
             mdm._seed_specs(self.memory_runtime)
             self.memory_runtime.load_snapshot(
                 {
@@ -410,7 +427,6 @@ class SteelMDMStudioApp:
                     "ContractSKU": copy.deepcopy(self.legacy_erp["ContractSKU"]),
                 }
             )
-            self.latent = self.memory_runtime.open_latent_space(self.lat_db_path)
 
             self._push_timeline(
                 "INIT",
@@ -422,30 +438,19 @@ class SteelMDMStudioApp:
             return self.state_snapshot()
 
     # -- Helpers -----------------------------------------------------------
-    def _ensure_ready(self) -> tuple[OntologyRuntime, LatentSpace]:
-        assert self.memory_runtime is not None and self.latent is not None
-        return self.memory_runtime, self.latent
+    def _ensure_ready(self) -> OntologyRuntime:
+        assert self.memory_runtime is not None
+        return self.memory_runtime
 
-    def _safe_rebase_if_clear(self) -> None:
-        rt, latent = self._ensure_ready()
-        del rt
-        if not latent.pending_moves() and not latent.awaiting_approval_moves():
-            latent.rebase()
-
-    def _stage_and_settle_owned(
+    def _submit_owned(
         self,
         run_id: str,
         action_name: str,
         params: dict[str, Any],
         actor: Actor,
     ) -> dict[str, Any]:
-        rt, latent = self._ensure_ready()
-        del rt
-        # 若此前有未签批的无关暂存（例如 Act 3 挂起期间试用其他只写 Owned 动作），确保不会有 pending 堵塞
-        if latent.pending_moves():
-            raise GovernanceViolationError("unexpected unsettled pending moves in W_lat")
-        latent.stage_move(run_id, action_name, params, actor)
-        return latent.settle_move(run_id)
+        rt = self._ensure_ready()
+        return rt.submit_action(run_id, action_name, params, actor)
 
     def _upsert_legacy_sku_source(self, source_fields: dict[str, Any]) -> None:
         skus = list(self.legacy_erp.get("ContractSKU") or [])
@@ -475,7 +480,7 @@ class SteelMDMStudioApp:
         }
 
     def _overlay_rows(self) -> list[dict[str, Any]]:
-        rt, _ = self._ensure_ready()
+        rt = self._ensure_ready()
         rows = rt.connection.execute(
             "SELECT object_type, object_id, patch_json FROM ontology_overlay "
             "ORDER BY object_type, object_id"
@@ -495,14 +500,13 @@ class SteelMDMStudioApp:
     def reindex_legacy_erp(self) -> dict[str, Any]:
         """模拟老 ERP 夜间全量快照覆写 (load_snapshot)，证明 overlay 与自有主数据 100% 存活。"""
         with self._lock:
-            rt, _ = self._ensure_ready()
+            rt = self._ensure_ready()
             before = {
                 sku.sku_id: sku.canonical_spec_id
                 for sku in rt.query_objects(mdm.ContractSKU, mdm.STEWARD)
             }
             payload = self._legacy_snapshot_payload()
             snap_result = rt.load_snapshot(payload)
-            self._safe_rebase_if_clear()
 
             after = {
                 sku.sku_id: sku.canonical_spec_id
@@ -547,13 +551,13 @@ class SteelMDMStudioApp:
     def run_act_1(self) -> dict[str, Any]:
         """第一幕：死结一破局 — 4 散码零改表寄生归并 + 3 高维批次桶入库 + 夜间重刷存活。"""
         with self._lock:
-            rt, _ = self._ensure_ready()
+            rt = self._ensure_ready()
             mapped_runs: list[dict[str, Any]] = []
             for sku_id, spec_id in _DEFAULT_MAPPINGS:
                 sku = rt.get_object(mdm.ContractSKU, sku_id, mdm.STEWARD)
                 if sku.canonical_spec_id != spec_id:
                     rid = self._next_run_id(f"MDM-MAP-{sku_id[-4:]}")
-                    settled = self._stage_and_settle_owned(
+                    settled = self._submit_owned(
                         rid,
                         "map_legacy_sku_to_spec",
                         {
@@ -570,7 +574,7 @@ class SteelMDMStudioApp:
             for lot_id, sku_id, tons in _DEFAULT_LOTS:
                 if lot_id not in existing_lots:
                     rid = self._next_run_id(f"MDM-RECV-{lot_id}")
-                    settled = self._stage_and_settle_owned(
+                    settled = self._submit_owned(
                         rid,
                         "receive_material_lot",
                         {"lot_id": lot_id, "sku_id": sku_id, "initial_tons": tons},
@@ -598,9 +602,9 @@ class SteelMDMStudioApp:
 
     # -- Act 2 & Custom Probe ----------------------------------------------
     def try_register_sku(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """在持久隐空间尝试增量建码（支持前端自定义破坏性试探与智能推荐）。"""
+        """统一闭环尝试增量建码（支持前端自定义破坏性试探与智能推荐）。"""
         with self._lock:
-            rt, latent = self._ensure_ready()
+            rt = self._ensure_ready()
             sku_id = _normalize_sku_input(payload.get("sku_id"))
             invoice_title = str(payload.get("invoice_title") or "").strip()
             brand_id = _normalize_brand_input(payload.get("brand_id"))
@@ -632,7 +636,7 @@ class SteelMDMStudioApp:
             }
             run_id = self._next_run_id("MDM-REG")
             try:
-                staged = latent.stage_move(run_id, "register_contract_sku", params, mdm.BUYER)
+                settled = rt.submit_action(run_id, "register_contract_sku", params, mdm.BUYER)
             except InvariantError as exc:
                 res = {
                     "ok": True,
@@ -670,7 +674,7 @@ class SteelMDMStudioApp:
                 self._save_meta()
                 return {"probe_result": res, "state": self.state_snapshot()}
 
-            if staged["status"] == "PENDING_APPROVAL":
+            if settled["status"] == "PENDING_APPROVAL":
                 res = {
                     "ok": True,
                     "blocked": False,
@@ -683,19 +687,14 @@ class SteelMDMStudioApp:
                 }
                 self.meta["last_probe"] = res
                 self._push_timeline(
-                    "W_lat 挂起",
-                    f"新物理品种 {request_new_spec_id} ({sku_id}) 已锁入 W_lat 待批",
+                    "审批挂起",
+                    f"新物理品种 {request_new_spec_id} ({sku_id}) 已锁入待批",
                     "W_mem 主世界与老 ERP 零污染，等待 MDM 管家签批。",
                     "warn",
                 )
                 self._save_meta()
                 return {"probe_result": res, "state": self.state_snapshot()}
 
-            # 合法增量绑定已有规格 -> 写入模拟老 ERP 源表 -> 读回结算进 W_mem
-            self._upsert_legacy_sku_source(params)
-            settled = latent.settle_move(
-                run_id, readback_objects=self._legacy_snapshot_payload()
-            )
             res = {
                 "ok": True,
                 "blocked": False,
@@ -709,7 +708,7 @@ class SteelMDMStudioApp:
             self._push_timeline(
                 "合规建码",
                 f"新建散码 {sku_id} 绑定 {canonical_spec_id} 并落盘",
-                f"经 W_lat 校验并通过源表回读核验（{settled['status']}）。",
+                f"经护栏校验并通过源表回读核验（{settled['status']}）。",
                 "ok",
             )
             self._save_meta()
@@ -751,12 +750,12 @@ class SteelMDMStudioApp:
             self._save_meta()
             return {"act_result": act2_summary, "state": self.state_snapshot()}
 
-    # -- Act 3: New Physical Variety Approval in W_lat ---------------------
+    # -- Act 3: New Physical Variety Approval ------------------------------
     def run_act_3(self) -> dict[str, Any]:
-        """第三幕：采购申报全新物理品种 SPEC-C，锁入持久隐空间 W_lat 待 MDM 管家签批。"""
+        """第三幕：采购申报全新物理品种 SPEC-C，锁入 PENDING_APPROVAL 待 MDM 管家签批。"""
         with self._lock:
-            rt, latent = self._ensure_ready()
-            awaiting = latent.awaiting_approval_moves()
+            rt = self._ensure_ready()
+            awaiting = rt.list_action_runs(status="PENDING_APPROVAL")
             existing_req = next(
                 (
                     mv
@@ -766,8 +765,6 @@ class SteelMDMStudioApp:
                 None,
             )
             if existing_req is None:
-                if rt.get_object_or_none(mdm.ContractSKU, "ERP-SKU-9102", mdm.STEWARD) if hasattr(rt, "get_object_or_none") else None:
-                    pass
                 existing_sku = next(
                     (
                         item
@@ -812,7 +809,7 @@ class SteelMDMStudioApp:
                 "run_id": run_id,
                 "status": "PENDING_APPROVAL",
                 "spec_c_exists_in_mem": spec_c_exists,
-                "awaiting_count": len(latent.awaiting_approval_moves()),
+                "awaiting_count": len(rt.list_action_runs(status="PENDING_APPROVAL")),
             }
             self._mark_act_done("3", act3_summary)
             self._save_meta()
@@ -825,16 +822,16 @@ class SteelMDMStudioApp:
         run_id: str | None = None,
         approver_id: str | None = None,
     ) -> dict[str, Any]:
-        """MDM 管家签批或驳回 W_lat 中挂起的新物理品种申请。"""
+        """MDM 管家签批或驳回挂起的新物理品种申请。"""
         with self._lock:
-            rt, latent = self._ensure_ready()
+            rt = self._ensure_ready()
             target_run_id = str(run_id or "").strip()
             if not target_run_id:
-                awaiting = latent.awaiting_approval_moves()
+                awaiting = rt.list_action_runs(status="PENDING_APPROVAL")
                 if not awaiting:
                     return {
                         "ok": False,
-                        "error": "W_lat 当前没有待签批的新规格申请",
+                        "error": "当前没有待签批的新规格申请",
                         "state": self.state_snapshot(),
                     }
                 target_run_id = str(awaiting[0]["run_id"])
@@ -845,15 +842,10 @@ class SteelMDMStudioApp:
                 clearance_tags=set(mdm.STEWARD.clearance_tags),
             )
             if op == "approve":
-                move = latent.approve_move(target_run_id, steward)
-                self._upsert_legacy_sku_source(move["params"])
-                settled = latent.settle_move(
-                    target_run_id,
-                    readback_objects=self._legacy_snapshot_payload(),
-                )
+                settled = rt.approve_action(target_run_id, steward)
+                spec_id = (settled.get("params") or {}).get("request_new_spec_id")
                 spec_c_exists = any(
-                    row["object_id"] == move["params"].get("request_new_spec_id")
-                    or row["object_id"] == "SPEC-C"
+                    row["object_id"] == spec_id or row["object_id"] == "SPEC-C"
                     for row in rt.list_objects("MaterialSpec")
                 )
                 res = {
@@ -868,11 +860,11 @@ class SteelMDMStudioApp:
                 self._push_timeline(
                     "ACT 3 签批",
                     f"MDM 管家 {steward.actor_id} 批准新规格入库 ({settled['status']})",
-                    f"post_approval 原子创建物理规格并完成 sku_maps_to_spec 关联。",
+                    "post_approval 原子创建物理规格并完成 sku_maps_to_spec 关联。",
                     "ok",
                 )
             elif op == "reject":
-                rejected = latent.reject_move(
+                rejected = rt.reject_action(
                     target_run_id, steward, reason="主数据管家驳回新规格申请"
                 )
                 res = {
@@ -905,11 +897,11 @@ class SteelMDMStudioApp:
     def consume_brand(self, *, brand_id: str = "BRAND-1", tons: int = 150) -> dict[str, Any]:
         """车间报工系统只按厂家盲投（先进先出）扣减高维批次桶，或拦截超库存投料。"""
         with self._lock:
-            rt, _ = self._ensure_ready()
+            rt = self._ensure_ready()
             norm_brand = _normalize_brand_input(brand_id)
             run_id = self._next_run_id("MDM-CONS")
             try:
-                settled = self._stage_and_settle_owned(
+                settled = self._submit_owned(
                     run_id,
                     "consume_by_brand_fifo",
                     {"brand_id": norm_brand, "tons": int(tons)},
@@ -955,7 +947,7 @@ class SteelMDMStudioApp:
     def run_act_4(self) -> dict[str, Any]:
         """第四幕：死结二破局 — 车间只按 BRAND-1 盲投 150 吨，三视角数学恒等对账。"""
         with self._lock:
-            rt, _ = self._ensure_ready()
+            rt = self._ensure_ready()
             if not rt.list_objects("MaterialLot"):
                 self.run_act_1()
             lots = rt.query_objects(mdm.MaterialLot, mdm.STEWARD)
@@ -980,7 +972,7 @@ class SteelMDMStudioApp:
     def revert_action_run(self, *, run_id: str | None = None) -> dict[str, Any]:
         """第五幕：1 秒时光机无损冲正指定或最近一条已生效业务变更。"""
         with self._lock:
-            rt, _ = self._ensure_ready()
+            rt = self._ensure_ready()
             target_run: dict[str, Any] | None = None
             runs = rt.list_action_runs("COMMITTED")
             if run_id:
@@ -1014,12 +1006,6 @@ class SteelMDMStudioApp:
             rev_id = self._next_run_id("MDM-REV")
             rev_run = rt.revert_action(target_id, rev_id, actor)
 
-            if action_type == "register_contract_sku":
-                sku_id = str((target_run.get("params") or {}).get("sku_id") or "")
-                if sku_id:
-                    self._remove_legacy_sku_source(sku_id)
-
-            self._safe_rebase_if_clear()
             ledger = rt.call_function("reconcile_multi_view_ledger", {}, mdm.STEWARD)
             rev_summary = {
                 "ok": True,
@@ -1055,9 +1041,9 @@ class SteelMDMStudioApp:
 
     # -- Live Multi-Board State Snapshot -----------------------------------
     def state_snapshot(self) -> dict[str, Any]:
-        """返回 W_real / W_mem / W_lat / 三视角对账账本与 ObjectSet 拓扑快照。"""
+        """返回 W_real / W_mem / 审批态 / 三视角对账账本与 ObjectSet 拓扑快照。"""
         with self._lock:
-            rt, latent = self._ensure_ready()
+            rt = self._ensure_ready()
 
             specs = [
                 {
@@ -1168,7 +1154,7 @@ class SteelMDMStudioApp:
             by_rid: dict[str, dict[str, Any]] = {}
             for item in list(self.meta.get("guardrail_history") or []):
                 by_rid[str(item["run_id"])] = dict(item)
-            for r in latent.latent_runtime.list_action_runs("REJECTED"):
+            for r in rt.list_action_runs("REJECTED"):
                 by_rid[str(r["run_id"])] = {
                     "run_id": r["run_id"],
                     "action_type": r["action_type"],
@@ -1185,16 +1171,9 @@ class SteelMDMStudioApp:
                     "action_type": mv["action_type"],
                     "params": mv.get("params"),
                 }
-                for mv in latent.awaiting_approval_moves()
+                for mv in rt.list_action_runs("PENDING_APPROVAL")
             ]
-            pending = [
-                {
-                    "run_id": mv["run_id"],
-                    "action_type": mv["action_type"],
-                    "params": mv.get("params"),
-                }
-                for mv in latent.pending_moves()
-            ]
+            pending: list[dict[str, Any]] = []
 
             snapshot = {
                 "studio": {
@@ -1220,7 +1199,7 @@ class SteelMDMStudioApp:
                     "recent_runs": mem_runs,
                 },
                 "w_lat": {
-                    "db_path": str(self.lat_db_path),
+                    "db_path": None,
                     "awaiting_approval_count": len(awaiting),
                     "awaiting_approval_moves": awaiting,
                     "pending_count": len(pending),

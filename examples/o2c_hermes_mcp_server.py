@@ -341,6 +341,7 @@ class PersistentO2CSession:
             )
             adapter._seen = set(meta.get("seen_run_ids") or [])
 
+            adapter.bind_coupled(allow_source_revert=True)
             gw = FeishuApprovalGateway(
                 rt,
                 adapter=adapter,
@@ -392,6 +393,7 @@ class PersistentO2CSession:
             self.adapter = OdooO2CAdapter(self.runtime)
             self.adapter.seed_odoo(empty_orders=empty_orders)
             self.adapter.sync_from_odoo()
+            self.adapter.bind_coupled(allow_source_revert=True)
             self.gateway = FeishuApprovalGateway(
                 self.runtime,
                 adapter=self.adapter,
@@ -589,7 +591,7 @@ class PersistentO2CSession:
                     "message": f"新建销售订单被拒绝：{exc}",
                 }
 
-            erp_evidence = self.adapter.process_new_runs()
+            erp_evidence = self.adapter.get_run_evidence(run["run_id"])
 
             note_run_id: str | None = None
             note_params: dict[str, Any] = {"order": order_id}
@@ -663,7 +665,7 @@ class PersistentO2CSession:
 
             erp_evidence: list[dict[str, Any]] = []
             if run["status"] == "COMMITTED":
-                erp_evidence = self.adapter.process_new_runs()
+                erp_evidence = self.adapter.get_run_evidence(confirm_run_id)
                 self.gateway.register_committed_card(confirm_run_id, erp_evidence)
 
             rec = self.gateway.get_card_record(confirm_run_id)
@@ -712,7 +714,7 @@ class PersistentO2CSession:
                     "message": f"仓库发货被拦截：{exc}",
                     "order": self._order_summary(order_id),
                 }
-            erp_evidence = self.adapter.process_new_runs()
+            erp_evidence = self.adapter.get_run_evidence(run["run_id"])
             self._save_meta()
             return {
                 "ok": True,
@@ -755,7 +757,7 @@ class PersistentO2CSession:
                     "order": self._order_summary(order_id),
                 }
 
-            erp_evidence = self.adapter.process_new_runs()
+            erp_evidence = self.adapter.get_run_evidence(run["run_id"])
             rec = self.gateway.register_committed_card(run_id, erp_evidence)
             self._save_meta()
             return {
@@ -798,7 +800,7 @@ class PersistentO2CSession:
                     "message": f"收款核销被拦截：{exc}",
                     "order": self._order_summary(order_id),
                 }
-            erp_evidence = self.adapter.process_new_runs()
+            erp_evidence = self.adapter.get_run_evidence(run["run_id"])
             self._save_meta()
             return {
                 "ok": True,

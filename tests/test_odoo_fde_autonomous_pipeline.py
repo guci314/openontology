@@ -3,7 +3,7 @@
 覆盖：
 1. 源码零硬编码守卫：``examples/odoo_fde_autonomous_pipeline.py`` 零业务表名、零字段名、零方法名、零阈值；
 2. 离线跨领域全链路（合成诊所 ERP）：证明 Probe 1+2+3 → 零剧本自动合成 → 五关熔炉 → Steward 结晶
-   → ``DeclarativeOdooBridge`` 双向驱动 + ``LatentSpace.settle_move`` 同态核销（``COMMITTED``）
+   → ``DeclarativeOdooBridge`` 双向驱动 + 闭环同态核销（``COMMITTED``）
    与外部漂移保护（``DEVICE_STATE_MISMATCH``）全自动跑通；
 3. 本机真实 Odoo 19 (``erp_north``) 全链路验收：验证生产库零写入、临时克隆库退出自动销毁、
    五关全绿结晶且真实双向调用克隆 Odoo 核销 ``COMMITTED`` + 漂移拦截 ``DEVICE_STATE_MISMATCH``。
@@ -71,7 +71,7 @@ def test_autonomous_pipeline_end_to_end_offline_synthetic_clinic_erp() -> None:
     assert cryst["gate_3_metrics"]["positive_rate"] == 1.0
     assert cryst["gate_3_metrics"]["negative_rate"] == 1.0
 
-    # Step 2: 双向执行 + LatentSpace 同态核销
+    # Step 2: 双向执行 + 闭环同态核销
     homo = out["homomorphic_settlement_runs"]
     assert len(homo) >= 1
     assert all(r["settled_status"] == "COMMITTED" and r["homomorphic_match"] for r in homo)
@@ -128,7 +128,7 @@ def test_autonomous_pipeline_live_odoo19_step1_and_step2_zero_leak() -> None:
     assert cryst["gate_3_metrics"]["positive_rate"] == 1.0
     assert cryst["gate_3_metrics"]["negative_rate"] == 1.0
 
-    # Step 2: 至少两条真实双向调用经 LatentSpace 同态核销 COMMITTED
+    # Step 2: 至少两条真实双向调用经闭环同态核销 COMMITTED
     homo = out["homomorphic_settlement_runs"]
     assert len(homo) >= 2
     assert all(r["settled_status"] == "COMMITTED" and r["homomorphic_match"] for r in homo)
