@@ -40,6 +40,15 @@ from .crucible import (
     ReplayEvent,
     SymbolicCrucible,
 )
+from .disambiguation import (
+    DisambiguationChoice,
+    DisambiguationOption,
+    GrayZoneAmbiguity,
+    StewardDisambiguationDecision,
+    compile_disambiguation_to_evolution_patch,
+    crystallize_disambiguated_patch,
+    default_disambiguation_options,
+)
 from .dsl import (
     ActionBlueprint,
     ActionMutationSpec,
@@ -179,6 +188,14 @@ __all__ = [
     "GateResult",
     "CrucibleReport",
     "SymbolicCrucible",
+    # M2 gray-zone human-in-the-loop disambiguation
+    "DisambiguationChoice",
+    "DisambiguationOption",
+    "GrayZoneAmbiguity",
+    "StewardDisambiguationDecision",
+    "default_disambiguation_options",
+    "compile_disambiguation_to_evolution_patch",
+    "crystallize_disambiguated_patch",
     # Meta-bootstrapped governance ontology
     "ActiveModelHead",
     "FrictionCluster",

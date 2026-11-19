@@ -10,7 +10,7 @@ import uuid
 from collections import defaultdict
 from typing import Any, Callable, Literal, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator, model_validator
 
 from ..sandbox import EditBatch, InvariantView, ObjectDiff
 from ..spec import (
@@ -181,6 +181,11 @@ class InvariantRuleSpec(BaseModel):
     must_hold: dict[str, Any]
     description: str = ""
 
+    @field_validator("when", mode="before")
+    @classmethod
+    def _empty_when_to_none(cls, v: Any) -> Any:
+        return None if v == {} else v
+
 
 class ActionMutationSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -208,6 +213,11 @@ class ActionBlueprint(BaseModel):
     mutations: list[ActionMutationSpec] = Field(default_factory=list)
     view_tags: list[str] = Field(default_factory=list)
     display_label: str = ""
+
+    @field_validator("approval_rule", mode="before")
+    @classmethod
+    def _empty_approval_rule_to_none(cls, v: Any) -> Any:
+        return None if v == {} else v
 
 
 class ScopedViewBlueprint(BaseModel):
@@ -492,7 +502,7 @@ def _validate_value_node(
                 f"aggregate {op!r} requires string or value-AST 'field'",
                 code="INVALID_PREDICATE_AST",
             )
-        if "where" in node and node["where"] is not None:
+        if node.get("where"):
             _validate_expr_node(
                 node["where"],
                 expect_bool=True,
@@ -527,8 +537,10 @@ def _validate_expr_node(
         raise InvariantError("predicate node must be a JSON object", code="INVALID_PREDICATE_AST")
     op = node.get("op")
     if op not in ALLOWED_EXPR_OPS:
+        snippet = json.dumps(node, ensure_ascii=False)[:180]
         raise InvariantError(
-            f"disallowed predicate operator {op!r}",
+            f"disallowed predicate operator {op!r} in {snippet} "
+            f"(boolean AST requires 'op' in {sorted(ALLOWED_EXPR_OPS)})",
             code="UNSAFE_EXPRESSION",
         )
     if op in ("and", "or"):
@@ -561,7 +573,7 @@ def _validate_expr_node(
         obj_type = node.get("object_type")
         _assert_safe_identifier(str(obj_type or ""), "quantifier object_type")
         sub_allowed = (allowed_roots | {"target"}) if allowed_roots is not None else None
-        if "where" in node and node["where"] is not None:
+        if node.get("where"):
             _validate_expr_node(
                 node["where"],
                 expect_bool=True,
@@ -678,7 +690,7 @@ def _eval_value(
             for cand in view.query(target_cls):
                 sub_ctx = dict(context)
                 sub_ctx["target"] = cand
-                if where is not None and not eval_predicate(where, sub_ctx, view):
+                if where and not eval_predicate(where, sub_ctx, view):
                     continue
                 v = (
                     getattr(cand, field_spec, None)
@@ -756,7 +768,7 @@ def eval_predicate(
         for cand in candidates:
             sub_ctx = dict(context)
             sub_ctx["target"] = cand
-            if where is None or eval_predicate(where, sub_ctx, view):
+            if not where or eval_predicate(where, sub_ctx, view):
                 matched += 1
         if op == "exists":
             return matched > 0
@@ -1323,6 +1335,7 @@ def compile_blueprint(
         owned_fields: dict[str, Any] = {}
         masked_fields: dict[str, tuple[str, ...]] = {}
         non_neg_fields: list[str] = []
+        optional_scalar_defaults: dict[str, Any] = {}
 
         pk_declared = False
         for fld in ot.fields:
@@ -1336,6 +1349,7 @@ def compile_blueprint(
                 default_val: Any = ... if fld.default is None else fld.default
             else:
                 default_val = _default_for_type(py_type) if fld.default is None else fld.default
+                optional_scalar_defaults[fld.name] = default_val
             field_defs[fld.name] = (ann, default_val)
             if fld.owned:
                 owned_fields[fld.name] = None if default_val is ... else default_val
@@ -1392,7 +1406,24 @@ def compile_blueprint(
         else:
             resolved_owned = False
 
-        cls = create_model(ot.name, __base__=base_cls, **field_defs)
+        validators: dict[str, Any] | None = None
+        if optional_scalar_defaults:
+            def _make_null_coercer(defaults_map: dict[str, Any]) -> Any:
+                @model_validator(mode="before")
+                @classmethod
+                def _coerce_null_optional_scalars(_cls_inner: Any, data: Any) -> Any:
+                    if isinstance(data, dict):
+                        return {
+                            k: (defaults_map[k] if (v is None and k in defaults_map) else v)
+                            for k, v in data.items()
+                        }
+                    return data
+
+                return _coerce_null_optional_scalars
+
+            validators = {"_coerce_null_optional_scalars": _make_null_coercer(dict(optional_scalar_defaults))}
+
+        cls = create_model(ot.name, __base__=base_cls, __validators__=validators, **field_defs)
         cls.__primary_key__ = ot.primary_key
         cls.__title__ = ot.title_field or ot.primary_key
         cls.__aggregate_root__ = bool(agg_root)
@@ -1950,7 +1981,9 @@ def dsl_schema_prompt_guide(
             "Populate 'setup_objects' with self-contained synthetic records (using synthetic IDs such as "
             "'EVAL-CUST-1', 'EVAL-ORD-1') so the case executes deterministically in Gate 4 without depending on "
             "ephemeral M0 rows. Gate 4 immediately executes every proposed_eval_case against your candidate blueprint "
-            "before crystallization."
+            "before crystallization. In simulation, a triggered 'preconditions' rule yields "
+            "expect={'valid': false, 'error_code': '<code>'}, whereas a triggered 'approval_rule' yields "
+            "expect={'valid': true, 'requires_approval': true} (error_code=null)."
         ),
     }
     if mode == "genesis":

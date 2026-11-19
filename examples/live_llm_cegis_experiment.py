@@ -33,6 +33,9 @@ from pathlib import Path
 from typing import Any
 
 from open_ontology import OntologyRuntime
+from open_ontology.runtime import SimulationResult
+from open_ontology.sandbox import ObjectDiff
+from open_ontology.spec import PermissionDeniedError
 from open_ontology.induction import (
     AbductionBackend,
     ActionExecutionBinding,
@@ -1430,8 +1433,21 @@ def run_live_llm_l2_architect_experiment(
                     )
                 )
 
+                def _sim_safe(act_name: str, params: dict[str, Any], actor: Any) -> SimulationResult:
+                    try:
+                        return rt.simulate_action(act_name, params, actor)
+                    except PermissionDeniedError as exc:
+                        return SimulationResult(
+                            valid=False,
+                            diff=ObjectDiff(),
+                            requires_approval=False,
+                            read_versions={},
+                            error=str(exc),
+                            error_code="PermissionDeniedError",
+                        )
+
                 # 1. Partial payment 50% (10,000 of 20,000)
-                s_part = rt.simulate_action(
+                s_part = _sim_safe(
                     c_pay.action_name,
                     {c_pay.id_param: f"{c_pay.id_prefix}901", amt_p: 10000.0},
                     AI_OPS_ACTOR,
@@ -1453,7 +1469,7 @@ def run_live_llm_l2_architect_experiment(
                         fk.close()
 
                 # 2. Full payment 100% (20,000 of 20,000)
-                s_full = rt.simulate_action(
+                s_full = _sim_safe(
                     c_pay.action_name,
                     {c_pay.id_param: f"{c_pay.id_prefix}902", amt_p: 20000.0},
                     AI_OPS_ACTOR,
@@ -1478,7 +1494,7 @@ def run_live_llm_l2_architect_experiment(
                     ("non_positive", "901", 0.0),
                     ("draft_invoice", "903", 10000.0),
                 ):
-                    s_bad = rt.simulate_action(
+                    s_bad = _sim_safe(
                         c_pay.action_name,
                         {c_pay.id_param: f"{c_pay.id_prefix}{inv_num}", amt_p: amt},
                         AI_OPS_ACTOR,
@@ -1487,7 +1503,7 @@ def run_live_llm_l2_architect_experiment(
                         errs.append(f"Payment action MUST reject {bad_label}, but simulate_action returned valid=True.")
 
                 # 4. Delivery validation assigned -> done
-                s_val = rt.simulate_action(
+                s_val = _sim_safe(
                     c_val.action_name,
                     {c_val.id_param: f"{c_val.id_prefix}901"},
                     AI_OPS_ACTOR,
@@ -1507,14 +1523,14 @@ def run_live_llm_l2_architect_experiment(
                         fk.close()
 
                 # 5. Steward credit-note refund vs ai_agent blocked/approval
-                s_ref_ai = rt.simulate_action(
+                s_ref_ai = _sim_safe(
                     c_ref.action_name,
                     {c_ref.id_param: f"{c_ref.id_prefix}901"},
                     AI_OPS_ACTOR,
                 )
                 if s_ref_ai.valid and not s_ref_ai.requires_approval:
                     errs.append("Credit-note refund MUST NOT commit unapproved for ai_agent.")
-                s_ref_st = rt.simulate_action(
+                s_ref_st = _sim_safe(
                     c_ref.action_name,
                     {c_ref.id_param: f"{c_ref.id_prefix}901"},
                     STEWARD_OPS_ACTOR,

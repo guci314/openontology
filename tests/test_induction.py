@@ -2612,3 +2612,104 @@ def test_stage1_p1_3_phenomenon_false_handling_and_p1_4_crucible_encapsulation(t
     finally:
         gov.close()
 
+
+def test_incident_expect_blocked_or_approval_accepts_both_reject_and_pending_approval() -> None:
+    """IncidentCounterexample.expect_blocked_or_approval accepts rejection and PENDING_APPROVAL but blocks unguarded commits."""
+    base_fields = [
+        FieldSpec(name="deal_id", field_type="str", required=True),
+        FieldSpec(name="amount", field_type="float", default=0.0, non_negative=True),
+        FieldSpec(name="status", field_type="str", default="open"),
+    ]
+    m0 = [
+        {"object_type": "Deal", "data": {"deal_id": "D-OK", "amount": 50.0, "status": "open"}},
+        {"object_type": "Deal", "data": {"deal_id": "D-BIG", "amount": 5000.0, "status": "open"}},
+    ]
+    inc = IncidentCounterexample(
+        name="INC-BIG-DEAL",
+        action="close_deal",
+        params={"deal_id": "D-BIG"},
+        actor=AI_AGENT,
+        expect_valid=None,
+        expect_blocked_or_approval=True,
+    )
+    pos = [ReplayEvent(name="POS-OK", action="close_deal", params={"deal_id": "D-OK"}, actor=AI_AGENT, expected_valid=True)]
+
+    # 1. Unguarded blueprint fails Gate 3
+    unguarded = DeclarativeBlueprint(
+        model_id="deal_guard_test",
+        version="1.0.0",
+        object_types=[ObjectTypeBlueprint(name="Deal", primary_key="deal_id", fields=base_fields)],
+        actions=[
+            ActionBlueprint(
+                name="close_deal",
+                allowed_roles=["ai_agent", "steward"],
+                params=[FieldSpec(name="deal_id", field_type="str", required=True)],
+                mutations=[ActionMutationSpec(op="modify", object_type="Deal", id_param="deal_id", set_fields={"status": {"lit": "closed"}})],
+            )
+        ],
+    )
+    r_unguarded = SymbolicCrucible().evaluate(
+        unguarded,
+        CrucibleContext(mode="evolution", m0_objects=m0, positive_events=pos, incident_counterexamples=[inc], default_actor=AI_AGENT),
+    )
+    assert not r_unguarded.passed
+
+    # 2. Hard precondition rejection passes Gate 3
+    hard_block = DeclarativeBlueprint(
+        model_id="deal_guard_test",
+        version="1.1.0",
+        object_types=[ObjectTypeBlueprint(name="Deal", primary_key="deal_id", fields=base_fields)],
+        actions=[
+            ActionBlueprint(
+                name="close_deal",
+                allowed_roles=["ai_agent", "steward"],
+                params=[FieldSpec(name="deal_id", field_type="str", required=True)],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="limit",
+                        code="BIG_DEAL_BLOCKED",
+                        target_type="Deal",
+                        id_param="deal_id",
+                        must_hold={"op": "le", "left": {"ref": "obj.amount"}, "right": {"lit": 1000.0}},
+                    )
+                ],
+                mutations=[ActionMutationSpec(op="modify", object_type="Deal", id_param="deal_id", set_fields={"status": {"lit": "closed"}})],
+            )
+        ],
+    )
+    r_hard = SymbolicCrucible().evaluate(
+        hard_block,
+        CrucibleContext(mode="evolution", m0_objects=m0, positive_events=pos, incident_counterexamples=[inc], default_actor=AI_AGENT),
+    )
+    assert r_hard.passed
+
+    # 3. Stage 1 approval_rule gating (PENDING_APPROVAL) also passes Gate 3
+    appr_gate = DeclarativeBlueprint(
+        model_id="deal_guard_test",
+        version="1.2.0",
+        object_types=[ObjectTypeBlueprint(name="Deal", primary_key="deal_id", fields=base_fields)],
+        actions=[
+            ActionBlueprint(
+                name="close_deal",
+                allowed_roles=["ai_agent", "steward"],
+                approver_roles=["steward"],
+                approval_target_type="Deal",
+                approval_id_param="deal_id",
+                approval_rule={
+                    "op": "and",
+                    "args": [
+                        {"op": "ne", "left": {"ref": "actor.role"}, "right": {"lit": "steward"}},
+                        {"op": "gt", "left": {"ref": "obj.amount"}, "right": {"lit": 1000.0}},
+                    ],
+                },
+                params=[FieldSpec(name="deal_id", field_type="str", required=True)],
+                mutations=[ActionMutationSpec(op="modify", object_type="Deal", id_param="deal_id", set_fields={"status": {"lit": "closed"}})],
+            )
+        ],
+    )
+    r_appr = SymbolicCrucible().evaluate(
+        appr_gate,
+        CrucibleContext(mode="evolution", m0_objects=m0, positive_events=pos, incident_counterexamples=[inc], default_actor=AI_AGENT),
+    )
+    assert r_appr.passed
+

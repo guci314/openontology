@@ -39,6 +39,8 @@ __all__ = [
     "FeishuGatewayError",
     "format_run_for_executive",
     "build_feishu_card",
+    "build_feishu_gray_zone_ruling_card",
+    "parse_feishu_ruling_callback",
     "verify_feishu_signature",
     "start_feishu_ws_listener",
 ]
@@ -520,6 +522,128 @@ def build_feishu_card(
             },
         },
         "elements": elements,
+    }
+
+
+def build_feishu_gray_zone_ruling_card(
+    card_view: dict[str, Any],
+    *,
+    callback_token: str = "",
+) -> dict[str, Any]:
+    """构造 AI-FDE 0.7 -> 1.0 未决灰区交互式裁决卡（附反例样本与可选裁决分支）。"""
+    status = str(card_view.get("status") or "PENDING_RULING")
+    card_id = str(card_view.get("card_id") or "")
+    ambiguity_id = str(card_view.get("ambiguity_id") or "")
+    title = str(card_view.get("title") or f"语义灰区待裁决（{ambiguity_id}）")
+    model_id = str(card_view.get("model_id") or "")
+    target_ot = str(card_view.get("target_object_type") or "")
+    target_action = str(card_view.get("target_action") or "")
+    summary = str(card_view.get("summary") or "")
+    sop_excerpt = str(card_view.get("sop_excerpt") or "")
+    samples = list(card_view.get("samples") or [])
+    options = list(card_view.get("options") or [])
+    recommended = str(card_view.get("recommended_choice") or "")
+
+    md_lines = [
+        f"**模型 / 目标对象**：`{model_id}` ｜ `{target_ot}` · 动作 `{target_action}`",
+        f"**歧义摘要**：{summary}",
+    ]
+    if sop_excerpt:
+        md_lines.append(f"**SOP / 文档条款摘录**：> {sop_excerpt}")
+    if samples:
+        md_lines.append("\n**真实账本反例样本（Observed Counterexamples）**")
+        for idx, smp in enumerate(samples[:5], start=1):
+            pretty = " · ".join(f"{k}={v}" for k, v in smp.items())
+            md_lines.append(f"• 样本 {idx}：{pretty}")
+    if recommended:
+        md_lines.append(f"\n**保守推荐策略**：`{recommended}`")
+
+    if status == "CRYSTALLIZED":
+        header_template = "green"
+        decided_choice = str(card_view.get("decided_choice") or "")
+        decided_by = str(card_view.get("decided_by") or "steward")
+        target_ver = str(card_view.get("crystallized_version") or "")
+        header_title = f"【已裁决结晶 v{target_ver}】{title}"
+        md_lines.append(
+            f"\n**裁决结果**：`{decided_choice}`（裁决人：{decided_by} ｜ 已通过 5-Gate 证伪并写入 GoldenEvalCase）"
+        )
+    else:
+        header_template = "orange"
+        header_title = f"【0.7→1.0 灰区待裁决】{title}"
+
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(md_lines)}},
+        {"tag": "hr"},
+    ]
+
+    if status == "PENDING_RULING" and options:
+        btn_types = {
+            "HARD_REJECT": "danger",
+            "REQUIRE_APPROVAL": "primary",
+            "ALLOW_AUTONOMOUS": "default",
+        }
+        buttons = [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": str(opt.get("label") or opt["choice_id"])},
+                "type": btn_types.get(str(opt["choice_id"]), "default"),
+                "value": {
+                    "kind": "gray_zone_ruling",
+                    "card_id": card_id,
+                    "ambiguity_id": ambiguity_id,
+                    "choice_id": str(opt["choice_id"]),
+                    "token": callback_token,
+                },
+            }
+            for opt in options
+        ]
+        elements.append({"tag": "action", "actions": buttons})
+    else:
+        elements.append(
+            {
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": f"裁决单 {card_id} 已锁定终态（{status}）。",
+                    }
+                ],
+            }
+        )
+
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "template": header_template,
+            "title": {"tag": "plain_text", "content": header_title},
+        },
+        "elements": elements,
+    }
+
+
+def parse_feishu_ruling_callback(
+    payload: dict[str, Any],
+    *,
+    callback_token: str = "",
+) -> dict[str, str]:
+    """解析并校验飞书 Steward 灰区裁决回调，返回标准裁决字段。"""
+    val, open_id = FeishuApprovalGateway._extract_callback_fields(payload)
+    if callback_token:
+        supplied = str(val.get("token") or "")
+        if not hmac.compare_digest(supplied, callback_token):
+            raise PermissionDeniedError("invalid gray-zone ruling callback token")
+    if str(val.get("kind") or "") != "gray_zone_ruling":
+        raise FeishuGatewayError(f"unsupported callback kind {val.get('kind')!r}")
+    card_id = str(val.get("card_id") or "")
+    ambiguity_id = str(val.get("ambiguity_id") or "")
+    choice_id = str(val.get("choice_id") or "")
+    if not card_id or not ambiguity_id or not choice_id:
+        raise FeishuGatewayError("gray_zone_ruling callback missing card_id/ambiguity_id/choice_id")
+    return {
+        "card_id": card_id,
+        "ambiguity_id": ambiguity_id,
+        "choice_id": choice_id,
+        "operator_open_id": open_id,
     }
 
 

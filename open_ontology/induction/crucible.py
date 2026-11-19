@@ -16,9 +16,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Sequence
 
 from ..osdk import EvalReport, run_eval_suite
-from ..runtime import OntologyRuntime
-from ..sandbox import EditBatch
-from ..spec import Actor, InvariantError, OntologySpec
+from ..runtime import OntologyRuntime, SimulationResult
+from ..sandbox import EditBatch, ObjectDiff
+from ..spec import Actor, InvariantError, OntologySpec, PermissionDeniedError
 from .dsl import (
     COMPARISON_OPS,
     DeclarativeBlueprint,
@@ -72,6 +72,7 @@ class IncidentCounterexample:
     expect_valid: bool | None = None
     expect_error_code: str | None = None
     expect_requires_approval: bool | None = None
+    expect_blocked_or_approval: bool = False
     expect_after: dict[str, Any] | None = None
     setup_objects: tuple[dict[str, Any], ...] = ()
 
@@ -474,6 +475,23 @@ def _walk_overfitting_checks(
                     )
 
 
+def _simulate_action_with_rbac(
+    rt: OntologyRuntime, action: str, params: dict[str, Any], actor: Actor
+) -> SimulationResult:
+    """Wrap simulate_action so PermissionDeniedError becomes a structured invalid SimulationResult."""
+    try:
+        return rt.simulate_action(action, params, actor)
+    except PermissionDeniedError as exc:
+        return SimulationResult(
+            valid=False,
+            diff=ObjectDiff(),
+            requires_approval=False,
+            read_versions={},
+            error=str(exc),
+            error_code="PermissionDeniedError",
+        )
+
+
 def _run_single_eval_case(
     sandbox_rt: OntologyRuntime,
     compiled_spec: OntologySpec,
@@ -524,6 +542,15 @@ def _run_single_eval_case(
         rep: EvalReport = run_eval_suite(case_rt, default_actor, [osdk_case])
         res = rep.results[0]
         failures = list(res.failures)
+        if (
+            raw_expect.get("valid") is False
+            and not raw_expect.get("requires_approval")
+            and len(failures) == 1
+            and failures[0].startswith("simulate raised PermissionDeniedError:")
+        ):
+            failures = []
+            if res.simulation is not None:
+                res.simulation["error_code"] = "PermissionDeniedError"
         exp_code = raw_expect.get("error_code")
         if exp_code:
             sim = res.simulation or {}
@@ -794,15 +821,18 @@ class SymbolicCrucible:
                 pos_events = list(context.positive_events)
                 neg_events = list(context.negative_events)
                 if context.replay_factory is not None:
-                    sig_params = len(inspect.signature(context.replay_factory).parameters)
-                    if sig_params >= 3:
-                        dyn_pos, dyn_neg = context.replay_factory(
-                            migrated, candidate, context.adapter_mapping
-                        )
-                    else:
-                        dyn_pos, dyn_neg = context.replay_factory(migrated)
-                    pos_events.extend(dyn_pos)
-                    neg_events.extend(dyn_neg)
+                    try:
+                        sig_params = len(inspect.signature(context.replay_factory).parameters)
+                        if sig_params >= 3:
+                            dyn_pos, dyn_neg = context.replay_factory(
+                                migrated, candidate, context.adapter_mapping
+                            )
+                        else:
+                            dyn_pos, dyn_neg = context.replay_factory(migrated)
+                        pos_events.extend(dyn_pos)
+                        neg_events.extend(dyn_neg)
+                    except Exception as exc:
+                        g3_errors.append(f"replay_factory failed: {type(exc).__name__}: {exc}")
                 pos_total = len(pos_events)
                 pos_ok = 0
                 for ev in pos_events:
@@ -812,7 +842,7 @@ class SymbolicCrucible:
                             migrated_so = migrate_m0_snapshot([so], candidate.migrations)[0]
                             cls = compiled_spec.get_object_type(migrated_so["object_type"])
                             ev_rt.put_object(cls(**migrated_so["data"]))
-                        sim = ev_rt.simulate_action(ev.action, ev.params, ev.actor)
+                        sim = _simulate_action_with_rbac(ev_rt, ev.action, ev.params, ev.actor)
                         if sim.valid == ev.expected_valid and (
                             ev.expected_requires_approval is None
                             or sim.requires_approval == ev.expected_requires_approval
@@ -837,7 +867,7 @@ class SymbolicCrucible:
                             migrated_so = migrate_m0_snapshot([so], candidate.migrations)[0]
                             cls = compiled_spec.get_object_type(migrated_so["object_type"])
                             nev_rt.put_object(cls(**migrated_so["data"]))
-                        sim = nev_rt.simulate_action(nev.action, nev.params, nev.actor)
+                        sim = _simulate_action_with_rbac(nev_rt, nev.action, nev.params, nev.actor)
                         blocked = not sim.valid
                         code_match = (
                             nev.expected_error_code is None
@@ -870,6 +900,7 @@ class SymbolicCrucible:
                 g3_passed = (
                     pos_rate >= context.min_positive_replay_rate
                     and neg_rate >= context.min_negative_rejection_rate
+                    and not g3_errors
                 )
             else:
                 inc_total = len(context.incident_counterexamples)
@@ -881,7 +912,7 @@ class SymbolicCrucible:
                             migrated_so = migrate_m0_snapshot([so], candidate.migrations)[0]
                             cls = compiled_spec.get_object_type(migrated_so["object_type"])
                             inc_rt.put_object(cls(**migrated_so["data"]))
-                        sim = inc_rt.simulate_action(inc.action, inc.params, inc.actor)
+                        sim = _simulate_action_with_rbac(inc_rt, inc.action, inc.params, inc.actor)
                         ok = True
                         if inc.expect_valid is not None and sim.valid != inc.expect_valid:
                             ok = False
@@ -904,6 +935,12 @@ class SymbolicCrucible:
                             g3_errors.append(
                                 f"incident {inc.name!r}: expected requires_approval="
                                 f"{inc.expect_requires_approval}, got {sim.requires_approval}"
+                            )
+                        if inc.expect_blocked_or_approval and sim.valid and not sim.requires_approval:
+                            ok = False
+                            g3_errors.append(
+                                f"incident {inc.name!r}: expected rejection or approval gate, got "
+                                f"unguarded valid=True, requires_approval=False"
                             )
                         if inc.expect_after is not None and sim.valid:
                             matched_after = False
@@ -937,7 +974,7 @@ class SymbolicCrucible:
                             migrated_so = migrate_m0_snapshot([so], candidate.migrations)[0]
                             cls = compiled_spec.get_object_type(migrated_so["object_type"])
                             ev_rt.put_object(cls(**migrated_so["data"]))
-                        sim = ev_rt.simulate_action(ev.action, ev.params, ev.actor)
+                        sim = _simulate_action_with_rbac(ev_rt, ev.action, ev.params, ev.actor)
                         valid_ok = sim.valid == ev.expected_valid
                         appr_ok = (
                             ev.expected_requires_approval is None

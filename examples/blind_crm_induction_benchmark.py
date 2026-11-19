@@ -63,6 +63,7 @@ from open_ontology.induction import (
     ObjectTypeBlueprint,
     OntologyBuilderAgent,
     OntologyEvolverAgent,
+    OpenRouterAbductionBackend,
     ProposedEvalCase,
     RelationSpec,
     ReplayEvent,
@@ -276,9 +277,14 @@ def build_blind_crm_genesis_requirement_doc() -> str:
         "and align every foreign_key_id prefix with its target master entity prefix.\n"
         "   - Preserve discovered source enum values directly (kind='direct') without remapping.\n"
         "   - In this initial v1.0.0 Genesis, synthesize mechanical forward lifecycle actions for closing deals "
-        "(won or lost) and resolving support tickets for standard operational roles, reserving enterprise policy "
-        "guardrails for Act 2 evolution.\n"
-        "4. Emit self-contained ProposedEvalCase checks using synthetic setup_objects."
+        "(won or lost) and resolving support tickets directly from any active non-terminal stage/status, allowing "
+        "standard operational actor roles 'ai_agent' and 'steward', and reserving enterprise policy guardrails for "
+        "Act 2 evolution.\n"
+        "4. Emit self-contained ProposedEvalCase checks using synthetic setup_objects (if asserting "
+        "expect.object_changes, always include 'object_id' matching the setup_object primary key, or assert "
+        "expect={'valid': true/false} directly).\n"
+        "5. Return a single root JSON object with exact top-level keys "
+        "{'rationale', 'blueprint', 'adapter_mapping', 'proposed_eval_cases'} in one turn without calling any tools."
     )
 
 
@@ -318,63 +324,71 @@ def _build_sqlite_genesis_replay_factory(
             rows = objs_by_type.get(b.target_object_type, [])
             if not rows:
                 continue
-            actor = (
-                Actor(actor_id="crm:eval_steward", role="steward")
-                if b.expected_state_after in ("CLOSED_LOST", "Cancelled")
-                else CRM_AI_ACTOR
-            )
-            rt = OntologyRuntime(compile_blueprint(candidate, seed_ontology=build_business_seed_ontology()), db_path=":memory:")
-            try:
-                for entry in projected:
-                    cls = rt.spec.get_object_type(entry["object_type"])
-                    rt.put_object(cls(**entry["data"]))
-                picked_pos = False
-                for r in rows:
-                    rid = str(r.get(pk) or "")
-                    if not rid:
-                        continue
-                    sim = rt.simulate_action(act.name, {b.id_param: rid}, actor)
-                    if sim.valid and not picked_pos:
-                        pos.append(
-                            ReplayEvent(
-                                name=f"GEN-POS-{act.name}",
-                                action=act.name,
-                                params={b.id_param: rid},
-                                actor=actor,
-                                expected_valid=True,
-                            )
+            actor = CRM_AI_ACTOR
+            ot_obj = next((o for o in candidate.object_types if o.name == b.target_object_type), None)
+            sf = (b.expected_state_field or (ot_obj.status_field if ot_obj else "")) or ""
+            term_states: set[str] = set()
+            if ot_obj and ot_obj.transitions:
+                term_states.update(st for st, nxts in ot_obj.transitions.items() if not nxts)
+            if b.expected_state_after:
+                term_states.add(b.expected_state_after)
+
+            seen_states: set[str] = set()
+            checked_steward = False
+            for r in rows:
+                rid = str(r.get(pk) or "")
+                if not rid:
+                    continue
+                cur_st = str(r.get(sf) or "") if sf else ""
+                if sf and cur_st in term_states:
+                    neg.append(
+                        ReplayEvent(
+                            name=f"GEN-NEG-M0-{act.name}-{rid[:8]}",
+                            action=act.name,
+                            params={b.id_param: rid},
+                            actor=actor,
+                            expected_valid=False,
                         )
-                        picked_pos = True
-                    elif not sim.valid and not neg:
-                        neg.append(
-                            ReplayEvent(
-                                name=f"GEN-NEG-{act.name}",
-                                action=act.name,
-                                params={b.id_param: rid},
-                                actor=actor,
-                                expected_valid=False,
-                            )
+                    )
+                    continue
+                if cur_st in seen_states and seen_states:
+                    continue
+                seen_states.add(cur_st)
+                pos.append(
+                    ReplayEvent(
+                        name=f"GEN-POS-{act.name}-{cur_st or rid[:6]}",
+                        action=act.name,
+                        params={b.id_param: rid},
+                        actor=actor,
+                        expected_valid=True,
+                    )
+                )
+                if not checked_steward:
+                    checked_steward = True
+                    pos.append(
+                        ReplayEvent(
+                            name=f"GEN-POS-STEWARD-{act.name}",
+                            action=act.name,
+                            params={b.id_param: rid},
+                            actor=CRM_STEWARD_ACTOR,
+                            expected_valid=True,
                         )
-                if picked_pos and len(neg) < 2 and rows:
-                    ot_obj = next(o for o in candidate.object_types if o.name == b.target_object_type)
-                    sf = b.expected_state_field or ot_obj.status_field
-                    terminal_val = b.expected_state_after
-                    if sf and terminal_val:
-                        pos_row_id = str(pos[-1].params[b.id_param])
-                        src_row = next((r for r in rows if str(r.get(pk) or "") == pos_row_id), rows[0])
-                        term_data = {**src_row, pk: f"{b.id_prefix}TERM-NEG", sf: terminal_val}
-                        neg.append(
-                            ReplayEvent(
-                                name=f"GEN-NEG-TERMINAL-{act.name}",
-                                action=act.name,
-                                params={b.id_param: f"{b.id_prefix}TERM-NEG"},
-                                actor=actor,
-                                setup_objects=[{"object_type": b.target_object_type, "data": term_data}],
-                                expected_valid=False,
-                            )
-                        )
-            finally:
-                rt.close()
+                    )
+
+            terminal_val = b.expected_state_after or (next(iter(term_states), "") if term_states else "")
+            if sf and terminal_val and rows:
+                src_row = rows[0]
+                term_data = {**src_row, pk: f"{b.id_prefix}TERM-NEG", sf: terminal_val}
+                neg.append(
+                    ReplayEvent(
+                        name=f"GEN-NEG-TERMINAL-{act.name}",
+                        action=act.name,
+                        params={b.id_param: f"{b.id_prefix}TERM-NEG"},
+                        actor=actor,
+                        setup_objects=({"object_type": b.target_object_type, "data": term_data},),
+                        expected_valid=False,
+                    )
+                )
         return pos, neg
 
     return _factory
@@ -682,6 +696,25 @@ def _make_offline_crm_backends(scout_info: dict[str, Any]):
     return CallableAbductionBackend(_gen_fn), CallableAbductionBackend(_evo_fn)
 
 
+def _find_crm_action_bindings(
+    adapter_mapping: AdapterMappingSpec,
+) -> tuple[ActionExecutionBinding, ActionExecutionBinding, ActionExecutionBinding]:
+    """Tolerantly resolve opportunity win/lost and support-case resolution bindings."""
+    opp_bindings = [b for b in adapter_mapping.action_bindings if b.external_table == "opportunity"]
+    case_bindings = [b for b in adapter_mapping.action_bindings if b.external_table == "case"]
+    assert len(opp_bindings) >= 2 and case_bindings, (
+        f"missing expected opportunity/case bindings: {adapter_mapping.action_bindings}"
+    )
+
+    def _sig(b: ActionExecutionBinding) -> str:
+        return f"{b.action_name} {b.external_method} {b.expected_state_after or ''}".lower()
+
+    win_b = next(b for b in opp_bindings if any(k in _sig(b) for k in ("win", "won", "closed_won")))
+    lost_b = next(b for b in opp_bindings if b is not win_b and any(k in _sig(b) for k in ("lost", "closed_lost", "lose_")))
+    res_b = case_bindings[0]
+    return win_b, lost_b, res_b
+
+
 def _sqlite_homomorphic_settlement_check(
     *,
     source_sqlite: Path,
@@ -697,18 +730,17 @@ def _sqlite_homomorphic_settlement_check(
 
     opp_em = next(em for em in adapter_mapping.entity_mappings if em.source_table == "opportunity")
     case_em = next(em for em in adapter_mapping.entity_mappings if em.source_table == "case")
-    win_b = next(
-        b for b in adapter_mapping.action_bindings
-        if b.external_table == "opportunity" and ("win" in b.action_name.lower() or "won" in b.external_method.lower())
+    win_b, lost_b, res_b = _find_crm_action_bindings(adapter_mapping)
+    case_act = next((a for a in blueprint.actions if a.name == res_b.action_name), None)
+    case_mut_val = next(
+        (
+            m.set_fields["status"].get("lit")
+            for m in (case_act.mutations if case_act else [])
+            if isinstance(m.set_fields.get("status"), dict) and isinstance(m.set_fields["status"].get("lit"), str)
+        ),
+        None,
     )
-    lost_b = next(
-        b for b in adapter_mapping.action_bindings
-        if b.external_table == "opportunity" and "lost" in (b.action_name + b.external_method).lower()
-    )
-    res_b = next(
-        b for b in adapter_mapping.action_bindings
-        if b.external_table == "case"
-    )
+    case_done_val = str(res_b.expected_state_after or case_mut_val or "Resolved")
 
     opp_rows = {r["name"]: r for r in raw_rows_by_table["opportunity"]}
     case_rows = {r["name"]: r for r in raw_rows_by_table["case"]}
@@ -739,12 +771,40 @@ def _sqlite_homomorphic_settlement_check(
             ) -> tuple[str, str | None, str]:
                 cid = f"{binding.id_prefix}{raw_uuid}"
 
-                def _actuate(_mv: dict[str, Any]) -> None:
-                    conn.execute(
-                        f'UPDATE "{binding.external_table}" SET "{col_name}"=? WHERE id=?',
-                        (new_val, raw_uuid),
-                    )
-                    conn.commit()
+                def _actuate(mv: dict[str, Any]) -> None:
+                    valid_cols = {
+                        str(r[1])
+                        for r in conn.execute(f'PRAGMA table_info("{binding.external_table}")').fetchall()
+                    }
+                    updates: dict[str, Any] = {}
+                    for ch in (mv.get("object_diff") or {}).get("object_changes") or []:
+                        if ch.get("object_type") != binding.target_object_type or ch.get("object_id") != cid:
+                            continue
+                        before = dict(ch.get("before") or {})
+                        after = dict(ch.get("after") or {})
+                        for ft in em.field_transforms:
+                            tf = ft.target_field
+                            sf = ft.source_field
+                            if tf not in after or after[tf] == before.get(tf) or sf not in valid_cols:
+                                continue
+                            val = after[tf]
+                            if ft.kind == "direct":
+                                updates[sf] = int(val) if isinstance(val, bool) else val
+                            elif ft.kind == "enum_map":
+                                inv = {v: k for k, v in (ft.enum_map or {}).items()}
+                                updates[sf] = inv.get(str(val), val)
+                            elif ft.kind in ("id_prefix", "foreign_key_id") and ft.prefix:
+                                sval = str(val)
+                                updates[sf] = sval[len(ft.prefix) :] if sval.startswith(ft.prefix) else sval
+                    if not updates and col_name in valid_cols:
+                        updates[col_name] = new_val
+                    if updates:
+                        set_sql = ", ".join(f'"{c}"=?' for c in updates)
+                        conn.execute(
+                            f'UPDATE "{binding.external_table}" SET {set_sql} WHERE id=?',
+                            (*updates.values(), raw_uuid),
+                        )
+                        conn.commit()
 
                 def _observe(_mv: dict[str, Any]) -> dict[str, Any]:
                     raw_after = dict(
@@ -787,7 +847,7 @@ def _sqlite_homomorphic_settlement_check(
             )
             # 4. Sequential: resolve Acme High case -> now Acme opportunity wins & settles homomorphically
             st_case_res, err_case_res, db_case_res = _try_crm_action(
-                "CRM-4-RESOLVE-CASE", res_b, case_em, acme_case_id, CRM_AI_ACTOR, "status", "Resolved"
+                "CRM-4-RESOLVE-CASE", res_b, case_em, acme_case_id, CRM_AI_ACTOR, "status", case_done_val
             )
             st_acme_win, err_acme_win, db_acme_win = _try_crm_action(
                 "CRM-5-ACME-WIN-AFTER", win_b, opp_em, acme_opp_id, CRM_AI_ACTOR, "stage", "CLOSED_WON"
@@ -815,7 +875,7 @@ def _sqlite_homomorphic_settlement_check(
                 "acme_resolve_case_then_win": {
                     "passed": (
                         st_case_res == "COMMITTED"
-                        and db_case_res == "Resolved"
+                        and db_case_res == case_done_val
                         and st_acme_win == "COMMITTED"
                         and db_acme_win == "CLOSED_WON"
                     ),
@@ -849,6 +909,11 @@ def run_blind_crm_induction_benchmark(
     if offline:
         gen_backend, evo_backend = _make_offline_crm_backends(scout_info)
         model_label = "offline-mock-crm"
+    elif model.startswith("openrouter/"):
+        or_slug = model[len("openrouter/") :]
+        gen_backend = OpenRouterAbductionBackend(model=or_slug, timeout_sec=240)
+        evo_backend = OpenRouterAbductionBackend(model=or_slug, timeout_sec=240)
+        model_label = model
     else:
         slug = model[len("agy/") :] if model.startswith("agy/") else model
         gen_backend = AntigravityCLIAbductionBackend(model=slug, timeout_sec=240)
@@ -905,15 +970,7 @@ def run_blind_crm_induction_benchmark(
 
         opp_em = next(em for em in map_v1.entity_mappings if em.source_table == "opportunity")
         case_em = next(em for em in map_v1.entity_mappings if em.source_table == "case")
-        win_b = next(
-            b for b in map_v1.action_bindings
-            if b.external_table == "opportunity" and ("win" in b.action_name.lower() or "won" in b.external_method.lower())
-        )
-        lost_b = next(
-            b for b in map_v1.action_bindings
-            if b.external_table == "opportunity" and "lost" in (b.action_name + b.external_method).lower()
-        )
-        res_b = next(b for b in map_v1.action_bindings if b.external_table == "case")
+        win_b, lost_b, res_b = _find_crm_action_bindings(map_v1)
 
         acme_opp_cid = f"{opp_em.id_transform.prefix}{opp_rows['Acme 产线升级一期']['id']}"
         nw_opp_cid = f"{opp_em.id_transform.prefix}{opp_rows['Northwind 年度框架采购']['id']}"
@@ -1011,7 +1068,8 @@ def run_blind_crm_induction_benchmark(
                         action=lost_b.action_name,
                         params={lost_b.id_param: south_opp_cid},
                         actor=CRM_AI_ACTOR,
-                        expect_valid=False,
+                        expect_valid=None,
+                        expect_blocked_or_approval=True,
                     ),
                 ],
                 default_actor=CRM_AI_ACTOR,
