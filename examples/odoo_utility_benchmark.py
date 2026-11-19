@@ -993,7 +993,7 @@ class PhysicalOdooHarness:
                     {
                         "move_type": "out_invoice",
                         "partner_id": order["partner_id"][0],
-                        "invoice_date": datetime.date.today().isoformat(),
+                        "invoice_date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
                         "invoice_origin": order["name"],
                         "invoice_line_ids": [
                             (
@@ -1026,7 +1026,7 @@ class PhysicalOdooHarness:
     def register_payment_physically(self, invoice_id: int, amount: float | None = None) -> dict[str, Any]:
         if self.live is not None:
             ctx = {"active_model": "account.move", "active_ids": [invoice_id]}
-            vals: dict[str, Any] = {"payment_date": datetime.date.today().isoformat()}
+            vals: dict[str, Any] = {"payment_date": datetime.datetime.now(datetime.timezone.utc).date().isoformat()}
             if amount is not None:
                 vals["amount"] = float(amount)
             wiz_id = self.live.execute_kw(
@@ -1051,7 +1051,7 @@ class PhysicalOdooHarness:
             ctx = {"active_model": "account.move", "active_ids": [invoice_id]}
             wiz_vals: dict[str, Any] = {
                 "move_ids": [(6, 0, [invoice_id])],
-                "date": datetime.date.today().isoformat(),
+                "date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
                 "reason": "Utility T4-2 Credit Note Probe",
             }
             if journal_id is not None:

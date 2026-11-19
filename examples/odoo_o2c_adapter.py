@@ -1004,7 +1004,7 @@ class OdooO2CAdapter:
                 {
                     "move_type": "out_invoice",
                     "partner_id": ref.partner_id,
-                    "invoice_date": datetime.date.today().isoformat(),
+                    "invoice_date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
                     "invoice_origin": ref.odoo_name,
                     "ref": f"{order_id}/{ref.run_tag}",
                     "invoice_line_ids": [
@@ -1072,7 +1072,7 @@ class OdooO2CAdapter:
                 "active_ids": [invoice_id],
             }
             wiz_vals: dict[str, Any] = {
-                "payment_date": datetime.date.today().isoformat(),
+                "payment_date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
             }
             if payment_cents is not None:
                 wiz_vals["amount"] = round(int(payment_cents) / 100.0, 2)
@@ -1152,7 +1152,7 @@ class OdooO2CAdapter:
         ctx = {"active_model": "account.move", "active_ids": [invoice_id]}
         wiz_vals: dict[str, Any] = {
             "move_ids": [(6, 0, [invoice_id])],
-            "date": datetime.date.today().isoformat(),
+            "date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
             "reason": reason,
         }
         if journal_id is not None:
@@ -1264,7 +1264,7 @@ class OdooO2CAdapter:
             ctx = {"active_model": "account.move", "active_ids": [invoice_id]}
             wiz_vals: dict[str, Any] = {
                 "move_ids": [(6, 0, [invoice_id])],
-                "date": datetime.date.today().isoformat(),
+                "date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
                 "reason": f"OpenOntology Time-Machine Revert ({run_id})",
             }
             if journal_id is not None:

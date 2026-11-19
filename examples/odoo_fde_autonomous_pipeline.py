@@ -734,7 +734,7 @@ class DeclarativeOdooBridge:
                 if val == "$m2m_ext_id":
                     return [(6, 0, [ext_id])]
                 if val == "$today":
-                    return datetime.date.today().isoformat()
+                    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
                 if val.startswith("$param."):
                     pname = val[len("$param.") :]
                     return action_params.get(pname)
