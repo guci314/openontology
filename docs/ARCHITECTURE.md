@@ -6,16 +6,16 @@
 
 ---
 
-## 1. 领域模型、业务世界、执行引擎与外部设备
+## 1. 认知本体论总纲与四大核心视角
 
-> **符号世界模型三元组**：`Model`（领域模型 / 世界法则） + `Runtime`（执行引擎 / 模拟器） + `World`（业务世界 / 世界状态实例，代码兼容别名 `Workspace`）共同构成完整的 **Symbolic World Model（符号世界模型）**。
+> **认知本体论总纲**：智能体无法直接触碰**外部世界（External World）**，只能经由 `Device` 边界接收高维感官**现象（Phenomenon / Observation）**，并将其压缩接地为内部结构化的**世界状态（World State / 信念态 Belief State，即 `World`）**。**世界模型（World Model）**是所有内部状态的**元模型**——在联结主义中体现为神经网络突触权重，在 OpenOntology 符号主义中体现为 `Model`（领域模型：`TBox` 结构 + `Behavior` 因果转移法则）与 `Runtime`（确定性转移模拟器），共同与 `World` 状态实例构成完整的 **Symbolic World Model（符号世界模型）**。在付诸外部行动前，**规划器（Planner）**以当前世界状态为起点，用同一个世界模型在严格纯内存的**反事实空间（Counterfactual Space，`runtime.fork()` / `world_mode="counterfactual"`）**中推演可能未来，依据**价值函数（Value Function）**择优决策，并通过 `OntologyRuntime`（`world_mode="coupled"` + `SourceBridge`）默认执行“沙箱预测 → 外部驱动 → 独立只读回读核验 → 同态提交或零污染拒收”的滚动闭环。
 
 | 概念 | 职责（M2 语义） | 不是什么 |
 |---|---|---|
-| **Model / 领域模型** | 定义世界结构（TBox）、关系、声明式约束与状态转移法则（Behavior），可被多个业务世界复用 | 不是具体对象数据，也不因启动执行而变成事实 |
-| **World / 世界状态**<br>（代码兼容别名 `Workspace`） | 绑定模型引用、事实状态（ABox）、Runtime 与演化审计历史，提供隔离的业务世界实例（含主世界与 `fork()` 平行沙盘世界） | 不是单个业务对象，也不是源代码工作目录 |
-| **Runtime / 执行引擎** | 执行模型定义的查询、动作、治理切面、持久化和平行沙盘推演 | 不是额外一份业务事实 |
-| **Device / 外部设备** | 登记与适配外部系统（OpenAPI）与外部数据源连接器；外部智能体直接作为 `Actor` 通过 OSDK / `ActionDef` 与世界模型交互 | 不是未经校验即可进入事实图的可信数据 |
+| **Model / 领域模型** | 定义世界模型的存在结构（TBox）、关系、声明式约束与因果状态转移法则（Behavior），作为所有内部状态的元模型可被多个世界状态实例复用 | 不是具体对象数据，也不因启动执行而变成事实 |
+| **World / 世界状态**<br>（代码兼容别名 `Workspace`） | 外部现象经世界模型接地后的实然信念态：绑定模型引用、事实状态（ABox）、Runtime 与演化审计历史（与纯内存 `fork()` 反事实空间共享同一元模型） | **不是外部客观世界本身**，不是单个业务对象，也不是源代码工作目录 |
+| **Runtime / 执行引擎** | 执行模型定义的查询、受控动作、治理切面、持久化与反事实沙盘推演 | 不是额外一份业务事实 |
+| **Device / 外部设备** | 登记与适配外部世界源系统（OpenAPI）与现象观测连接器；外部智能体直接作为 `Actor` 通过 OSDK / `ActionDef` 与世界模型交互 | 不是未经校验即可进入事实图的可信数据 |
 
 四种职责不意味着四个完全正交、必须各自独立管理生命周期的业务资源。指挥台界面可以按这四种视角组织展示，但不能由四个标签页反推出四套割裂的资源账本。
 
@@ -40,7 +40,7 @@ flowchart TB
     subgraph RUNTIME["3. Runtime / 执行引擎（世界模拟器与治理宿体）"]
         direction TB
         CORE["① Runtime.Core 微内核｜EditBatch 内存沙箱 · ObjectDiff · fork() 平行世界推演 · ontology_write_gate 写门禁"]
-        ASPECT["② Runtime.Aspect 七大系统调用切面｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 审批 / 时光机 · 被拒审计 · 反射 · 忙闲回调"]
+        ASPECT["② Runtime.Aspect 八大系统调用切面｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 审批 / 时光机 · 被拒审计 · 反射 · 忙闲回调 · 同态结算"]
         ADAPTER["③ Runtime.DeviceAdapter 设备驱动｜SnapshotIngestionDriver"]
         CORE <--> ASPECT
         CORE <--> ADAPTER
@@ -212,7 +212,7 @@ sequenceDiagram
 │   schema.sql  5 张业务治理表 + 1 张写门禁表（:memory: 与文件同构）   │
 ├──────────────────────────────────────────────────────────────────────┤
 │ ② 系统调用切面 / Runtime.Aspect (Syscall Aspects) —— 确定性治理铁笼  │
-│   aspects.py                                                         │
+│   aspects.py / settlement.py                                         │
 │   ColumnMaskingAspect          读出口列级脱敏投影                    │
 │   SecurityAndAuthorityAspect   RBAC / 字段主权门禁（__owned__）      │
 │   IdempotencyAndOCCAspect      幂等短路 / MVCC 乐观锁                │
@@ -220,15 +220,15 @@ sequenceDiagram
 │   RejectionAuditAspect         不变量被拒企图入账                    │
 │   AutomationReflexAspect       提交后条件反射与版本去重              │
 │   IdleAwareCallbackAspect      忙闲感知回调（忙时入队、闲时 FIFO）   │
+│   HomomorphicSettlementAspect  三阶段无锁同态回读核销与收敛提交      │
 ├──────────────────────────────────────────────────────────────────────┤
 │ ③ 设备驱动 / Runtime.DeviceAdapter (Device Drivers)                  │
 │   ingestion.py        SnapshotIngestionDriver 快照摄入与多源列拼接   │
 │   examples/*adapter.py  Odoo · CRM · SaaS 外部协议桥接               │
 ├══════════════════════════════════════════════════════════════════════┤
 │ 内核外围 M2 通用支撑与传输边界（领域无关，零具体行业语义）：         │
-│   mcts.py              基于 fork() 的蒙特卡洛树搜索规划器            │
-│   latent.py            基于同构 6 表的持久化隐空间与独立回读结算      │
-│   mpc.py               闭环滚动时域控制器 ClosedLoopMPCController    │
+│   mcts.py              规划器：基于纯内存 fork() 的前瞻树搜索        │
+│   mpc.py               无状态滚动时域闭环控制器                      │
 │   osdk.py              受控 LLM 工具 Schema 导出、执行器与评测套件   │
 │   execution/fabric.py  JSON 调用边界与非干涉观察织入 ExecutionFabric │
 │   workspaces.py / model_views.py  工作空间目录与 TBox/Behavior 投影  │
@@ -282,12 +282,17 @@ sequenceDiagram
 * **显式 `Actor` 零信任约束**：面向 HTTP 路由、指挥台 UI、工作空间枚举或外部 Agent 的一切查询与 `FunctionDef` 调用，必须显式传入真实调用方 `Actor`，严禁在外部可达入口依赖缺省 `system` 角色绕过 RLS 或列级脱敏。
 * **读出口脱敏的作用面**：`EditBatch` 可注入读脱敏回调，但只有**只读** `FunctionDef` 批处理会注入；动作批处理永不脱敏，确保暂存 diff 只会写入真实值，绝不会把 `***MASKED***` 落库。
 
-### 3.3 虚拟现实沙盘推演与时光机（Simulation & Time-Travel）
-* **隔离分叉（`runtime.fork()`）**：复用同一 `OntologySpec`，通过 SQLite backup 将当前业务世界事实与历史克隆至独立 `:memory:` 实例形成平行沙盘世界（非操作系统页级零拷贝，但与原世界物理隔离）。
-* **蒙特卡洛树搜索（`OntologyMCTSPlanner`）**：在 `fork()` 平行世界沙盘上枚举候选动作序列并自动剪枝违反 `InvariantError` 的分支，择优后再受控提交回主业务世界。
-* **持久隐空间与回读结算（`LatentSpace`，实现在 `open_ontology/latent.py`）**：复用同构 6 表 SQLite（零新增表、零新账本状态），`stage_move` / `approve_move` 在隐空间内落子推演且记忆世界零写入，重启重开无损保留未结算棋步（`pending_moves`）；`settle_move` 对 `affects_source=False` 自有动作直接校验提升，对外部主权动作以独立 `readback_objects` / `readback_links` 逐项核对预期终态（后台 `load_snapshot` 抢跑收敛至同一终态时不误报冲突），一致则提升入记忆并记 `COMMITTED`，不一致则记忆零改动记 `REJECTED`（`DEVICE_STATE_MISMATCH`）并自动 `rebase()` 重对齐隐空间。
-* **闭环滚动时域控制器（`ClosedLoopMPCController`，实现在 `open_ontology/mpc.py`）**：将多步 MCTS 搜索与 `LatentSpace` 单步落子合龙——每次只在 `:memory:` 分叉上展开多步规划并只把第一步落入持久隐空间；启动/续跑优先排空遗留 `pending_moves()`，遇到 `PENDING_APPROVAL` 干净暂停为 `AWAITING_APPROVAL`；若独立只读传感器 `observe_fn`（与 `act_fn` 严格分离）揭示设备状态不一致导致被拒，必先以最新观察执行 `load_snapshot` 刷新记忆棋盘并 `rebase()` 后再重规划，并受 `max_replans` 与 `max_steps` 护栏封顶。
-* **因果账本与逆向冲正（`runtime.approve_action` / `runtime.revert_action`，委托 `aspects.ApprovalGateAspect`）**：基于持久化 `ObjectDiff` 与版本号执行带冲突检测的精确逆向回滚，并支持提交后 `evaluate_automations` 条件反射与版本级去重。
+### 3.3 反事实空间推演、双世界同态结算与闭环规划（Counterfactual Space & Continual Planning）
+* **同一世界模型下的运行模式边界（同构 6 表不变量）**：`OntologyRuntime` 通过显式 `world_mode`（`standalone` / `coupled` / `counterfactual`）复用同一套 6 表世界模型，并强制划分事实世界与想象空间的物理边界：
+  * **`world_mode="standalone"`**：独立实然世界状态，无外部 `SourceBridge`，动作直接经 OCC 原子提交；
+  * **`world_mode="coupled"`**：耦合实然世界状态，绑定 `SourceBridge`，凡触碰非自有（source-backed）对象的提交/审批/冲正统一走 `HomomorphicSettlementAspect` 闭环；
+  * **`world_mode="counterfactual"`**：反事实想象空间，严格强制 `db_path=":memory:"` 且 `source_bridge=None`，物理绝缘外部设备与磁盘状态。
+* **反事实空间隔离分叉（`runtime.fork()`）**：复用同一 `OntologySpec`，通过 SQLite backup 将当前世界状态与历史克隆至独立 `:memory:` 且 `world_mode="counterfactual"` 的推演沙盘（与实然世界状态及外部设备物理隔离、零写入承诺）。
+* **前瞻树搜索与价值函数评估（`OntologyMCTSPlanner`）**：**规划器（Planner）** 在 `fork()` 反事实空间上枚举候选动作序列，自动剪除违反 `InvariantError` 的非法分支与死局状态（`dead_end`），依据**价值函数（Value Function，`@spec.function` 显式效用算分与树节点 `Q(s, a)` 动作价值估计）**择优决策。
+* **默认无锁三阶段同态结算（`HomomorphicSettlementAspect` 与 `SourceBridge`，实现在 `open_ontology/settlement.py`）**：彻底淘汰独立持久队列文件，将“反事实预测 → 外部驱动 → 独立只读回读核验 → 原子提交或零污染拒收”内化为 `OntologyRuntime.submit_action`、`approve_action` 与 `revert_action` 的默认通道——Phase A 在纯内存沙箱推演预期差集 $\hat{\Delta}$ 并通过权责与不变量门控（需审批直接停在 `PENDING_APPROVAL`，不触发外写）；Phase B 完全释放 SQLite 写门禁后调用 `SourceBridge.actuate` 并**丢弃写响应文本**，仅采信独立 `SourceBridge.observe` 回读到的物理终态；Phase C 逐项比对非自有字段与连边，一致则原子提升入主世界并记 `COMMITTED`（支持并发快照抢跑收敛至同一终态时的无损合并），失配则主库事实零改动记 `REJECTED`（`DEVICE_STATE_MISMATCH`）并抛出 `DeviceStateMismatchError`；`coupled` 下的 `revert_action` 默认禁止自动反冲外部源（`SOURCE_REVERT_FORBIDDEN`），仅当 `SourceBridge(allow_source_revert=True)` 时走同态冲正闭环。
+* **无状态滚动时域闭环规划器（`ClosedLoopMPCController`，实现在 `open_ontology/mpc.py`）**：直接驱动主 `OntologyRuntime` 执行“多步想象、单步承诺、独立核销、滚动重算”，不依赖本地待执行队列；若 `observe_fn` 揭示外部偏离预期，先执行 `load_snapshot` 刷新实然信念态再在线重规划（支持 `refresh_on_start=True` 马尔可夫冷重启恢复），并受 `max_replans` 与 `max_steps` 护栏封顶。
+* **因果账本与逆向冲正（`runtime.approve_action` / `runtime.revert_action`，委托 `ApprovalGateAspect` / `HomomorphicSettlementAspect`）**：基于持久化 `ObjectDiff` 与版本号执行带冲突检测的精确逆向回滚，并支持提交后 `evaluate_automations` 条件反射与版本级去重。
+* **指挥台运行视角**：`Runtime · 算力与治理宿体` 展示宿体配置与已挂载的八大 `Aspect` 链路（含 `HomomorphicSettlementAspect`）。
 
 ### 3.4 指挥台四展示视角与领域无关图形协议（4-View Command Center）
 * **指挥台展示视角**（一级标签升级为 `Model / Runtime / World / Device`，代码与 HTTP 兼容映射见第 6 节）：
@@ -330,8 +335,8 @@ sequenceDiagram
 
 | 现有代码拼写 | 架构含义 / 渐进迁移方向 |
 |---|---|
-| `Workspace`、`workspace_id`、`workspaces.py` | 业务世界（`World`）在代码、HTTP 路由（`?workspace=`）与目录清单（`workspaces.json`）中的现行兼容标识符；与界面 `World · 世界状态` 指向同一实体 |
-| `OntologySpec`、`ontology_id` | M1 领域模型定义容器与模型身份；保留代码兼容，目标别名 `model_id` |
+| `Workspace`、`workspace_id`、`workspaces.py` | 世界状态实例（`World`）在代码、HTTP 路由（`?workspace=`）与目录清单（`workspaces.json`）中的现行兼容标识符；与界面 `World · 世界状态` 指向同一实体 |
+| `OntologySpec`、`ontology_id` | M1 领域模型（世界模型法则）定义容器与模型身份；保留代码兼容，目标别名 `model_id` |
 | `OntologyRuntime` | 绑定单个模型与存储的 M2 执行引擎，不因术语收敛推倒重写 |
 | `instance_id`、`?instance=` | 早期工作空间 / 业务世界身份与 HTTP 查询参数；与 `workspace_id` / `?workspace=` 双栈兼容（冲突参数显式报错） |
 | `register_instance`、`get_instance` | `CommandCenterRegistry` 上的早期登记/查找方法；与 `register_workspace` / `get_workspace` 指向同一份底层条目 |

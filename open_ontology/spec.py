@@ -15,6 +15,7 @@ No SQL and no mutation lives here.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 import types as _types
 from typing import (
@@ -535,15 +536,31 @@ class ActionDef(BaseModel):
     handler: Any  # Callable[[EditBatch, BaseModel], None]
     allowed_roles: tuple[str, ...] = ()
     approver_roles: tuple[str, ...] = ()
-    approval_rule: Any = None  # Callable[[BaseModel, Actor], bool]
+    approval_rule: Any = None  # Callable[[BaseModel, Actor], bool] | Callable[..., bool]
     affects_source: bool = True
     visibility: Literal["public", "private"] = "public"
     post_approval: Any = None  # optional Callable[[EditBatch, BaseModel], None]
     description: str = ""
 
-    def requires_approval(self, params: BaseModel, actor: Actor) -> bool:
+    def requires_approval(
+        self,
+        params: BaseModel,
+        actor: Actor,
+        view: Any = None,
+    ) -> bool:
         if self.approval_rule is None:
             return False
+        if getattr(self.approval_rule, "_accepts_view", False):
+            return bool(self.approval_rule(params, actor, view))
+        sig = inspect.signature(self.approval_rule)
+        positional = [
+            p
+            for p in sig.parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
+        if has_varargs or len(positional) >= 3 or "view" in sig.parameters:
+            return bool(self.approval_rule(params, actor, view))
         return bool(self.approval_rule(params, actor))
 
 
@@ -1144,7 +1161,7 @@ class OntologySpec:
         params: type[BaseModel],
         allowed_roles: Sequence[str] = (),
         approver_roles: Sequence[str] = (),
-        approval_rule: Callable[[Any, Actor], bool] | None = None,
+        approval_rule: Callable[..., bool] | None = None,
         description: str = "",
         affects_source: bool = True,
         visibility: Literal["public", "private"] = "public",

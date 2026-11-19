@@ -102,6 +102,7 @@ class FieldTransformSpec(BaseModel):
     fallback_fields: list[str] = Field(default_factory=list)
     lookup_table: str = ""
     lookup_key_field: str = ""
+    treat_false_as_null: bool | None = None
 
 
 class EntityMappingSpec(BaseModel):
@@ -113,6 +114,7 @@ class EntityMappingSpec(BaseModel):
     row_filters: list[RowFilterSpec] = Field(default_factory=list)
     field_transforms: list[FieldTransformSpec] = Field(default_factory=list)
     drop_if_missing_refs: list[str] = Field(default_factory=list)
+    treat_false_as_null: bool | None = None
 
 
 class ActionExecutionBinding(BaseModel):
@@ -137,6 +139,7 @@ class AdapterMappingSpec(BaseModel):
 
     mapping_id: str = ""
     source_kind: str = "erp"
+    treat_false_as_null: bool = False
     entity_mappings: list[EntityMappingSpec] = Field(default_factory=list)
     action_bindings: list[ActionExecutionBinding] = Field(default_factory=list)
 
@@ -170,46 +173,67 @@ def _row_matches_filter(row: dict[str, Any], flt: RowFilterSpec) -> bool:
     return False
 
 
-def _extract_raw_value(row: dict[str, Any], field_name: str) -> Any:
+def _resolve_false_as_null(
+    tf: FieldTransformSpec,
+    em: EntityMappingSpec | None,
+    default_false_as_null: bool,
+) -> bool:
+    if tf.treat_false_as_null is not None:
+        return bool(tf.treat_false_as_null)
+    if em is not None and em.treat_false_as_null is not None:
+        return bool(em.treat_false_as_null)
+    return bool(default_false_as_null)
+
+
+def _extract_raw_value(
+    row: dict[str, Any],
+    field_name: str,
+    *,
+    treat_false_as_null: bool = False,
+) -> Any:
     val = row.get(field_name)
-    return None if val is False else val
+    if treat_false_as_null and val is False:
+        return None
+    return val
 
 
 def _apply_field_transform(
     row: dict[str, Any],
     tf: FieldTransformSpec,
     lookup_index: dict[tuple[str, str, str], str],
+    *,
+    treat_false_as_null: bool = False,
 ) -> Any:
     if tf.kind == "const":
         return copy.deepcopy(tf.default)
     if tf.kind == "direct":
         raw = row.get(tf.source_field)
-        if raw is None or (raw is False and not isinstance(tf.default, bool)):
+        if raw is None or (treat_false_as_null and raw is False and not isinstance(tf.default, bool)):
             return copy.deepcopy(tf.default)
         return raw
     if tf.kind == "coalesce":
         for fname in [tf.source_field, *tf.fallback_fields]:
             if not fname:
                 continue
-            cand = _extract_raw_value(row, fname)
+            cand = _extract_raw_value(row, fname, treat_false_as_null=treat_false_as_null)
             if cand is not None and str(cand).strip() != "":
                 return f"{tf.prefix}{cand}" if tf.prefix else cand
         return copy.deepcopy(tf.default)
     if tf.kind == "id_prefix":
-        raw = _extract_raw_value(row, tf.source_field)
+        raw = _extract_raw_value(row, tf.source_field, treat_false_as_null=treat_false_as_null)
         if raw is None:
             return copy.deepcopy(tf.default)
         return f"{tf.prefix}{raw}"
     if tf.kind == "foreign_key_id":
         raw = row.get(tf.source_field)
-        if raw is None or raw is False:
+        if raw is None or (treat_false_as_null and raw is False):
             return copy.deepcopy(tf.default)
         raw_id = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
-        if raw_id is None or raw_id is False:
+        if raw_id is None or (treat_false_as_null and raw_id is False):
             return copy.deepcopy(tf.default)
         return f"{tf.prefix}{raw_id}"
     if tf.kind == "lookup_join":
-        raw = _extract_raw_value(row, tf.source_field)
+        raw = _extract_raw_value(row, tf.source_field, treat_false_as_null=treat_false_as_null)
         if raw is None:
             return copy.deepcopy(tf.default)
         return lookup_index.get(
@@ -217,7 +241,7 @@ def _apply_field_transform(
             copy.deepcopy(tf.default),
         )
     if tf.kind == "enum_map":
-        raw = _extract_raw_value(row, tf.source_field)
+        raw = _extract_raw_value(row, tf.source_field, treat_false_as_null=treat_false_as_null)
         if raw is None:
             return copy.deepcopy(tf.default)
         return tf.enum_map.get(
@@ -225,8 +249,8 @@ def _apply_field_transform(
             copy.deepcopy(tf.default) if tf.default is not None else str(raw),
         )
     if tf.kind == "scale_int":
-        raw = _extract_raw_value(row, tf.source_field)
-        if raw is None:
+        raw = _extract_raw_value(row, tf.source_field, treat_false_as_null=treat_false_as_null)
+        if raw is None or isinstance(raw, bool):
             return int(tf.default or 0)
         return int(round(float(raw) * tf.scale))
     raise InvariantError(f"unsupported transform kind {tf.kind!r}", code="INVALID_TRANSFORM")
@@ -328,7 +352,14 @@ def project_external_phenomenon(
         for row in src_entity.sample_rows:
             if any(not _row_matches_filter(row, flt) for flt in em.row_filters):
                 continue
-            obj_id = _apply_field_transform(row, em.id_transform, lookup_index)
+            obj_id = _apply_field_transform(
+                row,
+                em.id_transform,
+                lookup_index,
+                treat_false_as_null=_resolve_false_as_null(
+                    em.id_transform, em, mapping.treat_false_as_null
+                ),
+            )
             if obj_id is None or str(obj_id).strip() == "":
                 errors.append(
                     f"failed to compute canonical ID for {em.source_table} -> {em.target_object_type}"
@@ -338,7 +369,14 @@ def project_external_phenomenon(
             data: dict[str, Any] = {em.id_transform.target_field: canonical_id}
             dropped = False
             for tf in em.field_transforms:
-                val = _apply_field_transform(row, tf, lookup_index)
+                val = _apply_field_transform(
+                    row,
+                    tf,
+                    lookup_index,
+                    treat_false_as_null=_resolve_false_as_null(
+                        tf, em, mapping.treat_false_as_null
+                    ),
+                )
                 if val is None and tf.target_field in em.drop_if_missing_refs:
                     dropped = True
                     break
@@ -347,8 +385,17 @@ def project_external_phenomenon(
                 continue
 
             # Register lookup keys for downstream child tables (e.g. foreign_ref -> parent.code)
+            em_false_as_null = (
+                bool(em.treat_false_as_null)
+                if em.treat_false_as_null is not None
+                else bool(mapping.treat_false_as_null)
+            )
             for raw_k, raw_v in row.items():
-                if raw_v is not None and raw_v is not False and not isinstance(raw_v, (list, dict)):
+                if (
+                    raw_v is not None
+                    and not (em_false_as_null and raw_v is False)
+                    and not isinstance(raw_v, (list, dict))
+                ):
                     lookup_index[(em.source_table, str(raw_k), str(raw_v))] = canonical_id
 
             dedup_key = (em.target_object_type, canonical_id)
@@ -381,10 +428,16 @@ def project_single_record(
     raw_row: dict[str, Any],
     *,
     lookup_index: dict[tuple[str, str, str], str] | None = None,
+    treat_false_as_null: bool = False,
 ) -> dict[str, Any]:
     """Project a single raw external record using an EntityMappingSpec (e.g. for independent readback)."""
     idx = lookup_index or {}
-    obj_id = _apply_field_transform(raw_row, em.id_transform, idx)
+    obj_id = _apply_field_transform(
+        raw_row,
+        em.id_transform,
+        idx,
+        treat_false_as_null=_resolve_false_as_null(em.id_transform, em, treat_false_as_null),
+    )
     if obj_id is None or str(obj_id).strip() == "":
         raise InvariantError(
             f"failed to compute canonical ID for {em.source_table} -> {em.target_object_type}",
@@ -392,5 +445,10 @@ def project_single_record(
         )
     data: dict[str, Any] = {em.id_transform.target_field: str(obj_id)}
     for tf in em.field_transforms:
-        data[tf.target_field] = _apply_field_transform(raw_row, tf, idx)
+        data[tf.target_field] = _apply_field_transform(
+            raw_row,
+            tf,
+            idx,
+            treat_false_as_null=_resolve_false_as_null(tf, em, treat_false_as_null),
+        )
     return data

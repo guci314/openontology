@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from examples.business_ontology import BUSINESS_SEED_ONTOLOGY
 from examples.o2c_induction_demo import (
     AI_AGENT,
     FINANCE_DIRECTOR,
@@ -83,7 +84,7 @@ def test_l1_zero_exec_compiler_supports_object_properties_fsm_and_arithmetic() -
     bp = DeclarativeBlueprint.model_validate(
         _base_o2c_blueprint(include_unshipped_invoice_guard=True)
     )
-    spec = compile_blueprint(bp)
+    spec = compile_blueprint(bp, seed_ontology=BUSINESS_SEED_ONTOLOGY)
 
     # TBox 投影必须完整暴露 AutoID 与 ObjectProperty 元数据
     tbox = describe_tbox(spec)
@@ -103,7 +104,7 @@ def test_l1_zero_exec_compiler_supports_object_properties_fsm_and_arithmetic() -
         # 非法状态跳变（draft -> shipped 绕过 confirmed）必须被 FSM 跃迁不变量拦截
         with pytest.raises(InvariantError) as exc_fsm:
             rt.submit_action("BAD-FSM", "ship_sales_order", {"order_id": "SO-SMALL-01"}, AI_AGENT)
-        assert exc_fsm.value.code == "ILLEGAL_STATE_TRANSITION"
+        assert exc_fsm.value.code == "ILLEGAL_DOCUMENT_TRANSITION"
 
         # 未发货开票必须被跨 ObjectProperty 不变量拦截
         with pytest.raises(InvariantError) as exc_inv:
@@ -205,7 +206,11 @@ def test_crucible_gate_2_blocks_incompatible_rule_over_legacy_m0_objects() -> No
     candidate = apply_evolution_patch(base, patch)
     report = SymbolicCrucible().evaluate(
         candidate,
-        CrucibleContext(mode="evolution", m0_objects=build_initial_o2c_m0_objects()),
+        CrucibleContext(
+            mode="evolution",
+            m0_objects=build_initial_o2c_m0_objects(),
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
+        ),
         patch=patch,
     )
     assert report.passed is False
@@ -221,6 +226,7 @@ def test_crucible_gate_3_catches_vacuous_genesis_blueprint() -> None:
     ctx = CrucibleContext(
         mode="genesis",
         m0_objects=build_initial_o2c_m0_objects(),
+        seed_ontology=BUSINESS_SEED_ONTOLOGY,
         negative_events=[
             ReplayEvent(
                 name="neg_invoice_unshipped",
@@ -270,6 +276,7 @@ def test_crucible_gate_3_evolution_enforces_positive_events_against_shortcut_rul
     ctx = CrucibleContext(
         mode="evolution",
         m0_objects=build_initial_o2c_m0_objects(),
+        seed_ontology=BUSINESS_SEED_ONTOLOGY,
         incident_counterexamples=[
             IncidentCounterexample(
                 name="cx_big_order_ai",
@@ -350,7 +357,7 @@ def test_crucible_gate_3_evolution_enforces_positive_events_against_shortcut_rul
 
 def test_crucible_gate_4_prevents_catastrophic_forgetting_and_preserves_production() -> None:
     base = DeclarativeBlueprint.model_validate(_base_o2c_blueprint(include_unshipped_invoice_guard=True))
-    spec = compile_blueprint(base)
+    spec = compile_blueprint(base, seed_ontology=BUSINESS_SEED_ONTOLOGY)
     prod = OntologyRuntime(spec, db_path=":memory:")
     try:
         for row in build_initial_o2c_m0_objects():
@@ -373,6 +380,7 @@ def test_crucible_gate_4_prevents_catastrophic_forgetting_and_preserves_producti
         ctx = CrucibleContext(
             mode="evolution",
             production_runtime=prod,
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
             golden_eval_cases=[
                 {
                     "name": "small_order_no_approval",
@@ -409,7 +417,11 @@ def test_crucible_gate_5_catches_instance_id_overfitting_and_rule_bloat() -> Non
     candidate = apply_evolution_patch(base, overfit_patch)
     report = SymbolicCrucible().evaluate(
         candidate,
-        CrucibleContext(mode="evolution", m0_objects=build_initial_o2c_m0_objects()),
+        CrucibleContext(
+            mode="evolution",
+            m0_objects=build_initial_o2c_m0_objects(),
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
+        ),
         patch=overfit_patch,
     )
     assert report.passed is False
@@ -423,7 +435,7 @@ def test_crucible_gate_5_catches_instance_id_overfitting_and_rule_bloat() -> Non
 # ---------------------------------------------------------------------------
 def test_friction_collector_filters_single_noise_and_escalates_systemic_reverts() -> None:
     bp = DeclarativeBlueprint.model_validate(_base_o2c_blueprint(include_unshipped_invoice_guard=True))
-    spec = compile_blueprint(bp)
+    spec = compile_blueprint(bp, seed_ontology=BUSINESS_SEED_ONTOLOGY)
     rt = OntologyRuntime(spec, db_path=":memory:")
     try:
         for row in build_initial_o2c_m0_objects():
@@ -476,12 +488,16 @@ def test_friction_collector_filters_single_noise_and_escalates_systemic_reverts(
             evolver = OntologyEvolverAgent(
                 backend=CallableAbductionBackend(lambda *_: {}),
                 governance=gov,
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
             )
             with pytest.raises(InvariantError) as exc_noise:
                 evolver.run_evolution_cycle(
                     model_id="erp_o2c",
                     cluster=by_kind["DEVICE_STATE_MISMATCH"],
-                    crucible_context=CrucibleContext(mode="evolution"),
+                    crucible_context=CrucibleContext(
+                        mode="evolution",
+                        seed_ontology=BUSINESS_SEED_ONTOLOGY,
+                    ),
                     base_blueprint=bp,
                 )
             assert exc_noise.value.code == "BELOW_ESCALATION_THRESHOLD"
@@ -667,6 +683,7 @@ def test_p0_1_cegis_recovers_from_llm_schema_error_and_prompts_include_schema() 
         builder = OntologyBuilderAgent(
             backend=CallableAbductionBackend(_flaky_llm),
             governance=gov,
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
         )
         res = builder.run_genesis_cycle(
             model_id="erp_o2c",
@@ -674,6 +691,7 @@ def test_p0_1_cegis_recovers_from_llm_schema_error_and_prompts_include_schema() 
                 mode="genesis",
                 m0_objects=build_initial_o2c_m0_objects(),
                 default_actor=AI_AGENT,
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
             ),
             max_rounds=3,
         )
@@ -695,7 +713,7 @@ def test_p0_2_gate_2_verifies_production_ontology_overlay_and_detects_ownership_
     from open_ontology.induction import AdapterMappingSpec, project_external_phenomenon
 
     bp = DeclarativeBlueprint.model_validate(_synthesize_o2c_blueprint(include_unshipped_guard=True))
-    spec = compile_blueprint(bp)
+    spec = compile_blueprint(bp, seed_ontology=BUSINESS_SEED_ONTOLOGY)
     prod = OntologyRuntime(spec, db_path=":memory:")
     try:
         profile = build_offline_odoo_mirror_profile()
@@ -715,7 +733,12 @@ def test_p0_2_gate_2_verifies_production_ontology_overlay_and_detects_ownership_
         # 合法候选模型保留 __owned__ -> 关 2 应校验 1 条 overlay 并通过
         ok_report = SymbolicCrucible().evaluate(
             bp,
-            CrucibleContext(mode="evolution", production_runtime=prod, default_actor=SALES_AGENT),
+            CrucibleContext(
+                mode="evolution",
+                production_runtime=prod,
+                default_actor=SALES_AGENT,
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
+            ),
         )
         g2_ok = next(g for g in ok_report.gates if g.gate == "gate_2_m0_grounding")
         assert g2_ok.passed is True
@@ -730,7 +753,12 @@ def test_p0_2_gate_2_verifies_production_ontology_overlay_and_detects_ownership_
                         f.owned = False
         bad_report = SymbolicCrucible().evaluate(
             broken_bp,
-            CrucibleContext(mode="evolution", production_runtime=prod, default_actor=SALES_AGENT),
+            CrucibleContext(
+                mode="evolution",
+                production_runtime=prod,
+                default_actor=SALES_AGENT,
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
+            ),
         )
         g2_bad = next(g for g in bad_report.gates if g.gate == "gate_2_m0_grounding")
         assert g2_bad.passed is False
@@ -894,7 +922,7 @@ def test_p1_fixes_precondition_no_full_scan_toposort_and_arithmetic_guard() -> N
 
     # P1-1: 传入不存在的 order_id 必须抛 ObjectNotFoundError，而非全表扫描报无关单据错误
     bp = DeclarativeBlueprint.model_validate(_base_o2c_blueprint(include_unshipped_invoice_guard=True))
-    spec = compile_blueprint(bp)
+    spec = compile_blueprint(bp, seed_ontology=BUSINESS_SEED_ONTOLOGY)
     rt = OntologyRuntime(spec, db_path=":memory:")
     try:
         for row in build_initial_o2c_m0_objects():
@@ -992,7 +1020,11 @@ def test_p1_fixes_precondition_no_full_scan_toposort_and_arithmetic_guard() -> N
     )
     g5_report = SymbolicCrucible().evaluate(
         code_overfit,
-        CrucibleContext(mode="evolution", m0_objects=build_initial_o2c_m0_objects()),
+        CrucibleContext(
+            mode="evolution",
+            m0_objects=build_initial_o2c_m0_objects(),
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
+        ),
     )
     g5 = next(g for g in g5_report.gates if g.gate == "gate_5_parsimony_anti_overfitting")
     assert g5.passed is False
@@ -1253,6 +1285,7 @@ def test_strong_typed_proposed_eval_cases_self_check_and_multi_cycle_gate4_lock(
             backend=CallableAbductionBackend(_three_round_evolver),
             governance=gov,
             crucible=SymbolicCrucible(),
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
         )
         res = evolver.run_evolution_cycle(
             model_id="erp_o2c",
@@ -1260,6 +1293,7 @@ def test_strong_typed_proposed_eval_cases_self_check_and_multi_cycle_gate4_lock(
             crucible_context=CrucibleContext(
                 mode="evolution",
                 m0_objects=build_initial_o2c_m0_objects(),
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
                 incident_counterexamples=[
                     IncidentCounterexample(
                         name="cx_big",
@@ -1297,12 +1331,14 @@ def test_strong_typed_proposed_eval_cases_self_check_and_multi_cycle_gate4_lock(
             backend=CallableAbductionBackend(lambda *_: {"patch": regressing_patch.model_dump(mode="json")}),
             governance=gov,
             crucible=SymbolicCrucible(),
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
         ).run_evolution_cycle(
             model_id="erp_o2c",
             cluster=cluster,
             crucible_context=CrucibleContext(
                 mode="evolution",
                 m0_objects=[],
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
                 default_actor=AI_AGENT,
             ),
             max_rounds=1,
@@ -1736,3 +1772,843 @@ def test_induction_kernel_zero_psm_or_protocol_smuggling() -> None:
         (repo_root / "open_ontology" / "runtime.py").read_text(encoding="utf-8").splitlines()
     )
     assert runtime_lines <= 1400, f"runtime.py exceeded 1400 lines ({runtime_lines})"
+
+
+def test_stage1_p0_1_approval_rule_target_and_view_access(tmp_path: Path) -> None:
+    from open_ontology import ConcurrencyConflictError
+
+    bad_global_bp = DeclarativeBlueprint(
+        model_id="stage1-bad-global",
+        version="1.0.0",
+        object_types=[
+            ObjectTypeBlueprint(
+                name="Ticket",
+                primary_key="ticket_id",
+                fields=[
+                    FieldSpec(name="ticket_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="owner_id", field_type="str", required=True),
+                ],
+            )
+        ],
+        invariants=[
+            InvariantRuleSpec(
+                name="bad_actor_ref",
+                code="BAD_REF",
+                target_type="Ticket",
+                must_hold={"op": "eq", "left": {"ref": "obj.owner_id"}, "right": {"ref": "actor.actor_id"}},
+            )
+        ],
+    )
+    with pytest.raises(InvariantError) as exc_global:
+        compile_blueprint(bad_global_bp)
+    assert exc_global.value.code == "UNAVAILABLE_REF_IN_CONTEXT"
+
+    bad_create_approval_bp = DeclarativeBlueprint(
+        model_id="stage1-bad-create-approval",
+        version="1.0.0",
+        object_types=[
+            ObjectTypeBlueprint(
+                name="Ticket",
+                primary_key="ticket_id",
+                fields=[
+                    FieldSpec(name="ticket_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="amount", field_type="float", required=True),
+                ],
+            )
+        ],
+        actions=[
+            ActionBlueprint(
+                name="create_ticket",
+                allowed_roles=["sales", "admin"],
+                params=[
+                    FieldSpec(name="ticket_id", field_type="str", required=True),
+                    FieldSpec(name="amount", field_type="float", required=True),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="create",
+                        object_type="Ticket",
+                        id_param="ticket_id",
+                        set_fields={
+                            "ticket_id": {"ref": "param.ticket_id"},
+                            "amount": {"ref": "param.amount"},
+                        },
+                    )
+                ],
+                approval_rule={"op": "gt", "left": {"ref": "obj.amount"}, "right": {"lit": 100.0}},
+            )
+        ],
+    )
+    with pytest.raises(InvariantError) as exc_create_appr:
+        compile_blueprint(bad_create_approval_bp)
+    assert exc_create_appr.value.code == "UNAVAILABLE_REF_IN_CONTEXT"
+
+    approval_bp = DeclarativeBlueprint(
+        model_id="stage1-approval-view",
+        version="1.0.0",
+        object_types=[
+            ObjectTypeBlueprint(
+                name="Customer",
+                primary_key="customer_id",
+                fields=[
+                    FieldSpec(name="customer_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="credit_limit", field_type="float", required=True),
+                ],
+            ),
+            ObjectTypeBlueprint(
+                name="SalesOrder",
+                primary_key="order_id",
+                fields=[
+                    FieldSpec(name="order_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="amount", field_type="float", required=True),
+                    FieldSpec(name="state", field_type="str", required=True),
+                ],
+                relations=[
+                    RelationSpec(field="customer", target_type="Customer", required=True),
+                ],
+            ),
+        ],
+        actions=[
+            ActionBlueprint(
+                name="seed_customer",
+                allowed_roles=["sales", "manager", "admin"],
+                params=[
+                    FieldSpec(name="customer_id", field_type="str", required=True),
+                    FieldSpec(name="credit_limit", field_type="float", required=True),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="create",
+                        object_type="Customer",
+                        id_param="customer_id",
+                        set_fields={
+                            "customer_id": {"ref": "param.customer_id"},
+                            "credit_limit": {"ref": "param.credit_limit"},
+                        },
+                    )
+                ],
+            ),
+            ActionBlueprint(
+                name="bump_credit",
+                allowed_roles=["manager", "admin"],
+                params=[
+                    FieldSpec(name="customer_id", field_type="str", required=True),
+                    FieldSpec(name="credit_limit", field_type="float", required=True),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="Customer",
+                        id_param="customer_id",
+                        set_fields={"credit_limit": {"ref": "param.credit_limit"}},
+                    )
+                ],
+            ),
+            ActionBlueprint(
+                name="seed_order",
+                allowed_roles=["sales", "manager", "admin"],
+                params=[
+                    FieldSpec(name="order_id", field_type="str", required=True),
+                    FieldSpec(name="customer", field_type="str", required=True),
+                    FieldSpec(name="amount", field_type="float", required=True),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="create",
+                        object_type="SalesOrder",
+                        id_param="order_id",
+                        set_fields={
+                            "order_id": {"ref": "param.order_id"},
+                            "customer": {"ref": "param.customer"},
+                            "amount": {"ref": "param.amount"},
+                            "state": {"lit": "draft"},
+                        },
+                    )
+                ],
+            ),
+            ActionBlueprint(
+                name="confirm_order",
+                allowed_roles=["sales", "manager", "admin"],
+                approver_roles=["manager", "admin"],
+                params=[FieldSpec(name="order_id", field_type="str", required=True)],
+                approval_target_type="SalesOrder",
+                approval_id_param="order_id",
+                approval_rule={
+                    "op": "gt",
+                    "left": {"ref": "obj.amount"},
+                    "right": {"ref": "obj.customer.credit_limit"},
+                },
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="SalesOrder",
+                        id_param="order_id",
+                        set_fields={"state": {"lit": "confirmed"}},
+                    )
+                ],
+            ),
+        ],
+    )
+    spec = compile_blueprint(approval_bp)
+    sales = Actor(actor_id="sales-1", role="sales", clearance_tags={"*"})
+    mgr = Actor(actor_id="mgr-1", role="manager", clearance_tags={"*"})
+
+    rt = OntologyRuntime(spec, db_path=tmp_path / "approval.db")
+    try:
+        rt.submit_action("RUN-C1", "seed_customer", {"customer_id": "C1", "credit_limit": 1000.0}, sales)
+        rt.submit_action(
+            "RUN-SO1",
+            "seed_order",
+            {"order_id": "SO-1", "customer": "C1", "amount": 1500.0},
+            sales,
+        )
+        rt.submit_action(
+            "RUN-SO2",
+            "seed_order",
+            {"order_id": "SO-2", "customer": "C1", "amount": 500.0},
+            sales,
+        )
+
+        # Within customer credit_limit -> executes immediately without approval
+        low_res = rt.submit_action("RUN-CFM-2", "confirm_order", {"order_id": "SO-2"}, sales)
+        assert low_res["status"] == "COMMITTED"
+
+        # Exceeds obj.customer.credit_limit -> simulation & submit require approval
+        sim = rt.simulate_action("confirm_order", {"order_id": "SO-1"}, sales)
+        assert sim.requires_approval is True
+
+        pending = rt.submit_action("RUN-CFM-1", "confirm_order", {"order_id": "SO-1"}, sales)
+        assert pending["status"] == "PENDING_APPROVAL"
+
+        # Concurrent update to traversed Customer.credit_limit invalidates the approval read set
+        rt.submit_action("RUN-BUMP", "bump_credit", {"customer_id": "C1", "credit_limit": 2000.0}, mgr)
+        with pytest.raises(ConcurrencyConflictError):
+            rt.approve_action("RUN-CFM-1", mgr)
+
+        # Re-submit for another high order where approval_rule triggers (amount 2500 > 2000) and approve cleanly
+        rt.submit_action("RUN-SO3", "seed_order", {"order_id": "SO-3", "customer": "C1", "amount": 2500.0}, sales)
+        pending3 = rt.submit_action("RUN-CFM-3", "confirm_order", {"order_id": "SO-3"}, sales)
+        assert pending3["status"] == "PENDING_APPROVAL"
+        approved3 = rt.approve_action("RUN-CFM-3", mgr)
+        assert approved3["status"] == "COMMITTED"
+    finally:
+        rt.close()
+
+
+def test_stage1_p0_2_zero_m1_hardcoding_and_custom_seed_ontology(tmp_path: Path) -> None:
+    from typing import ClassVar
+    from open_ontology import ObjectType, OntologySpec
+    from open_ontology.induction import seed_from_spec
+
+    m1_archetype_without_seed = DeclarativeBlueprint(
+        model_id="stage1-no-m1-default",
+        version="1.0.0",
+        object_types=[
+            ObjectTypeBlueprint(
+                name="Account",
+                archetype="MasterEntity",
+                primary_key="account_id",
+                fields=[FieldSpec(name="account_id", field_type="str", primary_key=True, required=True)],
+            )
+        ],
+    )
+    with pytest.raises(InvariantError) as exc_arch:
+        compile_blueprint(m1_archetype_without_seed)
+    assert exc_arch.value.code == "UNKNOWN_SEED_ARCHETYPE"
+
+    class FlightTelemetry(ObjectType):
+        __abstract__: ClassVar[bool] = True
+        __non_negative_fields__: ClassVar[tuple[str, ...]] = ()
+
+    class MissionDirective(ObjectType):
+        __abstract__: ClassVar[bool] = True
+        __status_field__: ClassVar[str] = "status"
+        __transitions__: ClassVar[dict[str, tuple[str, ...]]] = {}
+
+    aero_spec = OntologySpec()
+    aero_spec.object_type(FlightTelemetry)
+    aero_spec.object_type(MissionDirective)
+
+    @aero_spec.invariant("aero_non_negative_fuel", code="NEGATIVE_FUEL")
+    def _inv_fuel(view: Any) -> bool:
+        for cls in view.spec.object_types.values():
+            for fname in tuple(getattr(cls, "__non_negative_fields__", ()) or ()):
+                for obj in view.query(cls):
+                    val = getattr(obj, fname, None)
+                    if isinstance(val, (int, float)) and not isinstance(val, bool) and val < 0:
+                        raise InvariantError(f"{cls.__name__}.{fname} < 0", code="NEGATIVE_FUEL")
+        return True
+
+    @aero_spec.transition_invariant("aero_directive_fsm", code="ILLEGAL_DIRECTIVE_STEP")
+    def _inv_fsm(diff: Any, view: Any) -> bool:
+        for ch in diff.object_changes:
+            cls = view.spec.get_object_type(ch.object_type)
+            if not issubclass(cls, MissionDirective):
+                continue
+            if ch.kind == "update":
+                old_s = (ch.before or {}).get("status")
+                new_s = (ch.after or {}).get("status")
+                allowed = (getattr(cls, "__transitions__", {}) or {}).get(old_s, ())
+                if old_s != new_s and new_s not in allowed:
+                    raise InvariantError(f"{old_s} -> {new_s} illegal", code="ILLEGAL_DIRECTIVE_STEP")
+        return True
+
+    aero_seed = seed_from_spec(
+        seed_id="aerospace_seed",
+        domain_name="aerospace",
+        base_spec=aero_spec,
+        provides_non_negative=True,
+        provides_fsm=True,
+    )
+
+    aero_bp = DeclarativeBlueprint(
+        model_id="stage1-aero",
+        version="1.0.0",
+        object_types=[
+            ObjectTypeBlueprint(
+                name="DroneFuel",
+                archetype="FlightTelemetry",
+                primary_key="telemetry_id",
+                fields=[
+                    FieldSpec(name="telemetry_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="fuel_kg", field_type="float", required=True, non_negative=True),
+                ],
+            ),
+            ObjectTypeBlueprint(
+                name="LaunchTask",
+                archetype="MissionDirective",
+                primary_key="directive_id",
+                fields=[
+                    FieldSpec(name="directive_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="status", field_type="str", required=True),
+                ],
+                status_field="status",
+                initial_statuses=["queued"],
+                transitions={"queued": ["active"]},
+            ),
+        ],
+        actions=[
+            ActionBlueprint(
+                name="create_fuel",
+                allowed_roles=["ops"],
+                params=[
+                    FieldSpec(name="telemetry_id", field_type="str", required=True),
+                    FieldSpec(name="fuel_kg", field_type="float", required=True),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="create",
+                        object_type="DroneFuel",
+                        id_param="telemetry_id",
+                        set_fields={
+                            "telemetry_id": {"ref": "param.telemetry_id"},
+                            "fuel_kg": {"ref": "param.fuel_kg"},
+                        },
+                    )
+                ],
+            ),
+            ActionBlueprint(
+                name="create_task",
+                allowed_roles=["ops"],
+                params=[
+                    FieldSpec(name="directive_id", field_type="str", required=True),
+                    FieldSpec(name="status", field_type="str", required=True),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="create",
+                        object_type="LaunchTask",
+                        id_param="directive_id",
+                        set_fields={
+                            "directive_id": {"ref": "param.directive_id"},
+                            "status": {"ref": "param.status"},
+                        },
+                    )
+                ],
+            ),
+            ActionBlueprint(
+                name="step_task",
+                allowed_roles=["ops"],
+                params=[
+                    FieldSpec(name="directive_id", field_type="str", required=True),
+                    FieldSpec(name="status", field_type="str", required=True),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="LaunchTask",
+                        id_param="directive_id",
+                        set_fields={"status": {"ref": "param.status"}},
+                    )
+                ],
+            ),
+        ],
+    )
+    compiled = compile_blueprint(aero_bp, seed_ontology=aero_seed)
+    assert "declarative_non_negative_fields" not in compiled.invariants
+    assert "declarative_fsm_transitions" not in compiled.transition_invariants
+
+    op = Actor(actor_id="flight-op", role="ops", clearance_tags={"*"})
+    rt = OntologyRuntime(compiled, db_path=tmp_path / "aero.db")
+    try:
+        with pytest.raises(InvariantError) as exc_fuel:
+            rt.submit_action("RUN-F1", "create_fuel", {"telemetry_id": "D1", "fuel_kg": -5.0}, op)
+        assert exc_fuel.value.code == "NEGATIVE_FUEL"
+
+        rt.submit_action("RUN-M1", "create_task", {"directive_id": "M1", "status": "queued"}, op)
+        with pytest.raises(InvariantError) as exc_fsm:
+            rt.submit_action("RUN-M2", "step_task", {"directive_id": "M1", "status": "done"}, op)
+        assert exc_fsm.value.code == "ILLEGAL_DIRECTIVE_STEP"
+    finally:
+        rt.close()
+
+
+def test_stage1_p1_1_dsl_arithmetic_aggregates_target_ref_and_evolution(tmp_path: Path) -> None:
+    from open_ontology.induction import (
+        AdapterMappingSpec,
+        EntityMappingSpec,
+        FieldTransformSpec,
+        apply_adapter_mapping_patch,
+    )
+
+    assert eval_predicate(
+        {"op": "eq", "left": {"op": "div", "left": {"lit": 600}, "right": {"lit": 3}}, "right": {"lit": 200}},
+        {},
+    )
+    with pytest.raises(InvariantError) as exc_div:
+        eval_predicate({"op": "gt", "left": {"op": "div", "left": {"lit": 10}, "right": {"lit": 0}}, "right": {"lit": 0}}, {})
+    assert exc_div.value.code == "DIVISION_BY_ZERO"
+
+    bp = DeclarativeBlueprint(
+        model_id="stage1-p1-1",
+        version="1.0.0",
+        object_types=[
+            ObjectTypeBlueprint(
+                name="Customer",
+                primary_key="customer_id",
+                fields=[
+                    FieldSpec(name="customer_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="credit_limit", field_type="float", required=True),
+                    FieldSpec(name="exposure", field_type="float", required=True),
+                    FieldSpec(name="legacy_note", field_type="str", required=False),
+                ],
+            ),
+            ObjectTypeBlueprint(
+                name="SalesOrder",
+                primary_key="order_id",
+                fields=[
+                    FieldSpec(name="order_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="amount", field_type="float", required=True),
+                ],
+                relations=[
+                    RelationSpec(field="customer", target_type="Customer", required=True),
+                ],
+            ),
+        ],
+        actions=[
+            ActionBlueprint(
+                name="seed_customer",
+                allowed_roles=["sales"],
+                params=[
+                    FieldSpec(name="customer_id", field_type="str", required=True),
+                    FieldSpec(name="credit_limit", field_type="float", required=True),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="create",
+                        object_type="Customer",
+                        id_param="customer_id",
+                        set_fields={
+                            "customer_id": {"ref": "param.customer_id"},
+                            "credit_limit": {"ref": "param.credit_limit"},
+                            "exposure": {"lit": 0.0},
+                        },
+                    )
+                ],
+            ),
+            ActionBlueprint(
+                name="book_order",
+                allowed_roles=["sales"],
+                params=[
+                    FieldSpec(name="order_id", field_type="str", required=True),
+                    FieldSpec(name="customer", field_type="str", required=True),
+                    FieldSpec(name="amount", field_type="float", required=True),
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="customer_sum_cap",
+                        code="SUM_CAP_EXCEEDED",
+                        target_type="Customer",
+                        id_param="customer",
+                        must_hold={
+                            "op": "le",
+                            "left": {
+                                "op": "add",
+                                "left": {
+                                    "op": "sum",
+                                    "object_type": "SalesOrder",
+                                    "field": "amount",
+                                    "where": {
+                                        "op": "eq",
+                                        "left": {"ref": "target.customer"},
+                                        "right": {"ref": "param.customer"},
+                                    },
+                                },
+                                "right": {"ref": "param.amount"},
+                            },
+                            "right": {"lit": 1000.0},
+                        },
+                    )
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="create",
+                        object_type="SalesOrder",
+                        id_param="order_id",
+                        set_fields={
+                            "order_id": {"ref": "param.order_id"},
+                            "customer": {"ref": "param.customer"},
+                            "amount": {"ref": "param.amount"},
+                        },
+                    )
+                ],
+            ),
+            ActionBlueprint(
+                name="post_order_exposure",
+                allowed_roles=["sales"],
+                params=[FieldSpec(name="order_id", field_type="str", required=True)],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="SalesOrder",
+                        id_param="order_id",
+                        set_fields={"amount": {"ref": "obj.amount"}},
+                    ),
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="Customer",
+                        target_ref="obj.customer",
+                        set_fields={
+                            "exposure": {
+                                "op": "add",
+                                "left": {"ref": "obj.exposure"},
+                                "right": {"ref": "source_obj.amount"},
+                            }
+                        },
+                    ),
+                ],
+            ),
+        ],
+        invariants=[
+            InvariantRuleSpec(
+                name="max_order_cap",
+                code="MAX_ORDER_EXCEEDED",
+                target_type="SalesOrder",
+                must_hold={
+                    "op": "le",
+                    "left": {"op": "max", "object_type": "SalesOrder", "field": "amount"},
+                    "right": {"lit": 900.0},
+                },
+            ),
+            InvariantRuleSpec(
+                name="min_order_floor",
+                code="MIN_ORDER_FLOOR",
+                target_type="SalesOrder",
+                must_hold={
+                    "op": "ge",
+                    "left": {"op": "min", "object_type": "SalesOrder", "field": "amount"},
+                    "right": {"lit": 10.0},
+                },
+            ),
+        ],
+    )
+
+    spec = compile_blueprint(bp)
+    actor = Actor(actor_id="sales-1", role="sales", clearance_tags={"*"})
+    rt = OntologyRuntime(spec, db_path=tmp_path / "p1_1.db")
+    try:
+        rt.submit_action("RUN-C1", "seed_customer", {"customer_id": "C1", "credit_limit": 2000.0}, actor)
+        rt.submit_action("RUN-O1", "book_order", {"order_id": "O1", "customer": "C1", "amount": 600.0}, actor)
+        rt.submit_action("RUN-EXP1", "post_order_exposure", {"order_id": "O1"}, actor)
+        cust = rt.get_object(spec.get_object_type("Customer"), "C1", actor)
+        assert cust.exposure == pytest.approx(600.0)
+        # sum(600) + 500 > 1000 precondition fails
+        with pytest.raises(InvariantError) as exc_sum:
+            rt.submit_action("RUN-O2", "book_order", {"order_id": "O2", "customer": "C1", "amount": 500.0}, actor)
+        assert exc_sum.value.code == "SUM_CAP_EXCEEDED"
+    finally:
+        rt.close()
+
+    # Invalid target_ref checks
+    bad_target_ref_bp = bp.model_copy(
+        update={
+            "actions": [
+                ActionBlueprint(
+                    name="bad_target",
+                    allowed_roles=["sales"],
+                    params=[FieldSpec(name="order_id", field_type="str", required=True)],
+                    mutations=[
+                        ActionMutationSpec(
+                            op="modify",
+                            object_type="Customer",
+                            target_ref="customer",
+                            set_fields={"exposure": {"lit": 0.0}},
+                        )
+                    ],
+                )
+            ]
+        }
+    )
+    with pytest.raises(InvariantError) as exc_tref:
+        compile_blueprint(bad_target_ref_bp)
+    assert exc_tref.value.code in {"INVALID_MUTATION_TARGET_REF", "MISSING_TARGET_REF"}
+
+    # EvolutionPatch: CANNOT_REMOVE_PRIMARY_KEY, FIELD_IN_USE, clean remove_fields + add_relations
+    with pytest.raises(InvariantError) as exc_pk:
+        apply_evolution_patch(
+            bp,
+            EvolutionPatch(base_version="1.0.0", target_version="1.1.0", remove_fields={"Customer": ["customer_id"]}),
+        )
+    assert exc_pk.value.code == "CANNOT_REMOVE_PRIMARY_KEY"
+
+    with pytest.raises(InvariantError) as exc_inuse:
+        apply_evolution_patch(
+            bp,
+            EvolutionPatch(base_version="1.0.0", target_version="1.1.0", remove_fields={"Customer": ["exposure"]}),
+        )
+    assert exc_inuse.value.code == "FIELD_IN_USE"
+
+    clean_patch = EvolutionPatch(
+        base_version="1.0.0",
+        target_version="1.1.0",
+        add_relations={
+            "SalesOrder": [RelationSpec(field="alt_customer", target_type="Customer", required=False)]
+        },
+        remove_fields={"Customer": ["legacy_note"]},
+    )
+    evolved = apply_evolution_patch(bp, clean_patch)
+    so_bp = next(ot for ot in evolved.object_types if ot.name == "SalesOrder")
+    cust_bp = next(ot for ot in evolved.object_types if ot.name == "Customer")
+    assert any(r.field == "alt_customer" for r in so_bp.relations)
+    assert all(f.name != "legacy_note" for f in cust_bp.fields)
+    assert any(m.op == "drop_field" and m.field == "legacy_note" for m in evolved.migrations)
+
+    mapping = AdapterMappingSpec(
+        mapping_id="mock-map",
+        source_kind="mock",
+        entity_mappings=[
+            EntityMappingSpec(
+                source_table="res.partner",
+                target_object_type="Customer",
+                id_transform=FieldTransformSpec(target_field="customer_id", source_field="id", kind="direct"),
+                field_transforms=[
+                    FieldTransformSpec(target_field="credit_limit", source_field="credit_limit", kind="direct"),
+                    FieldTransformSpec(target_field="exposure", source_field="exposure", kind="direct"),
+                    FieldTransformSpec(target_field="legacy_note", source_field="comment", kind="direct"),
+                ],
+            )
+        ],
+    )
+    patched_mapping = apply_adapter_mapping_patch(mapping, clean_patch)
+    assert patched_mapping is not None
+    assert all(tf.target_field != "legacy_note" for tf in patched_mapping.entity_mappings[0].field_transforms)
+
+
+def test_stage1_p1_2_gate5_overfitting_and_categorical_codes() -> None:
+    crucible = SymbolicCrucible()
+    m0_objs = [
+        {
+            "object_type": "Customer",
+            "object_id": "1042",
+            "data": {"customer_id": 1042, "tier_code": "B2B-VIP", "region_code": "US-EAST", "cert_code": "ISO-9001"},
+        },
+        {
+            "object_type": "Customer",
+            "object_id": "1043",
+            "data": {"customer_id": 1043, "tier_code": "B2B-VIP", "region_code": "US-EAST", "cert_code": "ISO-9001"},
+        },
+        {
+            "object_type": "Customer",
+            "object_id": "1044",
+            "data": {"customer_id": 1044, "tier_code": "B2B-STD", "region_code": "EU-WEST", "cert_code": "ISO-9001"},
+        },
+    ]
+    base_bp = DeclarativeBlueprint(
+        model_id="stage1-gate5",
+        version="1.0.0",
+        object_types=[
+            ObjectTypeBlueprint(
+                name="Customer",
+                primary_key="customer_id",
+                fields=[
+                    FieldSpec(name="customer_id", field_type="int", primary_key=True, required=True),
+                    FieldSpec(name="tier_code", field_type="str", required=True),
+                    FieldSpec(name="region_code", field_type="str", required=True),
+                    FieldSpec(name="cert_code", field_type="str", required=True),
+                ],
+            )
+        ],
+    )
+
+    uuid_bp = base_bp.model_copy(
+        update={
+            "invariants": [
+                InvariantRuleSpec(
+                    name="uuid_hardcode",
+                    code="ERR",
+                    target_type="Customer",
+                    must_hold={"op": "ne", "left": {"ref": "obj.tier_code"}, "right": {"lit": "550e8400-e29b-41d4-a716-446655440000"}},
+                )
+            ]
+        }
+    )
+    uuid_res = crucible.evaluate(uuid_bp, CrucibleContext(mode="evolution", m0_objects=m0_objs))
+    g5_uuid = next(g for g in uuid_res.gates if g.gate == "gate_5_parsimony_anti_overfitting")
+    assert g5_uuid.passed is False
+    assert any("OVERFITTING_INSTANCE_ID" in ce for ce in g5_uuid.counterexamples)
+
+    pk_bp = base_bp.model_copy(
+        update={
+            "invariants": [
+                InvariantRuleSpec(
+                    name="pk_hardcode",
+                    code="ERR",
+                    target_type="Customer",
+                    must_hold={"op": "ne", "left": {"ref": "obj.customer_id"}, "right": {"lit": 1042}},
+                )
+            ]
+        }
+    )
+    pk_res = crucible.evaluate(pk_bp, CrucibleContext(mode="evolution", m0_objects=m0_objs))
+    g5_pk = next(g for g in pk_res.gates if g.gate == "gate_5_parsimony_anti_overfitting")
+    assert g5_pk.passed is False
+    assert any("OVERFITTING_INSTANCE_ID" in ce for ce in g5_pk.counterexamples)
+
+    cat_bp = base_bp.model_copy(
+        update={
+            "invariants": [
+                InvariantRuleSpec(
+                    name="valid_codes",
+                    code="ERR",
+                    target_type="Customer",
+                    must_hold={
+                        "op": "and",
+                        "args": [
+                            {"op": "in", "left": {"ref": "obj.tier_code"}, "right": {"lit": ["B2B-VIP", "B2B-STD"]}},
+                            {"op": "in", "left": {"ref": "obj.region_code"}, "right": {"lit": ["US-EAST", "EU-WEST"]}},
+                            {"op": "eq", "left": {"ref": "obj.cert_code"}, "right": {"lit": "ISO-9001"}},
+                        ],
+                    },
+                )
+            ]
+        }
+    )
+    cat_res = crucible.evaluate(cat_bp, CrucibleContext(mode="evolution", m0_objects=m0_objs))
+    g5_cat = next(g for g in cat_res.gates if g.gate == "gate_5_parsimony_anti_overfitting")
+    assert not any("OVERFITTING_INSTANCE_ID" in ce for ce in g5_cat.counterexamples)
+    assert g5_cat.passed is True
+
+
+def test_stage1_p1_3_phenomenon_false_handling_and_p1_4_crucible_encapsulation(tmp_path: Path) -> None:
+    from open_ontology.induction import (
+        AdapterMappingSpec,
+        EntityMappingSpec,
+        ExternalEntityProfile,
+        ExternalFieldProfile,
+        ExternalPhenomenonProfile,
+        FieldTransformSpec,
+        project_external_phenomenon,
+        project_single_record,
+    )
+
+    entity_map = EntityMappingSpec(
+        source_table="lead",
+        target_object_type="Lead",
+        id_transform=FieldTransformSpec(target_field="id", source_field="id", kind="direct"),
+        field_transforms=[
+            FieldTransformSpec(target_field="is_active", source_field="active", kind="direct", default=None),
+            FieldTransformSpec(
+                target_field="fallback_flag",
+                source_field="active",
+                kind="coalesce",
+                fallback_fields=["backup_flag"],
+            ),
+            FieldTransformSpec(
+                target_field="status_label",
+                source_field="active",
+                kind="enum_map",
+                enum_map={"False": "inactive", "True": "active"},
+                default="unknown",
+            ),
+        ],
+    )
+    raw = {"id": "L1", "active": False, "backup_flag": True}
+
+    kept = project_single_record(entity_map, raw)
+    assert kept["is_active"] is False
+    assert kept["fallback_flag"] is False
+    assert kept["status_label"] == "inactive"
+
+    nullified = project_single_record(entity_map, raw, treat_false_as_null=True)
+    assert nullified["is_active"] is None
+    assert nullified["fallback_flag"] is True
+    assert nullified["status_label"] == "unknown"
+
+    phenom = ExternalPhenomenonProfile(
+        source_kind="sqlite",
+        source_locator="sqlite://test",
+        entities=[
+            ExternalEntityProfile(
+                table_name="lead",
+                row_count=1,
+                fields=[
+                    ExternalFieldProfile(name="id", raw_type="string", label="id"),
+                    ExternalFieldProfile(name="active", raw_type="integer", label="active"),
+                    ExternalFieldProfile(name="backup_flag", raw_type="integer", label="backup_flag"),
+                ],
+                sample_rows=[raw],
+            )
+        ],
+    )
+    proj_default, err_default = project_external_phenomenon(
+        phenom,
+        AdapterMappingSpec(mapping_id="m-sql", source_kind="sqlite", entity_mappings=[entity_map]),
+    )
+    assert err_default == []
+    assert proj_default[0]["data"]["is_active"] is False
+
+    proj_odoo, err_odoo = project_external_phenomenon(
+        phenom,
+        AdapterMappingSpec(
+            mapping_id="m-odoo",
+            source_kind="odoo",
+            treat_false_as_null=True,
+            entity_mappings=[entity_map],
+        ),
+    )
+    assert err_odoo == []
+    assert proj_odoo[0]["data"]["is_active"] is None
+
+    agents_src = (Path(__file__).resolve().parents[1] / "open_ontology" / "induction" / "agents.py").read_text(
+        encoding="utf-8"
+    )
+    assert "._actor" not in agents_src
+    assert "crucible._actor" not in agents_src
+
+    gov = InductionGovernanceService(tmp_path / "gov_encap.db")
+    try:
+        cluster = FrictionClusterSummary(
+            cluster_id="cl-stage1",
+            signal_kind="ROLLBACK",
+            action_type="confirm_order",
+            signature="CREDIT_EXCEEDED",
+            support_count=3,
+            escalated=True,
+            run_ids=("R1", "R2", "R3"),
+            evidences=(),
+        )
+        run = SymbolicCrucible().record_friction_cluster(gov, model_id="stage1-model", cluster=cluster)
+        assert run["actor_id"] == CRUCIBLE_ACTOR.actor_id
+    finally:
+        gov.close()
+

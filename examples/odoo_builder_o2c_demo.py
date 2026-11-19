@@ -68,6 +68,7 @@ from open_ontology.induction import (
 )
 from open_ontology.model_views import describe_behavior, describe_tbox
 
+from .business_ontology import BUSINESS_SEED_ONTOLOGY
 from .odoo_dual_erp_demo import DB_NORTH, OdooJSONRPC, OdooRPCError
 
 REQUIREMENT_DOC_PATH = Path(__file__).resolve().parent / "docs" / "sales_agent_o2c_requirement.md"
@@ -687,6 +688,7 @@ def _synthesize_odoo_adapter_mapping(*, clean_filters: bool) -> dict[str, Any]:
     mapping = AdapterMappingSpec(
         mapping_id="odoo19_to_o2c_v1",
         source_kind="odoo19_erp",
+        treat_false_as_null=True,
         entity_mappings=[
             EntityMappingSpec(
                 source_table="res.partner",
@@ -1049,11 +1051,13 @@ def run_odoo_to_o2c_builder_demo(
             backend=backend,
             governance=governance,
             crucible=SymbolicCrucible(),
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
         )
         crucible_ctx = CrucibleContext(
             mode="genesis",
             replay_factory=build_replay_events_from_projected_odoo,
             default_actor=SALES_AGENT,
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
         )
         result: InductionCycleResult = builder.run_genesis_cycle(
             model_id="o2c_ontology",
@@ -1069,7 +1073,7 @@ def run_odoo_to_o2c_builder_demo(
         assert crystallized_bp is not None
 
         # 3) 输出验证：将结晶的 O2C Ontology 编译为真实可运行的 OntologySpec + 装载真实 Odoo M0 数据
-        o2c_spec = compile_blueprint(crystallized_bp)
+        o2c_spec = compile_blueprint(crystallized_bp, seed_ontology=BUSINESS_SEED_ONTOLOGY)
         tbox_view = describe_tbox(o2c_spec)
         behavior_view = describe_behavior(o2c_spec)
         osdk_tools = export_llm_tools(o2c_spec)

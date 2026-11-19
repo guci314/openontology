@@ -239,6 +239,9 @@ def build_business_seed_ontology() -> Any:
             "Every ProcessDocument status field MUST follow declared finite-state transitions.",
             "Every EventVoucher record is append-only and immutable after creation.",
         ),
+        provides_non_negative=True,
+        provides_fsm=True,
+        provides_balance_conservation=True,
     )
 
 

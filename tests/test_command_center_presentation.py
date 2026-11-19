@@ -430,9 +430,10 @@ def test_browser_topology_new_tab_zoom_drag_reset(live, browser):
     fits = topo.evaluate(
         """() => {
             const r = document.getElementById('scene').getBoundingClientRect();
-            return {left:r.left, top:r.top, right:r.right, bottom:r.bottom,
-                    w:document.getElementById('canvas').clientWidth,
-                    h:document.getElementById('canvas').clientHeight};
+            const c = document.getElementById('canvas').getBoundingClientRect();
+            return {left:r.left - c.left, top:r.top - c.top,
+                    right:r.right - c.left, bottom:r.bottom - c.top,
+                    w:c.width, h:c.height};
         }"""
     )
     assert fits["left"] >= -2 and fits["top"] >= -2
@@ -496,12 +497,12 @@ def test_browser_topology_shows_objects_links_actions_and_functions(live, browse
     )
     page.wait_for_selector("#scene rect.node")
 
-    # 数据层：5 个对象类型仍走 class="node"，不被新增语义层污染。
-    assert page.locator("#scene rect.node").count() == 5
-    # 语义层：13 个受控业务动作 + 3 个只读查询函数 + 1 个自动化规则各自独立成卡。
-    assert page.locator("#scene rect.action-node").count() == 13
-    assert page.locator("#scene rect.fn-node").count() == 3
-    assert page.locator("#scene rect.auto-node").count() == 1
+    # 数据层：4 个对象类型走 class="node"，不被新增语义层污染。
+    assert page.locator("#scene rect.node").count() == 4
+    # 语义层：11 个受控业务动作 + 4 个只读查询函数各自独立成卡。
+    assert page.locator("#scene rect.action-node").count() == 11
+    assert page.locator("#scene rect.fn-node").count() == 4
+    assert page.locator("#scene rect.auto-node").count() == 0
 
     scene_text = page.evaluate(
         "() => document.getElementById('scene').textContent || ''"
@@ -511,18 +512,25 @@ def test_browser_topology_shows_objects_links_actions_and_functions(live, browse
         "登记执行结果",
         "创建任务卡片",
         "指派承接人",
-        "调度看板任务",
+        "解除卡片阻塞",
         "释放卡片认领",
     ):
         assert marker in scene_text, marker
-    for marker in ("看板总览", "看板流程图", "生成任务简报"):
-        assert marker in scene_text, marker
-    for marker in ("自动化规则层 · AUTOMATIONS", "看板版本变更自动调度", "监听 看板"):
+    for marker in ("看板总览", "看板流程图", "查询可认领卡片", "生成任务简报"):
         assert marker in scene_text, marker
 
     subtitle = page.inner_text("#subtitle")
-    for marker in ("5 个对象类型", "6 个对象属性", "13 个业务动作", "3 个查询函数", "1 个自动化规则"):
+    for marker in ("4 个对象类型", "4 个对象属性", "11 个业务动作", "4 个查询函数"):
         assert marker in subtitle, marker
+
+    # 额外验证含自动化规则的蓝图（osv2_governance）完整渲染自动化规则层
+    page.goto(base_url + "/topology?ontology=osv2_governance", wait_until="networkidle")
+    page.wait_for_selector("#scene rect.auto-node")
+    assert page.locator("#scene rect.auto-node").count() == 3
+    gov_text = page.evaluate("() => document.getElementById('scene').textContent || ''")
+    assert "自动化规则层 · AUTOMATIONS" in gov_text
+    page.goto(base_url + "/topology?ontology=task_board", wait_until="networkidle")
+    page.wait_for_selector("#scene rect.node")
 
     page.locator("#fitBtn").click()
     page.wait_for_timeout(150)
@@ -1624,7 +1632,7 @@ def test_browser_topology_model_alias_renders_same_scene(live, browser):
     try:
         page.goto(base_url + "/topology?model=task_board", wait_until="networkidle")
         page.wait_for_selector("#scene rect.node")
-        assert page.locator("#scene rect.node").count() == 6
+        assert page.locator("#scene rect.node").count() == 4
         assert "任务看板" in page.inner_text("#title")
         assert errors == [], errors
     finally:

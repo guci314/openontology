@@ -537,6 +537,7 @@ def synthesize_from_fde_evidence(
     adapter_mapping = AdapterMappingSpec(
         mapping_id=f"{model_id}_bidirectional_v1",
         source_kind="discovered_erp",
+        treat_false_as_null=True,
         entity_mappings=entity_mappings,
         action_bindings=action_bindings,
     )
@@ -750,7 +751,12 @@ class DeclarativeOdooBridge:
                 raise RuntimeError(
                     f"independent readback could not find {binding.external_table}:{ext_id}"
                 )
-            projected_row = project_single_record(em, raw_rows[0], lookup_index=self.lookup_index)
+            projected_row = project_single_record(
+                em,
+                raw_rows[0],
+                lookup_index=self.lookup_index,
+                treat_false_as_null=True,
+            )
             run_id = str(move.get("run_id") or "")
             if run_id:
                 self._last_observed_by_run[run_id] = dict(projected_row)
@@ -1140,25 +1146,28 @@ def run_autonomous_fde_end_to_end(
                 sandbox=sandbox_client,
             ) as bridge:
                 # Pick up to 2 forward actions with available live records on the sandbox
+                def _valid_befores_for(act_def: ActionBlueprint) -> set[str]:
+                    valid: set[str] = set()
+                    for pre in act_def.preconditions:
+                        r_lit = pre.must_hold.get("right", {}).get("lit")
+                        if isinstance(r_lit, list):
+                            valid.update(str(x) for x in r_lit)
+                    return valid
+
                 used_records: set[tuple[str, str]] = set()
+                # Pass 1: one per distinct clean forward binding (prefers cross-model diversity)
                 for binding in active_mapping.action_bindings:
                     if len(homomorphic_results) >= 2:
                         break
                     act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
                     if act_def.approval_rule is not None:
                         continue  # prefer clean forward actions first
-                    valid_befores: set[str] = set()
-                    for pre in act_def.preconditions:
-                        r_lit = pre.must_hold.get("right", {}).get("lit")
-                        if isinstance(r_lit, list):
-                            valid_befores.update(str(x) for x in r_lit)
-                    # Find a real record currently in one of valid_befores in memory_rt
+                    valid_befores = _valid_befores_for(act_def)
                     cls = compiled_spec.get_object_type(binding.target_object_type)
-                    objs = memory_rt.query_objects(cls, AI_OPS_ACTOR)
                     target_obj = next(
                         (
                             o
-                            for o in objs
+                            for o in memory_rt.query_objects(cls, AI_OPS_ACTOR)
                             if str(getattr(o, binding.expected_state_field, "")) in valid_befores
                             and (binding.target_object_type, o.primary_key_value()) not in used_records
                         ),
@@ -1175,16 +1184,44 @@ def run_autonomous_fde_end_to_end(
                     )
                     homomorphic_results.append(res)
 
+                # Pass 2: if fewer than 2 ran, top up from remaining unused clean candidates
+                # while keeping >= 1 unused candidate reserved for the drift check below.
+                while len(homomorphic_results) < 2:
+                    unused_keys: set[tuple[str, str]] = set()
+                    next_pick: tuple[ActionExecutionBinding, Any] | None = None
+                    for binding in active_mapping.action_bindings:
+                        act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
+                        if act_def.approval_rule is not None:
+                            continue
+                        valid_befores = _valid_befores_for(act_def)
+                        cls = compiled_spec.get_object_type(binding.target_object_type)
+                        for o in memory_rt.query_objects(cls, AI_OPS_ACTOR):
+                            key = (binding.target_object_type, o.primary_key_value())
+                            if (
+                                str(getattr(o, binding.expected_state_field, "")) in valid_befores
+                                and key not in used_records
+                            ):
+                                unused_keys.add(key)
+                                if next_pick is None:
+                                    next_pick = (binding, o)
+                    if len(unused_keys) < 2 or next_pick is None:
+                        break
+                    binding, target_obj = next_pick
+                    used_records.add((binding.target_object_type, target_obj.primary_key_value()))
+                    res = bridge.execute_and_settle(
+                        run_id=f"HOMO-{len(homomorphic_results) + 1}",
+                        action_name=binding.action_name,
+                        params={binding.id_param: target_obj.primary_key_value()},
+                        actor=AI_OPS_ACTOR,
+                    )
+                    homomorphic_results.append(res)
+
                 # Also prove DEVICE_STATE_MISMATCH protection on a live record when external drifts
                 for binding in active_mapping.action_bindings:
                     act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
                     if act_def.approval_rule is not None:
                         continue
-                    valid_befores = set()
-                    for pre in act_def.preconditions:
-                        r_lit = pre.must_hold.get("right", {}).get("lit")
-                        if isinstance(r_lit, list):
-                            valid_befores.update(str(x) for x in r_lit)
+                    valid_befores = _valid_befores_for(act_def)
                     cls = compiled_spec.get_object_type(binding.target_object_type)
                     objs = memory_rt.query_objects(cls, AI_OPS_ACTOR)
                     drift_obj = next(

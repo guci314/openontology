@@ -211,7 +211,12 @@ def _evaluate_south_m0_grounding(
                 raw_row = rows_by_table[em.source_table][rid]
                 if any(not _row_matches_filter(raw_row, flt) for flt in em.row_filters):
                     continue
-                proj = project_single_record(em, raw_row, lookup_index=lookup_index)
+                proj = project_single_record(
+                    em,
+                    raw_row,
+                    lookup_index=lookup_index,
+                    treat_false_as_null=True,
+                )
                 if any(proj.get(rf) is None for rf in em.drop_if_missing_refs):
                     continue
                 cid = str(proj[em.id_transform.target_field])

@@ -59,6 +59,7 @@ from open_ontology.induction import (
     SymbolicCrucible,
     compile_blueprint,
 )
+from .business_ontology import BUSINESS_SEED_ONTOLOGY
 
 AI_AGENT = Actor(actor_id="agent:o2c-ops", role="ai_agent", clearance_tags=frozenset({"*"}))
 FINANCE_DIRECTOR = Actor(
@@ -515,12 +516,14 @@ def run_o2c_induction_demo(*, offline: bool = True) -> dict[str, Any]:
                 ),
             ],
             default_actor=AI_AGENT,
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
         )
 
         builder = OntologyBuilderAgent(
             backend=builder_backend,
             governance=governance,
             crucible=crucible,
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
         )
         genesis_res: InductionCycleResult = builder.run_genesis_cycle(
             model_id="erp_o2c",
@@ -543,7 +546,7 @@ def run_o2c_induction_demo(*, offline: bool = True) -> dict[str, Any]:
         # ===================================================================
         # 第二幕：基于结晶 v1.0.0 运行生产 M0 世界 -> 产生偶发噪声 + 系统性大单回滚摩擦
         # ===================================================================
-        v1_spec = compile_blueprint(v1_blueprint)
+        v1_spec = compile_blueprint(v1_blueprint, seed_ontology=BUSINESS_SEED_ONTOLOGY)
         prod_rt = OntologyRuntime(v1_spec, db_path=":memory:")
         try:
             for item in m0_seed:
@@ -643,12 +646,14 @@ def run_o2c_induction_demo(*, offline: bool = True) -> dict[str, Any]:
                     ),
                 ],
                 default_actor=AI_AGENT,
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
             )
 
             evolver = OntologyEvolverAgent(
                 backend=evolver_backend,
                 governance=governance,
                 crucible=crucible,
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
             )
             evo_res: InductionCycleResult = evolver.run_evolution_cycle(
                 model_id="erp_o2c",

@@ -1111,9 +1111,11 @@ class OntologyRuntime:
         self._check_role(action, actor)
         model = self._build_params(action.params, params)
 
+        approval_view = EditBatch(self.spec, self, actor) if action.approval_rule is not None else None
+        batch = EditBatch(self.spec, self, actor)
         try:
-            batch = EditBatch(self.spec, self, actor)
             diff = self._run_handler(action, model, actor, batch=batch)
+            requires_approval = action.requires_approval(model, actor, view=approval_view)
         except InvariantError as exc:
             return SimulationResult(
                 valid=False,
@@ -1124,11 +1126,15 @@ class OntologyRuntime:
                 error_code=exc.code,
             )
 
+        read_versions = dict(batch.read_versions)
+        if approval_view is not None:
+            for k, v in approval_view.read_versions.items():
+                read_versions.setdefault(k, v)
         return SimulationResult(
             valid=True,
             diff=diff,
-            requires_approval=action.requires_approval(model, actor),
-            read_versions=dict(batch.read_versions),
+            requires_approval=requires_approval,
+            read_versions=read_versions,
         )
 
     # -- submit ------------------------------------------------------------
@@ -1156,9 +1162,11 @@ class OntologyRuntime:
         model = self._build_params(action.params, params)
         params_json = model.model_dump(mode="json")
 
+        approval_view = EditBatch(self.spec, self, actor) if action.approval_rule is not None else None
         batch = EditBatch(self.spec, self, actor)
         try:
             diff = self._run_handler(action, model, actor, batch=batch)
+            requires_approval = action.requires_approval(model, actor, view=approval_view)
         except InvariantError as exc:
             # Refusal auditing: persist the failed attempt, then re-raise.
             self._record_rejection(
@@ -1175,7 +1183,9 @@ class OntologyRuntime:
             raise
 
         read_versions = dict(batch.read_versions)
-        requires_approval = action.requires_approval(model, actor)
+        if approval_view is not None:
+            for k, v in approval_view.read_versions.items():
+                read_versions.setdefault(k, v)
         diff_json = diff.to_dict()
 
         if requires_approval:

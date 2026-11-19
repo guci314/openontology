@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Sequence
 
@@ -43,6 +44,11 @@ __all__ = [
 ]
 
 _INSTANCE_ID_LITERAL_RE = re.compile(r"^[A-Z]{2,}(?:-[A-Z0-9]+)+$")
+_ZERO_PADDED_SERIAL_RE = re.compile(r"^[A-Z]{2,6}-(?:0\d+|\d{4}-\d{2,})(?:-[A-Z0-9]+)*$")
+_UUID_LITERAL_RE = re.compile(
+    r"^(?:[A-Z]{2,12}-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    r"|^(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{32}$"
+)
 
 
 @dataclass(frozen=True)
@@ -155,13 +161,47 @@ class CrucibleReport:
         }
 
 
+def _collect_m0_identifiers(
+    m0_objects: Sequence[dict[str, Any]],
+) -> tuple[set[str], set[str]]:
+    """Collect known IDs and high-cardinality / name / ref instance codes from M0 objects."""
+    known_ids: set[str] = set()
+    known_codes: set[str] = set()
+    code_col_values: dict[tuple[str, str], list[str]] = {}
+
+    for obj in m0_objects:
+        ot_name = str(obj.get("object_type") or "")
+        if obj.get("object_id") not in (None, ""):
+            known_ids.add(str(obj["object_id"]))
+        data = obj.get("data") or {}
+        for k, v in data.items():
+            if v is None or v == "" or isinstance(v, bool):
+                continue
+            if k == "id" or k.endswith("_id"):
+                if isinstance(v, (str, int)):
+                    known_ids.add(str(v))
+            elif k == "name" or k.endswith(("_ref", "_name")):
+                if isinstance(v, str):
+                    known_codes.add(v)
+            elif k == "code" or k.endswith("_code"):
+                if isinstance(v, str):
+                    code_col_values.setdefault((ot_name, k), []).append(v)
+
+    for vals in code_col_values.values():
+        if len(vals) >= 3 and len(set(vals)) == len(vals):
+            known_codes.update(vals)
+        elif any(_ZERO_PADDED_SERIAL_RE.match(v) or _UUID_LITERAL_RE.match(v) for v in vals):
+            known_codes.update(
+                v for v in vals if _ZERO_PADDED_SERIAL_RE.match(v) or _UUID_LITERAL_RE.match(v)
+            )
+    return known_ids, known_codes
+
+
 def _extract_m0_from_runtime(
     runtime: OntologyRuntime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], set[str], set[str]]:
     """Read-only export of ontology_objects, ontology_links, ontology_overlay, and known identifiers."""
     objects: list[dict[str, Any]] = []
-    known_ids: set[str] = set()
-    known_codes: set[str] = set()
 
     rows = runtime._conn.execute(
         "SELECT object_type, object_id, properties_json FROM ontology_objects ORDER BY object_type, object_id"
@@ -169,13 +209,6 @@ def _extract_m0_from_runtime(
     for row in rows:
         oid = str(row["object_id"])
         data = json.loads(row["properties_json"])
-        known_ids.add(oid)
-        for k, v in data.items():
-            if isinstance(v, str) and v:
-                if k == "id" or k.endswith("_id"):
-                    known_ids.add(v)
-                elif k in ("name", "code") or k.endswith("_code") or k.endswith("_ref"):
-                    known_codes.add(v)
         objects.append(
             {
                 "object_type": str(row["object_type"]),
@@ -183,6 +216,7 @@ def _extract_m0_from_runtime(
                 "data": data,
             }
         )
+    known_ids, known_codes = _collect_m0_identifiers(objects)
 
     links: list[dict[str, Any]] = []
     lrows = runtime._conn.execute(
@@ -338,6 +372,7 @@ def _walk_overfitting_checks(
     expr: Any,
     *,
     pk_fields: set[str],
+    rel_fields: set[str] = frozenset(),
     known_ids: set[str],
     known_codes: set[str],
     rule_label: str,
@@ -363,7 +398,12 @@ def _walk_overfitting_checks(
             elif isinstance(val_side, list):
                 lit_values = list(val_side)
 
-            is_id_field = leaf_field in pk_fields or leaf_field == "id" or leaf_field.endswith("_id")
+            is_id_field = (
+                leaf_field in pk_fields
+                or leaf_field in rel_fields
+                or leaf_field == "id"
+                or leaf_field.endswith("_id")
+            )
             is_code_or_name = (
                 leaf_field in ("name", "code")
                 or leaf_field.endswith("_code")
@@ -371,9 +411,23 @@ def _walk_overfitting_checks(
                 or leaf_field.endswith("_name")
             )
             for lv in lit_values:
+                if lv is None or isinstance(lv, bool):
+                    continue
+                if isinstance(lv, int):
+                    if is_id_field and (op in ("eq", "ne", "in", "not_in") or str(lv) in known_ids):
+                        findings.append(
+                            f"OVERFITTING_INSTANCE_ID in {rule_label}: "
+                            f"hardcoding numeric identifier literal {lv!r} via {ref_path}"
+                        )
+                    continue
                 if not isinstance(lv, str) or not lv:
                     continue
-                if lv in known_ids:
+                if _UUID_LITERAL_RE.match(lv):
+                    findings.append(
+                        f"OVERFITTING_INSTANCE_ID in {rule_label}: "
+                        f"rule references concrete UUID literal {lv!r} via {ref_path}"
+                    )
+                elif lv in known_ids:
                     findings.append(
                         f"OVERFITTING_INSTANCE_ID in {rule_label}: "
                         f"rule references concrete instance ID {lv!r} via {ref_path}"
@@ -388,10 +442,10 @@ def _walk_overfitting_checks(
                         f"OVERFITTING_INSTANCE_ID in {rule_label}: "
                         f"hardcoding literal {lv!r} on identifier field {ref_path}"
                     )
-                elif is_code_or_name and _INSTANCE_ID_LITERAL_RE.match(lv):
+                elif is_code_or_name and _ZERO_PADDED_SERIAL_RE.match(lv):
                     findings.append(
                         f"OVERFITTING_INSTANCE_CODE in {rule_label}: "
-                        f"hardcoding code literal {lv!r} on field {ref_path}"
+                        f"hardcoding serial code literal {lv!r} on field {ref_path}"
                     )
     for k, v in expr.items():
         if k == "lit":
@@ -400,6 +454,7 @@ def _walk_overfitting_checks(
             _walk_overfitting_checks(
                 v,
                 pk_fields=pk_fields,
+                rel_fields=rel_fields,
                 known_ids=known_ids,
                 known_codes=known_codes,
                 rule_label=rule_label,
@@ -411,6 +466,7 @@ def _walk_overfitting_checks(
                     _walk_overfitting_checks(
                         item,
                         pk_fields=pk_fields,
+                        rel_fields=rel_fields,
                         known_ids=known_ids,
                         known_codes=known_codes,
                         rule_label=rule_label,
@@ -518,6 +574,30 @@ class SymbolicCrucible:
         )
         return report
 
+    def record_friction_cluster(
+        self,
+        governance: InductionGovernanceService,
+        *,
+        model_id: str,
+        cluster: Any,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record an escalated production friction cluster into governance under CRUCIBLE_ACTOR."""
+        return governance.runtime.submit_action(
+            run_id or f"FRC-REC-{cluster.cluster_id}-{uuid.uuid4().hex[:6]}",
+            "record_friction_cluster",
+            {
+                "cluster_id": cluster.cluster_id,
+                "model_id": model_id,
+                "signal_kind": cluster.signal_kind,
+                "action_type": cluster.action_type,
+                "signature": cluster.signature,
+                "support_count": cluster.support_count,
+                "run_ids_json": json.dumps(list(cluster.run_ids), ensure_ascii=False),
+            },
+            self._actor,
+        )
+
     def record_parse_failure(
         self,
         governance: InductionGovernanceService,
@@ -603,26 +683,19 @@ class SymbolicCrucible:
             known_ids |= exp_ids
             known_codes |= exp_codes
         else:
-            for obj in m0_objects:
-                if obj.get("object_id"):
-                    known_ids.add(str(obj["object_id"]))
-                data = obj.get("data") or {}
-                for k, v in data.items():
-                    if isinstance(v, str) and v:
-                        if k == "id" or k.endswith("_id"):
-                            known_ids.add(v)
-                        elif k in ("name", "code") or k.endswith("_code") or k.endswith("_ref"):
-                            known_codes.add(v)
+            col_ids, col_codes = _collect_m0_identifiers(m0_objects)
+            known_ids |= col_ids
+            known_codes |= col_codes
 
         for inc in context.incident_counterexamples:
             for k, v in inc.params.items():
-                if isinstance(v, str) and v:
+                if v not in (None, "") and not isinstance(v, bool):
                     if k == "id" or k.endswith("_id"):
-                        known_ids.add(v)
-                    elif k in ("name", "code") or k.endswith("_code") or k.endswith("_ref"):
+                        known_ids.add(str(v))
+                    elif isinstance(v, str) and (k == "name" or k.endswith(("_ref", "_name"))):
                         known_codes.add(v)
             for so in inc.setup_objects:
-                if so.get("object_id"):
+                if so.get("object_id") not in (None, ""):
                     known_ids.add(str(so["object_id"]))
 
         gates: list[GateResult] = []
@@ -965,6 +1038,7 @@ class SymbolicCrucible:
 
             # --- Gate 5: Occam's Razor / Anti-Overfitting + Global Complexity Budget ---
             pk_fields = {ot.primary_key for ot in candidate.object_types}
+            rel_fields = {rel.field for ot in candidate.object_types for rel in ot.relations}
             g5_errors: list[str] = []
             max_seen_depth = 0
             total_ast_nodes = 0
@@ -984,6 +1058,7 @@ class SymbolicCrucible:
                 _walk_overfitting_checks(
                     expr,
                     pk_fields=pk_fields,
+                    rel_fields=rel_fields,
                     known_ids=known_ids,
                     known_codes=known_codes,
                     rule_label=label,

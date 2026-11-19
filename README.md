@@ -45,9 +45,9 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 | L4 沙箱 | `open_ontology/sandbox.py` | `EditBatch` 内存推演、`ObjectDiff` 与逆向补丁 |
 | L4 运行时（微内核） | `open_ontology/runtime.py` | put_object / simulate / submit 的治理管线；摄入与切面均为薄委托，≤1400 行 |
 | L4 系统调用切面 | `open_ontology/aspects.py` | 脱敏 / 角色与主权门禁 / 幂等与乐观锁 / 审批与回滚 / 被拒入账 / 自动化反射 |
+| L4 同态结算闭环 | `open_ontology/settlement.py` | `SourceBridge` 与 `HomomorphicSettlementAspect`：无锁三阶段「预测 → 外部驱动 → 独立回读核验 → 原子提交或零污染拒收」 |
 | L4 查询 | `open_ontology/query.py` | `ObjectSet` 集合代数、`pivot`、`aggregate` |
-| L4.5 持久隐空间 | `open_ontology/latent.py` | 同构 6 表持久化隐空间 `LatentSpace`：落子推演、跨重启待执行棋步恢复、独立回读核对与记忆提升 |
-| L4.5 闭环 MPC | `open_ontology/mpc.py` | 闭环滚动时域控制器 `ClosedLoopMPCController`：看多步走一步、感知刷新重规划与防死循环停机 |
+| L4.5 闭环 MPC | `open_ontology/mpc.py` | 无状态闭环滚动时域控制器 `ClosedLoopMPCController`：看多步走一步、感知刷新重规划与防死循环停机 |
 | L5 OSDK | `open_ontology/osdk.py` | LLM Tool JSON Schema 导出 + AIP 确定性评测器 |
 | 设备驱动 · 摄入 | `open_ontology/ingestion.py` | 外部快照解析、多源列拼接（MDO）、时间戳冲突裁决、overlay 重放 |
 | HTTP 传输边界 | `open_ontology/http_server.py` | 标准库 `ThreadingHTTPServer` 暴露 health / snapshot / action-runs / objects；不是业务蓝图 |
@@ -98,7 +98,7 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 13. **时光机回滚**：`revert_action` 取原 diff 的 `inverted()` 逆向恢复对象与关系，原运行标记 `REVERTED`，新增一条回滚运行记录。
 14. **ObjectSet 集合代数**：`search_set` / `union` / `intersect` / `subtract` / `pivot`（正向或反向群跳转，两端 RLS 过滤）/ `aggregate`（分组计数与求和）/ `filter_aggregation`。
 15. **OSDK / AIP**：`export_llm_tools` 导出 OpenAI Tool JSON Schema；`AIPAgentExecutor` 统一分派 `query_objects / call_function / simulate_action / submit_action / pivot / aggregate`；`run_eval_suite` 对模型决策产生的 `ObjectDiff` 做确定性评分。
-16. **内存海选分叉、持久隐空间与闭环滚动时域（`fork()` / `LatentSpace` / `ClosedLoopMPCController`）**：`runtime.fork()` 默认克隆至 `:memory:` 支撑 MCTS 高频无污染推演；`LatentSpace(memory_runtime, db_path)` 基于同构 6 表 SQLite 提供跨重启持久化决策隐空间；`ClosedLoopMPCController` 将多步 MCTS 想象与单步隐空间结算合龙，严守传感器/执行器分离，遇到回读偏差先刷新感知再重新规划并受 `max_replans` / `max_steps` 护栏约束。
+16. **纯内存反事实分叉、默认同态结算与闭环滚动时域（`fork()` / `HomomorphicSettlementAspect` / `ClosedLoopMPCController`）**：`runtime.fork()` 强制返回 `world_mode="counterfactual"`、`source_bridge=None` 的纯 `:memory:` 沙盘支撑 MCTS 高频无污染推演；主 `OntologyRuntime` 在 `world_mode="coupled"` 下通过 `SourceBridge` 与 `HomomorphicSettlementAspect` 默认走三阶段无锁同态回读核销（`COMMITTED` / `DEVICE_STATE_MISMATCH`）；无状态 `ClosedLoopMPCController` 将多步 MCTS 想象与单步实然结算合龙，严守传感器/执行器分离，遇到回读偏差先刷新感知再重新规划并受 `max_replans` / `max_steps` 护栏约束。
 
 ## 任务看板本体
 

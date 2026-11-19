@@ -64,10 +64,12 @@ _SCALAR_TYPES: dict[str, type[Any]] = {
 COMPARISON_OPS = frozenset({"eq", "ne", "lt", "le", "gt", "ge", "in", "not_in"})
 LOGICAL_OPS = frozenset({"and", "or", "not"})
 QUANTIFIER_OPS = frozenset({"exists", "not_exists", "count_eq", "count_ge", "count_le"})
-ARITHMETIC_OPS = frozenset({"add", "sub", "mul"})
-ALLOWED_EXPR_OPS = COMPARISON_OPS | LOGICAL_OPS | QUANTIFIER_OPS | ARITHMETIC_OPS
+ARITHMETIC_OPS = frozenset({"add", "sub", "mul", "div"})
+AGGREGATE_OPS = frozenset({"sum", "min", "max"})
+ALLOWED_EXPR_OPS = COMPARISON_OPS | LOGICAL_OPS | QUANTIFIER_OPS | ARITHMETIC_OPS | AGGREGATE_OPS
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_VALID_REF_ROOTS = frozenset({"obj", "source_obj", "param", "actor", "before", "after", "target"})
 
 
 def _assert_safe_identifier(name: str, label: str) -> str:
@@ -132,15 +134,7 @@ class RelationSpec(BaseModel):
     description: str = ""
 
 
-_DEFAULT_STANDALONE_ARCHETYPES: frozenset[str] = frozenset(
-    {
-        "ObjectType",
-        "MasterEntity",
-        "BalanceLedger",
-        "ProcessDocument",
-        "EventVoucher",
-    }
-)
+_DEFAULT_STANDALONE_ARCHETYPES: frozenset[str] = frozenset({"ObjectType"})
 
 
 class ObjectTypeBlueprint(BaseModel):
@@ -166,7 +160,7 @@ class FieldMigrationSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     object_type: str
-    op: Literal["add_default", "rename_field", "cast_type"] = "add_default"
+    op: Literal["add_default", "rename_field", "cast_type", "drop_field"] = "add_default"
     field: str
     new_field: str | None = None
     default: Any = None
@@ -191,6 +185,7 @@ class ActionMutationSpec(BaseModel):
     op: Literal["create", "modify", "delete"] = "modify"
     object_type: str
     id_param: str = "id"
+    target_ref: str | None = None
     set_fields: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -202,6 +197,8 @@ class ActionBlueprint(BaseModel):
     allowed_roles: list[str] = Field(default_factory=lambda: ["admin", "ai_agent"])
     approver_roles: list[str] = Field(default_factory=lambda: ["admin"])
     approval_rule: dict[str, Any] | None = None
+    approval_target_type: str | None = None
+    approval_id_param: str | None = None
     affects_source: bool = True
     params: list[FieldSpec] = Field(default_factory=list)
     preconditions: list[InvariantRuleSpec] = Field(default_factory=list)
@@ -294,6 +291,8 @@ class EvolutionPatch(BaseModel):
     rationale: str = ""
     add_object_types: list[ObjectTypeBlueprint] = Field(default_factory=list)
     add_fields: dict[str, list[FieldSpec]] = Field(default_factory=dict)
+    remove_fields: dict[str, list[str]] = Field(default_factory=dict)
+    add_relations: dict[str, list[RelationSpec]] = Field(default_factory=dict)
     update_transitions: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
     add_actions: list[ActionBlueprint] = Field(default_factory=list)
     update_actions: list[ActionBlueprint] = Field(default_factory=list)
@@ -340,7 +339,13 @@ def count_ast_nodes(node: Any) -> int:
     return 0
 
 
-def validate_predicate_ast(expr: Any, *, max_depth: int = 12) -> int:
+def validate_predicate_ast(
+    expr: Any,
+    *,
+    max_depth: int = 12,
+    allowed_roots: frozenset[str] | None = None,
+    allow_view: bool = True,
+) -> int:
     """Strictly validate a declarative predicate/value JSON AST. Returns its depth."""
     if not isinstance(expr, dict):
         raise InvariantError(
@@ -353,11 +358,50 @@ def validate_predicate_ast(expr: Any, *, max_depth: int = 12) -> int:
             f"predicate AST depth {depth} exceeds max_depth={max_depth}",
             code="PREDICATE_TOO_DEEP",
         )
-    _validate_expr_node(expr, expect_bool=True)
+    _validate_expr_node(expr, expect_bool=True, allowed_roots=allowed_roots, allow_view=allow_view)
     return depth
 
 
-def _validate_value_node(node: Any) -> None:
+def _collect_ref_roots(node: Any) -> set[str]:
+    roots: set[str] = set()
+    if isinstance(node, dict):
+        if set(node.keys()) == {"lit"}:
+            return roots
+        if set(node.keys()) == {"ref"} and isinstance(node["ref"], str) and node["ref"]:
+            roots.add(node["ref"].split(".")[0])
+            return roots
+        for k, v in node.items():
+            if k != "lit":
+                roots.update(_collect_ref_roots(v))
+    elif isinstance(node, list):
+        for item in node:
+            roots.update(_collect_ref_roots(item))
+    return roots
+
+
+def _iter_ast_refs(node: Any) -> list[str]:
+    refs: list[str] = []
+    if isinstance(node, dict):
+        if set(node.keys()) == {"lit"}:
+            return refs
+        if set(node.keys()) == {"ref"} and isinstance(node["ref"], str) and node["ref"]:
+            refs.append(node["ref"])
+            return refs
+        for k, v in node.items():
+            if k != "lit":
+                refs.extend(_iter_ast_refs(v))
+    elif isinstance(node, list):
+        for item in node:
+            refs.extend(_iter_ast_refs(item))
+    return refs
+
+
+def _validate_value_node(
+    node: Any,
+    *,
+    allowed_roots: frozenset[str] | None = None,
+    allow_view: bool = True,
+) -> None:
     if isinstance(node, (str, int, float, bool)) or node is None:
         return
     if isinstance(node, list):
@@ -374,20 +418,30 @@ def _validate_value_node(node: Any) -> None:
             code="INVALID_PREDICATE_AST",
         )
     if set(node.keys()) == {"lit"}:
-        _validate_value_node(node["lit"])
+        _validate_value_node(node["lit"], allowed_roots=allowed_roots, allow_view=allow_view)
         return
     if set(node.keys()) == {"ref"}:
         ref = node["ref"]
         if not isinstance(ref, str) or not ref:
             raise InvariantError("ref must be a non-empty string", code="INVALID_PREDICATE_AST")
         parts = ref.split(".")
-        if parts[0] not in ("obj", "param", "actor", "before", "after", "target"):
+        if parts[0] not in _VALID_REF_ROOTS:
             raise InvariantError(
                 f"unsupported ref root {parts[0]!r}",
                 code="INVALID_PREDICATE_AST",
             )
+        if allowed_roots is not None and parts[0] not in allowed_roots:
+            raise InvariantError(
+                f"ref root {parts[0]!r} is unavailable in this context (allowed: {sorted(allowed_roots)})",
+                code="UNAVAILABLE_REF_IN_CONTEXT",
+            )
         for seg in parts[1:]:
             _assert_safe_identifier(seg, "ref path segment")
+        if len(parts) > 2 and not allow_view:
+            raise InvariantError(
+                f"relation traversal {ref!r} requires a sandbox view",
+                code="MISSING_VIEW_IN_CONTEXT",
+            )
         return
     op = node.get("op")
     if op in ARITHMETIC_OPS:
@@ -396,13 +450,45 @@ def _validate_value_node(node: Any) -> None:
                 f"arithmetic op {op!r} requires 'left' and 'right'",
                 code="INVALID_PREDICATE_AST",
             )
-        _validate_value_node(node["left"])
-        _validate_value_node(node["right"])
+        _validate_value_node(node["left"], allowed_roots=allowed_roots, allow_view=allow_view)
+        _validate_value_node(node["right"], allowed_roots=allowed_roots, allow_view=allow_view)
+        return
+    if op in AGGREGATE_OPS:
+        if not allow_view:
+            raise InvariantError(
+                f"aggregate {op!r} requires a sandbox view",
+                code="MISSING_VIEW_IN_CONTEXT",
+            )
+        obj_type = node.get("object_type")
+        _assert_safe_identifier(str(obj_type or ""), "aggregate object_type")
+        field_spec = node.get("field")
+        sub_allowed = (allowed_roots | {"target"}) if allowed_roots is not None else None
+        if isinstance(field_spec, str):
+            _assert_safe_identifier(field_spec, "aggregate field")
+        elif isinstance(field_spec, dict):
+            _validate_value_node(field_spec, allowed_roots=sub_allowed, allow_view=True)
+        else:
+            raise InvariantError(
+                f"aggregate {op!r} requires string or value-AST 'field'",
+                code="INVALID_PREDICATE_AST",
+            )
+        if "where" in node and node["where"] is not None:
+            _validate_expr_node(
+                node["where"],
+                expect_bool=True,
+                allowed_roots=sub_allowed,
+                allow_view=True,
+            )
+        if "default" in node and node["default"] is not None and not _is_real_number(node["default"]):
+            raise InvariantError(
+                f"aggregate {op!r} 'default' must be numeric or None",
+                code="INVALID_PREDICATE_AST",
+            )
         return
     if op == "if_else" and set(node.keys()) == {"op", "cond", "then", "else"}:
-        _validate_expr_node(node["cond"], expect_bool=True)
-        _validate_value_node(node["then"])
-        _validate_value_node(node["else"])
+        _validate_expr_node(node["cond"], expect_bool=True, allowed_roots=allowed_roots, allow_view=allow_view)
+        _validate_value_node(node["then"], allowed_roots=allowed_roots, allow_view=allow_view)
+        _validate_value_node(node["else"], allowed_roots=allowed_roots, allow_view=allow_view)
         return
     raise InvariantError(
         f"disallowed value AST keys {sorted(node.keys())}",
@@ -410,7 +496,13 @@ def _validate_value_node(node: Any) -> None:
     )
 
 
-def _validate_expr_node(node: Any, *, expect_bool: bool = True) -> None:
+def _validate_expr_node(
+    node: Any,
+    *,
+    expect_bool: bool = True,
+    allowed_roots: frozenset[str] | None = None,
+    allow_view: bool = True,
+) -> None:
     if not isinstance(node, dict):
         raise InvariantError("predicate node must be a JSON object", code="INVALID_PREDICATE_AST")
     op = node.get("op")
@@ -424,12 +516,12 @@ def _validate_expr_node(node: Any, *, expect_bool: bool = True) -> None:
         if not isinstance(args, list) or not args:
             raise InvariantError(f"{op!r} requires non-empty 'args' list", code="INVALID_PREDICATE_AST")
         for sub in args:
-            _validate_expr_node(sub, expect_bool=True)
+            _validate_expr_node(sub, expect_bool=True, allowed_roots=allowed_roots, allow_view=allow_view)
         return
     if op == "not":
         if "arg" not in node:
             raise InvariantError("'not' requires 'arg'", code="INVALID_PREDICATE_AST")
-        _validate_expr_node(node["arg"], expect_bool=True)
+        _validate_expr_node(node["arg"], expect_bool=True, allowed_roots=allowed_roots, allow_view=allow_view)
         return
     if op in COMPARISON_OPS:
         if "left" not in node or "right" not in node:
@@ -437,14 +529,25 @@ def _validate_expr_node(node: Any, *, expect_bool: bool = True) -> None:
                 f"comparison {op!r} requires 'left' and 'right'",
                 code="INVALID_PREDICATE_AST",
             )
-        _validate_value_node(node["left"])
-        _validate_value_node(node["right"])
+        _validate_value_node(node["left"], allowed_roots=allowed_roots, allow_view=allow_view)
+        _validate_value_node(node["right"], allowed_roots=allowed_roots, allow_view=allow_view)
         return
     if op in QUANTIFIER_OPS:
+        if not allow_view:
+            raise InvariantError(
+                f"quantifier {op!r} requires a sandbox view",
+                code="MISSING_VIEW_IN_CONTEXT",
+            )
         obj_type = node.get("object_type")
         _assert_safe_identifier(str(obj_type or ""), "quantifier object_type")
+        sub_allowed = (allowed_roots | {"target"}) if allowed_roots is not None else None
         if "where" in node and node["where"] is not None:
-            _validate_expr_node(node["where"], expect_bool=True)
+            _validate_expr_node(
+                node["where"],
+                expect_bool=True,
+                allowed_roots=sub_allowed,
+                allow_view=True,
+            )
         if op.startswith("count_"):
             val = node.get("value")
             if not isinstance(val, int) or isinstance(val, bool) or val < 0:
@@ -464,7 +567,12 @@ def _resolve_ref(
 ) -> Any:
     parts = ref.split(".")
     root_name = parts[0]
-    current = context.get(root_name)
+    if root_name not in context:
+        raise InvariantError(
+            f"ref root {root_name!r} is missing from evaluation context",
+            code="UNAVAILABLE_REF_IN_CONTEXT",
+        )
+    current = context[root_name]
     tail = parts[1:]
     for idx, seg in enumerate(tail):
         if current is None:
@@ -472,7 +580,12 @@ def _resolve_ref(
         if isinstance(current, ObjectType):
             prop_map = getattr(type(current), "__object_properties__", None) or {}
             has_more = idx < len(tail) - 1
-            if seg in prop_map and view is not None and has_more:
+            if seg in prop_map and has_more:
+                if view is None:
+                    raise InvariantError(
+                        f"resolving relation path {ref!r} requires a sandbox view",
+                        code="MISSING_SANDBOX_VIEW",
+                    )
                 decl = prop_map[seg]
                 raw_val = getattr(current, seg, None)
                 if raw_val is None or isinstance(raw_val, (list, tuple)):
@@ -525,6 +638,50 @@ def _eval_value(
                 return lv - rv
             if op == "mul":
                 return lv * rv
+            if op == "div":
+                if rv == 0:
+                    raise InvariantError(
+                        "division by zero in declarative expression",
+                        code="DIVISION_BY_ZERO",
+                    )
+                return lv / rv
+        if op in AGGREGATE_OPS:
+            if view is None:
+                raise InvariantError(
+                    f"aggregate {op!r} requires a sandbox view",
+                    code="MISSING_SANDBOX_VIEW",
+                )
+            target_cls = view.spec.get_object_type(node["object_type"])
+            where = node.get("where")
+            field_spec = node["field"]
+            vals: list[int | float] = []
+            for cand in view.query(target_cls):
+                sub_ctx = dict(context)
+                sub_ctx["target"] = cand
+                if where is not None and not eval_predicate(where, sub_ctx, view):
+                    continue
+                v = (
+                    getattr(cand, field_spec, None)
+                    if isinstance(field_spec, str)
+                    else _eval_value(field_spec, sub_ctx, view)
+                )
+                if v is None:
+                    continue
+                if not _is_real_number(v):
+                    raise InvariantError(
+                        f"aggregate {op!r} requires numeric values, got {type(v).__name__}",
+                        code="INVALID_ARITHMETIC_OPERAND",
+                    )
+                vals.append(v)
+            if not vals:
+                if "default" in node:
+                    return node["default"]
+                return 0 if op == "sum" else None
+            if op == "sum":
+                return sum(vals)
+            if op == "min":
+                return min(vals)
+            return max(vals)
         if op == "if_else" and set(node.keys()) == {"op", "cond", "then", "else"}:
             if eval_predicate(node["cond"], context, view):
                 return _eval_value(node["then"], context, view)
@@ -598,6 +755,99 @@ def eval_predicate(
 # ---------------------------------------------------------------------------
 # 3. Blueprint Patching, M0 Migration & Zero-Exec Spec Compiler
 # ---------------------------------------------------------------------------
+def _ref_hits_removed_field(
+    ref: str,
+    *,
+    removed_by_type: dict[str, set[str]],
+    ot_by_name: dict[str, ObjectTypeBlueprint],
+    root_types: dict[str, str],
+) -> tuple[str, str] | None:
+    parts = ref.split(".")
+    if len(parts) < 2:
+        return None
+    cur_type = root_types.get(parts[0])
+    for idx, seg in enumerate(parts[1:]):
+        if cur_type is None:
+            return None
+        if seg in removed_by_type.get(cur_type, ()):
+            return cur_type, seg
+        ot = ot_by_name.get(cur_type)
+        if ot is None or idx == len(parts) - 2:
+            return None
+        rel = next((r for r in ot.relations if r.field == seg), None)
+        cur_type = rel.target_type if rel is not None else None
+    return None
+
+
+def _expr_removed_field_hit(
+    node: Any,
+    *,
+    removed_by_type: dict[str, set[str]],
+    ot_by_name: dict[str, ObjectTypeBlueprint],
+    root_types: dict[str, str],
+) -> tuple[str, str] | None:
+    if isinstance(node, dict):
+        if set(node.keys()) == {"lit"}:
+            return None
+        if set(node.keys()) == {"ref"} and isinstance(node["ref"], str):
+            return _ref_hits_removed_field(
+                node["ref"],
+                removed_by_type=removed_by_type,
+                ot_by_name=ot_by_name,
+                root_types=root_types,
+            )
+        op = node.get("op")
+        if op in QUANTIFIER_OPS or op in AGGREGATE_OPS:
+            sub_type = str(node.get("object_type") or "")
+            if op in AGGREGATE_OPS and isinstance(node.get("field"), str):
+                if node["field"] in removed_by_type.get(sub_type, ()):
+                    return sub_type, node["field"]
+            sub_roots = {**root_types, "target": sub_type}
+            for k, v in node.items():
+                if k in ("where", "field") and isinstance(v, dict):
+                    hit = _expr_removed_field_hit(
+                        v,
+                        removed_by_type=removed_by_type,
+                        ot_by_name=ot_by_name,
+                        root_types=sub_roots,
+                    )
+                    if hit is not None:
+                        return hit
+            return None
+        for k, v in node.items():
+            if k != "lit":
+                hit = _expr_removed_field_hit(
+                    v,
+                    removed_by_type=removed_by_type,
+                    ot_by_name=ot_by_name,
+                    root_types=root_types,
+                )
+                if hit is not None:
+                    return hit
+    elif isinstance(node, list):
+        for item in node:
+            hit = _expr_removed_field_hit(
+                item,
+                removed_by_type=removed_by_type,
+                ot_by_name=ot_by_name,
+                root_types=root_types,
+            )
+            if hit is not None:
+                return hit
+    return None
+
+
+def _resolve_blueprint_action_subject(act: ActionBlueprint) -> str | None:
+    if act.approval_target_type:
+        return act.approval_target_type
+    for mut in act.mutations:
+        if mut.op != "create" and mut.target_ref is None:
+            return mut.object_type
+    for pre in act.preconditions:
+        return pre.target_type
+    return None
+
+
 def apply_evolution_patch(
     base: DeclarativeBlueprint,
     patch: EvolutionPatch,
@@ -627,7 +877,9 @@ def apply_evolution_patch(
                 f"patch adds field to unknown object type {ot_name!r}",
                 code="UNKNOWN_OBJECT_TYPE",
             )
-        existing_names = {f.name for f in ot_by_name[ot_name].fields}
+        existing_names = {f.name for f in ot_by_name[ot_name].fields} | {
+            r.field for r in ot_by_name[ot_name].relations
+        }
         for nf in new_fields:
             if nf.name in existing_names:
                 raise InvariantError(
@@ -636,6 +888,29 @@ def apply_evolution_patch(
                 )
             ot_by_name[ot_name].fields.append(copy.deepcopy(nf))
             existing_names.add(nf.name)
+
+    for ot_name, new_rels in patch.add_relations.items():
+        if ot_name not in ot_by_name:
+            raise InvariantError(
+                f"patch adds relation to unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        existing_names = {f.name for f in ot_by_name[ot_name].fields} | {
+            r.field for r in ot_by_name[ot_name].relations
+        }
+        for nr in new_rels:
+            if nr.target_type not in ot_by_name:
+                raise InvariantError(
+                    f"relation {ot_name}.{nr.field} references unknown target {nr.target_type!r}",
+                    code="UNKNOWN_RELATION_TARGET",
+                )
+            if nr.field in existing_names:
+                raise InvariantError(
+                    f"relation field {nr.field!r} already exists on {ot_name!r}",
+                    code="DUPLICATE_RELATION",
+                )
+            ot_by_name[ot_name].relations.append(copy.deepcopy(nr))
+            existing_names.add(nr.field)
 
     for ot_name, trans_map in patch.update_transitions.items():
         if ot_name not in ot_by_name:
@@ -695,6 +970,137 @@ def apply_evolution_patch(
             inv_names.add(new_inv.name)
 
     candidate.migrations.extend(copy.deepcopy(patch.migrations))
+
+    if patch.remove_fields:
+        removed_by_type: dict[str, set[str]] = {}
+        for ot_name, fnames in patch.remove_fields.items():
+            if ot_name not in ot_by_name:
+                raise InvariantError(
+                    f"patch removes fields from unknown object type {ot_name!r}",
+                    code="UNKNOWN_OBJECT_TYPE",
+                )
+            ot = ot_by_name[ot_name]
+            fields_by_name = {f.name: f for f in ot.fields}
+            for fname in fnames:
+                if fname not in fields_by_name:
+                    raise InvariantError(
+                        f"cannot remove unknown field {ot_name}.{fname}",
+                        code="UNKNOWN_FIELD",
+                    )
+                fld = fields_by_name[fname]
+                if fname == ot.primary_key or fld.primary_key:
+                    raise InvariantError(
+                        f"cannot remove primary key field {ot_name}.{fname}",
+                        code="CANNOT_REMOVE_PRIMARY_KEY",
+                    )
+                if fname == ot.title_field:
+                    raise InvariantError(
+                        f"cannot remove title_field {ot_name}.{fname}",
+                        code="FIELD_IN_USE",
+                    )
+                if (ot.transitions or ot.initial_statuses is not None) and fname == ot.status_field:
+                    raise InvariantError(
+                        f"cannot remove FSM status_field {ot_name}.{fname}",
+                        code="FIELD_IN_USE",
+                    )
+                for bal_field, (_vt, v_link, v_delta) in ot.voucher_delta_rules.items():
+                    if fname in (bal_field, v_link, v_delta):
+                        raise InvariantError(
+                            f"cannot remove voucher-conservation field {ot_name}.{fname}",
+                            code="FIELD_IN_USE",
+                        )
+                removed_by_type.setdefault(ot_name, set()).add(fname)
+
+        for inv in candidate.invariants:
+            for expr in (inv.when, inv.must_hold):
+                hit = _expr_removed_field_hit(
+                    expr,
+                    removed_by_type=removed_by_type,
+                    ot_by_name=ot_by_name,
+                    root_types={"obj": inv.target_type},
+                )
+                if hit is not None:
+                    raise InvariantError(
+                        f"cannot remove {hit[0]}.{hit[1]} referenced by invariant {inv.name!r}",
+                        code="FIELD_IN_USE",
+                    )
+
+        for act in candidate.actions:
+            anchor_type = _resolve_blueprint_action_subject(act)
+            for pre in act.preconditions:
+                for expr in (pre.when, pre.must_hold):
+                    hit = _expr_removed_field_hit(
+                        expr,
+                        removed_by_type=removed_by_type,
+                        ot_by_name=ot_by_name,
+                        root_types={"obj": pre.target_type},
+                    )
+                    if hit is not None:
+                        raise InvariantError(
+                            f"cannot remove {hit[0]}.{hit[1]} referenced by precondition {pre.name!r}",
+                            code="FIELD_IN_USE",
+                        )
+            if act.approval_rule is not None and anchor_type is not None:
+                hit = _expr_removed_field_hit(
+                    act.approval_rule,
+                    removed_by_type=removed_by_type,
+                    ot_by_name=ot_by_name,
+                    root_types={"obj": anchor_type},
+                )
+                if hit is not None:
+                    raise InvariantError(
+                        f"cannot remove {hit[0]}.{hit[1]} referenced by approval_rule on {act.name!r}",
+                        code="FIELD_IN_USE",
+                    )
+            for mut in act.mutations:
+                if mut.target_ref and anchor_type is not None:
+                    hit = _ref_hits_removed_field(
+                        mut.target_ref,
+                        removed_by_type=removed_by_type,
+                        ot_by_name=ot_by_name,
+                        root_types={"obj": anchor_type},
+                    )
+                    if hit is not None:
+                        raise InvariantError(
+                            f"cannot remove {hit[0]}.{hit[1]} referenced by mutation target_ref on {act.name!r}",
+                            code="FIELD_IN_USE",
+                        )
+                mut_roots = {"obj": mut.object_type}
+                if mut.target_ref and anchor_type is not None:
+                    mut_roots["source_obj"] = anchor_type
+                for k, v_expr in mut.set_fields.items():
+                    if k in removed_by_type.get(mut.object_type, ()):
+                        raise InvariantError(
+                            f"cannot remove {mut.object_type}.{k} written by action {act.name!r}",
+                            code="FIELD_IN_USE",
+                        )
+                    hit = _expr_removed_field_hit(
+                        v_expr,
+                        removed_by_type=removed_by_type,
+                        ot_by_name=ot_by_name,
+                        root_types=mut_roots,
+                    )
+                    if hit is not None:
+                        raise InvariantError(
+                            f"cannot remove {hit[0]}.{hit[1]} read by mutation on {act.name!r}",
+                            code="FIELD_IN_USE",
+                        )
+
+        existing_drops = {
+            (m.object_type, m.field)
+            for m in candidate.migrations
+            if m.op == "drop_field"
+        }
+        for ot_name, fset in removed_by_type.items():
+            ot = ot_by_name[ot_name]
+            ot.fields = [f for f in ot.fields if f.name not in fset]
+            for fname in sorted(fset):
+                if (ot_name, fname) not in existing_drops:
+                    candidate.migrations.append(
+                        FieldMigrationSpec(object_type=ot_name, op="drop_field", field=fname)
+                    )
+                    existing_drops.add((ot_name, fname))
+
     return candidate
 
 
@@ -708,10 +1114,12 @@ def apply_adapter_mapping_patch(
         and not patch.update_entity_mappings
         and not patch.add_action_bindings
         and not patch.update_action_bindings
+        and not patch.remove_fields
     ):
         return None
     updated = copy.deepcopy(base_mapping) if base_mapping is not None else AdapterMappingSpec()
 
+    replaced_types = {em.target_object_type for em in patch.update_entity_mappings}
     em_idx = {em.target_object_type: idx for idx, em in enumerate(updated.entity_mappings)}
     for new_em in patch.update_entity_mappings:
         cloned_em = copy.deepcopy(new_em)
@@ -720,6 +1128,13 @@ def apply_adapter_mapping_patch(
         else:
             em_idx[new_em.target_object_type] = len(updated.entity_mappings)
             updated.entity_mappings.append(cloned_em)
+
+    for ot_name, fnames in patch.remove_fields.items():
+        if ot_name in replaced_types or ot_name not in em_idx:
+            continue
+        drop_set = set(fnames)
+        em = updated.entity_mappings[em_idx[ot_name]]
+        em.field_transforms = [tf for tf in em.field_transforms if tf.target_field not in drop_set]
 
     ab_idx = {ab.action_name: idx for idx, ab in enumerate(updated.action_bindings)}
     for new_ab in (*patch.add_action_bindings, *patch.update_action_bindings):
@@ -758,6 +1173,8 @@ def migrate_m0_snapshot(
             elif mig.op == "cast_type" and mig.target_type and mig.field in data:
                 py_type = _resolve_scalar_type(mig.target_type)
                 data[mig.field] = py_type(data[mig.field])
+            elif mig.op == "drop_field":
+                data.pop(mig.field, None)
         migrated.append(entry)
     return migrated
 
@@ -882,16 +1299,16 @@ def compile_blueprint(
         if ot.aggregate_root is not None:
             agg_root = ot.aggregate_root
         elif seed_ontology is not None:
-            agg_root = bool(getattr(base_cls, "__aggregate_root__", False))
+            agg_root = seed_ontology.default_aggregate_root_for(ot.archetype, base_cls)
         else:
-            agg_root = ot.archetype == "MasterEntity"
+            agg_root = False
 
         if ot.append_only is not None:
             append_only = ot.append_only
         elif seed_ontology is not None:
-            append_only = bool(getattr(base_cls, "__append_only__", False))
+            append_only = seed_ontology.default_append_only_for(ot.archetype, base_cls)
         else:
-            append_only = ot.archetype == "EventVoucher"
+            append_only = False
 
         resolved_owned: bool | dict[str, Any]
         if ot.owned is True:
@@ -957,7 +1374,8 @@ def compile_blueprint(
             prop_map[rel.field] = decl
         cls.__object_properties__ = prop_map
 
-    if non_neg_map and "business_non_negative_fields" not in spec.invariants:
+    seed_covers_non_neg = seed_ontology is not None and seed_ontology.covers_non_negative()
+    if non_neg_map and not seed_covers_non_neg:
 
         @spec.invariant(
             "declarative_non_negative_fields",
@@ -977,15 +1395,12 @@ def compile_blueprint(
                             )
             return True
 
-    # Only run fallback declarative FSM check on types not already covered by an inherited ProcessDocument axiom
-    fallback_fsm_specs = dict(fsm_specs)
-    if "process_document_state_transitions" in spec.transition_invariants and "ProcessDocument" in spec.abstract_types:
-        pd_cls = spec.abstract_types["ProcessDocument"]
-        fallback_fsm_specs = {
-            tname: fspec
-            for tname, fspec in fsm_specs.items()
-            if not issubclass(created_classes[tname], pd_cls)
-        }
+    # Only run fallback declarative FSM check on types not already covered by an inherited seed archetype axiom
+    fallback_fsm_specs = {
+        tname: fspec
+        for tname, fspec in fsm_specs.items()
+        if not (seed_ontology is not None and seed_ontology.covers_fsm_for(created_classes[tname]))
+    }
 
     if fallback_fsm_specs:
 
@@ -1021,14 +1436,14 @@ def compile_blueprint(
             return True
 
     # Balance conservation fallback when not already inherited from seed_ontology
-    fallback_voucher_rules = dict(voucher_rules_map)
-    if "voucher_backed_balance_conservation" in spec.transition_invariants and "BalanceLedger" in spec.abstract_types:
-        bl_cls = spec.abstract_types["BalanceLedger"]
-        fallback_voucher_rules = {
-            tname: rules
-            for tname, rules in voucher_rules_map.items()
-            if not issubclass(created_classes[tname], bl_cls)
-        }
+    fallback_voucher_rules = {
+        tname: rules
+        for tname, rules in voucher_rules_map.items()
+        if not (
+            seed_ontology is not None
+            and seed_ontology.covers_balance_conservation_for(created_classes[tname])
+        )
+    }
 
     if fallback_voucher_rules:
 
@@ -1088,9 +1503,10 @@ def compile_blueprint(
                 f"invariant {inv.name!r} targets unknown object type {inv.target_type!r}",
                 code="UNKNOWN_OBJECT_TYPE",
             )
+        inv_roots = frozenset({"obj"})
         if inv.when is not None:
-            validate_predicate_ast(inv.when)
-        validate_predicate_ast(inv.must_hold)
+            validate_predicate_ast(inv.when, allowed_roots=inv_roots, allow_view=True)
+        validate_predicate_ast(inv.must_hold, allowed_roots=inv_roots, allow_view=True)
 
         def _make_invariant(rule: InvariantRuleSpec) -> Callable[[InvariantView], bool]:
             target_cls = created_classes[rule.target_type]
@@ -1114,6 +1530,35 @@ def compile_blueprint(
 
         spec.invariant(inv.name, code=inv.code, description=inv.description)(_make_invariant(inv))
 
+    def _resolve_subject(
+        action_bp: ActionBlueprint,
+        pdefs: dict[str, Any],
+    ) -> tuple[type[ObjectType] | None, str | None]:
+        if action_bp.approval_target_type is not None:
+            if action_bp.approval_target_type not in created_classes:
+                raise InvariantError(
+                    f"action {action_bp.name!r} approval_target_type references unknown "
+                    f"{action_bp.approval_target_type!r}",
+                    code="UNKNOWN_OBJECT_TYPE",
+                )
+            s_cls = created_classes[action_bp.approval_target_type]
+            s_idp = action_bp.approval_id_param or s_cls.__primary_key__
+            if s_idp not in pdefs:
+                raise InvariantError(
+                    f"action {action_bp.name!r} approval_id_param {s_idp!r} not in params",
+                    code="MISSING_ID_PARAM",
+                )
+            return s_cls, s_idp
+        for m in action_bp.mutations:
+            if m.op != "create" and m.target_ref is None and m.id_param in pdefs:
+                return created_classes[m.object_type], m.id_param
+        for pre in action_bp.preconditions:
+            s_cls = created_classes[pre.target_type]
+            s_idp = pre.id_param or s_cls.__primary_key__
+            if s_idp in pdefs:
+                return s_cls, s_idp
+        return None, None
+
     action_display: dict[str, str] = {}
     for act in blueprint.actions:
         _assert_safe_identifier(act.name, "action name")
@@ -1128,6 +1573,9 @@ def compile_blueprint(
             param_defs[p.name] = (py_type, default_val)
         params_cls = create_model(f"{act.name}_Params", **param_defs)
 
+        subject_cls, subject_id_param = _resolve_subject(act, param_defs)
+
+        pre_roots = frozenset({"obj", "param", "actor"})
         for pre in act.preconditions:
             if pre.target_type not in created_classes:
                 raise InvariantError(
@@ -1135,8 +1583,8 @@ def compile_blueprint(
                     code="UNKNOWN_OBJECT_TYPE",
                 )
             if pre.when is not None:
-                validate_predicate_ast(pre.when)
-            validate_predicate_ast(pre.must_hold)
+                validate_predicate_ast(pre.when, allowed_roots=pre_roots, allow_view=True)
+            validate_predicate_ast(pre.must_hold, allowed_roots=pre_roots, allow_view=True)
 
         for mut in act.mutations:
             if mut.object_type not in created_classes:
@@ -1144,23 +1592,93 @@ def compile_blueprint(
                     f"action {act.name!r} mutates unknown object type {mut.object_type!r}",
                     code="UNKNOWN_OBJECT_TYPE",
                 )
+            if mut.target_ref is not None:
+                if mut.op == "create":
+                    raise InvariantError(
+                        f"action {act.name!r} create mutation cannot use target_ref",
+                        code="INVALID_MUTATION_TARGET_REF",
+                    )
+                tref_parts = mut.target_ref.split(".")
+                if tref_parts[0] not in ("obj", "param") or len(tref_parts) < 2:
+                    raise InvariantError(
+                        f"action {act.name!r} target_ref {mut.target_ref!r} must start with 'obj.' or 'param.'",
+                        code="INVALID_MUTATION_TARGET_REF",
+                    )
+                for seg in tref_parts[1:]:
+                    _assert_safe_identifier(seg, "target_ref segment")
+                if tref_parts[0] == "obj" and subject_cls is None:
+                    raise InvariantError(
+                        f"action {act.name!r} mutation target_ref {mut.target_ref!r} requires a primary subject object",
+                        code="UNAVAILABLE_REF_IN_CONTEXT",
+                    )
+                mut_roots = frozenset({"obj", "source_obj", "param", "actor"})
+            elif mut.op == "create":
+                mut_roots = frozenset({"param", "actor"})
+            else:
+                mut_roots = frozenset({"obj", "param", "actor"})
             for fv in mut.set_fields.values():
-                _validate_value_node(fv)
+                _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
 
-        approval_fn: Callable[[BaseModel, Actor], bool] | None = None
+        approval_fn: Callable[..., bool] | None = None
         if act.approval_rule is not None:
-            validate_predicate_ast(act.approval_rule)
+            approval_roots = (
+                frozenset({"obj", "param", "actor"})
+                if subject_cls is not None
+                else frozenset({"param", "actor"})
+            )
+            validate_predicate_ast(act.approval_rule, allowed_roots=approval_roots, allow_view=True)
             rule_ast = copy.deepcopy(act.approval_rule)
+            ast_needs_obj = "obj" in _collect_ref_roots(rule_ast)
 
-            def _make_approval(ast_node: dict[str, Any]) -> Callable[[BaseModel, Actor], bool]:
-                def _needs_approval(params: BaseModel, actor: Actor) -> bool:
-                    return eval_predicate(ast_node, {"param": params, "actor": actor}, None)
+            def _make_approval(
+                ast_node: dict[str, Any],
+                subj_cls: type[ObjectType] | None,
+                subj_id_param: str | None,
+                needs_obj: bool,
+            ) -> Callable[..., bool]:
+                def _needs_approval(
+                    params: BaseModel,
+                    actor: Actor,
+                    view: EditBatch | InvariantView | None = None,
+                ) -> bool:
+                    eval_ctx: dict[str, Any] = {"param": params, "actor": actor}
+                    if needs_obj:
+                        if view is None:
+                            raise InvariantError(
+                                "approval_rule referencing 'obj' requires an active sandbox view",
+                                code="MISSING_SANDBOX_VIEW",
+                            )
+                        assert subj_cls is not None and subj_id_param is not None
+                        target_id = getattr(params, subj_id_param, None)
+                        if target_id is None:
+                            raise InvariantError(
+                                f"approval_rule missing non-null {subj_id_param!r}",
+                                code="MISSING_ID_PARAM",
+                            )
+                        eval_ctx["obj"] = view.require(subj_cls, str(target_id))
+                    elif (
+                        view is not None
+                        and subj_cls is not None
+                        and subj_id_param is not None
+                        and hasattr(params, subj_id_param)
+                    ):
+                        target_id = getattr(params, subj_id_param, None)
+                        if target_id is not None:
+                            loaded = view.get(subj_cls, str(target_id))
+                            if loaded is not None:
+                                eval_ctx["obj"] = loaded
+                    return eval_predicate(ast_node, eval_ctx, view)
 
+                _needs_approval._accepts_view = True  # type: ignore[attr-defined]
                 return _needs_approval
 
-            approval_fn = _make_approval(rule_ast)
+            approval_fn = _make_approval(rule_ast, subject_cls, subject_id_param, ast_needs_obj)
 
-        def _make_action_handler(action_bp: ActionBlueprint) -> Callable[[EditBatch, BaseModel], None]:
+        def _make_action_handler(
+            action_bp: ActionBlueprint,
+            anchor_cls: type[ObjectType] | None,
+            anchor_id_param: str | None,
+        ) -> Callable[[EditBatch, BaseModel], None]:
             def _handler(ctx: EditBatch, params: BaseModel) -> None:
                 # 1. Preconditions (P1-1 fix: require exact target IDs instead of silent full-table scan)
                 for pre in action_bp.preconditions:
@@ -1170,7 +1688,7 @@ def compile_blueprint(
                         explicit_id_params.append(pre.id_param)
                     else:
                         for m in action_bp.mutations:
-                            if m.object_type == pre.target_type and m.op != "create":
+                            if m.object_type == pre.target_type and m.op != "create" and m.target_ref is None:
                                 explicit_id_params.append(m.id_param)
                         if not explicit_id_params and hasattr(params, target_cls.__primary_key__):
                             explicit_id_params.append(target_cls.__primary_key__)
@@ -1207,6 +1725,12 @@ def compile_blueprint(
                             )
                             raise InvariantError(msg, code=pre.code)
 
+                anchor_obj: ObjectType | None = None
+                if anchor_cls is not None and anchor_id_param is not None and hasattr(params, anchor_id_param):
+                    raw_anchor_id = getattr(params, anchor_id_param, None)
+                    if raw_anchor_id is not None:
+                        anchor_obj = ctx.require(anchor_cls, str(raw_anchor_id))
+
                 # 2. Mutations
                 for mut in action_bp.mutations:
                     target_cls = created_classes[mut.object_type]
@@ -1219,6 +1743,32 @@ def compile_blueprint(
                             payload[target_cls.__primary_key__] = getattr(params, mut.id_param)
                         obj = target_cls(**payload)
                         ctx.create(obj)
+                    elif mut.target_ref is not None:
+                        ref_ctx: dict[str, Any] = {"param": params, "actor": ctx.actor}
+                        if anchor_obj is not None:
+                            ref_ctx["obj"] = anchor_obj
+                        ref_val = _resolve_ref(mut.target_ref, ref_ctx, ctx)
+                        if ref_val is None:
+                            raise InvariantError(
+                                f"action {action_bp.name!r} mutation target_ref {mut.target_ref!r} resolved to None",
+                                code="MISSING_TARGET_REF",
+                            )
+                        target_id = (
+                            ref_val.primary_key_value()
+                            if isinstance(ref_val, ObjectType)
+                            else str(ref_val)
+                        )
+                        existing = ctx.require(target_cls, target_id)
+                        if mut.op == "delete":
+                            ctx.delete(existing)
+                        else:
+                            eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
+                            if anchor_obj is not None:
+                                eval_ctx["source_obj"] = anchor_obj
+                            updates: dict[str, Any] = {}
+                            for k, v_expr in mut.set_fields.items():
+                                updates[k] = _eval_value(v_expr, eval_ctx, ctx)
+                            ctx.modify(existing, **updates)
                     else:
                         if not hasattr(params, mut.id_param):
                             raise InvariantError(
@@ -1231,7 +1781,7 @@ def compile_blueprint(
                             ctx.delete(existing)
                         else:
                             eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
-                            updates: dict[str, Any] = {}
+                            updates = {}
                             for k, v_expr in mut.set_fields.items():
                                 updates[k] = _eval_value(v_expr, eval_ctx, ctx)
                             ctx.modify(existing, **updates)
@@ -1246,7 +1796,7 @@ def compile_blueprint(
             approval_rule=approval_fn,
             affects_source=act.affects_source,
             description=act.description,
-        )(_make_action_handler(act))
+        )(_make_action_handler(act, subject_cls, subject_id_param))
         if act.display_label:
             action_display[act.name] = act.display_label
 
@@ -1270,22 +1820,27 @@ def dsl_schema_prompt_guide(
             "logical": ["and (args:[...])", "or (args:[...])", "not (arg:{...})"],
             "comparison": ["eq", "ne", "lt", "le", "gt", "ge", "in", "not_in (left:{...}, right:{...})"],
             "quantifier": ["exists", "not_exists", "count_eq", "count_ge", "count_le (object_type, where, value?)"],
-            "arithmetic": ["add", "sub", "mul (numeric left/right only)"],
+            "aggregate": ["sum", "min", "max (object_type, field, where?, default?)"],
+            "arithmetic": ["add", "sub", "mul", "div (numeric left/right; zero divisor -> DIVISION_BY_ZERO)"],
             "conditional": ["if_else (cond:<predicate>, then:<value>, else:<value>)"],
             "values": [
-                '{"ref": "obj.<field> | obj.<rel>.<field> | param.<field> | actor.role | target.<field>"}',
+                '{"ref": "obj.<field> | obj.<rel>.<field> | param.<field> | actor.role | target.<field> | source_obj.<field>"}',
                 '{"lit": <scalar_or_list>}',
+                '{"op": "sum|min|max", "object_type": "<Type>", "field": "<field>", "where": {...}}',
                 '{"op": "if_else", "cond": {...}, "then": {...}, "else": {...}}',
             ],
         },
         "quantifier_binding_rule": (
-            "Inside exists/not_exists/count_* 'where' clauses, 'obj' refers to the OUTER object being checked, "
-            "and 'target' refers to the CANDIDATE row of 'object_type' being scanned."
+            "Inside exists/not_exists/count_* and sum/min/max 'where' clauses, 'obj' refers to the OUTER object "
+            "being checked, and 'target' refers to the CANDIDATE row of 'object_type' being scanned."
         ),
         "scope_rule": (
             "Global 'invariants' / 'add_invariants' run on all M0 records with ONLY 'obj' (no 'actor' or 'param'). "
-            "Action-level guards referencing 'actor.role' or 'param.*' MUST be placed in "
-            "'update_actions[].preconditions' (preserving all existing action preconditions and mutations)."
+            "Action 'preconditions' and 'approval_rule' can access 'obj' (including relations obj.<rel>.<field>), "
+            "'param.*', 'actor.role', and cross-object quantifiers/aggregates; use 'approval_rule' when over-limit "
+            "or governed actions should pause in PENDING_APPROVAL for steward sign-off instead of hard-rejecting. "
+            "Mutations may use 'target_ref' (e.g. 'obj.customer') to update linked entities ('source_obj.*' refers to "
+            "the primary anchor object). EvolutionPatch supports 'add_relations' and 'remove_fields' with reference checks."
         ),
         "eval_case_rule": (
             "Every entry in 'proposed_eval_cases' MUST conform strictly to ProposedEvalCase "

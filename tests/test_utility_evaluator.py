@@ -58,7 +58,7 @@ def test_anti_smuggling_catches_smuggled_business_rule() -> None:
         object_types=[
             ObjectTypeBlueprint(
                 name="OrderDoc",
-                archetype="ProcessDocument",
+                archetype="ObjectType",
                 primary_key="order_id",
                 fields=[
                     FieldSpec(name="order_id", field_type="str", primary_key=True),

@@ -57,6 +57,9 @@ class SeedOntology:
     default_archetype: str = "ObjectType"
     extra_prior_notes: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    provides_non_negative: bool = False
+    fsm_archetypes: tuple[str, ...] = ()
+    balance_conservation_archetypes: tuple[str, ...] = ()
 
     def archetype_names(self) -> tuple[str, ...]:
         """Return every allowed archetype name (always includes base 'ObjectType')."""
@@ -74,6 +77,35 @@ class SeedOntology:
             if hint.name == archetype:
                 return hint
         return None
+
+    def covers_non_negative(self) -> bool:
+        return bool(self.provides_non_negative)
+
+    def covers_fsm_for(self, cls: type[ObjectType]) -> bool:
+        for arch_name in self.fsm_archetypes:
+            arch_cls = self.base_spec.abstract_types.get(arch_name)
+            if arch_cls is not None and issubclass(cls, arch_cls):
+                return True
+        return False
+
+    def covers_balance_conservation_for(self, cls: type[ObjectType]) -> bool:
+        for arch_name in self.balance_conservation_archetypes:
+            arch_cls = self.base_spec.abstract_types.get(arch_name)
+            if arch_cls is not None and issubclass(cls, arch_cls):
+                return True
+        return False
+
+    def default_aggregate_root_for(self, archetype: str, base_cls: type[ObjectType]) -> bool:
+        hint = self.get_archetype_hint(archetype)
+        if hint is not None and hint.default_aggregate_root:
+            return True
+        return bool(getattr(base_cls, "__aggregate_root__", False))
+
+    def default_append_only_for(self, archetype: str, base_cls: type[ObjectType]) -> bool:
+        hint = self.get_archetype_hint(archetype)
+        if hint is not None and hint.default_append_only:
+            return True
+        return bool(getattr(base_cls, "__append_only__", False))
 
     def resolve_base_class(self, archetype: str) -> type[ObjectType]:
         """Resolve an archetype name to a concrete Python base class for model compilation.
@@ -106,6 +138,9 @@ class SeedOntology:
             "description": self.description,
             "allowed_archetypes": list(self.archetype_names()),
             "archetypes": [h.to_dict() for h in self.archetypes],
+            "provides_non_negative": self.provides_non_negative,
+            "fsm_archetypes": list(self.fsm_archetypes),
+            "balance_conservation_archetypes": list(self.balance_conservation_archetypes),
             "inherited_state_invariants": [
                 {
                     "name": inv.name,
@@ -137,6 +172,9 @@ def seed_from_spec(
     default_archetype: str = "ObjectType",
     extra_prior_notes: Sequence[str] = (),
     metadata: Mapping[str, Any] | None = None,
+    provides_non_negative: bool | None = None,
+    provides_fsm: bool | None = None,
+    provides_balance_conservation: bool | None = None,
 ) -> SeedOntology:
     """Introspect any OntologySpec's abstract types & axioms into a pluggable SeedOntology."""
     role_hints = archetype_role_hints or {}
@@ -156,6 +194,20 @@ def seed_from_spec(
                 discovery_role_hints=tuple(role_hints.get(name, ())),
             )
         )
+    has_non_neg = (
+        bool(provides_non_negative)
+        if provides_non_negative is not None
+        else (
+            bool(base_spec.invariants)
+            and any(hasattr(cls, "__non_negative_fields__") for cls in base_spec.abstract_types.values())
+        )
+    )
+    has_fsm = bool(provides_fsm) if provides_fsm is not None else bool(base_spec.transition_invariants)
+    has_conservation = (
+        bool(provides_balance_conservation)
+        if provides_balance_conservation is not None
+        else bool(base_spec.transition_invariants)
+    )
     return SeedOntology(
         seed_id=seed_id,
         domain_name=domain_name,
@@ -165,4 +217,9 @@ def seed_from_spec(
         default_archetype=default_archetype,
         extra_prior_notes=tuple(extra_prior_notes),
         metadata=dict(metadata or {}),
+        provides_non_negative=has_non_neg,
+        fsm_archetypes=tuple(h.name for h in hints if h.supports_fsm) if has_fsm else (),
+        balance_conservation_archetypes=(
+            tuple(h.name for h in hints if h.supports_balance_conservation) if has_conservation else ()
+        ),
     )

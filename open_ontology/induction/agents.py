@@ -434,20 +434,11 @@ class OntologyEvolverAgent:
             or self.governance.get_active_adapter_mapping(model_id)
         )
 
-        # Record friction cluster under crucible's own actor
-        self.governance.runtime.submit_action(
-            f"FRC-REC-{cluster.cluster_id}-{uuid.uuid4().hex[:6]}",
-            "record_friction_cluster",
-            {
-                "cluster_id": cluster.cluster_id,
-                "model_id": model_id,
-                "signal_kind": cluster.signal_kind,
-                "action_type": cluster.action_type,
-                "signature": cluster.signature,
-                "support_count": cluster.support_count,
-                "run_ids_json": json.dumps(list(cluster.run_ids), ensure_ascii=False),
-            },
-            self.crucible._actor,
+        # Record friction cluster under crucible's public method (zero private _actor access)
+        self.crucible.record_friction_cluster(
+            self.governance,
+            model_id=model_id,
+            cluster=cluster,
         )
 
         active_seed = seed_ontology or crucible_context.seed_ontology or self.seed_ontology
