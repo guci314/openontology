@@ -148,6 +148,7 @@ def export_llm_tools(
                 "x-ontology-kind": "action",
                 "x-allowed-roles": list(action.allowed_roles),
                 "x-approver-roles": list(action.approver_roles),
+                "x-revert-roles": list(action.revert_roles),
             }
         )
 

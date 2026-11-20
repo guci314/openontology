@@ -29,6 +29,10 @@ try:
         EventVoucher,
         MasterEntity,
         ProcessDocument,
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
         spec as business_spec,
     )
 except ImportError:
@@ -37,6 +41,10 @@ except ImportError:
         EventVoucher,
         MasterEntity,
         ProcessDocument,
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
         spec as business_spec,
     )
 
@@ -323,15 +331,6 @@ def _credit_over_limit(
     )
 
 
-def _confirm_needs_approval(
-    params: ConfirmOrderParams, actor: Actor
-) -> bool:
-    return (
-        bool(params.credit_requires_approval)
-        and actor.role != "finance_director"
-    )
-
-
 def _find_order_delivery(ctx: Any, order_id: str) -> Delivery | None:
     direct = ctx.get(Delivery, f"DEL-{order_id}")
     if direct is not None and direct.order == order_id:
@@ -537,10 +536,9 @@ def create_sales_order(ctx: Any, params: CreateOrderParams) -> None:
     "confirm_sales_order",
     ConfirmOrderParams,
     allowed_roles=("sales_rep", "buyer", "ai_agent", "finance_director", "ops_manager"),
-    approver_roles=("finance_director",),
-    approval_rule=_confirm_needs_approval,
+    revert_roles=("finance_director",),
     affects_source=True,
-    description="确认草稿销售订单，创建待发货交货单；超信用额度需财务总监审批。",
+    description="确认草稿销售订单，创建待发货交货单；超信用额度须由财务总监审批（WorkCard）后在最新状态重算执行。",
 )
 def confirm_sales_order(ctx: Any, params: ConfirmOrderParams) -> None:
     order = ctx.require(SalesOrder, params.order)
@@ -557,9 +555,15 @@ def confirm_sales_order(ctx: Any, params: ConfirmOrderParams) -> None:
         )
 
     ar_balance_cents = get_customer_ar_balance(ctx, customer.customer_id)
-    params.credit_requires_approval = (
-        _credit_over_limit(customer, ar_balance_cents, order) > 0
-    )
+    over_cents = _credit_over_limit(customer, ar_balance_cents, order)
+    params.credit_requires_approval = over_cents > 0
+    if over_cents > 0 and ctx.actor.role != "finance_director":
+        raise InvariantError(
+            f"order {order.order_id} ({order.total_cents} cents) + AR ({ar_balance_cents} cents) "
+            f"exceeds credit_limit ({customer.credit_limit_cents} cents) by {over_cents} cents; "
+            "finance_director approval required",
+            code="APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED",
+        )
 
     ctx.modify(order, status="confirmed")
     ctx.create(
@@ -753,20 +757,13 @@ def record_customer_payment(ctx: Any, params: RecordPaymentParams) -> None:
     )
 
 
-def _refund_needs_approval(
-    params: IssueCreditNoteParams, actor: Actor
-) -> bool:
-    return actor.role != "finance_director"
-
-
 @spec.action(
     "issue_credit_note_refund",
     IssueCreditNoteParams,
     allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
-    approver_roles=("finance_director",),
-    approval_rule=_refund_needs_approval,
+    revert_roles=("finance_director",),
     affects_source=True,
-    description="对已过账/部分收款/已收款发票开具红字退款贷项通知单；非财务总监需审批。",
+    description="对已过账/部分收款/已收款发票开具红字退款贷项通知单；非财务总监须开立 WorkCard 审批。",
 )
 def issue_credit_note_refund(ctx: Any, params: IssueCreditNoteParams) -> None:
     order = ctx.require(SalesOrder, params.order)
@@ -780,6 +777,11 @@ def issue_credit_note_refund(ctx: Any, params: IssueCreditNoteParams) -> None:
         raise InvariantError(
             f"invoice {invoice.invoice_id} is already refunded",
             code="INVOICE_ALREADY_REFUNDED",
+        )
+    if ctx.actor.role != "finance_director":
+        raise InvariantError(
+            f"credit note refund for order {order.order_id} requires finance_director approval",
+            code="APPROVAL_REQUIRED_CREDIT_NOTE_REFUND",
         )
     ledger = ctx.require(ReceivableBalance, ar_ledger_id(invoice.customer))
     unpaid_residual = max(0, invoice.amount_cents - invoice.paid_cents)
@@ -892,6 +894,12 @@ def customer_ar_non_negative(view: Any) -> bool:
 # ---------------------------------------------------------------------------
 # Display dictionary (pure business Chinese; zero kernel leakage)
 # ---------------------------------------------------------------------------
+register_work_card_primitives(
+    spec,
+    opener_roles=("sales_rep", "buyer", "warehouse", "finance", "finance_director", "ops_manager", "ai_agent"),
+    resolver_roles=("finance_director", "ops_manager"),
+)
+
 spec.update_display(
     {
         "ontologies": {

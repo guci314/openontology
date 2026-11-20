@@ -279,22 +279,38 @@ def test_credit_exposure_and_initial_bottlenecks(o2c_env):
 def test_ai_large_order_requires_finance_director(o2c_env):
     runtime, adapter, _ = o2c_env
 
-    pending = runtime.submit_action(
+    pending = o2c.submit_or_open_work_card(
+        runtime,
         "AI-CONFIRM-LARGE",
         "confirm_sales_order",
         {"order": "O2C-SO-002"},
         o2c.AI_AGENT,
+        target_object_type="SalesOrder",
+        target_object_id="O2C-SO-002",
+        assignee_role="finance_director",
+        card_id="AI-CONFIRM-LARGE",
     )
-    assert pending["status"] == "PENDING_APPROVAL"
+    assert pending["status"] == "AWAITING_WORK_CARD"
+    assert pending["work_card_status"] == "OPEN"
+    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
     assert adapter.process_new_runs() == []
     assert adapter.order_row("O2C-SO-002")["state"] == "draft"
     assert _order(runtime, "O2C-SO-002").status == "draft"
 
-    approved = runtime.approve_action(
-        "AI-CONFIRM-LARGE", o2c.FINANCE_DIRECTOR
+    settled = o2c.settle_work_card(
+        runtime,
+        "AI-CONFIRM-LARGE",
+        o2c.FINANCE_DIRECTOR,
+        action_run_id="AI-CONFIRM-LARGE-ACT",
     )
+    approved = settled["settled_action_run"]
     assert approved["status"] == "COMMITTED"
-    assert approved["approved_by"] == o2c.FINANCE_DIRECTOR.actor_id
+    assert approved["actor_id"] == o2c.FINANCE_DIRECTOR.actor_id
+    assert (
+        runtime.get_object(o2c.WorkCard, "AI-CONFIRM-LARGE", o2c.FINANCE_DIRECTOR)
+        .resolved_by_actor_id
+        == o2c.FINANCE_DIRECTOR.actor_id
+    )
 
     evidence = adapter.process_new_runs()
     assert len(evidence) == 1

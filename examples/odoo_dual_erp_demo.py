@@ -25,7 +25,9 @@ from .odoo_orders_ontology import (
     Customer,
     Order,
     OrderNote,
+    settle_work_card,
     spec,
+    submit_or_open_work_card,
 )
 
 # ---------------------------------------------------------------------------
@@ -687,11 +689,9 @@ class OdooWritebackBridge:
     def __init__(self, runtime: OntologyRuntime, data: DualERPData) -> None:
         self.runtime = runtime
         self.data = data
-        # Pending runs must stay eligible: approval may change them later.
         self._seen: set[str] = {
             run["run_id"]
             for run in runtime.list_action_runs()
-            if run["status"] != "PENDING_APPROVAL"
         }
 
     def process_new_runs(self) -> list[dict[str, Any]]:
@@ -700,9 +700,6 @@ class OdooWritebackBridge:
         for run in self.runtime.list_action_runs():
             run_id = run["run_id"]
             if run_id in self._seen:
-                continue
-            if run["status"] == "PENDING_APPROVAL":
-                # Approval may change this run later; do not consume it yet.
                 continue
             if run["status"] != "COMMITTED":
                 self._seen.add(run_id)
@@ -893,8 +890,9 @@ def main() -> dict[str, Any]:
     print(f"  ontology order status="
           f"{runtime.get_object(Order, 'N-SO001', OPS_MANAGER).status}")
 
-    _section("7. AI Agent 大额取消 -> 人工审批 -> 真实回写 erp_south")
-    ai_pending = runtime.submit_action(
+    _section("7. AI Agent 大额取消 -> WorkCard 人工放行 -> 真实回写 erp_south")
+    ai_card = submit_or_open_work_card(
+        runtime,
         "RUN-AI-LARGE",
         "cancel_order",
         {
@@ -904,12 +902,22 @@ def main() -> dict[str, Any]:
             "order_total_cents": 6000000,
         },
         AI_AGENT,
+        target_object_type="Order",
+        target_object_id="S-SO002",
+        assignee_role="ops_manager",
+        card_id="RUN-AI-LARGE",
     )
-    print(f"  submit status={ai_pending['status']}"
+    print(f"  submit status={ai_card['status']} card_status={ai_card['work_card_status']}"
           f" erp_south state={data.state('S-SO002')!r} (must stay sale)")
     print(f"  bridge while pending={bridge.process_new_runs()}")
-    approved = runtime.approve_action("RUN-AI-LARGE", OPS_MANAGER)
-    print(f"  approved by={approved['approved_by']} status={approved['status']}")
+    settled = settle_work_card(
+        runtime,
+        "RUN-AI-LARGE",
+        OPS_MANAGER,
+        action_run_id="RUN-AI-LARGE-ACT",
+    )
+    approved = settled["settled_action_run"]
+    print(f"  settled by={approved['actor_id']} status={approved['status']}")
     for item in bridge.process_new_runs():
         print(
             f"  writeback {item['order_id']} db={item['db']}"

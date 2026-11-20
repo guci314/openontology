@@ -396,7 +396,7 @@ def test_legacy_single_runtime_compatibility():
         assert len(catalog["instances"]) == 1
         assert catalog["instances"][0]["instance_id"] == "default"
         meta = _get(handle.base_url, "/api/meta")
-        assert {t["name"] for t in meta["object_types"]} == {"SteelCoil", "ScrapLot"}
+        assert {t["name"] for t in meta["object_types"]} == {"SteelCoil", "ScrapLot", "WorkCard"}
         assert meta["instance"]["instance_id"] == "default"
     finally:
         handle.stop()
@@ -457,24 +457,60 @@ def test_masking_by_role(base):
 # 13. 审批与时光机
 # ---------------------------------------------------------------------------
 def test_approve_and_revert_flow(base):
-    submitted = _post(
+    with pytest.raises(urllib.error.HTTPError) as blocked:
+        _post(
+            base,
+            "/api/submit",
+            {
+                "instance": "osv2-coil-prod",
+                "run_id": "CC-APPROVE-1-TRY",
+                "action": "request_price_change",
+                "params": {"asset_id": "C-2", "unit_price_ton": 24500.0},
+            },
+        )
+    assert blocked.value.code == 400
+
+    opened = _post(
         base,
         "/api/submit",
         {
             "instance": "osv2-coil-prod",
-            "run_id": "CC-APPROVE-1",
+            "run_id": "CC-APPROVE-1-OPEN",
+            "action": "open_work_card",
+            "params": {
+                "card_id": "CC-APPROVE-1",
+                "card_kind": "APPROVAL",
+                "target_object_type": "SteelCoil",
+                "target_object_id": "C-2",
+                "requested_action": "request_price_change",
+                "requested_params_json": '{"asset_id": "C-2", "unit_price_ton": 24500.0}',
+                "assignee_role": "finance_manager",
+            },
+        },
+    )
+    assert opened["run"]["status"] == "COMMITTED"
+
+    approved = _post(
+        base,
+        "/api/submit?role=finance_manager",
+        {
+            "instance": "osv2-coil-prod",
+            "run_id": "CC-APPROVE-1-ACT",
             "action": "request_price_change",
             "params": {"asset_id": "C-2", "unit_price_ton": 24500.0},
         },
     )
-    assert submitted["run"]["status"] == "PENDING_APPROVAL"
-
-    approved = _post(
-        base,
-        "/api/approve?role=finance_manager",
-        {"instance": "osv2-coil-prod", "run_id": "CC-APPROVE-1"},
-    )
     assert approved["run"]["status"] == "COMMITTED"
+    _post(
+        base,
+        "/api/submit?role=finance_manager",
+        {
+            "instance": "osv2-coil-prod",
+            "run_id": "CC-APPROVE-1-COMP",
+            "action": "complete_work_card",
+            "params": {"card_id": "CC-APPROVE-1", "settled_run_id": "CC-APPROVE-1-ACT"},
+        },
+    )
 
     coil = _get(
         base, "/api/objects/SteelCoil", instance="osv2-coil-prod", role="finance"
@@ -485,7 +521,7 @@ def test_approve_and_revert_flow(base):
     reverted = _post(
         base,
         "/api/revert?role=finance_manager",
-        {"instance": "osv2-coil-prod", "run_id": "CC-APPROVE-1"},
+        {"instance": "osv2-coil-prod", "run_id": "CC-APPROVE-1-ACT"},
     )
     assert reverted["run"]["status"] == "COMMITTED"
     coil = _get(
@@ -1363,22 +1399,33 @@ def test_live_fingerprint_revision_tracks_external_writes_and_auto_poll_ui(tmp_p
             fp2 = _get(base, "/api/fingerprint", instance="o2c-erp-north")
             assert fp2["revision"] != fp1["revision"]
 
-            r_pending = ext_rt.submit_action(
+            r_pending = o2c.submit_or_open_work_card(
+                ext_rt,
                 "EXT-CONFIRM-003",
                 "confirm_sales_order",
                 {"order": "O2C-SO-003"},
                 o2c.AI_AGENT,
+                target_object_type="SalesOrder",
+                target_object_id="O2C-SO-003",
+                assignee_role="finance_director",
+                card_id="EXT-CONFIRM-003",
             )
-            assert r_pending["status"] == "PENDING_APPROVAL"
+            assert r_pending["status"] == "AWAITING_WORK_CARD"
+            assert r_pending["work_card_status"] == "OPEN"
             fp3 = _get(base, "/api/fingerprint", instance="o2c-erp-north")
             assert fp3["revision"] != fp2["revision"]
 
-            r_rejected = ext_rt.reject_action(
-                "EXT-CONFIRM-003",
+            r_rejected = ext_rt.submit_action(
+                "EXT-CONFIRM-003-REJ",
+                "reject_work_card",
+                {"card_id": "EXT-CONFIRM-003", "resolution_note": "演练驳回测试"},
                 o2c.FINANCE_DIRECTOR,
-                reason="演练驳回测试",
             )
-            assert r_rejected["status"] == "REJECTED"
+            assert r_rejected["status"] == "COMMITTED"
+            assert (
+                ext_rt.get_object(o2c.WorkCard, "EXT-CONFIRM-003", o2c.FINANCE_DIRECTOR).status
+                == "REJECTED"
+            )
             fp4 = _get(base, "/api/fingerprint", instance="o2c-erp-north")
             assert fp4["revision"] != fp3["revision"]
         finally:

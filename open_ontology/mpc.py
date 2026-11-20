@@ -141,6 +141,8 @@ class ClosedLoopMPCController:
         conflict_strategy: str = "user_edits_win",
         auto_trigger: bool = False,
         refresh_on_start: bool = False,
+        pending_check: Callable[[OntologyRuntime], str | None] | None = None,
+        on_blocked_step: Callable[[OntologyRuntime, CandidateAction, InvariantError], str | None] | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
@@ -180,6 +182,8 @@ class ClosedLoopMPCController:
         self.conflict_strategy = conflict_strategy
         self.auto_trigger = auto_trigger
         self.refresh_on_start = bool(refresh_on_start)
+        self.pending_check = pending_check
+        self.on_blocked_step = on_blocked_step
         self._seq = 0
 
         if act_fn is not None and observe_fn is not None:
@@ -286,7 +290,14 @@ class ClosedLoopMPCController:
                 snapshots_refreshed += 1
 
         while True:
-            # 1) 挂起审批单统一存放在 ontology_action_runs，存在待批单时保持干净暂停态
+            # 1) 领域无关的在途协同/审批等待检查（优先 M1 工作卡回调，兼容 Phase 3 遗留 PENDING_APPROVAL）
+            if self.pending_check is not None:
+                pending_id = self.pending_check(self.runtime)
+                if pending_id:
+                    return _result(
+                        MPC_AWAITING_APPROVAL,
+                        awaiting_run_id=str(pending_id),
+                    )
             awaiting = self.runtime.list_action_runs(status=AUDIT_STATUS_PENDING)
             if awaiting:
                 return _result(
@@ -345,6 +356,26 @@ class ClosedLoopMPCController:
                 replans_used += 1
                 continue
             except InvariantError as exc:
+                if self.on_blocked_step is not None:
+                    escalated_id = self.on_blocked_step(self.runtime, first, exc)
+                    if escalated_id:
+                        trajectory.append(
+                            MPCStepRecord(
+                                run_id=rid,
+                                action_type=first.action,
+                                params=dict(first.params),
+                                status=MPC_AWAITING_APPROVAL,
+                                planned_horizon=len(plan),
+                                resumed=False,
+                                snapshot_refreshed=False,
+                                error_code=exc.code or "INVARIANT_ERROR",
+                                error_message=str(exc),
+                            )
+                        )
+                        return _result(
+                            MPC_AWAITING_APPROVAL,
+                            awaiting_run_id=str(escalated_id),
+                        )
                 trajectory.append(
                     MPCStepRecord(
                         run_id=rid,

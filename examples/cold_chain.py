@@ -53,6 +53,9 @@ from .cold_chain_ontology import (
     RecommendParams,
     RerouteParams,
     SHIPS_FROM,
+    WorkCard,
+    settle_work_card,
+    submit_or_open_work_card,
     Shipment,
     Truck,
     Warehouse,
@@ -296,7 +299,7 @@ def main() -> dict[str, Any]:
                 "replacement_truck_id": "TRK-002",
                 "extra_cost": 2400,
             },
-            "expect": {"valid": True, "requires_approval": True},
+            "expect": {"valid": False, "error_contains": "ops_manager"},
         },
         {
             "name": "eta_over_limit_rejected",
@@ -386,7 +389,7 @@ def main() -> dict[str, Any]:
     print(f"  overlay after reindex={overlay_row['patch_json'] if overlay_row else None}")
     print(f"  version after reindex={runtime.list_objects('Shipment')[0]['version']}")
 
-    _section("7. 沙箱模拟（ai_agent 高成本 -> 需审批）")
+    _section("7. 沙箱模拟（ai_agent 高成本 -> 前置门控拦截；经理 -> 可执行）")
     high_cost = {
         "shipment_id": "SHP-001",
         "replacement_warehouse_id": "WH-002",
@@ -394,9 +397,11 @@ def main() -> dict[str, Any]:
         "extra_cost": 2400,
         "reason": "冷链车抛锚，需紧急重派",
     }
-    simulation = runtime.simulate_action("reroute_shipment", high_cost, AI_AGENT)
+    sim_ai = runtime.simulate_action("reroute_shipment", high_cost, AI_AGENT)
+    simulation = runtime.simulate_action("reroute_shipment", high_cost, OPS_MANAGER)
     version_before_sim = runtime.list_objects("Shipment")[0]["version"]
-    print(f"  valid={simulation.valid} requires_approval={simulation.requires_approval}")
+    print(f"  ai valid={sim_ai.valid} error_code={sim_ai.error_code}")
+    print(f"  mgr valid={simulation.valid} requires_approval={simulation.requires_approval}")
     print(f"  diff: {simulation.diff.summary()}")
     print(f"  read_versions={simulation.read_versions}")
     print(f"  db shipment version after simulate="
@@ -423,14 +428,30 @@ def main() -> dict[str, Any]:
     print(f"  carriers(SHP-001)={_carriers(runtime, demo.shipment_id)}")
     print(f"  WH-002 stock={warehouse.batch_stock}")
 
-    _section("10. 治理审批（ai_agent 高成本 -> 经理审批）")
-    pending = runtime.submit_action("RUN-0002", "reroute_shipment", high_cost, AI_AGENT)
-    print(f"  run={pending['run_id']} status={pending['status']}")
+    _section("10. 治理审批（ai_agent 高成本 -> 签发 WorkCard + 经理结算）")
+    pending = submit_or_open_work_card(
+        runtime,
+        "RUN-0002",
+        "reroute_shipment",
+        high_cost,
+        AI_AGENT,
+        target_object_type="Shipment",
+        target_object_id=demo.shipment_id,
+        assignee_role="ops_manager",
+        card_id="RUN-0002",
+    )
+    print(f"  run=RUN-0002 status={pending['status']} card={pending['work_card_status']}")
     shipment = runtime.get_object(Shipment, demo.shipment_id, OPS_MANAGER)
     print(f"  before approve: status={shipment.status} truck={shipment.assigned_truck_id}"
           f" (must be unchanged)")
-    approved = runtime.approve_action("RUN-0002", OPS_MANAGER)
-    print(f"  approved by={approved['approved_by']} status={approved['status']}")
+    settled = settle_work_card(
+        runtime,
+        "RUN-0002",
+        OPS_MANAGER,
+        action_run_id="RUN-0002-ACT",
+    )
+    approved = settled["settled_action_run"]
+    print(f"  settled by={approved['actor_id']} status={approved['status']}")
     shipment = runtime.get_object(Shipment, demo.shipment_id, OPS_MANAGER)
     print(f"  after approve: status={shipment.status} truck={shipment.assigned_truck_id}"
           f" warehouse={shipment.current_warehouse_id}")

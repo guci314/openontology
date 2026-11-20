@@ -43,6 +43,7 @@ __all__ = [
     "parse_feishu_ruling_callback",
     "verify_feishu_signature",
     "start_feishu_ws_listener",
+    "submit_with_feishu_approval",
 ]
 
 TransportFn = Callable[[str, str, dict[str, str], bytes, float], tuple[int, bytes]]
@@ -53,7 +54,14 @@ _ACTION_LABELS: dict[str, str] = {
     "ship_order_delivery": "仓库确认发货出库",
     "issue_and_post_invoice": "开具并过账应收发票",
     "record_customer_payment": "登记客户收款核销",
+    "issue_credit_note_refund": "开具红字退款贷项单",
     "annotate_o2c_governance": "登记业务风控特批备注",
+    "open_work_card": "发起财务总监签批申请",
+    "claim_work_card": "认领协同签批单",
+    "complete_work_card": "完成主管签批归档",
+    "reject_work_card": "驳回高风险签批申请",
+    "mark_work_card_sla_breached": "标记签批单超时",
+    "cancel_work_card": "作废失效签批单",
 }
 
 _ACTOR_ROLE_LABELS: dict[str, str] = {
@@ -79,6 +87,7 @@ _OBJECT_LABELS: dict[str, str] = {
     "Delivery": "仓库交货单",
     "Invoice": "应收账款发票",
     "ReceivableVoucher": "应收账务凭证",
+    "WorkCard": "风险协同签批单",
 }
 
 _FIELD_LABELS: dict[str, str] = {
@@ -135,11 +144,88 @@ _ERROR_LABELS: dict[str, str] = {
     "APPEND_ONLY_VIOLATION": "历史账务凭证不可篡改或删除，仅允许红冲",
     "ILLEGAL_DOCUMENT_TRANSITION": "单据状态跃迁非法，已拦截跨步变更",
     "APPROVAL_REJECTED": "财务总监已驳回本次高风险变更申请",
+    "APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED": "订单金额超出剩余可用授信，须发起财务总监签批",
+    "APPROVAL_REQUIRED_CREDIT_NOTE_REFUND": "红字退款须由财务总监签批放行",
+    "WORK_CARD_ASSIGNEE_MISMATCH": "当前操作角色无权签批此高风险申请",
+    "WORK_CARD_RESOLVER_FORBIDDEN": "当前操作角色无权批结签批单",
+    "SOD_SELF_APPROVAL_FORBIDDEN": "职责分离限制：禁止申请人自批自结",
     "REVERT_BLOCKED_ALREADY_SHIPPED": "货物已完成物理出库，禁止直接冲正撤单，请走退货入库流程",
     "REVERT_BLOCKED_ALREADY_PAID": "发票已完成收款核销，禁止直接冲正，请走红字退款流程",
 }
 
 _REVERSIBLE_ACTIONS = frozenset({"confirm_sales_order", "issue_and_post_invoice"})
+
+
+def _read_target_version(runtime: OntologyRuntime, obj_type: str, obj_id: str) -> int | None:
+    if not obj_type or not obj_id:
+        return None
+    row = runtime.connection.execute(
+        "SELECT version FROM ontology_objects WHERE object_type = ? AND object_id = ?",
+        (obj_type, obj_id),
+    ).fetchone()
+    return int(row["version"]) if row is not None else None
+
+
+def _parse_occ_external_ref(external_ref: str) -> tuple[str, str, int] | None:
+    text = str(external_ref or "").strip()
+    if not text.startswith("occ:"):
+        return None
+    parts = text.split(":")
+    if len(parts) != 4 or not parts[3].startswith("v"):
+        return None
+    try:
+        return parts[1], parts[2], int(parts[3][1:])
+    except ValueError:
+        return None
+
+
+def submit_with_feishu_approval(
+    runtime: OntologyRuntime,
+    run_id: str,
+    action_name: str,
+    params: dict[str, Any],
+    actor: Actor,
+    *,
+    assignee_role: str = "finance_director",
+    target_object_type: str = "SalesOrder",
+) -> dict[str, Any]:
+    """提交 O2C 动作；若触发 ``APPROVAL_REQUIRED_*`` 预条件，同步开立 M1 签批协同卡。"""
+    try:
+        return runtime.submit_action(run_id, action_name, params, actor)
+    except InvariantError as exc:
+        if not str(exc.code or "").startswith("APPROVAL_REQUIRED_"):
+            raise
+        order_id = str(params.get("order") or params.get("order_id") or "")
+        ver = _read_target_version(runtime, target_object_type, order_id)
+        ext_ref = f"occ:{target_object_type}:{order_id}:v{ver}" if ver is not None else ""
+        target_action = runtime.spec.get_action(action_name)
+        params_json = target_action.params.model_validate(params or {}).model_dump_json()
+        open_run = runtime.submit_action(
+            f"{run_id}-OPEN",
+            "open_work_card",
+            {
+                "card_id": run_id,
+                "card_kind": "APPROVAL",
+                "target_object_type": target_object_type,
+                "target_object_id": order_id,
+                "requested_action": action_name,
+                "requested_params_json": params_json,
+                "assignee_role": assignee_role,
+                "external_ref": ext_ref,
+            },
+            actor,
+        )
+        return {
+            "run_id": run_id,
+            "card_id": run_id,
+            "action_type": action_name,
+            "status": "OPEN",
+            "work_card_status": "OPEN",
+            "blocked_run_id": run_id,
+            "open_run_id": open_run["run_id"],
+            "error_code": exc.code,
+            "error_message": str(exc),
+        }
 
 
 class FeishuGatewayError(RuntimeError):
@@ -215,26 +301,80 @@ def format_run_for_executive(
     conflict_error: str | None = None,
     card_status_override: str | None = None,
 ) -> dict[str, Any]:
-    """把运行记录与 ObjectDiff 翻译为面向管理层的零技术黑话业务卡片视图。"""
-    run_id = str(run.get("run_id") or "")
-    action_type = str(run.get("action_type") or "")
+    """把运行记录或 M1 签批单翻译为面向管理层的零技术黑话业务卡片视图。"""
+    run_id = str(run.get("card_id") or run.get("run_id") or "")
+    raw_action = str(run.get("action_type") or "")
     params = dict(run.get("params") or {})
     status = str(card_status_override or run.get("status") or "")
-    is_revert = _is_revert_run(run)
+    diff = dict(run.get("object_diff") or {})
+    read_versions = dict(run.get("read_versions") or {})
+    approved_by = run.get("approved_by")
+    actor_role = str(run.get("actor_role") or "")
+    actor_id = str(run.get("actor_id") or "")
+
+    # 若传入的是 open_work_card / reject_work_card / complete_work_card 或 WorkCard 对象，展开目标业务动作与 live 推演预览
+    work_card: o2c.WorkCard | None = None
+    card_id_hint = str(run.get("card_id") or params.get("card_id") or "")
+    if card_id_hint and (raw_action == "open_work_card" or run.get("work_card_status")):
+        try:
+            sys_actor = Actor(actor_id="__card__", role="system", clearance_tags={"*"})
+            work_card = runtime.get_object(o2c.WorkCard, card_id_hint, sys_actor)
+        except Exception:
+            work_card = None
+
+    if work_card is not None:
+        run_id = work_card.card_id
+        action_type = work_card.requested_action
+        try:
+            params = json.loads(work_card.requested_params_json or "{}")
+        except Exception:
+            params = {}
+        if card_status_override is None:
+            if work_card.status in ("OPEN", "IN_PROGRESS"):
+                status = "OPEN"
+            elif work_card.status == "REJECTED":
+                status = "REJECTED"
+            elif work_card.status == "CANCELLED":
+                status = "CONFLICT" if conflict_error else "REJECTED"
+            elif work_card.status == "COMPLETED":
+                status = "COMMITTED"
+        approved_by = work_card.resolved_by_actor_id or approved_by
+        actor_id = work_card.requester_actor_id or actor_id
+        if status == "OPEN":
+            try:
+                sim_res = runtime.simulate_action(
+                    work_card.requested_action,
+                    params,
+                    o2c.FINANCE_DIRECTOR,
+                )
+                if sim_res.valid:
+                    diff = sim_res.diff.to_dict()
+                    read_versions = dict(sim_res.read_versions)
+            except Exception:
+                pass
+    else:
+        action_type = raw_action
+
+    is_revert = _is_revert_run({"action_type": action_type, "object_diff": diff})
 
     action_label = _ACTION_LABELS.get(action_type, action_type)
     if is_revert:
         action_label = f"紧急冲正撤回：{action_label}"
 
-    actor_role = str(run.get("actor_role") or "")
-    actor_label = _ACTOR_ROLE_LABELS.get(actor_role, str(run.get("actor_id") or "业务操作员"))
+    actor_label = (
+        _ACTOR_ID_LABELS.get(actor_id)
+        or _ACTOR_ROLE_LABELS.get(actor_role)
+        or actor_id
+        or "业务操作员"
+    )
     order_id = str(params.get("order") or params.get("order_id") or "")
 
     # 提取结构化字段变更（Before -> After）
     changes_summary: list[dict[str, str]] = []
-    diff = run.get("object_diff") or {}
     for ch in diff.get("object_changes") or []:
         obj_type = str(ch.get("object_type") or "")
+        if obj_type == "WorkCard" and work_card is not None:
+            continue
         obj_id = str(ch.get("object_id") or "")
         obj_label = _OBJECT_LABELS.get(obj_type, obj_type)
         kind = str(ch.get("kind") or "")
@@ -298,25 +438,25 @@ def format_run_for_executive(
             customer_name = cust_obj.name
             remaining = max(0, cust_obj.credit_limit_cents - ar_cents)
             over = max(0, ar_cents + order_obj.total_cents - cust_obj.credit_limit_cents)
-            if status == "PENDING_APPROVAL" and action_type == "confirm_sales_order" and over > 0:
+            if status in ("OPEN", "IN_PROGRESS") and action_type == "confirm_sales_order" and over > 0:
                 risk_headline = (
                     f"订单金额 {format_rmb(order_obj.total_cents)}，"
                     f"超出客户剩余可用授信 {format_rmb(over)}"
                     f"（授信总额 {format_rmb(cust_obj.credit_limit_cents)}，"
                     f"当前可用 {format_rmb(remaining)}），"
-                    "已由数字沙箱自动锁死挂起，ERP 原单据保持草稿未变动。"
+                    "已由数字沙箱安全拦截并开立财务签批单，ERP 原单据保持草稿未变动。"
                 )
         except Exception:
             pass
 
     if not risk_headline:
-        if status == "PENDING_APPROVAL":
-            risk_headline = "当前高风险业务变更已触发风控挂起锁，审批放行前 ERP 真实单据零修改。"
+        if status in ("OPEN", "IN_PROGRESS"):
+            risk_headline = "当前高风险业务变更已由签批工单锁定等待复核，签批放行前 ERP 真实单据零修改。"
         elif status == "CONFLICT":
             risk_headline = conflict_error or "审批等待期间底层 ERP 单据已被修改，版本校验触发自动熔断作废。"
         elif status == "REJECTED":
             code = str(run.get("error_code") or "")
-            reason = _ERROR_LABELS.get(code) or str(run.get("error_message") or "违反企业风控红线")
+            reason = _ERROR_LABELS.get(code) or str(run.get("error_message") or "财务总监已驳回本次高风险变更")
             risk_headline = f"安全闸门已拦截：{reason}。底层 ERP 零改动，企图已记入合规审计账本。"
         elif status == "REVERTED":
             risk_headline = "已执行一键时光机冲正，ERP 真实单据与授信占用已自动恢复至操作前状态。"
@@ -326,7 +466,6 @@ def format_run_for_executive(
             risk_headline = "变更已通过规则校验并正式生效，真实 ERP 单据同步完成。"
 
     # 拼装数据锁版本摘要
-    read_versions = dict(run.get("read_versions") or {})
     version_badges = [
         f"{_OBJECT_LABELS.get(k.partition(':')[0], k.partition(':')[0])}({k.partition(':')[2]}) v{v}"
         for k, v in sorted(read_versions.items())
@@ -351,7 +490,7 @@ def format_run_for_executive(
         elif ev_action == "record_customer_payment":
             erp_lines.append(f"Odoo 收款核销完成｜剩余应收：¥{float(ev.get('amount_residual', 0)):,.2f}")
 
-    if status == "PENDING_APPROVAL":
+    if status in ("OPEN", "IN_PROGRESS"):
         header_title = f"【待签批】{action_label}（{order_id or run_id}）"
         header_template = "orange"
         status_label = "待签批挂起"
@@ -370,7 +509,7 @@ def format_run_for_executive(
     else:
         header_title = (
             f"【已签批生效】{action_label}（{order_id or run_id}）"
-            if run.get("approved_by")
+            if approved_by
             else f"【已生效】{action_label}（{order_id or run_id}）"
         )
         header_template = "green"
@@ -387,13 +526,13 @@ def format_run_for_executive(
         "action_type": action_type,
         "action_label": action_label,
         "actor_label": actor_label,
-        "approved_by": run.get("approved_by"),
+        "approved_by": approved_by,
         "approved_by_label": (
             _ACTOR_ID_LABELS.get(
-                str(run.get("approved_by")),
-                _ACTOR_ROLE_LABELS.get(str(run.get("approved_by")), str(run.get("approved_by"))),
+                str(approved_by),
+                _ACTOR_ROLE_LABELS.get(str(approved_by), str(approved_by)),
             )
-            if run.get("approved_by")
+            if approved_by
             else None
         ),
         "reverted_by_run_id": run.get("reverted_by_run_id"),
@@ -462,7 +601,7 @@ def build_feishu_card(
 
     status = card_view.get("status")
     run_id = card_view["run_id"]
-    if status == "PENDING_APPROVAL":
+    if status in ("OPEN", "IN_PROGRESS"):
         elements.append(
             {
                 "tag": "action",
@@ -798,11 +937,13 @@ class CardRecord:
     card: dict[str, Any]
     message_id: str | None = None
     push_error: str | None = None
+    settled_run_id: str | None = None
+    baseline_versions: dict[str, int] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
 
 
 class FeishuApprovalGateway:
-    """连接 OntologyRuntime、真实 ERP 适配器与飞书审批卡片的核心网关。"""
+    """连接 OntologyRuntime、真实 ERP 适配器与飞书 M1 协同签批卡的核心网关。"""
 
     def __init__(
         self,
@@ -840,9 +981,72 @@ class FeishuApprovalGateway:
         self._cards: dict[str, CardRecord] = {}
         self._card_order: list[str] = []
         self._evidence_by_run: dict[str, list[dict[str, Any]]] = {}
+        self._settled_run_by_card: dict[str, str] = {}
+        self._baseline_versions: dict[str, dict[str, int]] = {}
         self._suppress_event_run_ids: set[str] = set()
 
         self.runtime.add_run_event_hook(self._on_run_event)
+
+    def submit_or_escalate(
+        self,
+        run_id: str,
+        action_name: str,
+        params: dict[str, Any],
+        actor: Actor,
+        *,
+        assignee_role: str = "finance_director",
+        target_object_type: str = "SalesOrder",
+    ) -> dict[str, Any]:
+        """便捷入口：提交业务动作并在 ``APPROVAL_REQUIRED_*`` 时自动开立 M1 WorkCard。"""
+        return submit_with_feishu_approval(
+            self.runtime,
+            run_id,
+            action_name,
+            params,
+            actor,
+            assignee_role=assignee_role,
+            target_object_type=target_object_type,
+        )
+
+    def _capture_card_baseline(self, card_id: str) -> dict[str, int]:
+        if card_id in self._baseline_versions and self._baseline_versions[card_id]:
+            return dict(self._baseline_versions[card_id])
+        baseline: dict[str, int] = {}
+        try:
+            sys_actor = Actor(actor_id="__card__", role="system", clearance_tags={"*"})
+            wc = self.runtime.get_object(o2c.WorkCard, card_id, sys_actor)
+            parsed = _parse_occ_external_ref(wc.external_ref)
+            if parsed is not None:
+                baseline[f"{parsed[0]}:{parsed[1]}"] = parsed[2]
+            elif wc.target_object_type and wc.target_object_id:
+                ver = _read_target_version(
+                    self.runtime, wc.target_object_type, wc.target_object_id
+                )
+                if ver is not None:
+                    baseline[f"{wc.target_object_type}:{wc.target_object_id}"] = ver
+        except Exception:
+            pass
+        if baseline:
+            self._baseline_versions[card_id] = dict(baseline)
+        return baseline
+
+    def _resolve_settled_run_id(self, key_id: str) -> str:
+        if key_id in self._settled_run_by_card:
+            return self._settled_run_by_card[key_id]
+        rec = self._cards.get(key_id)
+        if rec and rec.settled_run_id:
+            self._settled_run_by_card[key_id] = rec.settled_run_id
+            return rec.settled_run_id
+        for r in self.runtime.list_action_runs("COMMITTED"):
+            if r.get("action_type") == "complete_work_card":
+                p = r.get("params") or {}
+                if p.get("card_id") == key_id and p.get("settled_run_id"):
+                    sid = str(p["settled_run_id"])
+                    self._settled_run_by_card[key_id] = sid
+                    return sid
+        if self.runtime.get_action_run(f"{key_id}-ACT") is not None:
+            return f"{key_id}-ACT"
+        return key_id
 
     # -- lifecycle & card sync --------------------------------------------
     def _on_run_event(self, actor: Actor, run: dict[str, Any]) -> None:
@@ -853,15 +1057,29 @@ class FeishuApprovalGateway:
         with self._lock:
             if run_id in self._suppress_event_run_ids:
                 return
-            if run["status"] == "PENDING_APPROVAL":
-                self._upsert_card(run, push_if_new=True)
-            elif run["status"] == "REJECTED" and run.get("error_code") not in (None, "APPROVAL_REJECTED"):
-                # 违规红线拦截告警卡片（用于演播室/飞书即时告警）
-                self._upsert_card(run, push_if_new=self.push_all_cards)
+            action_type = str(run.get("action_type") or "")
+            if action_type == "open_work_card" and run["status"] == "COMMITTED":
+                card_id = str((run.get("params") or {}).get("card_id") or "")
+                if not card_id:
+                    for ch in (run.get("object_diff") or {}).get("object_changes", []):
+                        if ch.get("object_type") == "WorkCard":
+                            card_id = str(ch.get("object_id") or "")
+                            break
+                if card_id:
+                    self._capture_card_baseline(card_id)
+                    wc_run = dict(run, run_id=card_id, card_id=card_id)
+                    self._upsert_card(wc_run, push_if_new=True)
+            elif run["status"] == "REJECTED":
+                err_code = str(run.get("error_code") or "")
+                if err_code.startswith("APPROVAL_REQUIRED_"):
+                    return
+                if err_code not in ("", "APPROVAL_REJECTED"):
+                    # 违规红线拦截告警卡片（用于演播室/飞书即时告警）
+                    self._upsert_card(run, push_if_new=self.push_all_cards)
             elif run["status"] == "COMMITTED":
                 if _is_revert_run(run):
                     return
-                if run_id in self._cards or run.get("action_type") in _REVERSIBLE_ACTIONS:
+                if run_id in self._cards or action_type in _REVERSIBLE_ACTIONS:
                     self._upsert_card(run, push_if_new=False)
 
     def register_committed_card(
@@ -886,12 +1104,45 @@ class FeishuApprovalGateway:
         erp_evidence: list[dict[str, Any]] | None = None,
         conflict_error: str | None = None,
         card_status_override: str | None = None,
+        settled_run_id: str | None = None,
+        baseline_versions: dict[str, int] | None = None,
     ) -> CardRecord | None:
-        """从持久化元数据恢复本地卡片索引与飞书 ``message_id``（不触发外发）。"""
-        run = self.runtime.get_action_run(run_id)
-        if run is None:
-            return None
+        """从持久化元数据恢复本地卡片索引、OCC 基线与飞书 ``message_id``（不触发外发）。"""
         with self._lock:
+            if baseline_versions:
+                self._baseline_versions[run_id] = {
+                    str(k): int(v) for k, v in baseline_versions.items()
+                }
+            eff_settled_id = settled_run_id or self._resolve_settled_run_id(run_id)
+            if settled_run_id:
+                self._settled_run_by_card[run_id] = settled_run_id
+            run: dict[str, Any] | None = None
+            if eff_settled_id and eff_settled_id != run_id:
+                settled = self.runtime.get_action_run(eff_settled_id)
+                if settled is not None:
+                    run = dict(settled)
+                    run["run_id"] = run_id
+                    if settled.get("approved_by") is None:
+                        for r in reversed(self.runtime.list_action_runs("COMMITTED")):
+                            if r.get("action_type") == "complete_work_card" and (r.get("params") or {}).get("card_id") == run_id:
+                                run["approved_by"] = r.get("actor_id")
+                                break
+            if run is None:
+                try:
+                    sys_actor = Actor(actor_id="__card__", role="system", clearance_tags={"*"})
+                    wc = self.runtime.get_object(o2c.WorkCard, run_id, sys_actor)
+                    self._capture_card_baseline(run_id)
+                    run = {
+                        "run_id": wc.card_id,
+                        "card_id": wc.card_id,
+                        "action_type": "open_work_card",
+                        "params": {"card_id": wc.card_id},
+                        "status": wc.status,
+                    }
+                except Exception:
+                    run = self.runtime.get_action_run(run_id)
+            if run is None:
+                return None
             if erp_evidence is not None:
                 self._evidence_by_run[run_id] = list(erp_evidence)
             stored_evidence = self._evidence_by_run.get(run_id)
@@ -908,6 +1159,8 @@ class FeishuApprovalGateway:
                 card_view=view,
                 card=card,
                 message_id=message_id,
+                settled_run_id=eff_settled_id if eff_settled_id != run_id else None,
+                baseline_versions=dict(self._baseline_versions.get(run_id) or {}),
             )
             self._cards[run_id] = rec
             if run_id not in self._card_order:
@@ -928,6 +1181,10 @@ class FeishuApprovalGateway:
                         rec.card_view.get("risk_headline") if override == "CONFLICT" else None
                     ),
                     "card_status_override": override,
+                    "settled_run_id": rec.settled_run_id or self._settled_run_by_card.get(run_id),
+                    "baseline_versions": dict(
+                        self._baseline_versions.get(run_id) or rec.baseline_versions
+                    ),
                 }
             return out
 
@@ -939,8 +1196,9 @@ class FeishuApprovalGateway:
         erp_evidence: list[dict[str, Any]] | None = None,
         conflict_error: str | None = None,
         card_status_override: str | None = None,
+        settled_run_id: str | None = None,
     ) -> CardRecord:
-        run_id = str(run["run_id"])
+        run_id = str(run.get("card_id") or run["run_id"])
         if erp_evidence is not None:
             self._evidence_by_run[run_id] = list(erp_evidence)
         stored_evidence = self._evidence_by_run.get(run_id)
@@ -954,6 +1212,9 @@ class FeishuApprovalGateway:
         card = build_feishu_card(view, callback_token=self.callback_token)
         existing = self._cards.get(run_id)
         message_id = existing.message_id if existing else None
+        eff_settled = settled_run_id or self._settled_run_by_card.get(run_id) or (
+            existing.settled_run_id if existing else None
+        )
         push_error: str | None = None
 
         if self.feishu_client.is_configured:
@@ -971,6 +1232,8 @@ class FeishuApprovalGateway:
             card=card,
             message_id=message_id,
             push_error=push_error,
+            settled_run_id=eff_settled,
+            baseline_versions=dict(self._baseline_versions.get(run_id) or {}),
         )
         self._cards[run_id] = record
         if run_id not in self._card_order:
@@ -1105,16 +1368,58 @@ class FeishuApprovalGateway:
         with self._lock:
             actor = self._resolve_actor(open_id)
             if op == "approve":
-                self._suppress_event_run_ids.add(run_id)
+                act_rid = f"{run_id}-ACT"
+                comp_rid = f"{run_id}-COMP"
+                self._suppress_event_run_ids.update({run_id, act_rid, comp_rid})
                 try:
-                    committed = self.runtime.approve_action(run_id, actor)
+                    baseline = self._capture_card_baseline(run_id)
+                    for obj_key, expected_ver in baseline.items():
+                        obj_type, _, obj_id = obj_key.partition(":")
+                        live_ver = _read_target_version(self.runtime, obj_type, obj_id)
+                        if live_ver != expected_ver:
+                            raise ConcurrencyConflictError(
+                                f"stale approval on {obj_key}: card opened at v{expected_ver}, "
+                                f"live version is v{live_ver}"
+                            )
+                    settled_res = o2c.settle_work_card(
+                        self.runtime,
+                        run_id,
+                        actor,
+                        resolution_note="财务总监飞书卡片批准",
+                        action_run_id=act_rid,
+                        complete_run_id=comp_rid,
+                    )
+                    committed = settled_res.get("settled_action_run") or settled_res
                 except ConcurrencyConflictError as exc:
-                    run = self.runtime.get_action_run(run_id)
-                    if run is None:
-                        return {"toast": {"type": "error", "content": str(exc)}}
-                    msg = f"并发锁熔断：审批期间底层 ERP 单据已被修改，原提案自动作废（{exc}）"
+                    cancel_rid = f"{run_id}-CONFLICT-CANCEL"
+                    self._suppress_event_run_ids.add(cancel_rid)
+                    try:
+                        wc = self.runtime.get_object(
+                            o2c.WorkCard,
+                            run_id,
+                            Actor(actor_id="__occ__", role="system", clearance_tags={"*"}),
+                        )
+                        if wc.status in ("OPEN", "IN_PROGRESS"):
+                            self.runtime.submit_action(
+                                cancel_rid,
+                                "cancel_work_card",
+                                {"card_id": run_id, "resolution_note": str(exc)},
+                                Actor(actor_id="__occ__", role="admin", clearance_tags={"*"}),
+                            )
+                    except Exception:
+                        pass
+                    finally:
+                        self._suppress_event_run_ids.discard(cancel_rid)
+                    msg = f"并发锁熔断：审批期间底层 ERP 单据已被修改，原签批单自动作废（{exc}）"
+                    card_run = {
+                        "run_id": run_id,
+                        "card_id": run_id,
+                        "action_type": "open_work_card",
+                        "params": {"card_id": run_id},
+                        "status": "CONFLICT",
+                    }
                     rec = self._upsert_card(
-                        run,
+                        card_run,
                         push_if_new=False,
                         conflict_error=msg,
                         card_status_override="CONFLICT",
@@ -1133,50 +1438,84 @@ class FeishuApprovalGateway:
                     }
                 finally:
                     self._suppress_event_run_ids.discard(run_id)
+                    self._suppress_event_run_ids.discard(act_rid)
+                    self._suppress_event_run_ids.discard(comp_rid)
 
+                settled_rid = str(committed["run_id"])
+                self._settled_run_by_card[run_id] = settled_rid
                 evidence = self.adapter.process_new_runs() if self.adapter is not None else []
                 if (
                     not evidence
                     and self.adapter is not None
                     and hasattr(self.adapter, "get_run_evidence")
                 ):
-                    evidence = self.adapter.get_run_evidence(committed["run_id"])
-                rec = self._upsert_card(committed, push_if_new=False, erp_evidence=evidence)
+                    evidence = self.adapter.get_run_evidence(settled_rid)
+                card_view_run = dict(committed)
+                card_view_run["card_id"] = run_id
+                card_view_run["run_id"] = run_id
+                card_view_run["approved_by"] = committed.get("approved_by") or actor.actor_id
+                rec = self._upsert_card(
+                    card_view_run,
+                    push_if_new=False,
+                    erp_evidence=evidence,
+                    settled_run_id=settled_rid,
+                )
                 return {
                     "toast": {"type": "success", "content": "已签批并同步写入真实 ERP"},
                     "card": rec.card,
                     "status": committed["status"],
+                    "settled_run_id": settled_rid,
                     "erp_evidence": evidence,
                 }
 
             if op == "reject":
-                self._suppress_event_run_ids.add(run_id)
+                rej_rid = f"{run_id}-REJ"
+                self._suppress_event_run_ids.update({run_id, rej_rid})
                 try:
-                    rejected = self.runtime.reject_action(
-                        run_id, actor, reason="财务总监飞书卡片驳回"
+                    self.runtime.submit_action(
+                        rej_rid,
+                        "reject_work_card",
+                        {"card_id": run_id, "resolution_note": "财务总监飞书卡片驳回"},
+                        actor,
                     )
-                except (PermissionDeniedError, GovernanceViolationError) as exc:
-                    return {"toast": {"type": "error", "content": str(exc)}}
+                except (InvariantError, PermissionDeniedError, GovernanceViolationError) as exc:
+                    err_code = getattr(exc, "code", None)
+                    return {
+                        "toast": {"type": "error", "content": str(exc)},
+                        **({"error_code": err_code} if err_code else {}),
+                    }
                 finally:
                     self._suppress_event_run_ids.discard(run_id)
+                    self._suppress_event_run_ids.discard(rej_rid)
 
-                rec = self._upsert_card(rejected, push_if_new=False)
+                card_view_run = {
+                    "run_id": run_id,
+                    "card_id": run_id,
+                    "action_type": "open_work_card",
+                    "params": {"card_id": run_id},
+                    "status": "REJECTED",
+                    "error_code": "APPROVAL_REJECTED",
+                    "error_message": "财务总监飞书卡片驳回",
+                    "approved_by": actor.actor_id,
+                }
+                rec = self._upsert_card(card_view_run, push_if_new=False, card_status_override="REJECTED")
                 return {
                     "toast": {"type": "info", "content": "已驳回该高风险操作，ERP 保持原状"},
                     "card": rec.card,
-                    "status": rejected["status"],
+                    "status": "REJECTED",
                 }
 
             # op == "revert"
-            run = self.runtime.get_action_run(run_id)
+            target_run_id = self._resolve_settled_run_id(run_id)
+            run = self.runtime.get_action_run(target_run_id)
             if run is None:
                 return {"toast": {"type": "error", "content": f"流水号 {run_id} 不存在"}}
 
-            revert_run_id = f"{run_id}-REVERT"
-            self._suppress_event_run_ids.update({run_id, revert_run_id})
+            revert_run_id = f"{target_run_id}-REVERT"
+            self._suppress_event_run_ids.update({run_id, target_run_id, revert_run_id})
             try:
                 self._check_revert_allowed(run)
-                revert_run = self.runtime.revert_action(run_id, revert_run_id, actor)
+                revert_run = self.runtime.revert_action(target_run_id, revert_run_id, actor)
             except (InvariantError, PermissionDeniedError, GovernanceViolationError) as exc:
                 err_code = getattr(exc, "code", None)
                 return {
@@ -1185,6 +1524,7 @@ class FeishuApprovalGateway:
                 }
             finally:
                 self._suppress_event_run_ids.discard(run_id)
+                self._suppress_event_run_ids.discard(target_run_id)
                 self._suppress_event_run_ids.discard(revert_run_id)
 
             evidence = self.adapter.process_new_runs() if self.adapter is not None else []
@@ -1194,11 +1534,17 @@ class FeishuApprovalGateway:
                 and hasattr(self.adapter, "get_run_evidence")
             ):
                 evidence = self.adapter.get_run_evidence(revert_run["run_id"])
-            original_after = self.runtime.get_action_run(run_id) or run
+            original_after = dict(self.runtime.get_action_run(target_run_id) or run)
+            card_view_run = dict(original_after)
+            card_view_run["card_id"] = run_id
+            card_view_run["run_id"] = run_id
+            if card_view_run.get("approved_by") is None and target_run_id != run_id:
+                card_view_run["approved_by"] = actor.actor_id
             rec = self._upsert_card(
-                original_after,
+                card_view_run,
                 push_if_new=False,
                 erp_evidence=evidence,
+                settled_run_id=target_run_id if target_run_id != run_id else None,
             )
             return {
                 "toast": {"type": "success", "content": "一键时光机冲正成功，ERP 已 1 秒恢复原状"},

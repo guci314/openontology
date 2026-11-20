@@ -987,6 +987,7 @@ function renderActionInspector(a) {
   const govRows = [
     '<tr><td class="insp-name">可执行角色</td><td>' + esc((a.allowed_roles || []).map(zhRole).join(' / ') || '无限制') + '</td></tr>',
     '<tr><td class="insp-name">审批角色</td><td>' + esc((a.approver_roles || []).map(zhRole).join(' / ') || '无需审批') + '</td></tr>',
+    '<tr><td class="insp-name">冲正角色</td><td>' + esc((a.revert_roles || []).map(zhRole).join(' / ') || '跟随可执行/审批角色') + '</td></tr>',
     '<tr><td class="insp-name">可见性 / 归属</td><td>' + (a.visibility === 'private' ? '🔒 私有（仅内部触发）' : '公开动作') + ' · ' + (a.affects_source ? '来自外部数据源' : '本体自有') + '</td></tr>'
   ].join('');
   parts.push('<div><div class="insp-sec-title"><span>治理与权限 · GOVERNANCE</span></div>' +

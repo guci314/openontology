@@ -190,6 +190,7 @@ def test_describe_behavior_keeps_existing_contract_shape():
         "description",
         "allowed_roles",
         "approver_roles",
+        "revert_roles",
         "affects_source",
         "visibility",
         "params",
@@ -198,6 +199,7 @@ def test_describe_behavior_keeps_existing_contract_shape():
     assert action["name"] == "activate_widget"
     assert action["allowed_roles"] == ["ops"]
     assert action["approver_roles"] == ["manager"]
+    assert action["revert_roles"] == []
     assert action["affects_source"] is True
     assert set(action["params"]["properties"]) == {"widget_id", "reason"}
 
@@ -385,6 +387,7 @@ def test_role_def_validation_and_behavior_projection():
             "declared": True,
             "allowed_actions": ["do_op"],
             "approver_actions": [],
+            "revert_actions": [],
             "masked_fields": [],
         }
     ]

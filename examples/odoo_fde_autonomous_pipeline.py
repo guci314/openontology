@@ -1694,7 +1694,7 @@ def run_autonomous_fde_end_to_end(
                     return valid
 
                 def _has_approval_gate(act_bp: ActionBlueprint) -> bool:
-                    return act_bp.approval_rule is not None or any(
+                    return any(
                         pre.code.startswith("APPROVAL_REQUIRED_") for pre in act_bp.preconditions
                     )
 

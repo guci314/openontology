@@ -32,7 +32,7 @@ from open_ontology import (
 
 
 # ---------------------------------------------------------------------------
-# 1. 内核 reject_action 与 全生命周期 run_event_hooks
+# 1. M1 WorkCard 审批拒止/流转 与 全生命周期 run_event_hooks
 # ---------------------------------------------------------------------------
 def test_reject_action_and_run_event_hooks():
     demo = build_o2c_demo()
@@ -51,45 +51,72 @@ def test_reject_action_and_run_event_hooks():
             )
         assert ("RUN-INV-BAD", "REJECTED") in events
 
-        # Over-credit confirm enters PENDING_APPROVAL and emits hook
-        pending = rt.submit_action(
+        # Over-credit confirm is blocked by precondition and opens M1 WorkCard (zero PENDING_APPROVAL)
+        pending = o2c.submit_or_open_work_card(
+            rt,
             "RUN-OVER-001",
             "confirm_sales_order",
             {"order": "O2C-SO-002"},
             o2c.AI_AGENT,
+            target_object_type="SalesOrder",
+            target_object_id="O2C-SO-002",
+            assignee_role="finance_director",
+            card_id="RUN-OVER-001",
         )
-        assert pending["status"] == "PENDING_APPROVAL"
-        assert ("RUN-OVER-001", "PENDING_APPROVAL") in events
-
-        # Non-approver cannot reject
-        with pytest.raises(PermissionDeniedError):
-            rt.reject_action("RUN-OVER-001", o2c.SALES_REP, reason="nope")
-
-        # Approver rejects -> REJECTED + objects untouched + hook fires
-        rejected = rt.reject_action(
-            "RUN-OVER-001", o2c.FINANCE_DIRECTOR, reason="风控超额驳回"
-        )
-        assert rejected["status"] == "REJECTED"
-        assert rejected["approved_by"] == o2c.FINANCE_DIRECTOR.actor_id
-        assert rejected["error_code"] == "APPROVAL_REJECTED"
-        assert rejected["error_message"] == "风控超额驳回"
-        assert rt.get_object(o2c.SalesOrder, "O2C-SO-002", o2c.FINANCE_DIRECTOR).status == "draft"
+        assert pending["status"] == "AWAITING_WORK_CARD"
+        assert pending["work_card_status"] == "OPEN"
+        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
         assert ("RUN-OVER-001", "REJECTED") in events
+        assert ("RUN-OVER-001-OPEN", "COMMITTED") in events
 
-        # Cannot reject a non-pending run
-        with pytest.raises(GovernanceViolationError):
-            rt.reject_action("RUN-OVER-001", o2c.FINANCE_DIRECTOR)
+        # Non-approver cannot reject WorkCard
+        with pytest.raises(PermissionDeniedError):
+            rt.submit_action(
+                "RUN-OVER-001-REJ-BAD",
+                "reject_work_card",
+                {"card_id": "RUN-OVER-001", "resolution_note": "nope"},
+                o2c.SALES_REP,
+            )
 
-        # Approve + Revert lifecycle hooks
-        rt.submit_action(
+        # Approver rejects WorkCard -> REJECTED + objects untouched + hook fires
+        rej_run = rt.submit_action(
+            "RUN-OVER-001-REJ",
+            "reject_work_card",
+            {"card_id": "RUN-OVER-001", "resolution_note": "风控超额驳回"},
+            o2c.FINANCE_DIRECTOR,
+        )
+        assert rej_run["status"] == "COMMITTED"
+        wc_after_rej = rt.get_object(o2c.WorkCard, "RUN-OVER-001", o2c.FINANCE_DIRECTOR)
+        assert wc_after_rej.status == "REJECTED"
+        assert wc_after_rej.resolved_by_actor_id == o2c.FINANCE_DIRECTOR.actor_id
+        assert wc_after_rej.resolution_note == "风控超额驳回"
+        assert rt.get_object(o2c.SalesOrder, "O2C-SO-002", o2c.FINANCE_DIRECTOR).status == "draft"
+        assert ("RUN-OVER-001-REJ", "COMMITTED") in events
+
+        # Cannot settle/approve an already-rejected WorkCard
+        with pytest.raises(InvariantError):
+            o2c.settle_work_card(rt, "RUN-OVER-001", o2c.FINANCE_DIRECTOR)
+
+        # Open WorkCard -> settle_work_card -> Revert lifecycle hooks
+        o2c.submit_or_open_work_card(
+            rt,
             "RUN-OVER-002",
             "confirm_sales_order",
             {"order": "O2C-SO-002"},
             o2c.AI_AGENT,
+            target_object_type="SalesOrder",
+            target_object_id="O2C-SO-002",
+            assignee_role="finance_director",
+            card_id="RUN-OVER-002",
         )
-        rt.approve_action("RUN-OVER-002", o2c.FINANCE_DIRECTOR)
-        rt.revert_action("RUN-OVER-002", "RUN-OVER-002-REV", o2c.FINANCE_DIRECTOR)
-        assert ("RUN-OVER-002", "COMMITTED") in events
+        o2c.settle_work_card(
+            rt,
+            "RUN-OVER-002",
+            o2c.FINANCE_DIRECTOR,
+            action_run_id="RUN-OVER-002-ACT",
+        )
+        rt.revert_action("RUN-OVER-002-ACT", "RUN-OVER-002-REV", o2c.FINANCE_DIRECTOR)
+        assert ("RUN-OVER-002-ACT", "COMMITTED") in events
         assert ("RUN-OVER-002-REV", "COMMITTED") in events
     finally:
         rt.close()
@@ -142,14 +169,14 @@ def test_feishu_card_jargon_free_and_openapi_push_patch():
             {"type": "url_verification", "token": "ver_tok_demo", "challenge": "ch-999"}
         ) == {"challenge": "ch-999"}
 
-        # Stage pending run -> auto pushes Feishu interactive card
-        pending = rt.submit_action(
+        # Stage WorkCard -> auto pushes Feishu interactive card
+        pending = gw.submit_or_escalate(
             "FEISHU-PUSH-001",
             "confirm_sales_order",
             {"order": "O2C-SO-002"},
             o2c.AI_AGENT,
         )
-        assert pending["status"] == "PENDING_APPROVAL"
+        assert pending["status"] == "OPEN"
         assert len(http_calls) == 2  # tenant_access_token + send message
         assert http_calls[1][0] == "POST"
 
@@ -220,7 +247,7 @@ def test_feishu_card_jargon_free_and_openapi_push_patch():
                 },
             }
         )
-        rt.submit_action(
+        gw.submit_or_escalate(
             "FEISHU-REJ-003",
             "confirm_sales_order",
             {"order": "O2C-SO-002"},
@@ -278,13 +305,13 @@ def test_four_act_real_odoo_feishu_approve_and_revert_loop(live_o2c_gateway):
         },
         o2c.AI_AGENT,
     )
-    pending = rt.submit_action(
+    pending = gw.submit_or_escalate(
         "LIVE-ACT2-CONFIRM",
         "confirm_sales_order",
         {"order": "O2C-SO-002"},
         o2c.AI_AGENT,
     )
-    assert pending["status"] == "PENDING_APPROVAL"
+    assert pending["status"] == "OPEN"
     assert adapter.order_row("O2C-SO-002")["state"] == "draft"
     assert gw.get_card_record("LIVE-ACT2-CONFIRM") is not None
 
@@ -334,7 +361,7 @@ def test_four_act_real_odoo_feishu_approve_and_revert_loop(live_o2c_gateway):
 def test_occ_conflict_meltdown_when_erp_changes_during_pending(live_o2c_gateway):
     rt, adapter, gw = live_o2c_gateway
 
-    rt.submit_action(
+    gw.submit_or_escalate(
         "LIVE-OCC-PENDING",
         "confirm_sales_order",
         {"order": "O2C-SO-002"},
@@ -466,7 +493,7 @@ def test_demo_http_server_endpoints_and_ui_jargon_guard():
             {"scenario": "act2_over_credit_order"},
         )
         run_id = act2["run_id"]
-        assert act2["status"] == "PENDING_APPROVAL"
+        assert act2["status"] == "OPEN"
 
         approved = _http_json(
             "POST",

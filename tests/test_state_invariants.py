@@ -8,6 +8,12 @@ import random
 import pytest
 from pydantic import BaseModel
 
+from examples.business_ontology import (
+    WorkCard,
+    register_work_card_primitives,
+    settle_work_card,
+    submit_or_open_work_card,
+)
 from examples.kanban import (
     BLOCK_KINDS,
     BOARD_MANAGER,
@@ -93,15 +99,26 @@ def _make_bank_spec(
             )
         )
 
+    if require_approval:
+        register_work_card_primitives(
+            spec,
+            opener_roles=("admin", "operator"),
+            resolver_roles=("admin",),
+        )
+
     @spec.action(
         "adjust_balance",
         _AdjustParams,
         allowed_roles=("admin", "operator"),
-        approver_roles=("admin",),
-        approval_rule=(lambda _p, _a: True) if require_approval else None,
+        revert_roles=("admin",),
         affects_source=False,
     )
     def adjust_balance(ctx, params):
+        if require_approval and ctx.actor.role != "admin":
+            raise InvariantError(
+                "operator balance adjustment requires admin WorkCard approval",
+                code="APPROVAL_REQUIRED_BALANCE_ADJUST",
+            )
         acc = ctx.require(_Account, params.account_id)
         ctx.modify(acc, balance=acc.balance + params.delta)
 
@@ -247,25 +264,40 @@ def test_invariant_has_full_rls_visibility_without_polluting_occ_read_versions()
             beta_actor,
         )
 
-        # Alpha cannot see Beta via RLS, yet invariant sees A-BETA (50 + 70 + 40 = 160 > 150)
+        alpha_admin = Actor(
+            actor_id="admin-alpha", role="admin", clearance_tags={"tenant:alpha"}
+        )
+        # Alpha admin cannot see Beta via RLS, yet invariant sees A-BETA (50 + 70 + 40 = 160 > 150)
         with pytest.raises(InvariantError) as excinfo:
             rt.submit_action(
                 _next_run(),
                 "adjust_balance",
                 {"account_id": "A-ALPHA", "delta": 40},
-                alpha_actor,
+                alpha_admin,
             )
         assert excinfo.value.code == "GLOBAL_CAP_EXCEEDED"
 
-        # Valid pending action by alpha must NOT pull A-BETA into read_versions
-        pending = rt.submit_action(
+        # Valid simulation by alpha_admin must NOT pull A-BETA into read_versions,
+        # while operator escalates via M1 WorkCard
+        sim_ok = rt.simulate_action(
+            "adjust_balance",
+            {"account_id": "A-ALPHA", "delta": 20},
+            alpha_admin,
+        )
+        assert sim_ok.valid is True
+        assert set(sim_ok.read_versions) == {"_Account:A-ALPHA"}
+        pending = submit_or_open_work_card(
+            rt,
             _next_run(),
             "adjust_balance",
             {"account_id": "A-ALPHA", "delta": 20},
             alpha_actor,
+            target_object_type="_Account",
+            target_object_id="A-ALPHA",
+            assignee_role="admin",
         )
-        assert pending["status"] == "PENDING_APPROVAL"
-        assert set(pending["read_versions"]) == {"_Account:A-ALPHA"}
+        assert pending["status"] == "AWAITING_WORK_CARD"
+        assert pending["work_card_status"] == "OPEN"
     finally:
         rt.close()
 
@@ -308,28 +340,34 @@ def test_invariant_enforced_on_approve_and_revert():
             {"account_id": "A-2", "tenant": "alpha", "balance": 20},
             ADMIN,
         )
-        # Stage A-1 +40 (40+40 + 20 = 100 <= 100, passes at submit time)
+        # Stage A-1 +40 as operator (40+40 + 20 = 100 <= 100, opens WorkCard)
+        operator = Actor(actor_id="op-01", role="operator", clearance_tags={"*"})
         pending_id = _next_run("PEND")
-        pending = rt.submit_action(
+        pending = submit_or_open_work_card(
+            rt,
             pending_id,
             "adjust_balance",
             {"account_id": "A-1", "delta": 40},
-            ADMIN,
+            operator,
+            target_object_type="_Account",
+            target_object_id="A-1",
+            assignee_role="admin",
+            card_id=pending_id,
         )
-        assert pending["status"] == "PENDING_APPROVAL"
+        assert pending["status"] == "AWAITING_WORK_CARD"
+        assert pending["work_card_status"] == "OPEN"
 
-        # Meanwhile A-2 increases by 10 (still <= 100: 40 + 30 = 70), approved immediately
+        # Meanwhile A-2 increases by 10 as admin (still <= 100: 40 + 30 = 70), committed immediately
         inc_id = _next_run("INC")
         rt.submit_action(inc_id, "adjust_balance", {"account_id": "A-2", "delta": 10}, ADMIN)
-        rt.approve_action(inc_id, ADMIN)
         assert rt.get_object(_Account, "A-2", ADMIN).balance == 30
 
-        # Approving pending_id now would yield 80 + 30 = 110 > 100 -> rejected & rolled back
+        # Settling pending_id now at t1 would yield 80 + 30 = 110 > 100 -> rejected & rolled back
         with pytest.raises(InvariantError) as exc_approve:
-            rt.approve_action(pending_id, ADMIN)
+            settle_work_card(rt, pending_id, ADMIN)
         assert exc_approve.value.code == "GLOBAL_CAP_EXCEEDED"
         assert rt.get_object(_Account, "A-1", ADMIN).balance == 40
-        assert rt.get_action_run(pending_id)["status"] == "PENDING_APPROVAL"
+        assert rt.get_object(WorkCard, pending_id, ADMIN).status == "OPEN"
 
         # Test revert_action enforcement with a cross-object reserve invariant
         spec_reserve = OntologySpec(read_only_source=True)

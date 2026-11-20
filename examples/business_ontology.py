@@ -41,6 +41,7 @@ __all__ = [
     "WorkCard",
     "register_work_card_primitives",
     "settle_work_card",
+    "submit_or_open_work_card",
     "build_work_card_object_blueprint",
     "build_work_card_invariant_blueprints",
     "build_work_card_action_blueprints",
@@ -518,6 +519,7 @@ def register_work_card_primitives(
             "complete_work_card",
             CompleteWorkCardParams,
             allowed_roles=eff_resolvers,
+            revert_roles=eff_resolvers,
             affects_source=False,
             touched_object_types=("WorkCard",),
             description="批结 WorkCard；若为 APPROVAL 卡且目标动作纯自有则在 t1 当场重算执行，源系统写动作须经 settle_work_card 提供 settled_run_id。",
@@ -619,6 +621,46 @@ def register_work_card_primitives(
                 resolution_note=params.resolution_note or card.resolution_note,
             )
 
+    target_spec.update_display(
+        {
+            "objects": {
+                "WorkCard": "协同审批工单卡",
+            },
+            "actions": {
+                "open_work_card": "发起协同工单卡",
+                "claim_work_card": "认领协同工单卡",
+                "complete_work_card": "批结协同工单卡",
+                "reject_work_card": "驳回协同工单卡",
+                "mark_work_card_sla_breached": "标记工单卡超时",
+                "cancel_work_card": "撤销协同工单卡",
+            },
+            "fields": {
+                "card_id": "工单卡编号",
+                "card_kind": "工单卡类别",
+                "target_object_type": "目标对象类型",
+                "target_object_id": "目标对象编号",
+                "requested_action": "申请执行动作",
+                "requested_params_json": "申请动作参数",
+                "requester_actor_id": "发起人标识",
+                "assignee_role": "指派审批角色",
+                "assignee_dept": "指派协同部门",
+                "sla_due_at": "时效截止时间",
+                "external_ref": "外部回执编号",
+                "resolution_note": "审批处理意见",
+                "claimed_by_actor_id": "认领人标识",
+                "resolved_by_actor_id": "批结人标识",
+                "settled_run_id": "关联结算流水号",
+            },
+            "statuses": {
+                "OPEN": "待处理",
+                "IN_PROGRESS": "处理中",
+                "COMPLETED": "已批结",
+                "SLA_BREACHED": "已超时",
+                "CANCELLED": "已撤销",
+            },
+        }
+    )
+
     return target_spec
 
 
@@ -706,6 +748,62 @@ def settle_work_card(
         },
         approver,
     )
+
+
+def submit_or_open_work_card(
+    rt_handle: Any,
+    run_id: str,
+    action_name: str,
+    params: BaseModel | dict[str, Any] | None,
+    actor: Any,
+    *,
+    target_object_type: str,
+    target_object_id: str,
+    assignee_role: str = "steward",
+    assignee_dept: str = "",
+    card_id: str | None = None,
+    sla_due_at: str = "",
+    external_ref: str = "",
+) -> dict[str, Any]:
+    """尝试同步执行目标动作；遇 ``APPROVAL_REQUIRED_*`` 时改开一张 M1 ``WorkCard``。"""
+    try:
+        return rt_handle.submit_action(run_id, action_name, params, actor)
+    except InvariantError as exc:
+        if not str(exc.code or "").startswith("APPROVAL_REQUIRED_"):
+            raise
+        target_action = rt_handle.spec.get_action(action_name)
+        if isinstance(params, BaseModel):
+            params_json = params.model_dump_json()
+        else:
+            params_model = target_action.params.model_validate(params or {})
+            params_json = params_model.model_dump_json()
+        cid = (card_id or run_id).strip()
+        card_run = rt_handle.submit_action(
+            f"{cid}-OPEN",
+            "open_work_card",
+            {
+                "card_id": cid,
+                "card_kind": "APPROVAL",
+                "target_object_type": target_object_type,
+                "target_object_id": target_object_id,
+                "requested_action": action_name,
+                "requested_params_json": params_json,
+                "assignee_role": assignee_role,
+                "assignee_dept": assignee_dept,
+                "sla_due_at": sla_due_at,
+                "external_ref": external_ref,
+            },
+            actor,
+        )
+        return {
+            "status": "AWAITING_WORK_CARD",
+            "card_id": cid,
+            "work_card_status": "OPEN",
+            "blocked_run_id": run_id,
+            "work_card_run": card_run,
+            "error_code": exc.code,
+            "error_message": str(exc),
+        }
 
 
 def build_work_card_object_blueprint() -> dict[str, Any]:

@@ -18,6 +18,21 @@ from open_ontology.spec import (
     OntologySpec,
 )
 
+try:
+    from .business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+except ImportError:
+    from examples.business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+
 __all__ = [
     "RETURN_WINDOW_DAYS",
     "MANAGER_APPROVAL_THRESHOLD_CENTS",
@@ -26,6 +41,9 @@ __all__ = [
     "CS_AGENT",
     "STORE_MANAGER",
     "PARASITIC_OWNED_FIELDS",
+    "WorkCard",
+    "settle_work_card",
+    "submit_or_open_work_card",
     "SaasOntologyBundle",
     "build_saas_ontology",
     "build_saas_ontology_spec",
@@ -189,6 +207,9 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
         vip_tier: str = "STANDARD"
         note: str | None = None
 
+    class TriageStatusParams(BaseModel):
+        ticket_id: str
+
     class RefundParams(BaseModel):
         ticket_id: str
         refund_id: str
@@ -261,18 +282,13 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
         ctx.create(ticket)
         ctx.link(order, order_tickets, ticket)
 
-    def _mark_triaged(ctx: Any, params: TriageParams) -> None:
-        """工单流转状态由治理流程推进（寄生态写回外部系统，脱壳态写本体）。"""
-        ticket = ctx.require(SupportTicket, params.ticket_id)
-        ctx.modify(ticket, status="triaged")
-
     @spec.action(
         "ai_triage_ticket",
         TriageParams,
         allowed_roles=("ai_agent", "cs_agent", "store_manager"),
+        revert_roles=("store_manager",),
         affects_source=False,
-        post_approval=_mark_triaged,
-        description="AI 智能分诊与反欺诈评分：写客户风控字段与工单分诊备注。",
+        description="AI 智能分诊与反欺诈评分：写客户风控字段与工单分诊备注（单平面自有写）。",
     )
     def ai_triage_ticket(ctx: Any, params: TriageParams) -> None:
         if not 0 <= params.fraud_score <= 100:
@@ -296,36 +312,25 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
             ),
         )
 
-    def _record_refund(ctx: Any, params: RefundParams) -> None:
-        """资金凭证落账。"""
+    @spec.action(
+        "mark_ticket_triaged",
+        TriageStatusParams,
+        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
+        revert_roles=("store_manager",),
+        affects_source=not standalone,
+        description="工单分诊状态推进：单平面推进 SupportTicket.status 为 triaged。",
+    )
+    def mark_ticket_triaged(ctx: Any, params: TriageStatusParams) -> None:
         ticket = ctx.require(SupportTicket, params.ticket_id)
-        refund = RefundRecord(
-            refund_id=params.refund_id,
-            ticket_id=ticket.ticket_id,
-            order_id=ticket.order_id,
-            customer_id=ticket.customer_id,
-            amount_cents=params.amount_cents,
-            approved_by=params.approved_by or ctx.actor.actor_id,
-        )
-        ctx.create(refund)
-        ctx.link(ticket, ticket_refund, refund)
-
-    def _needs_manager(params: RefundParams, actor: Actor) -> bool:
-        """≥ 100 元的退款由 AI 提交时必须挂起等店长审批。"""
-        return (
-            params.amount_cents >= MANAGER_APPROVAL_THRESHOLD_CENTS
-            and actor.role == "ai_agent"
-        )
+        ctx.modify(ticket, status="triaged")
 
     @spec.action(
         "process_return_and_refund",
         RefundParams,
         allowed_roles=("ai_agent", "cs_agent", "store_manager"),
-        approver_roles=("store_manager",),
-        approval_rule=_needs_manager,
+        revert_roles=("store_manager",),
         affects_source=not standalone,
-        post_approval=_record_refund,
-        description="跨订单 + 工单 + 资金的核心治理动作。",
+        description="跨订单 + 工单 + 资金的核心治理动作（单平面源状态变更，大额 AI 请求需店长签批）。",
     )
     def process_return_and_refund(ctx: Any, params: RefundParams) -> None:
         ticket = ctx.require(SupportTicket, params.ticket_id)
@@ -361,6 +366,14 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
                 f"{order.amount_cents}",
                 code="INVALID_REFUND_STATE",
             )
+        if (
+            params.amount_cents >= MANAGER_APPROVAL_THRESHOLD_CENTS
+            and ctx.actor.role == "ai_agent"
+        ):
+            raise InvariantError(
+                f"AI refund request of {params.amount_cents} cents requires store_manager approval",
+                code="APPROVAL_REQUIRED_LARGE_REFUND",
+            )
 
         ctx.modify(order, status="refunded")
         ctx.modify(ticket, status="resolved")
@@ -368,6 +381,27 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
             customer,
             lifetime_value_cents=customer.lifetime_value_cents - params.amount_cents,
         )
+
+    @spec.action(
+        "record_refund_voucher",
+        RefundParams,
+        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
+        revert_roles=("store_manager",),
+        affects_source=False,
+        description="登记全自有退款凭证 RefundRecord 并关联 ticket_refund 边（单平面自有写）。",
+    )
+    def record_refund_voucher(ctx: Any, params: RefundParams) -> None:
+        ticket = ctx.require(SupportTicket, params.ticket_id)
+        refund = RefundRecord(
+            refund_id=params.refund_id,
+            ticket_id=ticket.ticket_id,
+            order_id=ticket.order_id,
+            customer_id=ticket.customer_id,
+            amount_cents=params.amount_cents,
+            approved_by=params.approved_by or ctx.actor.actor_id,
+        )
+        ctx.create(refund)
+        ctx.link(ticket, ticket_refund, refund)
 
     @spec.function(
         "workspace_overview",
@@ -414,6 +448,8 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
             blocked: dict[str, int] = {}
             for run in loader.list_action_runs("REJECTED"):
                 code = run.get("error_code") or "UNKNOWN"
+                if str(code).startswith("APPROVAL_REQUIRED_"):
+                    continue
                 blocked[code] = blocked.get(code, 0) + 1
             overview["blocked_runs"] = dict(sorted(blocked.items()))
         return overview
@@ -459,7 +495,9 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
                 "create_customer_and_order": "创建客户与订单",
                 "open_support_ticket": "创建客服工单",
                 "ai_triage_ticket": "智能分诊工单",
+                "mark_ticket_triaged": "更新工单分诊状态",
                 "process_return_and_refund": "处理退货退款",
+                "record_refund_voucher": "登记退款凭证",
             },
             "functions": {
                 "workspace_overview": "工作区概览",
@@ -477,6 +515,12 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
                 "refunded": "已退款",
             },
         }
+    )
+
+    register_work_card_primitives(
+        spec,
+        opener_roles=("ai_agent", "cs_agent", "store_manager"),
+        resolver_roles=("store_manager",),
     )
 
     return SaasOntologyBundle(

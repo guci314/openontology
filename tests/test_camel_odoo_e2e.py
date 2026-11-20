@@ -281,7 +281,8 @@ def test_camel_cbr_south_large_ai_approval(stack: CamelStack):
     stack.ingest()
     south = stack.data.client("erp_south")
 
-    pending = stack.runtime.submit_action(
+    pending = dom.submit_or_open_work_card(
+        stack.runtime,
         "CAMEL-AI-LARGE",
         "cancel_order",
         {
@@ -291,8 +292,14 @@ def test_camel_cbr_south_large_ai_approval(stack: CamelStack):
             "order_total_cents": 6_000_000,
         },
         demo.AI_AGENT,
+        target_object_type="Order",
+        target_object_id="S-SO002",
+        assignee_role="ops_manager",
+        card_id="CAMEL-AI-LARGE",
     )
-    assert pending["status"] == "PENDING_APPROVAL"
+    assert pending["status"] == "AWAITING_WORK_CARD"
+    assert pending["work_card_status"] == "OPEN"
+    assert stack.runtime.list_action_runs(status="PENDING_APPROVAL") == []
 
     before = stack.writeback()
     assert before["count"] == 0
@@ -301,9 +308,13 @@ def test_camel_cbr_south_large_ai_approval(stack: CamelStack):
     assert stats["south_writebacks"] == 0
     assert stats["north_writebacks"] == 0
 
-    approved = stack.runtime.approve_action(
-        "CAMEL-AI-LARGE", demo.OPS_MANAGER
+    settled = dom.settle_work_card(
+        stack.runtime,
+        "CAMEL-AI-LARGE",
+        demo.OPS_MANAGER,
+        action_run_id="CAMEL-AI-LARGE-ACT",
     )
+    approved = settled["settled_action_run"]
     assert approved["status"] == "COMMITTED"
 
     after = stack.writeback()

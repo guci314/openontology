@@ -12,6 +12,21 @@ from pydantic import BaseModel
 
 from open_ontology.spec import Actor, InvariantError, ObjectProperty, ObjectType, OntologySpec
 
+try:
+    from .business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+except ImportError:
+    from examples.business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+
 # ---------------------------------------------------------------------------
 # Object types
 # ---------------------------------------------------------------------------
@@ -86,6 +101,11 @@ for _cls in (Customer, Order, OrderNote):
     spec.object_type(_cls)
 for _prop in (CUSTOMER_ORDERS, ORDER_NOTES):
     spec.add_object_property(_prop)
+register_work_card_primitives(
+    spec,
+    opener_roles=("dispatcher", "ai_agent", "ops_manager"),
+    resolver_roles=("ops_manager",),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -141,21 +161,13 @@ def customer_unshipped_summary(
 # ---------------------------------------------------------------------------
 # Governed actions
 # ---------------------------------------------------------------------------
-def _cancel_needs_approval(params: CancelOrderParams, actor: Actor) -> bool:
-    """AI agent cancelling a large order always needs a human manager."""
-    return actor.role == "ai_agent" and (
-        params.large_order or params.order_total_cents >= 50_000_00
-    )
-
-
 @spec.action(
     "cancel_order",
     CancelOrderParams,
     allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
-    approver_roles=("ops_manager",),
-    approval_rule=_cancel_needs_approval,
+    revert_roles=("ops_manager",),
     affects_source=True,
-    description="取消一张尚未发货的订单（会写回源业务系统）。",
+    description="取消一张尚未发货的订单（AI 代理取消大额订单须由运营主管通过 WorkCard 签批）。",
 )
 def cancel_order(ctx: Any, params: CancelOrderParams) -> None:
     order = ctx.require(Order, params.order_id)
@@ -174,6 +186,16 @@ def cancel_order(ctx: Any, params: CancelOrderParams) -> None:
         raise InvariantError(
             "a non-empty cancellation reason is required",
             code="EMPTY_REASON",
+        )
+    is_large = (
+        bool(params.large_order)
+        or params.order_total_cents >= 50_000_00
+        or order.total_cents >= 50_000_00
+    )
+    if ctx.actor.role == "ai_agent" and is_large:
+        raise InvariantError(
+            f"AI cancellation of large order {order.order_id} requires ops_manager approval",
+            code="APPROVAL_REQUIRED_LARGE_ORDER_CANCEL",
         )
 
     ctx.modify(order, status="cancelled")

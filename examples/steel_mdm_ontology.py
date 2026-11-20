@@ -17,11 +17,27 @@ from open_ontology.spec import (
     OntologySpec,
 )
 
+try:
+    from .business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+except ImportError:
+    from examples.business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+
 __all__ = [
     "MaterialSpec",
     "Manufacturer",
     "ContractSKU",
     "MaterialLot",
+    "WorkCard",
     "SKU_MAPS_TO_SPEC",
     "LOT_HAS_SPEC",
     "LOT_PRODUCED_BY",
@@ -30,15 +46,19 @@ __all__ = [
     "ReconcileParams",
     "MapSkuParams",
     "RegisterSkuParams",
+    "CreateMaterialSpecParams",
     "ReceiveLotParams",
     "ConsumeBrandParams",
     "spec",
     "recommend_spec_for_sku",
     "reconcile_multi_view_ledger",
     "map_legacy_sku_to_spec",
+    "create_material_spec",
     "register_contract_sku",
     "receive_material_lot",
     "consume_by_brand_fifo",
+    "settle_work_card",
+    "submit_or_open_work_card",
     "BUYER",
     "AI_AGENT",
     "STEWARD",
@@ -179,6 +199,14 @@ class RegisterSkuParams(BaseModel):
     canonical_spec_id: str | None = None
     request_new_spec_id: str | None = None
     request_new_spec_name: str | None = None
+    mapped_by: str | None = None
+
+
+class CreateMaterialSpecParams(BaseModel):
+    spec_id: str
+    name: str
+    ash_max_pct: float
+    sulfur_max_pct: float
 
 
 class ReceiveLotParams(BaseModel):
@@ -200,41 +228,6 @@ def _quality_fits(spec_obj: MaterialSpec, ash_pct: float, sulfur_pct: float) -> 
         ash_pct <= spec_obj.ash_max_pct
         and sulfur_pct <= spec_obj.sulfur_max_pct
     )
-
-
-def _register_needs_approval(
-    params: RegisterSkuParams, actor: Actor
-) -> bool:
-    """A brand-new physical variety always needs the MDM steward."""
-    return params.request_new_spec_id is not None
-
-
-def _register_post_approval(ctx: Any, params: RegisterSkuParams) -> None:
-    """Ontology-owned follow-up: create a new spec if requested, then link it."""
-    sku = ctx.require(ContractSKU, params.sku_id)
-    target_spec_id = params.request_new_spec_id or params.canonical_spec_id
-    if target_spec_id is None:  # pragma: no cover - guarded by the action
-        raise InvariantError(
-            "contract sku has no physical spec target",
-            code="UNMAPPED_PHYSICAL_SPEC",
-        )
-
-    spec_obj = ctx.get(MaterialSpec, target_spec_id)
-    if spec_obj is None:
-        if params.request_new_spec_id is None:
-            raise InvariantError(
-                f"canonical spec {target_spec_id!r} does not exist",
-                code="SPEC_NOT_FOUND",
-            )
-        spec_obj = MaterialSpec(
-            spec_id=params.request_new_spec_id,
-            name=params.request_new_spec_name or params.invoice_title,
-            ash_max_pct=params.ash_pct,
-            sulfur_max_pct=params.sulfur_pct,
-        )
-        ctx.create(spec_obj)
-
-    ctx.link(sku, SKU_MAPS_TO_SPEC, spec_obj)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +370,7 @@ def reconcile_multi_view_ledger(
     "map_legacy_sku_to_spec",
     MapSkuParams,
     allowed_roles=("buyer", "ai_agent", "mdm_steward"),
+    revert_roles=("mdm_steward",),
     affects_source=False,
     description="存量散码零侵入寄生归并：只写 Ontology 自有字段与归并边。",
 )
@@ -399,14 +393,41 @@ def map_legacy_sku_to_spec(ctx: Any, params: MapSkuParams) -> None:
 
 
 @spec.action(
+    "create_material_spec",
+    CreateMaterialSpecParams,
+    allowed_roles=("mdm_steward",),
+    revert_roles=("mdm_steward",),
+    affects_source=False,
+    description="主数据管理员核准后创建全新物理规格（仅写 Ontology 自有层）。",
+)
+def create_material_spec(ctx: Any, params: CreateMaterialSpecParams) -> None:
+    if params.ash_max_pct <= 0 or params.sulfur_max_pct <= 0:
+        raise InvariantError(
+            "material spec quality thresholds must be positive",
+            code="INVALID_SPEC_THRESHOLDS",
+        )
+    if ctx.get(MaterialSpec, params.spec_id) is not None:
+        raise InvariantError(
+            f"material spec {params.spec_id!r} already exists",
+            code="SPEC_ALREADY_EXISTS",
+        )
+    ctx.create(
+        MaterialSpec(
+            spec_id=params.spec_id,
+            name=params.name,
+            ash_max_pct=params.ash_max_pct,
+            sulfur_max_pct=params.sulfur_max_pct,
+        )
+    )
+
+
+@spec.action(
     "register_contract_sku",
     RegisterSkuParams,
     allowed_roles=("buyer", "ai_agent", "mdm_steward"),
-    approver_roles=("mdm_steward",),
-    approval_rule=_register_needs_approval,
+    revert_roles=("mdm_steward",),
     affects_source=True,
-    post_approval=_register_post_approval,
-    description="增量建码硬护栏：必须绑定规格；新物理品种必须主数据管理员审批。",
+    description="增量建码硬护栏：必须绑定规格；缺失新物理品种需经主数据管理员核准开卡后建码。",
 )
 def register_contract_sku(ctx: Any, params: RegisterSkuParams) -> None:
     if not params.canonical_spec_id and not params.request_new_spec_id:
@@ -426,14 +447,21 @@ def register_contract_sku(ctx: Any, params: RegisterSkuParams) -> None:
         )
 
     if params.request_new_spec_id is not None:
-        target_spec_id = params.request_new_spec_id
+        material_spec = ctx.get(MaterialSpec, params.request_new_spec_id)
+        if material_spec is None:
+            raise InvariantError(
+                f"new physical spec {params.request_new_spec_id!r} requires MDM steward approval and creation",
+                code="APPROVAL_REQUIRED_NEW_MATERIAL_SPEC",
+            )
+        if not _quality_fits(material_spec, params.ash_pct, params.sulfur_pct):
+            raise InvariantError(
+                f"sku quality does not fit {material_spec.spec_id}",
+                code="SPEC_QUALITY_MISMATCH",
+            )
+        target_spec_id = material_spec.spec_id
     else:
-        material_spec = ctx.require(
-            MaterialSpec, params.canonical_spec_id
-        )
-        if not _quality_fits(
-            material_spec, params.ash_pct, params.sulfur_pct
-        ):
+        material_spec = ctx.require(MaterialSpec, params.canonical_spec_id)
+        if not _quality_fits(material_spec, params.ash_pct, params.sulfur_pct):
             raise InvariantError(
                 f"sku quality does not fit {material_spec.spec_id}",
                 code="SPEC_QUALITY_MISMATCH",
@@ -448,7 +476,7 @@ def register_contract_sku(ctx: Any, params: RegisterSkuParams) -> None:
         ash_pct=params.ash_pct,
         sulfur_pct=params.sulfur_pct,
         canonical_spec_id=target_spec_id,
-        mapped_by=ctx.actor.actor_id,
+        mapped_by=params.mapped_by or ctx.actor.actor_id,
     )
     ctx.create(sku)
 
@@ -457,6 +485,7 @@ def register_contract_sku(ctx: Any, params: RegisterSkuParams) -> None:
     "receive_material_lot",
     ReceiveLotParams,
     allowed_roles=("buyer", "mdm_steward", "warehouse", "ops_manager"),
+    revert_roles=("mdm_steward",),
     affects_source=False,
     description="按已治理散码入库，建立规格/厂家/发票三边齐备的高维批次桶。",
 )
@@ -508,6 +537,7 @@ def receive_material_lot(ctx: Any, params: ReceiveLotParams) -> None:
     "consume_by_brand_fifo",
     ConsumeBrandParams,
     allowed_roles=("mes", "mes_operator", "production", "ops_manager"),
+    revert_roles=("mdm_steward", "mes", "mes_operator", "production", "ops_manager"),
     affects_source=False,
     description="按厂家报工后自动按 FIFO 扣减高维批次桶。",
 )
@@ -585,6 +615,7 @@ spec.update_display(
         },
         "actions": {
             "map_legacy_sku_to_spec": "归并历史物料编码",
+            "create_material_spec": "核准新建物料规格",
             "register_contract_sku": "登记合同物料编码",
             "receive_material_lot": "登记进厂批次",
             "consume_by_brand_fifo": "按品牌先进先出投料",
@@ -603,6 +634,12 @@ spec.update_display(
             "production": "生产主管",
         },
     }
+)
+
+register_work_card_primitives(
+    spec,
+    opener_roles=("buyer", "ai_agent", "mdm_steward"),
+    resolver_roles=("mdm_steward",),
 )
 
 

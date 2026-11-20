@@ -110,16 +110,16 @@ def test_steel_mdm_five_acts_restart_and_http_roundtrip(tmp_path: Path):
         assert valid_sku["blocked"] is False
         assert valid_sku["status"] == "COMMITTED"
 
-        # 第三幕：申报新品种 SPEC-C 锁入持久 W_lat（W_mem 零污染）
+        # 第三幕：申报新品种 SPEC-C 签发 M1 WorkCard (OPEN，W_mem 零污染)
         r3 = app.run_act_3()["act_result"]
-        assert r3["status"] == "PENDING_APPROVAL"
+        assert r3["status"] == "OPEN"
         assert r3["spec_c_exists_in_mem"] is False
         assert r3["awaiting_count"] == 1
         pending_rid = r3["run_id"]
     finally:
         app.close()
 
-    # 重启恢复验证：W_lat 待签批 SPEC-C 完好留存
+    # 重启恢复验证：M1 WorkCard 待签批 SPEC-C 完好留存
     app2 = SteelMDMStudioApp(state_dir, port=0)
     server = create_server(app2, host="127.0.0.1", port=0)
     port = int(server.server_address[1])
@@ -133,7 +133,7 @@ def test_steel_mdm_five_acts_restart_and_http_roundtrip(tmp_path: Path):
         assert resumed["w_lat"]["awaiting_approval_moves"][0]["run_id"] == pending_rid
         assert all(sp["spec_id"] != "SPEC-C" for sp in resumed["w_mem"]["specs"])
 
-        # MDM 管家签批 -> post_approval 原子创建 SPEC-C + ERP-SKU-9102
+        # MDM 管家签批 -> create_material_spec + settle_work_card + map_legacy_sku_to_spec
         dec = app2.decide_act_3(op="approve", run_id=pending_rid)["decision_result"]
         assert dec["status"] == "COMMITTED"
         assert dec["spec_c_exists_in_mem"] is True

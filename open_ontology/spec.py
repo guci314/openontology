@@ -559,6 +559,7 @@ class ActionDef(BaseModel):
     handler: Any  # Callable[[EditBatch, BaseModel], None]
     allowed_roles: tuple[str, ...] = ()
     approver_roles: tuple[str, ...] = ()
+    revert_roles: tuple[str, ...] = ()
     approval_rule: Any = None  # Callable[[BaseModel, Actor], bool] | Callable[..., bool]
     affects_source: bool = True
     visibility: Literal["public", "private"] = "public"
@@ -1222,6 +1223,7 @@ class OntologySpec:
         params: type[BaseModel],
         allowed_roles: Sequence[str] = (),
         approver_roles: Sequence[str] = (),
+        revert_roles: Sequence[str] = (),
         approval_rule: Callable[..., bool] | None = None,
         description: str = "",
         affects_source: bool = True,
@@ -1238,6 +1240,7 @@ class OntologySpec:
         _validate_params(params, name)
         self._validate_roles(allowed_roles, context=f"action {name!r} allowed_roles")
         self._validate_roles(approver_roles, context=f"action {name!r} approver_roles")
+        self._validate_roles(revert_roles, context=f"action {name!r} revert_roles")
         self._rebuild_model(params)
 
         def decorator(handler: Callable[..., Any]) -> Callable[..., Any]:
@@ -1247,6 +1250,7 @@ class OntologySpec:
                 handler=handler,
                 allowed_roles=tuple(allowed_roles),
                 approver_roles=tuple(approver_roles),
+                revert_roles=tuple(revert_roles),
                 approval_rule=approval_rule,
                 affects_source=affects_source,
                 visibility=visibility,

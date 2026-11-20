@@ -16,6 +16,11 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from examples.business_ontology import (
+    WorkCard,
+    register_work_card_primitives,
+    settle_work_card,
+)
 from open_ontology import (
     DEVICE_STATE_MISMATCH,
     MPC_AWAITING_APPROVAL,
@@ -35,6 +40,7 @@ from open_ontology import (
 
 def _build_routing_spec() -> tuple[OntologySpec, type[ObjectType], type[ObjectType]]:
     spec = OntologySpec()
+    register_work_card_primitives(spec, opener_roles=("ops", "director"), resolver_roles=("director",))
 
     class RouteLane(ObjectType):
         __primary_key__ = "lane_id"
@@ -73,15 +79,11 @@ def _build_routing_spec() -> tuple[OntologySpec, type[ObjectType], type[ObjectTy
     class EmptyParams(BaseModel):
         pass
 
-    def _needs_approval(params: AssignLaneParams, _actor: Actor) -> bool:
-        return params.lane_id == "L-APPR"
-
     @spec.action(
         "assign_lane",
         AssignLaneParams,
         allowed_roles=("ops", "director"),
-        approver_roles=("director",),
-        approval_rule=_needs_approval,
+        revert_roles=("director",),
         affects_source=True,
     )
     def assign_lane(ctx: Any, params: AssignLaneParams) -> None:
@@ -89,6 +91,11 @@ def _build_routing_spec() -> tuple[OntologySpec, type[ObjectType], type[ObjectTy
         lane = ctx.require(RouteLane, params.lane_id)
         if lane.status != "open":
             raise InvariantError(f"lane {lane.lane_id} is closed", code="LANE_CLOSED")
+        if params.lane_id == "L-APPR" and ctx.actor.role != "director":
+            raise InvariantError(
+                f"lane {params.lane_id} requires director approval",
+                code="APPROVAL_REQUIRED_HIGH_VALUE_LANE",
+            )
         ctx.modify(task, status="routed", lane_id=lane.lane_id)
 
     @spec.action(
@@ -477,7 +484,9 @@ def test_mpc_markov_crash_restart_and_approval_pause_resume(tmp_path):
     finally:
         mem2.close()
 
-    # 场景 2：提交触发 PENDING_APPROVAL → 暂停返回 AWAITING_APPROVAL → runtime.approve_action 放行后无缝续跑
+    # 场景 2：高价值通道触发 APPROVAL_REQUIRED_* → 改开 M1 WorkCard → 暂停返回 AWAITING_APPROVAL → settle_work_card 放行后无缝续跑
+    import json as _json
+
     ext_appr = _seed_external_world(
         lanes=[
             {"lane_id": "L-APPR", "status": "open", "score": 300},
@@ -508,39 +517,90 @@ def test_mpc_markov_crash_restart_and_approval_pause_resume(tmp_path):
         elif move["action_type"] == "complete_delivery":
             ext_appr["DeliveryTask"][0]["status"] = "delivered"
 
+    def _pending_work_card(rt: OntologyRuntime) -> str | None:
+        cards = rt.query_objects(WorkCard, OPS)
+        active = [c for c in cards if c.status in ("OPEN", "IN_PROGRESS")]
+        return active[0].card_id if active else None
+
+    def _escalate_to_work_card(
+        rt: OntologyRuntime, cand: CandidateAction, exc: InvariantError
+    ) -> str | None:
+        if not str(exc.code or "").startswith("APPROVAL_REQUIRED_"):
+            return None
+        card_id = f"WC-{cand.params.get('task_id', 'TASK')}-{cand.action}"
+        rt.submit_action(
+            f"OPEN-{card_id}",
+            "open_work_card",
+            {
+                "card_id": card_id,
+                "card_kind": "APPROVAL",
+                "target_object_type": "DeliveryTask",
+                "target_object_id": str(cand.params["task_id"]),
+                "requested_action": cand.action,
+                "requested_params_json": _json.dumps(cand.params, ensure_ascii=False),
+                "assignee_role": "director",
+            },
+            OPS,
+        )
+        return card_id
+
+    def _plan_with_director_foresight(
+        rt: OntologyRuntime, _actor: Actor
+    ) -> list[CandidateAction]:
+        from open_ontology import OntologyMCTSPlanner
+
+        with OntologyMCTSPlanner(
+            rt,
+            DIRECTOR,
+            candidate_generator=_appr_candidates,
+            value_function="eval_delivery_value",
+            simulations=24,
+            value_scale=100.0,
+            max_steps=2,
+            seed=17,
+        ) as planner:
+            return list(planner.search().best_plan)
+
     try:
         ctrl_a = ClosedLoopMPCController(
             mem_a,
             OPS,
             goal_fn="is_task_delivered",
-            candidate_generator=_appr_candidates,
-            value_function="eval_delivery_value",
-            simulations=24,
-            horizon=2,
+            plan_fn=_plan_with_director_foresight,
             act_fn=_appr_act,
             observe_fn=lambda: _copy_snapshot(ext_appr),
+            pending_check=_pending_work_card,
+            on_blocked_step=_escalate_to_work_card,
         )
         paused = ctrl_a.run()
         assert paused.status == MPC_AWAITING_APPROVAL
         assert paused.goal_reached is False
-        assert paused.awaiting_run_id is not None
+        assert paused.awaiting_run_id == "WC-T-1-assign_lane"
         assert appr_acts == []
         assert mem_a.get_object(DeliveryTask, "T-1", OPS).status == "pending"
+        assert mem_a.get_object(WorkCard, paused.awaiting_run_id, DIRECTOR).status == "OPEN"
 
-        # 批准前再次运行控制器仍停留在同一步 AWAITING_APPROVAL
+        # 批准前再次运行控制器仍停留在同一步 AWAITING_APPROVAL（通过 pending_check 观测 M1 WorkCard）
         still_paused = ctrl_a.run()
         assert still_paused.status == MPC_AWAITING_APPROVAL
         assert still_paused.awaiting_run_id == paused.awaiting_run_id
         assert appr_acts == []
 
-        # 外部总监在 W_mem 批准放行（同态三阶段完成第 1 步）→ 控制器继续完成第 2 步直达目标
-        approved = mem_a.approve_action(paused.awaiting_run_id, DIRECTOR)
-        assert approved["status"] == "COMMITTED"
-        assert appr_acts == [paused.awaiting_run_id]
+        # 外部总监在 t1 基于最新世界状态结算 WorkCard（同态三阶段完成第 1 步）→ 控制器继续完成第 2 步直达目标
+        settled = settle_work_card(
+            mem_a,
+            paused.awaiting_run_id,
+            DIRECTOR,
+            resolution_note="director approved high-value lane",
+        )
+        assert settled["status"] == "COMMITTED"
+        assert settled["settled_action_run"]["status"] == "COMMITTED"
+        assert mem_a.get_object(WorkCard, paused.awaiting_run_id, DIRECTOR).status == "COMPLETED"
+        assert appr_acts == [settled["settled_action_run"]["run_id"]]
 
         finished = ctrl_a.run()
         assert finished.status == MPC_GOAL_REACHED
-        assert finished.steps_committed == 1  # 第 1 步已在 approve_action 核销，本轮补齐第 2 步
+        assert finished.steps_committed == 1  # 第 1 步已由 settle_work_card 核销，本轮补齐第 2 步
         assert finished.trajectory[-1].action_type == "complete_delivery"
         assert mem_a.get_object(DeliveryTask, "T-1", OPS).status == "delivered"
         assert mem_a.get_object(DeliveryTask, "T-1", OPS).lane_id == "L-APPR"

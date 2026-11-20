@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 from pydantic import BaseModel
@@ -43,8 +44,11 @@ from .saas_unplug_ontology import (
     RETURN_WINDOW_DAYS,
     STORE_MANAGER,
     SaasOntologyBundle,
+    WorkCard,
     build_saas_ontology,
     build_saas_ontology_spec,
+    settle_work_card,
+    submit_or_open_work_card,
 )
 
 __all__ = [
@@ -200,8 +204,107 @@ def build_saas_snapshot(model: SaasModel) -> tuple[dict[str, Any], dict[str, Any
 # ---------------------------------------------------------------------------
 # 上层 AI Agent 的 Tool 层（两种模式共用同一份，零改动）
 # ---------------------------------------------------------------------------
+def submit_refund_or_work_card(
+    runtime: OntologyRuntime,
+    run_id: str,
+    params: dict[str, Any],
+    actor: Actor = AI_AGENT,
+) -> dict[str, Any]:
+    """Single-plane helper: run process_return_and_refund + record_refund_voucher, or open WorkCard."""
+    try:
+        run = runtime.submit_action(run_id, "process_return_and_refund", params, actor)
+    except InvariantError as exc:
+        if exc.code != "APPROVAL_REQUIRED_LARGE_REFUND":
+            raise
+        runtime.submit_action(
+            f"{run_id}-OPEN",
+            "open_work_card",
+            {
+                "card_id": run_id,
+                "card_kind": "APPROVAL",
+                "target_object_type": "SupportTicket",
+                "target_object_id": str(params["ticket_id"]),
+                "requested_action": "process_return_and_refund",
+                "requested_params_json": json.dumps(params, ensure_ascii=False),
+                "assignee_role": "store_manager",
+            },
+            actor,
+        )
+        return {
+            "status": "AWAITING_WORK_CARD",
+            "card_id": run_id,
+            "work_card_status": "OPEN",
+            "blocked_run_id": run_id,
+            "error_code": exc.code,
+            "error_message": str(exc),
+        }
+    runtime.submit_action(
+        f"{run_id}-VOUCHER",
+        "record_refund_voucher",
+        {**params, "approved_by": params.get("approved_by") or actor.actor_id},
+        actor,
+    )
+    return run
+
+
+def approve_refund_work_card(
+    runtime: OntologyRuntime,
+    card_id: str,
+    manager: Actor = STORE_MANAGER,
+) -> dict[str, Any]:
+    """Settle a refund WorkCard and record its RefundRecord voucher."""
+    settled = settle_work_card(
+        runtime,
+        card_id,
+        manager,
+        resolution_note="店长签批核准大额退款",
+        action_run_id=f"{card_id}-ACT",
+        complete_run_id=f"{card_id}-COMP",
+    )
+    card = runtime.get_object(WorkCard, card_id, manager)
+    req_params = json.loads(card.requested_params_json or "{}")
+    runtime.submit_action(
+        f"{card_id}-VOUCHER",
+        "record_refund_voucher",
+        {**req_params, "approved_by": req_params.get("approved_by") or manager.actor_id},
+        manager,
+    )
+    act_run = settled.get("settled_action_run", settled)
+    return {**act_run, "work_card_status": "COMPLETED"}
+
+
+def revert_refund_runs(
+    runtime: OntologyRuntime,
+    base_run_id: str,
+    rev_prefix: str,
+    manager: Actor = STORE_MANAGER,
+) -> dict[str, Any]:
+    """Revert the refund voucher and underlying return/refund mutation in reverse order."""
+    voucher_rid = f"{base_run_id}-VOUCHER"
+    if runtime.get_action_run(voucher_rid) is not None:
+        runtime.revert_action(voucher_rid, f"{rev_prefix}-VOUCHER", manager)
+    if runtime.get_action_run(f"{base_run_id}-ACT") is not None:
+        act_rid = f"{base_run_id}-ACT"
+    elif runtime.get_action_run(f"{base_run_id}-COMP") is not None:
+        act_rid = f"{base_run_id}-COMP"
+    else:
+        act_rid = base_run_id
+    return runtime.revert_action(act_rid, rev_prefix, manager)
+
+
 def agent_tools(runtime: OntologyRuntime, actor: Actor = AI_AGENT) -> dict[str, Any]:
     """把 Action / Function 暴露成 AI Agent 可直接调用的 Tool 字典。"""
+
+    def _ai_triage_ticket(run_id: str, **kw: Any) -> dict[str, Any]:
+        res = runtime.submit_action(run_id, "ai_triage_ticket", kw, actor)
+        runtime.submit_action(
+            f"{run_id}-TRIAGED",
+            "mark_ticket_triaged",
+            {"ticket_id": kw["ticket_id"]},
+            actor,
+        )
+        return res
+
     return {
         "create_customer_and_order": lambda run_id, **kw: runtime.submit_action(
             run_id, "create_customer_and_order", kw, actor
@@ -209,11 +312,9 @@ def agent_tools(runtime: OntologyRuntime, actor: Actor = AI_AGENT) -> dict[str, 
         "open_support_ticket": lambda run_id, **kw: runtime.submit_action(
             run_id, "open_support_ticket", kw, actor
         ),
-        "ai_triage_ticket": lambda run_id, **kw: runtime.submit_action(
-            run_id, "ai_triage_ticket", kw, actor
-        ),
-        "process_return_and_refund": lambda run_id, **kw: runtime.submit_action(
-            run_id, "process_return_and_refund", kw, actor
+        "ai_triage_ticket": _ai_triage_ticket,
+        "process_return_and_refund": lambda run_id, **kw: submit_refund_or_work_card(
+            runtime, run_id, kw, actor
         ),
         "workspace_overview": lambda: runtime.call_function(
             "workspace_overview", {}, actor
@@ -274,9 +375,15 @@ def run_eval_suite(standalone: bool) -> dict[str, Any]:
             {"ticket_id": "TKT-E1", "fraud_score": 10, "vip_tier": "STANDARD"},
             AI_AGENT,
         )
-        small = rt.submit_action(
+        rt.submit_action(
+            "EVAL-TRIAGE-1-ST",
+            "mark_ticket_triaged",
+            {"ticket_id": "TKT-E1"},
+            AI_AGENT,
+        )
+        small = submit_refund_or_work_card(
+            rt,
             "EVAL-REFUND-1",
-            "process_return_and_refund",
             {"ticket_id": "TKT-E1", "refund_id": "RFD-E1", "amount_cents": 4_500},
             AI_AGENT,
         )
@@ -411,19 +518,19 @@ def run_eval_suite(standalone: bool) -> dict[str, Any]:
             {"ticket_id": "TKT-E4", "fraud_score": 20, "vip_tier": "VIP"},
             AI_AGENT,
         )
-        pending = rt.submit_action(
+        pending = submit_refund_or_work_card(
+            rt,
             "EVAL-REFUND-4",
-            "process_return_and_refund",
             {"ticket_id": "TKT-E4", "refund_id": "RFD-E4", "amount_cents": 32_000},
             AI_AGENT,
         )
         order_while_pending = rt.get_object(model.ShopOrder, "ORD-E4", STORE_MANAGER)
-        approved = rt.approve_action("EVAL-REFUND-4", STORE_MANAGER)
+        approved = approve_refund_work_card(rt, "EVAL-REFUND-4", STORE_MANAGER)
         out["big_refund"] = {
             "submit_status": pending["status"],
             "order_status_while_pending": order_while_pending.status,
             "approve_status": approved["status"],
-            "approved_by": approved["approved_by"],
+            "approved_by": approved["actor_id"],
             "order_status_after": rt.get_object(
                 model.ShopOrder, "ORD-E4", STORE_MANAGER
             ).status,
@@ -445,8 +552,8 @@ def run_eval_suite(standalone: bool) -> dict[str, Any]:
             }
 
         # --- eval 6: 时光机撤回退款 --------------------------------------
-        reverted = rt.revert_action(
-            "EVAL-REFUND-4", "EVAL-REFUND-4-REV", STORE_MANAGER
+        reverted = revert_refund_runs(
+            rt, "EVAL-REFUND-4", "EVAL-REFUND-4-REV", STORE_MANAGER
         )
         refund_exists = (
             rt.connection.execute(
@@ -522,6 +629,12 @@ def phase_a_parasitic() -> dict[str, Any]:
             AI_AGENT,
         )
         rt.submit_action(
+            "A-TRIAGE-3001-ST",
+            "mark_ticket_triaged",
+            {"ticket_id": "TKT-3001"},
+            AI_AGENT,
+        )
+        rt.submit_action(
             "A-TRIAGE-3003",
             "ai_triage_ticket",
             {
@@ -533,6 +646,12 @@ def phase_a_parasitic() -> dict[str, Any]:
             AI_AGENT,
         )
         rt.submit_action(
+            "A-TRIAGE-3003-ST",
+            "mark_ticket_triaged",
+            {"ticket_id": "TKT-3003"},
+            AI_AGENT,
+        )
+        rt.submit_action(
             "A-TRIAGE-3004",
             "ai_triage_ticket",
             {
@@ -541,6 +660,12 @@ def phase_a_parasitic() -> dict[str, Any]:
                 "vip_tier": "VIP",
                 "note": "AI: 高客单老客，建议店长复核后全额退",
             },
+            AI_AGENT,
+        )
+        rt.submit_action(
+            "A-TRIAGE-3004-ST",
+            "mark_ticket_triaged",
+            {"ticket_id": "TKT-3004"},
             AI_AGENT,
         )
         overlay_rows = rt.connection.execute(
@@ -626,9 +751,9 @@ def phase_a_parasitic() -> dict[str, Any]:
             run = rt.get_action_run("A-REFUND-3003")
             print(f"    ORD-2003 fraud=92 -> {_err(exc)}  [run={run['status']}]")
 
-        small = rt.submit_action(
+        small = submit_refund_or_work_card(
+            rt,
             "A-REFUND-3001",
-            "process_return_and_refund",
             {"ticket_id": "TKT-3001", "refund_id": "RFD-3001", "amount_cents": 8_999},
             AI_AGENT,
         )
@@ -637,28 +762,28 @@ def phase_a_parasitic() -> dict[str, Any]:
             f"(无需审批)"
         )
 
-        pending = rt.submit_action(
+        pending = submit_refund_or_work_card(
+            rt,
             "A-REFUND-3004",
-            "process_return_and_refund",
             {"ticket_id": "TKT-3004", "refund_id": "RFD-3004", "amount_cents": 32_000},
             AI_AGENT,
         )
         print(
-            f"    ORD-2004 $320.00 大额 -> {pending['status']} "
-            f"(AI 提交，等店长审批)"
+            f"    ORD-2004 $320.00 大额 -> {pending['status']} ({pending['work_card_status']}) "
+            f"(AI 提交，已签发 WorkCard 等店长结算)"
         )
         order_pending = rt.get_object(model.ShopOrder, "ORD-2004", STORE_MANAGER)
-        print(f"      挂起期间 ORD-2004.status = {order_pending.status}（未动账）")
-        approved = rt.approve_action("A-REFUND-3004", STORE_MANAGER)
+        print(f"      待签批期间 ORD-2004.status = {order_pending.status}（未动账）")
+        approved = approve_refund_work_card(rt, "A-REFUND-3004", STORE_MANAGER)
         print(
-            f"      店长审批 -> {approved['status']} by {approved['approved_by']}，"
+            f"      店长签批 -> {approved['status']} by {approved['actor_id']}，"
             f"订单状态 = {rt.get_object(model.ShopOrder, 'ORD-2004', STORE_MANAGER).status}"
         )
 
         # --- 时光机撤回 --------------------------------------------------
         print("\n  [A4] 时光机撤回 A-REFUND-3004（把退款与扣减的 LTV 全部倒回）")
-        reverted = rt.revert_action(
-            "A-REFUND-3004", "A-REFUND-3004-REV", STORE_MANAGER
+        reverted = revert_refund_runs(
+            rt, "A-REFUND-3004", "A-REFUND-3004-REV", STORE_MANAGER
         )
         print(f"    撤回 run={reverted['run_id']} status={reverted['status']}")
         print(
@@ -819,12 +944,12 @@ def phase_b_standalone() -> dict[str, Any]:
             refund_id="RFD-B03",
             amount_cents=32_000,
         )
-        print(f"    ORD-B03 $320.00 -> {pending['status']} 等待店长审批")
+        print(f"    ORD-B03 $320.00 -> {pending['status']} ({pending['work_card_status']}) 等待店长签批")
         order_pending = rt.get_object(model.ShopOrder, "ORD-B03", STORE_MANAGER)
-        print(f"      挂起期间 ORD-B03.status = {order_pending.status}（未动账）")
-        approved = rt.approve_action("B-REFUND-3", STORE_MANAGER)
+        print(f"      待签批期间 ORD-B03.status = {order_pending.status}（未动账）")
+        approved = approve_refund_work_card(rt, "B-REFUND-3", STORE_MANAGER)
         print(
-            f"      店长审批 -> {approved['status']} by {approved['approved_by']}"
+            f"      店长签批 -> {approved['status']} by {approved['actor_id']}"
         )
 
         # --- 重复退款拦截 -------------------------------------------------
@@ -842,7 +967,7 @@ def phase_b_standalone() -> dict[str, Any]:
 
         # --- 时光机撤回 ---------------------------------------------------
         print("\n  [B7] 时光机一键撤回 B-REFUND-3")
-        reverted = rt.revert_action("B-REFUND-3", "B-REFUND-3-REV", STORE_MANAGER)
+        reverted = revert_refund_runs(rt, "B-REFUND-3", "B-REFUND-3-REV", STORE_MANAGER)
         print(f"    撤回 run={reverted['run_id']} status={reverted['status']}")
         print(
             f"    ORD-B03.status = "

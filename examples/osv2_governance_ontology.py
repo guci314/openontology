@@ -14,14 +14,32 @@ from open_ontology.spec import (
     OntologySpec,
 )
 
+try:
+    from .business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+except ImportError:
+    from examples.business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+
 __all__ = [
     "SteelCoil",
     "ScrapLot",
+    "WorkCard",
     "FEEDS",
     "Osv2SetGradeParams",
     "Osv2AdjustPriceParams",
     "Osv2EmptyParams",
     "osv2_spec",
+    "settle_work_card",
+    "submit_or_open_work_card",
     "OSV2_OPS",
     "OSV2_FINANCE",
 ]
@@ -123,13 +141,17 @@ def adjust_price(ctx: Any, params: Osv2AdjustPriceParams) -> None:
 @osv2_spec.action(
     "request_price_change",
     Osv2AdjustPriceParams,
-    allowed_roles=("ops", "finance", "admin"),
-    approver_roles=("finance_manager",),
-    approval_rule=lambda params, actor: params.unit_price_ton > 20000,
+    allowed_roles=("ops", "finance", "finance_manager", "admin"),
+    revert_roles=("finance_manager",),
     description="超过 2 万元/吨的改价需要财务经理批准",
 )
 def request_price_change(ctx: Any, params: Osv2AdjustPriceParams) -> None:
     coil = ctx.require(SteelCoil, params.asset_id)
+    if params.unit_price_ton > 20000 and ctx.actor.role != "finance_manager":
+        raise InvariantError(
+            f"unit_price_ton={params.unit_price_ton} > 20000 requires finance_manager approval via WorkCard",
+            code="APPROVAL_REQUIRED_PREMIUM_PRICE",
+        )
     ctx.modify(coil, unit_price_ton=params.unit_price_ton)
 
 
@@ -166,16 +188,26 @@ def log_low_stock(runtime: Any, coil: SteelCoil, actor: Actor) -> dict[str, Any]
     "escalate_premium_price",
     SteelCoil,
     lambda coil: coil.unit_price_ton > 20000,
-    description="高价钢卷改价走审批流",
+    description="高价钢卷改价签发 M1 协同签批单",
 )
-def escalate_premium_price(runtime: Any, coil: SteelCoil, actor: Actor) -> dict[str, Any]:
-    run = runtime.submit_action(
-        f"CC-AUTO-ESCALATE-{next(_AUTO_IDS):04d}",
+def escalate_premium_price(rt_handle: Any, coil: SteelCoil, actor: Actor) -> dict[str, Any]:
+    rid = f"CC-AUTO-ESCALATE-{next(_AUTO_IDS):04d}"
+    res = submit_or_open_work_card(
+        rt_handle,
+        rid,
         "request_price_change",
         {"asset_id": coil.asset_id, "unit_price_ton": coil.unit_price_ton + 100.0},
         actor,
+        target_object_type="SteelCoil",
+        target_object_id=coil.asset_id,
+        assignee_role="finance_manager",
+        card_id=rid,
     )
-    return {"run_id": run["run_id"], "status": run["status"]}
+    return {
+        "run_id": rid,
+        "card_id": res.get("card_id", rid),
+        "status": res.get("work_card_status", res["status"]),
+    }
 
 
 osv2_spec.update_display(
@@ -230,3 +262,9 @@ osv2_spec.update_display(
 
 OSV2_OPS = Actor(actor_id="cc-ops-01", role="ops", clearance_tags={"*"})
 OSV2_FINANCE = Actor(actor_id="cc-fin-01", role="finance", clearance_tags={"*"})
+
+register_work_card_primitives(
+    osv2_spec,
+    opener_roles=("ops", "finance", "finance_manager", "admin"),
+    resolver_roles=("finance_manager", "admin"),
+)

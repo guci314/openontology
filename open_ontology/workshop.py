@@ -1074,7 +1074,7 @@ def _ontology_roles(
 
     1. ``spec.roles`` 中显式声明的模型角色（``RoleDef``）；
     2. 该蓝图下各实例的 ``default_actor.role``；
-    3. ``spec.actions`` 中每个动作的 ``allowed_roles`` 与 ``approver_roles``；
+    3. ``spec.actions`` 中每个动作的 ``allowed_roles``、``approver_roles`` 与 ``revert_roles``；
     4. ``spec.object_types`` 中各对象类型的 ``__masked_fields__`` 白名单角色。
 
     均为空时回退 ``["admin"]``，保证前端下拉框永远有可选项。
@@ -1095,6 +1095,8 @@ def _ontology_roles(
         for role in action.allowed_roles:
             add(role)
         for role in action.approver_roles:
+            add(role)
+        for role in action.revert_roles:
             add(role)
     for cls in spec.object_types.values():
         masked = getattr(cls, "__masked_fields__", {}) or {}
@@ -1699,18 +1701,20 @@ function renderOntologyView(detail) {
       '<div class="badges"><span class="badge c">可执行角色 ' + esc((a.allowed_roles||[]).map(zhRole).join(' / ')) + '</span>' +
       (a.visibility === 'private' ? '<span class="badge a">🔒 私有 · 仅内部触发</span>' : '') +
       '<span class="badge a">审批角色 ' + esc((a.approver_roles||[]).map(zhRole).join(' / ') || '无需审批') + '</span>' +
+      ((a.revert_roles||[]).length ? '<span class="badge v">冲正角色 ' + esc((a.revert_roles||[]).map(zhRole).join(' / ')) + '</span>' : '') +
       '<span class="badge">' + (a.affects_source ? '来自外部数据源' : '本体自有') + '</span></div></div>';
   }).join('') || '<div class="hint">无。</div>';
 
   const roleCards = (m.role_defs || []).map(r => {
     const allowed = (r.allowed_actions || []).map(a => '<span class="badge c">' + esc(zhAction(a)) + '</span>').join(' ');
     const approvers = (r.approver_actions || []).map(a => '<span class="badge a">审批：' + esc(zhAction(a)) + '</span>').join(' ');
+    const reverts = (r.revert_actions || []).map(a => '<span class="badge v">冲正：' + esc(zhAction(a)) + '</span>').join(' ');
     const masked = (r.masked_fields || []).map(f => '<span class="badge r">🔒 ' + esc(f) + '</span>').join(' ');
     return '<div class="obj"><h4>🎭 ' + esc(zhRole(r.name)) + ' <span class="en">' + esc(r.name) + '</span>' +
       (r.declared ? ' <span class="badge v">显式 RoleDef</span>' : ' <span class="badge">动作推断</span>') + '</h4>' +
       (r.description ? '<div class="sub hint">' + esc(r.description) + '</div>' : '') +
       '<div class="badges">' + (allowed || '<span class="hint">无可执行动作</span>') +
-      (approvers ? ' ' + approvers : '') + (masked ? ' ' + masked : '') + '</div></div>';
+      (approvers ? ' ' + approvers : '') + (reverts ? ' ' + reverts : '') + (masked ? ' ' + masked : '') + '</div></div>';
   }).join('') || '<div class="hint">无。</div>';
 
   $('stage').innerHTML =

@@ -405,7 +405,7 @@ def test_gate4_fictional_domain_blind_m2_contract() -> None:
                 ActionBlueprint(
                     name="jump_sector",
                     allowed_roles=["navigator"],
-                    approver_roles=[],
+                    revert_roles=[],
                     params=[
                         FieldSpec(name="ship_id", field_type="str", required=True),
                         FieldSpec(name="target_sector", field_type="str", required=True),

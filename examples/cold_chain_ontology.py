@@ -14,11 +14,27 @@ from open_ontology.spec import (
     OntologySpec,
 )
 
+try:
+    from .business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+except ImportError:
+    from examples.business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+
 __all__ = [
     "Warehouse",
     "Truck",
     "Shipment",
     "Hospital",
+    "WorkCard",
     "CARRIES",
     "SHIPS_FROM",
     "DELIVERS_TO",
@@ -29,6 +45,8 @@ __all__ = [
     "recommend_reroute",
     "reroute_shipment",
     "annotate_shipment",
+    "settle_work_card",
+    "submit_or_open_work_card",
     "DISPATCHER",
     "AI_AGENT",
     "OPS_MANAGER",
@@ -190,17 +208,11 @@ def recommend_reroute(ctx: Any, params: RecommendParams) -> dict[str, Any]:
     }
 
 
-def _approval_rule(params: RerouteParams, actor: Actor) -> bool:
-    """AI agent spending >= 2000 CNY always needs a human manager."""
-    return actor.role == "ai_agent" and params.extra_cost >= 2000.0
-
-
 @spec.action(
     "reroute_shipment",
     RerouteParams,
     allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
-    approver_roles=("ops_manager",),
-    approval_rule=_approval_rule,
+    revert_roles=("ops_manager",),
     description="把冷链运单从抛锚卡车重派到接替仓 + 接替车（受治理）。",
 )
 def reroute_shipment(ctx: Any, params: RerouteParams) -> None:
@@ -243,6 +255,11 @@ def reroute_shipment(ctx: Any, params: RerouteParams) -> None:
             f"warehouse {warehouse.warehouse_id} has {stock} units of "
             f"batch {shipment.batch_no}, need {shipment.quantity}",
             code="INSUFFICIENT_STOCK",
+        )
+    if ctx.actor.role == "ai_agent" and params.extra_cost >= 2000.0:
+        raise InvariantError(
+            f"AI agent extra_cost {params.extra_cost} >= 2000.0 requires ops_manager approval via WorkCard",
+            code="APPROVAL_REQUIRED_HIGH_COST_REROUTE",
         )
 
     old_truck_id = shipment.assigned_truck_id
@@ -306,4 +323,10 @@ AUDITOR_NORTH = Actor(
     actor_id="auditor-01",
     role="auditor",
     clearance_tags={"region:north"},
+)
+
+register_work_card_primitives(
+    spec,
+    opener_roles=("dispatcher", "ai_agent", "ops_manager"),
+    resolver_roles=("ops_manager",),
 )

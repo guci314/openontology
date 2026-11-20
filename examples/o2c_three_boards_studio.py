@@ -10,7 +10,7 @@
 4. 四幕连续闭环剧场（零 ``w_lat.sqlite3`` 持久队列）：
    - 第一幕：全知之眼对齐（$W_{real} \\to W_{mem}$）+ 未出库强开票拦截；
    - 第二幕：撒谎执行器穿帮 + ``DEVICE_STATE_MISMATCH`` 独立回读否决与零幻觉保护；
-   - 第三幕：超授信挂起（``PENDING_APPROVAL`` 仅存 ``W_mem``）+ 真实飞书 ``o2c业财助手`` 审批推卡 + 回调核销；
+   - 第三幕：超授信触发 ``APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED`` 并签发 M1 ``WorkCard``（零 ``PENDING_APPROVAL`` 挂起）+ 真实飞书 ``o2c业财助手`` 审批推卡 + 回调核销；
    - 第四幕：``ClosedLoopMPCController`` 滚动求解 + 首次故障重规划自愈直至实收清零。
 """
 
@@ -79,7 +79,12 @@ _ACTION_CN = {
     "ship_order_delivery": "仓库发货出库",
     "issue_and_post_invoice": "开票并过账",
     "record_customer_payment": "客户收款核销",
+    "issue_credit_note_refund": "开具红字冲销退款",
     "annotate_o2c_governance": "登记治理备注",
+    "open_work_card": "发起签批任务卡",
+    "complete_work_card": "核销签批任务卡",
+    "reject_work_card": "驳回签批任务卡",
+    "cancel_work_card": "撤销签批任务卡",
 }
 
 _STATUS_CN = {
@@ -97,7 +102,11 @@ _STATUS_CN = {
     "cancel": "已取消",
     "cancelled": "已取消",
     "pending": "待出库",
-    "PENDING_APPROVAL": "待飞书签批挂起",
+    "OPEN": "待飞书签批",
+    "IN_PROGRESS": "签批处理中",
+    "COMPLETED": "已完成核销",
+    "CANCELLED": "已撤销作废",
+    "SLA_BREACHED": "签批已超时",
     "COMMITTED": "已正式生效",
     "REJECTED": "风控/读回拦截",
     "APPROVED": "已批准待执行",
@@ -239,7 +248,11 @@ _DISPLAY_STATUS_CN = {
     "cancel": "已作废取消",
     "cancelled": "已作废取消",
     "pending": "待物理出库",
-    "PENDING_APPROVAL": "待主管签批",
+    "OPEN": "待主管签批",
+    "IN_PROGRESS": "签批处理中",
+    "COMPLETED": "已完成核销",
+    "CANCELLED": "已撤销作废",
+    "SLA_BREACHED": "签批已超时",
     "COMMITTED": "已确认入账",
     "REJECTED": "已当场拦截",
     "APPROVED": "已批准待核验",
@@ -253,6 +266,9 @@ _DISPLAY_ERROR_CN = {
     "CANNOT_INVOICE_UNSHIPPED_ORDER": "未发货严禁开票",
     "DEVICE_STATE_MISMATCH": "外部实账核对不符",
     "APPROVAL_REJECTED": "主管已驳回放行申请",
+    "APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED": "超授信需财务总监签批",
+    "APPROVAL_REQUIRED_CREDIT_NOTE_REFUND": "红字退款需财务总监签批",
+    "CONCURRENCY_CONFLICT": "版本冲突已熔断",
 }
 
 
@@ -275,7 +291,7 @@ def _build_feishu_approval_card(
     ar_cents: int,
     callback_token: str,
     studio_callback_url: str,
-    status: str = "PENDING_APPROVAL",
+    status: str = "OPEN",
     decision_actor: str | None = None,
     decision_note: str | None = None,
 ) -> dict[str, Any]:
@@ -323,7 +339,7 @@ def _build_feishu_approval_card(
         {"tag": "div", "text": {"tag": "lark_md", "content": body_md}},
         {"tag": "hr"},
     ]
-    if status == "PENDING_APPROVAL":
+    if status in ("OPEN", "IN_PROGRESS"):
         cmd_approve = json.dumps(approve_val, ensure_ascii=False, separators=(",", ":"))
         elements.append(
             {
@@ -894,34 +910,46 @@ class ThreeBoardsStudioApp:
 
     # -- Act 3 & Feishu approval -------------------------------------------
     def run_act_3(self) -> dict[str, Any]:
-        """第三幕：O2C-3B-SO-002 超授信挂起为 PENDING_APPROVAL，并向飞书推送审批卡。"""
+        """第三幕：O2C-3B-SO-002 超授信拦截并签发 M1 WorkCard（OPEN），向飞书推送审批卡。"""
         with self._lock:
             rt, adapter, bare_adapter = self._ensure_ready()
 
-            existing_awaiting = rt.list_action_runs(status="PENDING_APPROVAL")
-            target_move = next(
-                (
-                    mv
-                    for mv in existing_awaiting
-                    if (mv.get("params") or {}).get("order") == self.order_2
-                ),
-                None,
-            )
-            if target_move is None:
+            existing_cards = [
+                c
+                for c in rt.query_objects(o2c.WorkCard, _SYSTEM_ACTOR)
+                if c.status in ("OPEN", "IN_PROGRESS") and c.target_object_id == self.order_2
+            ]
+            target_card = existing_cards[0] if existing_cards else None
+            if target_card is None:
                 mem_status_2 = self._order_mem_status(self.order_2)
                 if mem_status_2 != "draft":
                     raise RuntimeError(
                         f"{self.order_2} is already {mem_status_2!r}; reset studio to replay Act 3"
                     )
+                ver = next(
+                    (
+                        int(row.get("version", 1))
+                        for row in rt.list_objects("SalesOrder")
+                        if row.get("object_id") == self.order_2
+                    ),
+                    1,
+                )
                 run_id = self._next_run_id("3B-APPR")
-                target_move = rt.submit_action(
+                res = o2c.submit_or_open_work_card(
+                    rt,
                     run_id,
                     "confirm_sales_order",
                     {"order": self.order_2},
                     o2c.AI_AGENT,
+                    target_object_type="SalesOrder",
+                    target_object_id=self.order_2,
+                    assignee_role="finance_director",
+                    card_id=run_id,
+                    external_ref=f"occ:SalesOrder:{self.order_2}:v{ver}",
                 )
-
-            run_id = str(target_move["run_id"])
+                run_id = str(res["card_id"])
+            else:
+                run_id = str(target_card.card_id)
             odoo_name, order_total_cents, credit_limit_cents, ar_cents = (
                 self._sync_and_get_card_context(self.order_2)
             )
@@ -939,7 +967,7 @@ class ThreeBoardsStudioApp:
                 ar_cents=ar_cents,
                 callback_token=callback_token,
                 studio_callback_url=self.studio_callback_url,
-                status="PENDING_APPROVAL",
+                status="OPEN",
             )
 
             message_id = existing_card.get("message_id")
@@ -962,7 +990,7 @@ class ThreeBoardsStudioApp:
                 "run_id": run_id,
                 "order_id": self.order_2,
                 "odoo_order_name": odoo_name,
-                "status": "PENDING_APPROVAL",
+                "status": "OPEN",
                 "callback_token": callback_token,
                 "studio_callback_url": self.studio_callback_url,
                 "message_id": message_id,
@@ -988,7 +1016,7 @@ class ThreeBoardsStudioApp:
                 "act": 3,
                 "run_id": run_id,
                 "order_id": self.order_2,
-                "latent_status": "PENDING_APPROVAL",
+                "latent_status": "OPEN",
                 "odoo_order_state_before_approval": docs_2.get("order_state"),
                 "mem_status_before_approval": self._order_mem_status(self.order_2),
                 "feishu_push_status": push_status,
@@ -1029,9 +1057,13 @@ class ThreeBoardsStudioApp:
             card_meta = dict(self.meta.get("feishu_card") or {})
             target_run_id = str(run_id or card_meta.get("run_id") or "").strip()
             if not target_run_id:
-                awaiting = rt.list_action_runs(status="PENDING_APPROVAL")
-                if awaiting:
-                    target_run_id = str(awaiting[0]["run_id"])
+                open_cards = [
+                    c
+                    for c in rt.query_objects(o2c.WorkCard, _SYSTEM_ACTOR)
+                    if c.status in ("OPEN", "IN_PROGRESS")
+                ]
+                if open_cards:
+                    target_run_id = str(open_cards[0].card_id)
             if not target_run_id:
                 return {
                     "ok": False,
@@ -1051,6 +1083,7 @@ class ThreeBoardsStudioApp:
             if card_meta.get("run_id") == target_run_id and card_meta.get("status") in (
                 "COMMITTED",
                 "REJECTED",
+                "CONFLICT",
             ):
                 return {
                     "ok": True,
@@ -1065,18 +1098,55 @@ class ThreeBoardsStudioApp:
             director = self._resolve_director_actor(operator_open_id)
             odoo_evidence: dict[str, Any] | None = None
             if op == "approve":
-                final_run = rt.approve_action(target_run_id, director)
-                ev_list = adapter.get_run_evidence(target_run_id)
-                odoo_evidence = ev_list[0] if ev_list else None
-                final_status = str(final_run["status"])
-                toast_msg = (
-                    f"已批准 {self.order_2} 并正式写入真实 Odoo 19（状态：{_cn(final_status)}）"
-                )
+                card = rt.get_object(o2c.WorkCard, target_run_id, director)
+                ext = str(card.external_ref or "")
+                occ_conflict = False
+                if ext.startswith("occ:"):
+                    parts = ext.split(":")
+                    if len(parts) == 4 and parts[3].startswith("v"):
+                        _, occ_type, occ_id, occ_ver = parts
+                        live_row = next(
+                            (r for r in rt.list_objects(occ_type) if r.get("object_id") == occ_id),
+                            None,
+                        )
+                        if live_row is not None and int(live_row.get("version", 0)) != int(occ_ver[1:]):
+                            occ_conflict = True
+                if occ_conflict:
+                    rt.submit_action(
+                        f"{target_run_id}-CANCEL",
+                        "cancel_work_card",
+                        {"card_id": target_run_id, "resolution_note": "外部账套在签批期间发生版本变更，自动熔断"},
+                        Actor(actor_id="studio-occ-guard", role="admin"),
+                    )
+                    final_status = "CONFLICT"
+                    toast_msg = f"检测到 {self.order_2} 在签批期间版本冲突，已安全熔断作废"
+                else:
+                    settled = o2c.settle_work_card(
+                        rt,
+                        target_run_id,
+                        director,
+                        resolution_note="财务总监飞书签批放行",
+                        action_run_id=f"{target_run_id}-ACT",
+                        complete_run_id=f"{target_run_id}-COMP",
+                    )
+                    action_run = settled["settled_action_run"]
+                    act_rid = str(action_run["run_id"])
+                    ev_list = adapter.get_run_evidence(act_rid) or adapter.get_run_evidence(
+                        target_run_id
+                    )
+                    odoo_evidence = ev_list[0] if ev_list else None
+                    final_status = str(action_run["status"])
+                    toast_msg = (
+                        f"已批准 {self.order_2} 并正式写入真实 Odoo 19（状态：{_cn(final_status)}）"
+                    )
             elif op == "reject":
-                final_run = rt.reject_action(
-                    target_run_id, director, reason="财务总监驳回超授信放行申请"
+                rt.submit_action(
+                    f"{target_run_id}-REJ",
+                    "reject_work_card",
+                    {"card_id": target_run_id, "resolution_note": "财务总监驳回超授信放行申请"},
+                    director,
                 )
-                final_status = str(final_run["status"])
+                final_status = "REJECTED"
                 toast_msg = f"已驳回 {self.order_2}，真实 Odoo 19 报价单继续保持草稿"
             else:
                 return {
@@ -1240,10 +1310,14 @@ class ThreeBoardsStudioApp:
 
             drift_state = {"fired": False}
             exec_logs: list[dict[str, Any]] = []
-            pending_approvals = rt.list_action_runs(status="PENDING_APPROVAL")
-            if pending_approvals:
+            open_cards = [
+                c
+                for c in rt.query_objects(o2c.WorkCard, _SYSTEM_ACTOR)
+                if c.status in ("OPEN", "IN_PROGRESS")
+            ]
+            if open_cards:
                 raise GovernanceViolationError(
-                    f"尚有待签批动作 {pending_approvals[0]['run_id']}，"
+                    f"尚有待签批任务卡 {open_cards[0].card_id}，"
                     "请先在飞书或演播室完成第三幕签批再启动第四幕 MPC 收口。"
                 )
 
@@ -1285,6 +1359,10 @@ class ThreeBoardsStudioApp:
                     seed=17,
                     act_fn=_act_fn,
                     observe_fn=adapter.build_readback_snapshot,
+                    pending_check=lambda check_rt: any(
+                        c.status in ("OPEN", "IN_PROGRESS")
+                        for c in check_rt.query_objects(o2c.WorkCard, _SYSTEM_ACTOR)
+                    ),
                     max_steps=12,
                     max_replans=3,
                     run_id_prefix=f"3B-MPC-{self.meta.get('seq', 0) + 1}",
@@ -1381,7 +1459,16 @@ class ThreeBoardsStudioApp:
                 )
 
             bare_docs = self._safe_odoo_docs(bare_adapter, self.bare_order)
-            runs = rt.list_action_runs()
+            runs = [
+                r
+                for r in rt.list_action_runs()
+                if not (
+                    r.get("status") == "REJECTED"
+                    and str(r.get("error_code") or "").startswith("APPROVAL_REQUIRED_")
+                )
+                and str(r.get("action_type") or "")
+                not in ("open_work_card", "complete_work_card", "cancel_work_card")
+            ]
             recent_runs = [
                 {
                     "run_id": r["run_id"],
@@ -1390,7 +1477,13 @@ class ThreeBoardsStudioApp:
                     "status": r["status"],
                     "status_cn": _cn(r["status"]),
                     "order_id": (r.get("params") or {}).get("order")
-                    or (r.get("params") or {}).get("order_id"),
+                    or (r.get("params") or {}).get("order_id")
+                    or (r.get("params") or {}).get("target_object_id")
+                    or (
+                        self.order_2
+                        if str(r.get("action_type") or "") == "reject_work_card"
+                        else None
+                    ),
                     "approved_by": r.get("approved_by"),
                     "error_code": r.get("error_code"),
                     "error_message": r.get("error_message"),
@@ -1402,11 +1495,13 @@ class ThreeBoardsStudioApp:
             pending_moves: list[dict[str, Any]] = []
             awaiting_moves = [
                 {
-                    "run_id": mv["run_id"],
-                    "action_type": mv["action_type"],
-                    "params": mv.get("params"),
+                    "run_id": c.card_id,
+                    "card_id": c.card_id,
+                    "action_type": c.requested_action,
+                    "params": json.loads(c.requested_params_json or "{}"),
                 }
-                for mv in rt.list_action_runs(status="PENDING_APPROVAL")
+                for c in rt.query_objects(o2c.WorkCard, _SYSTEM_ACTOR)
+                if c.status in ("OPEN", "IN_PROGRESS")
             ]
 
             snapshot = {

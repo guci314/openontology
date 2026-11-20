@@ -19,6 +19,21 @@ from open_ontology.spec import (
     OntologySpec,
 )
 
+try:
+    from .business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+except ImportError:
+    from examples.business_ontology import (
+        WorkCard,
+        register_work_card_primitives,
+        settle_work_card,
+        submit_or_open_work_card,
+    )
+
 # ---------------------------------------------------------------------------
 # Object types
 # ---------------------------------------------------------------------------
@@ -242,13 +257,6 @@ def _parse_date(value: str | None) -> date | None:
         return None
 
 
-def _refund_needs_approval(
-    params: ResolveRefundParams, actor: Actor
-) -> bool:
-    """Refunds >= $100 must be approved by an ops manager."""
-    return actor.role != "ops_manager" and params.needs_approval
-
-
 # ---------------------------------------------------------------------------
 # Read-only functions
 # ---------------------------------------------------------------------------
@@ -440,10 +448,9 @@ def open_customer_case(ctx: Any, params: OpenCaseParams) -> None:
     "resolve_case_with_refund",
     ResolveRefundParams,
     allowed_roles=("support_agent", "ai_agent", "ops_manager"),
-    approver_roles=("ops_manager",),
-    approval_rule=_refund_needs_approval,
+    revert_roles=("ops_manager",),
     affects_source=True,
-    description="工单退款结案：退货期/欺诈分硬护栏 + 大额人工审批。",
+    description="工单退款结案：退货期/欺诈分硬护栏 + 大额前置门控签批。",
 )
 def resolve_case_with_refund(ctx: Any, params: ResolveRefundParams) -> None:
     case = ctx.require(SupportCase, params.case_id)
@@ -485,6 +492,12 @@ def resolve_case_with_refund(ctx: Any, params: ResolveRefundParams) -> None:
             code="CASE_ALREADY_RESOLVED",
         )
 
+    if ctx.actor.role != "ops_manager" and order.total_cents >= LARGE_REFUND_CENTS:
+        raise InvariantError(
+            f"refund of {order.total_cents} cents on {order.order_id} requires ops_manager approval",
+            code="APPROVAL_REQUIRED_LARGE_REFUND",
+        )
+
     settlement_id = params.settlement_id or f"RFD-{case.case_id}"
     params.refund_cents = order.total_cents
     params.needs_approval = order.total_cents >= LARGE_REFUND_CENTS
@@ -519,4 +532,10 @@ SUPPORT_AGENT = Actor(
 SALES_REP = Actor(actor_id="sales-rep-01", role="sales_rep", clearance_tags={"*"})
 OPS_MANAGER = Actor(
     actor_id="ops-manager-01", role="ops_manager", clearance_tags={"*"}
+)
+
+register_work_card_primitives(
+    spec,
+    opener_roles=("support_agent", "sales_rep", "ai_agent", "ops_manager"),
+    resolver_roles=("ops_manager",),
 )

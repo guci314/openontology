@@ -13,7 +13,7 @@
    * **隐藏字符串外键发现**：通过实测值集合包含率，自动发现未声明为 ``many2one`` 的跨表字符串关联；
    * **多态混合表判别器发现**：自动检测单个物理表内不同分类枚举值导致条件非空率剧烈分化的混合表；
    * **未决灰区与矛盾挖掘（``AMBIGUOUS_GRAY_ZONE``）**：自动挖掘空外键孤儿集、跨表额度越界矛盾与高频撤销/冲正循环，
-     在无人场景下给出保守默认策略（``PENDING_APPROVAL`` / ``FILTER_BY_DISCRIMINATOR``）。
+     在无人场景下给出保守默认策略（``REQUIRE_APPROVAL`` / ``FILTER_BY_DISCRIMINATOR``）。
 
 运行方式::
 
@@ -1329,7 +1329,7 @@ class OdooFDEScout:
                             "within_status_counts": dict(within_by_status),
                             "sample_records": exceeded_samples,
                         },
-                        conservative_default="PENDING_APPROVAL_WHEN_EXCEEDED",
+                        conservative_default="REQUIRE_APPROVAL_WHEN_EXCEEDED",
                     )
 
         # 5d. Backward/cancellation reversal loops in mined state machines

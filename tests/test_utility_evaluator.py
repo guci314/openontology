@@ -342,14 +342,26 @@ def test_l2_evolved_o2c_ontology_invariants_tax_partial_ship_partial_pay_and_ref
         assert o2c.get_customer_ar_balance(rt, "C1") == 650_000
 
         # 6. Credit note refund requires finance_director approval -> clears remaining 650,000 AR cleanly!
-        pending_ref = rt.submit_action(
+        pending_ref = o2c.submit_or_open_work_card(
+            rt,
             "REF-1",
             "issue_credit_note_refund",
             {"order": "SO-L2-1", "reason": "Damaged goods"},
             o2c.AI_AGENT,
+            target_object_type="SalesOrder",
+            target_object_id="SO-L2-1",
+            assignee_role="finance_director",
+            card_id="REF-1",
         )
-        assert pending_ref["status"] == "PENDING_APPROVAL"
-        approved_ref = rt.approve_action("REF-1", o2c.FINANCE_DIRECTOR)
+        assert pending_ref["status"] == "AWAITING_WORK_CARD"
+        assert pending_ref["work_card_status"] == "OPEN"
+        settled_ref = o2c.settle_work_card(
+            rt,
+            "REF-1",
+            o2c.FINANCE_DIRECTOR,
+            action_run_id="REF-1-ACT",
+        )
+        approved_ref = settled_ref["settled_action_run"]
         assert approved_ref["status"] == "COMMITTED"
         inv = rt.get_object(o2c.Invoice, "INV-SO-L2-1", o2c.FINANCE_DIRECTOR)
         assert inv.status == "refunded" and inv.refunded_cents == 1_150_000

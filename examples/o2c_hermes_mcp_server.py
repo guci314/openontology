@@ -87,7 +87,10 @@ _STATUS_CN: dict[str, str] = {
     "NORMAL": "正常",
     "WATCHLIST": "重点关注",
     "BLOCKED": "信用冻结",
-    "PENDING_APPROVAL": "待签批挂起",
+    "OPEN": "待签批挂起",
+    "IN_PROGRESS": "签批处理中",
+    "COMPLETED": "已签批归档",
+    "CANCELLED": "已作废",
     "COMMITTED": "已生效",
     "REJECTED": "已拦截",
     "REVERTED": "已冲正",
@@ -357,6 +360,8 @@ class PersistentO2CSession:
                     erp_evidence=card_meta.get("erp_evidence"),
                     conflict_error=card_meta.get("conflict_error"),
                     card_status_override=card_meta.get("card_status_override"),
+                    settled_run_id=card_meta.get("settled_run_id"),
+                    baseline_versions=card_meta.get("baseline_versions"),
                 )
 
             self._seq = int(meta.get("seq", len(rt.list_action_runs())))
@@ -646,7 +651,7 @@ class PersistentO2CSession:
 
             confirm_run_id = self._next_run_id("O2C-CONFIRM")
             try:
-                run = self.runtime.submit_action(
+                run = self.gateway.submit_or_escalate(
                     confirm_run_id,
                     "confirm_sales_order",
                     {"order": order_id},
@@ -671,9 +676,9 @@ class PersistentO2CSession:
             rec = self.gateway.get_card_record(confirm_run_id)
             self._save_meta()
 
-            if run["status"] == "PENDING_APPROVAL":
+            if run["status"] == "OPEN":
                 msg = (
-                    f"订单 {order_id} 触发授信超限红线，已自动挂起（流水号 {confirm_run_id}）。"
+                    f"订单 {order_id} 触发授信超限红线，已开立财务总监签批单（流水号 {confirm_run_id}）。"
                     "真实 Odoo 仍保持草稿未变动，等待财务总监签批放行。"
                 )
             else:
@@ -856,9 +861,12 @@ class PersistentO2CSession:
             }
             result = self.gateway.handle_feishu_callback(payload)
             rec = self.gateway.get_card_record(run_id)
-            run = self.runtime.get_action_run(run_id)
+            settled_id = self.gateway._resolve_settled_run_id(run_id)
+            run = self.runtime.get_action_run(settled_id) or self.runtime.get_action_run(run_id)
             p = (run or {}).get("params") or {}
             order_id = str(p.get("order") or p.get("order_id") or "")
+            if not order_id and rec:
+                order_id = str((rec.card_view or {}).get("order_id") or "")
             self._save_meta()
 
             toast = result.get("toast") or {}

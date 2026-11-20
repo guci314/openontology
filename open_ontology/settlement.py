@@ -1156,9 +1156,13 @@ class HomomorphicSettlementAspect:
 
         action = runtime.spec.get_action(run["action_type"])
         revert_roles = (
-            set(action.approver_roles)
-            if action.approver_roles
-            else set(action.allowed_roles)
+            set(action.revert_roles)
+            if action.revert_roles
+            else (
+                set(action.approver_roles)
+                if action.approver_roles
+                else set(action.allowed_roles)
+            )
         )
         if actor.role not in revert_roles:
             raise PermissionDeniedError(

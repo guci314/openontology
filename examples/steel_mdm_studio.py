@@ -4,7 +4,7 @@
 - W_real (`legacy_erp.json`)：老 ERP 源表仅含 Manufacturer 与混乱 ContractSKU（无规格列、无 MaterialSpec/MaterialLot）；
 - W_mem (`w_mem.sqlite3`)：OntologyRuntime 记忆棋盘 + `ontology_overlay` 属性级寄生层 + 三正交边高维批次桶；
 - 统一闭环同态结算：OntologyRuntime + SourceBridge 增量建码双硬护栏（UNMAPPED_PHYSICAL_SPEC / SPEC_QUALITY_MISMATCH）
-  与新物理品种审批隔离（PENDING_APPROVAL 存 W_mem，零 w_lat.sqlite3）；
+  与新物理品种审批隔离（M1 WorkCard 状态 OPEN 存 W_mem，零 w_lat.sqlite3）；
 - 三视角恒等账本：reconcile_multi_view_ledger + ObjectSet/pivot/aggregate + 1 秒时光机无损冲正。
 
 严禁修改 open_ontology/ 与 examples/steel_mdm_demo.py，仅做兼容只读导入与驱动。
@@ -91,9 +91,14 @@ _DEFAULT_LOTS: tuple[tuple[str, str, int], ...] = (
 
 _ACTION_CN = {
     "map_legacy_sku_to_spec": "外挂贴片归并",
+    "create_material_spec": "核准新建物料规格",
     "register_contract_sku": "增量建码护栏",
     "receive_material_lot": "高维批次桶入库",
     "consume_by_brand_fifo": "车间按厂家盲投先进先出",
+    "open_work_card": "发起签批任务卡",
+    "complete_work_card": "核销签批任务卡",
+    "reject_work_card": "驳回签批任务卡",
+    "cancel_work_card": "撤销签批任务卡",
 }
 
 _BRAND_CN = {
@@ -125,6 +130,7 @@ _ERROR_CN = {
     "INSUFFICIENT_BRAND_STOCK": "厂家可用库存不足",
     "INVALID_UNIT_PRICE": "含税单价无效",
     "BRAND_NOT_FOUND": "供货厂家不存在",
+    "APPROVAL_REQUIRED_NEW_MATERIAL_SPEC": "新物理品种需主数据管家核准",
 }
 
 
@@ -638,6 +644,43 @@ class SteelMDMStudioApp:
             try:
                 settled = rt.submit_action(run_id, "register_contract_sku", params, mdm.BUYER)
             except InvariantError as exc:
+                if exc.code == "APPROVAL_REQUIRED_NEW_MATERIAL_SPEC":
+                    rt.submit_action(
+                        f"{run_id}-OPEN",
+                        "open_work_card",
+                        {
+                            "card_id": run_id,
+                            "card_kind": "APPROVAL",
+                            "target_object_type": "ContractSKU",
+                            "target_object_id": sku_id,
+                            "requested_action": "register_contract_sku",
+                            "requested_params_json": json.dumps(
+                                {**params, "mapped_by": mdm.BUYER.actor_id},
+                                ensure_ascii=False,
+                            ),
+                            "assignee_role": "mdm_steward",
+                        },
+                        mdm.BUYER,
+                    )
+                    res = {
+                        "ok": True,
+                        "blocked": False,
+                        "status": "OPEN",
+                        "run_id": run_id,
+                        "sku_id": sku_id,
+                        "request_new_spec_id": request_new_spec_id,
+                        "request_new_spec_name": request_new_spec_name,
+                        "recommendations": recommendations,
+                    }
+                    self.meta["last_probe"] = res
+                    self._push_timeline(
+                        "审批挂起",
+                        f"新物理品种 {request_new_spec_id} ({sku_id}) 已签发工单卡",
+                        "W_mem 主世界与老 ERP 零污染，等待 MDM 管家签批。",
+                        "warn",
+                    )
+                    self._save_meta()
+                    return {"probe_result": res, "state": self.state_snapshot()}
                 res = {
                     "ok": True,
                     "blocked": True,
@@ -674,26 +717,18 @@ class SteelMDMStudioApp:
                 self._save_meta()
                 return {"probe_result": res, "state": self.state_snapshot()}
 
-            if settled["status"] == "PENDING_APPROVAL":
-                res = {
-                    "ok": True,
-                    "blocked": False,
-                    "status": "PENDING_APPROVAL",
-                    "run_id": run_id,
-                    "sku_id": sku_id,
-                    "request_new_spec_id": request_new_spec_id,
-                    "request_new_spec_name": request_new_spec_name,
-                    "recommendations": recommendations,
-                }
-                self.meta["last_probe"] = res
-                self._push_timeline(
-                    "审批挂起",
-                    f"新物理品种 {request_new_spec_id} ({sku_id}) 已锁入待批",
-                    "W_mem 主世界与老 ERP 零污染，等待 MDM 管家签批。",
-                    "warn",
+            target_spec = request_new_spec_id or canonical_spec_id
+            if target_spec:
+                rt.submit_action(
+                    f"{run_id}-LINK",
+                    "map_legacy_sku_to_spec",
+                    {
+                        "sku_id": sku_id,
+                        "canonical_spec_id": target_spec,
+                        "mapped_by": mdm.BUYER.actor_id,
+                    },
+                    mdm.BUYER,
                 )
-                self._save_meta()
-                return {"probe_result": res, "state": self.state_snapshot()}
 
             res = {
                 "ok": True,
@@ -752,15 +787,20 @@ class SteelMDMStudioApp:
 
     # -- Act 3: New Physical Variety Approval ------------------------------
     def run_act_3(self) -> dict[str, Any]:
-        """第三幕：采购申报全新物理品种 SPEC-C，锁入 PENDING_APPROVAL 待 MDM 管家签批。"""
+        """第三幕：采购申报全新物理品种 SPEC-C，签发 M1 WorkCard (OPEN) 待 MDM 管家签批。"""
         with self._lock:
             rt = self._ensure_ready()
-            awaiting = rt.list_action_runs(status="PENDING_APPROVAL")
+            open_cards = [
+                c
+                for c in rt.query_objects(mdm.WorkCard, _SYSTEM_ACTOR)
+                if c.status in ("OPEN", "IN_PROGRESS")
+            ]
             existing_req = next(
                 (
-                    mv
-                    for mv in awaiting
-                    if (mv.get("params") or {}).get("request_new_spec_id") == "SPEC-C"
+                    c
+                    for c in open_cards
+                    if json.loads(c.requested_params_json or "{}").get("request_new_spec_id")
+                    == "SPEC-C"
                 ),
                 None,
             )
@@ -798,7 +838,7 @@ class SteelMDMStudioApp:
                 )["probe_result"]
                 run_id = probe["run_id"]
             else:
-                run_id = str(existing_req["run_id"])
+                run_id = str(existing_req.card_id)
 
             spec_c_exists = any(
                 row["object_id"] == "SPEC-C" for row in rt.list_objects("MaterialSpec")
@@ -807,9 +847,15 @@ class SteelMDMStudioApp:
                 "ok": True,
                 "act": 3,
                 "run_id": run_id,
-                "status": "PENDING_APPROVAL",
+                "status": "OPEN",
                 "spec_c_exists_in_mem": spec_c_exists,
-                "awaiting_count": len(rt.list_action_runs(status="PENDING_APPROVAL")),
+                "awaiting_count": len(
+                    [
+                        c
+                        for c in rt.query_objects(mdm.WorkCard, _SYSTEM_ACTOR)
+                        if c.status in ("OPEN", "IN_PROGRESS")
+                    ]
+                ),
             }
             self._mark_act_done("3", act3_summary)
             self._save_meta()
@@ -822,19 +868,23 @@ class SteelMDMStudioApp:
         run_id: str | None = None,
         approver_id: str | None = None,
     ) -> dict[str, Any]:
-        """MDM 管家签批或驳回挂起的新物理品种申请。"""
+        """MDM 管家签批或驳回待批的新物理品种任务卡。"""
         with self._lock:
             rt = self._ensure_ready()
             target_run_id = str(run_id or "").strip()
             if not target_run_id:
-                awaiting = rt.list_action_runs(status="PENDING_APPROVAL")
+                awaiting = [
+                    c
+                    for c in rt.query_objects(mdm.WorkCard, _SYSTEM_ACTOR)
+                    if c.status in ("OPEN", "IN_PROGRESS")
+                ]
                 if not awaiting:
                     return {
                         "ok": False,
                         "error": "当前没有待签批的新规格申请",
                         "state": self.state_snapshot(),
                     }
-                target_run_id = str(awaiting[0]["run_id"])
+                target_run_id = str(awaiting[0].card_id)
 
             steward = Actor(
                 actor_id=str(approver_id or mdm.STEWARD.actor_id),
@@ -842,8 +892,48 @@ class SteelMDMStudioApp:
                 clearance_tags=set(mdm.STEWARD.clearance_tags),
             )
             if op == "approve":
-                settled = rt.approve_action(target_run_id, steward)
-                spec_id = (settled.get("params") or {}).get("request_new_spec_id")
+                card = rt.get_object(mdm.WorkCard, target_run_id, steward)
+                req_params = json.loads(card.requested_params_json or "{}")
+                spec_id = str(
+                    req_params.get("request_new_spec_id")
+                    or req_params.get("canonical_spec_id")
+                    or "SPEC-C"
+                )
+                if not any(
+                    row["object_id"] == spec_id for row in rt.list_objects("MaterialSpec")
+                ):
+                    rt.submit_action(
+                        f"{target_run_id}-SPEC",
+                        "create_material_spec",
+                        {
+                            "spec_id": spec_id,
+                            "name": req_params.get("request_new_spec_name")
+                            or req_params.get("invoice_title")
+                            or spec_id,
+                            "ash_max_pct": float(req_params["ash_pct"]),
+                            "sulfur_max_pct": float(req_params["sulfur_pct"]),
+                        },
+                        steward,
+                    )
+                settled = mdm.settle_work_card(
+                    rt,
+                    target_run_id,
+                    steward,
+                    resolution_note="MDM 管家签批核准新物理品种",
+                    action_run_id=f"{target_run_id}-ACT",
+                    complete_run_id=f"{target_run_id}-COMP",
+                )
+                action_run = settled["settled_action_run"]
+                rt.submit_action(
+                    f"{target_run_id}-LINK",
+                    "map_legacy_sku_to_spec",
+                    {
+                        "sku_id": req_params["sku_id"],
+                        "canonical_spec_id": spec_id,
+                        "mapped_by": req_params.get("mapped_by") or card.requester_actor_id,
+                    },
+                    steward,
+                )
                 spec_c_exists = any(
                     row["object_id"] == spec_id or row["object_id"] == "SPEC-C"
                     for row in rt.list_objects("MaterialSpec")
@@ -852,26 +942,29 @@ class SteelMDMStudioApp:
                     "ok": True,
                     "op": "approve",
                     "run_id": target_run_id,
-                    "status": settled["status"],
+                    "status": action_run["status"],
                     "approved_by": steward.actor_id,
                     "spec_c_exists_in_mem": spec_c_exists,
                 }
                 self._mark_act_done("3", {**(self.meta.get("acts") or {}).get("3", {}), **res})
                 self._push_timeline(
                     "ACT 3 签批",
-                    f"MDM 管家 {steward.actor_id} 批准新规格入库 ({settled['status']})",
-                    "post_approval 原子创建物理规格并完成 sku_maps_to_spec 关联。",
+                    f"MDM 管家 {steward.actor_id} 批准新规格入库 ({action_run['status']})",
+                    "核准创建物理规格、完成建码结算并建立 sku_maps_to_spec 关联。",
                     "ok",
                 )
             elif op == "reject":
-                rejected = rt.reject_action(
-                    target_run_id, steward, reason="主数据管家驳回新规格申请"
+                rt.submit_action(
+                    f"{target_run_id}-REJ",
+                    "reject_work_card",
+                    {"card_id": target_run_id, "resolution_note": "主数据管家驳回新规格申请"},
+                    steward,
                 )
                 res = {
                     "ok": True,
                     "op": "reject",
                     "run_id": target_run_id,
-                    "status": rejected["status"],
+                    "status": "REJECTED",
                     "rejected_by": steward.actor_id,
                 }
                 self._push_timeline(
@@ -1148,13 +1241,21 @@ class SteelMDMStudioApp:
                     "error_code": r.get("error_code"),
                     "params": r.get("params"),
                 }
-                for r in rt.list_action_runs()[-12:]
-            ]
+                for r in rt.list_action_runs()
+                if not (
+                    r.get("status") == "REJECTED"
+                    and str(r.get("error_code") or "").startswith("APPROVAL_REQUIRED_")
+                )
+                and str(r.get("action_type") or "")
+                not in ("open_work_card", "complete_work_card", "cancel_work_card")
+            ][-12:]
 
             by_rid: dict[str, dict[str, Any]] = {}
             for item in list(self.meta.get("guardrail_history") or []):
                 by_rid[str(item["run_id"])] = dict(item)
             for r in rt.list_action_runs("REJECTED"):
+                if str(r.get("error_code") or "").startswith("APPROVAL_REQUIRED_"):
+                    continue
                 by_rid[str(r["run_id"])] = {
                     "run_id": r["run_id"],
                     "action_type": r["action_type"],
@@ -1167,11 +1268,12 @@ class SteelMDMStudioApp:
 
             awaiting = [
                 {
-                    "run_id": mv["run_id"],
-                    "action_type": mv["action_type"],
-                    "params": mv.get("params"),
+                    "run_id": c.card_id,
+                    "action_type": c.requested_action,
+                    "params": json.loads(c.requested_params_json or "{}"),
                 }
-                for mv in rt.list_action_runs("PENDING_APPROVAL")
+                for c in rt.query_objects(mdm.WorkCard, _SYSTEM_ACTOR)
+                if c.status in ("OPEN", "IN_PROGRESS")
             ]
             pending: list[dict[str, Any]] = []
 
@@ -1292,7 +1394,10 @@ class SteelMDMStudioApp:
             code = str(lp.get("error_code") or "")
             status_raw = str(lp.get("status") or "")
             status_map = {
-                "PENDING_APPROVAL": "待主管签批",
+                "OPEN": "待主管签批",
+                "IN_PROGRESS": "签批处理中",
+                "COMPLETED": "已完成核销",
+                "CANCELLED": "已撤销作废",
                 "COMMITTED": "已确认入账",
                 "REJECTED": "已当场拦截",
             }

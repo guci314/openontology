@@ -244,6 +244,10 @@ class FeishuERPDemoApp:
 
             audit_runs: list[dict[str, Any]] = []
             for run in reversed(self.runtime.list_action_runs()):
+                if run["status"] == "REJECTED" and str(run.get("error_code") or "").startswith("APPROVAL_REQUIRED_"):
+                    continue
+                if run.get("action_type") in ("complete_work_card", "reject_work_card", "cancel_work_card"):
+                    continue
                 view = format_run_for_executive(self.runtime, run)
                 audit_runs.append(view)
 
@@ -344,19 +348,16 @@ class FeishuERPDemoApp:
                         },
                     },
                 )
-                resp = self.executor.dispatch(
-                    "submit_action",
-                    {
-                        "run_id": confirm_run_id,
-                        "action": "confirm_sales_order",
-                        "params": {"order": "O2C-SO-002"},
-                    },
+                run = self.gateway.submit_or_escalate(
+                    confirm_run_id,
+                    "confirm_sales_order",
+                    {"order": "O2C-SO-002"},
+                    o2c.AI_AGENT,
                 )
-                run = resp["run"]
                 msg = (
                     "AI 已给订单 O2C-SO-002 打上「战略特批大客户」风控备注；"
                     "确认下单时检测到金额 ¥120,000.00 超出可用授信 ¥20,000.00，"
-                    "系统已自动挂起并推送飞书审批卡片，等待财务总监签字。此时真实 Odoo 仍为草稿。"
+                    "系统已安全拦截并开立签批单推送飞书，等待财务总监签字。此时真实 Odoo 仍为草稿。"
                 )
                 self._append_log("第二幕 · 超限大单挂起等签批", msg, level="warn")
                 return {
@@ -646,7 +647,7 @@ SHOWROOM_HTML = """<!doctype html>
   }
   .badge.draft { background: rgba(148,163,184,.2); color: #cbd5e1; }
   .badge.sale, .badge.confirmed, .badge.COMMITTED { background: rgba(16,185,129,.2); color: #34d399; }
-  .badge.PENDING_APPROVAL { background: rgba(245,158,11,.22); color: #fbbf24; }
+  .badge.OPEN, .badge.IN_PROGRESS { background: rgba(245,158,11,.22); color: #fbbf24; }
   .badge.REJECTED, .badge.CONFLICT { background: rgba(239,68,68,.2); color: #fca5a5; }
   .badge.REVERTED { background: rgba(100,116,139,.3); color: #cbd5e1; }
   .kv { font-size: 12px; color: var(--muted); line-height: 1.7; }
@@ -681,7 +682,7 @@ SHOWROOM_HTML = """<!doctype html>
     font-size: 12px;
   }
   .audit-item.REJECTED, .audit-item.CONFLICT { border-left-color: var(--red); }
-  .audit-item.PENDING_APPROVAL { border-left-color: var(--orange); }
+  .audit-item.OPEN, .audit-item.IN_PROGRESS { border-left-color: var(--orange); }
   .audit-item.COMMITTED { border-left-color: var(--green); }
   .audit-item.REVERTED { border-left-color: #64748b; }
   /* 右屏：飞书移动端交互卡片风格 */
@@ -906,7 +907,7 @@ function renderState(state) {
       : '';
 
     let actionBlock = '';
-    if (v.status === 'PENDING_APPROVAL') {
+    if (v.status === 'OPEN' || v.status === 'IN_PROGRESS') {
       actionBlock = `
         <div class="f-actions">
           <button class="f-btn primary" onclick="cardAction('approve','${esc(v.run_id)}')">批准并写入 ERP</button>
@@ -1140,7 +1141,7 @@ def run_walkthrough() -> dict[str, Any]:
             f"[第二幕 · 人机共治] run={confirm_run_id} status={act2['status']} "
             f"| Odoo O2C-SO-002={app.adapter.order_row('O2C-SO-002')['state']}"
         )
-        assert act2["status"] == "PENDING_APPROVAL"
+        assert act2["status"] == "OPEN"
         assert app.adapter.order_row("O2C-SO-002")["state"] == "draft"
 
         # 第三幕：财务总监飞书卡片点【批准并写入 ERP】+ 同步重刷保留特批备注

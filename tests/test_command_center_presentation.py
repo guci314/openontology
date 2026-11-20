@@ -1501,24 +1501,47 @@ def test_workspace_alias_drives_actions_approval_audit_and_simulation(base):
     assert runs["instance"] == "coldchain-wave3"
     assert any(run["run_id"] == "CWS05-RUN-1" for run in runs["runs"])
 
-    pending = _post_json(
+    opened = _post_json(
         base,
         "/api/submit?workspace=osv2-coil-prod",
         {
             "workspace": "osv2-coil-prod",
-            "run_id": "CWS05-APPROVE-1",
+            "run_id": "CWS05-APPROVE-1-OPEN",
+            "action": "open_work_card",
+            "params": {
+                "card_id": "CWS05-APPROVE-1",
+                "card_kind": "APPROVAL",
+                "target_object_type": "SteelCoil",
+                "target_object_id": "C-2",
+                "requested_action": "request_price_change",
+                "requested_params_json": '{"asset_id": "C-2", "unit_price_ton": 24500.0}',
+                "assignee_role": "finance_manager",
+            },
+        },
+    )
+    assert opened["run"]["status"] == "COMMITTED"
+
+    approved = _post_json(
+        base,
+        "/api/submit?workspace=osv2-coil-prod&role=finance_manager",
+        {
+            "workspace": "osv2-coil-prod",
+            "run_id": "CWS05-APPROVE-1-ACT",
             "action": "request_price_change",
             "params": {"asset_id": "C-2", "unit_price_ton": 24500.0},
         },
     )
-    assert pending["run"]["status"] == "PENDING_APPROVAL"
-
-    approved = _post_json(
-        base,
-        "/api/approve?workspace=osv2-coil-prod&role=finance_manager",
-        {"workspace": "osv2-coil-prod", "run_id": "CWS05-APPROVE-1"},
-    )
     assert approved["run"]["status"] == "COMMITTED"
+    _post_json(
+        base,
+        "/api/submit?workspace=osv2-coil-prod&role=finance_manager",
+        {
+            "workspace": "osv2-coil-prod",
+            "run_id": "CWS05-APPROVE-1-COMP",
+            "action": "complete_work_card",
+            "params": {"card_id": "CWS05-APPROVE-1", "settled_run_id": "CWS05-APPROVE-1-ACT"},
+        },
+    )
 
 
 def test_workspace_alias_preserves_role_masking(base):

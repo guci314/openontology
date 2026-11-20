@@ -203,7 +203,8 @@ class ActionBlueprint(BaseModel):
     name: str
     description: str = ""
     allowed_roles: list[str] = Field(default_factory=lambda: ["admin", "ai_agent"])
-    approver_roles: list[str] = Field(default_factory=lambda: ["admin"])
+    approver_roles: list[str] = Field(default_factory=list)
+    revert_roles: list[str] = Field(default_factory=list)
     approval_rule: dict[str, Any] | None = None
     approval_target_type: str | None = None
     approval_id_param: str | None = None
@@ -328,6 +329,7 @@ class EvolutionPatch(BaseModel):
     remove_invariants: list[str] = Field(default_factory=list)
     update_approval_rules: dict[str, dict[str, Any]] = Field(default_factory=dict)
     update_approver_roles: dict[str, list[str]] = Field(default_factory=dict)
+    update_revert_roles: dict[str, list[str]] = Field(default_factory=dict)
     add_views: list[ScopedViewBlueprint] = Field(default_factory=list)
     update_views: list[ScopedViewBlueprint] = Field(default_factory=list)
     migrations: list[FieldMigrationSpec] = Field(default_factory=list)
@@ -987,6 +989,14 @@ def apply_evolution_patch(
                 code="UNKNOWN_ACTION",
             )
         candidate.actions[act_by_name[act_name]].approver_roles = list(roles)
+
+    for act_name, roles in patch.update_revert_roles.items():
+        if act_name not in act_by_name:
+            raise InvariantError(
+                f"patch sets revert_roles on unknown action {act_name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        candidate.actions[act_by_name[act_name]].revert_roles = list(roles)
 
     removed = set(patch.remove_invariants)
     candidate.invariants = [inv for inv in candidate.invariants if inv.name not in removed]
@@ -1901,6 +1911,7 @@ def compile_blueprint(
             params_cls,
             allowed_roles=tuple(act.allowed_roles),
             approver_roles=tuple(act.approver_roles),
+            revert_roles=tuple(act.revert_roles),
             approval_rule=approval_fn,
             affects_source=act.affects_source,
             description=act.description,

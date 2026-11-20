@@ -22,6 +22,12 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+from examples.business_ontology import (
+    WorkCard,
+    register_work_card_primitives,
+    settle_work_card,
+    submit_or_open_work_card,
+)
 from open_ontology import (
     Actor,
     InterfaceType,
@@ -129,13 +135,17 @@ def adjust_price(ctx: Any, params: AdjustPriceParams) -> None:
 @spec.action(
     "request_price_change",
     AdjustPriceParams,
-    allowed_roles=("ops", "finance", "admin"),
-    approver_roles=("finance_manager",),
-    approval_rule=lambda params, actor: params.unit_price_ton > 20000,
+    allowed_roles=("ops", "finance", "finance_manager", "admin"),
+    revert_roles=("finance_manager",),
     description="超过 2 万元/吨的改价需要财务经理批准",
 )
 def request_price_change(ctx: Any, params: AdjustPriceParams) -> None:
     coil = ctx.require(SteelCoil, params.asset_id)
+    if params.unit_price_ton > 20000 and ctx.actor.role != "finance_manager":
+        raise InvariantError(
+            f"unit_price_ton={params.unit_price_ton} > 20000 requires finance_manager approval via WorkCard",
+            code="APPROVAL_REQUIRED_PREMIUM_PRICE",
+        )
     ctx.modify(coil, unit_price_ton=params.unit_price_ton)
 
 
@@ -172,18 +182,35 @@ def log_low_stock(runtime: OntologyRuntime, coil: SteelCoil, actor: Actor) -> di
     "escalate_premium_price",
     SteelCoil,
     lambda coil: coil.unit_price_ton > 20000,
-    description="高价钢卷改价走审批流",
+    description="高价钢卷改价签发 M1 WorkCard 审批单",
 )
 def escalate_premium_price(
     runtime: OntologyRuntime, coil: SteelCoil, actor: Actor
 ) -> dict[str, Any]:
-    run = runtime.submit_action(
-        f"AUTO-ESCALATE-{next(AUTO_RUN_IDS):04d}",
+    rid = f"AUTO-ESCALATE-{next(AUTO_RUN_IDS):04d}"
+    res = submit_or_open_work_card(
+        runtime,
+        rid,
         "request_price_change",
         {"asset_id": coil.asset_id, "unit_price_ton": coil.unit_price_ton + 100.0},
         actor,
+        target_object_type="SteelCoil",
+        target_object_id=coil.asset_id,
+        assignee_role="finance_manager",
+        card_id=rid,
     )
-    return {"run_id": run["run_id"], "status": run["status"]}
+    return {
+        "run_id": rid,
+        "card_id": res.get("card_id", rid),
+        "status": res.get("work_card_status", res["status"]),
+    }
+
+
+register_work_card_primitives(
+    spec,
+    opener_roles=("ops", "finance", "finance_manager", "admin"),
+    resolver_roles=("finance_manager", "admin"),
+)
 
 
 OPS = Actor(actor_id="ops-01", role="ops", clearance_tags={"*"})
@@ -397,14 +424,19 @@ def test_automation_can_open_pending_approval(rt):
         )
         fired = rt2.evaluate_automations(OPS, automation="escalate_premium_price")
         assert len(fired) == 1
-        assert fired[0]["result"]["status"] == "PENDING_APPROVAL"
+        assert fired[0]["result"]["status"] == "OPEN"
+        assert rt2.list_action_runs(status="PENDING_APPROVAL") == []
 
-        run_id = fired[0]["result"]["run_id"]
-        approved = rt2.approve_action(
-            run_id, Actor(actor_id="cfo", role="finance_manager", clearance_tags={"*"})
+        card_id = fired[0]["result"]["card_id"]
+        settled = settle_work_card(
+            rt2,
+            card_id,
+            Actor(actor_id="cfo", role="finance_manager", clearance_tags={"*"}),
+            action_run_id=f"{card_id}-ACT",
         )
-        assert approved["status"] == "COMMITTED"
+        assert settled["settled_action_run"]["status"] == "COMMITTED"
         assert rt2.get_object(SteelCoil, "A-3", SYSTEM).unit_price_ton == 30100.0
+        assert rt2.get_object(WorkCard, card_id, SYSTEM).status == "COMPLETED"
     finally:
         rt2.close()
 
@@ -600,7 +632,7 @@ def test_workshop_index_returns_interactive_html(workshop):
 def test_workshop_meta_and_fingerprint(workshop):
     meta = _http(workshop.base_url + "/api/meta")
     assert meta["ok"] is True
-    assert {t["name"] for t in meta["object_types"]} == {"SteelCoil", "ScrapLot"}
+    assert {t["name"] for t in meta["object_types"]} == {"SteelCoil", "ScrapLot", "WorkCard"}
     assert [i["name"] for i in meta["interfaces"]] == ["PricedAsset"]
     assert {a["name"] for a in meta["automations"]} == {
         "fill_missing_grade",
@@ -645,43 +677,74 @@ def test_workshop_simulate_and_submit(workshop):
 
 
 def test_workshop_automations_approve_and_revert(workshop):
-    # 1) 提交一笔超限改价 → 进入 PENDING_APPROVAL
-    pending = _http(
+    # 1) 普通提交角色直接提交超限改价被前置拦截，并开出 M1 WorkCard
+    with pytest.raises(urllib.error.HTTPError) as blocked:
+        _http(
+            workshop.base_url + "/api/submit",
+            {
+                "run_id": "WS-PENDING-1-TRY",
+                "action": "request_price_change",
+                "params": {"asset_id": "C-1", "unit_price_ton": 25000.0},
+            },
+        )
+    assert blocked.value.code == 400
+    opened = _http(
         workshop.base_url + "/api/submit",
         {
-            "run_id": "WS-PENDING-1",
+            "run_id": "WS-PENDING-1-OPEN",
+            "action": "open_work_card",
+            "params": {
+                "card_id": "WS-PENDING-1",
+                "card_kind": "APPROVAL",
+                "target_object_type": "SteelCoil",
+                "target_object_id": "C-1",
+                "requested_action": "request_price_change",
+                "requested_params_json": '{"asset_id": "C-1", "unit_price_ton": 25000.0}',
+                "assignee_role": "finance_manager",
+            },
+        },
+    )
+    assert opened["run"]["status"] == "COMMITTED"
+
+    # 2) 财务经理在 t1 重新执行改价 + 核销 WorkCard
+    approved = _http(
+        workshop.base_url + "/api/submit?role=finance_manager",
+        {
+            "run_id": "WS-PENDING-1-ACT",
             "action": "request_price_change",
             "params": {"asset_id": "C-1", "unit_price_ton": 25000.0},
         },
     )
-    assert pending["run"]["status"] == "PENDING_APPROVAL"
-
-    # 2) 财务经理批准
-    approved = _http(
-        workshop.base_url + "/api/approve?role=finance_manager",
-        {"run_id": "WS-PENDING-1"},
-    )
     assert approved["run"]["status"] == "COMMITTED"
-    assert approved["run"]["approved_by"] == "workshop:finance_manager"
+    assert approved["run"]["actor_id"] == "workshop:finance_manager"
+    completed = _http(
+        workshop.base_url + "/api/submit?role=finance_manager",
+        {
+            "run_id": "WS-PENDING-1-COMP",
+            "action": "complete_work_card",
+            "params": {"card_id": "WS-PENDING-1", "settled_run_id": "WS-PENDING-1-ACT"},
+        },
+    )
+    assert completed["run"]["status"] == "COMMITTED"
 
     # 3) 时光机撤回：普通提交角色拒绝 403，财务经理可冲正回滚
     with pytest.raises(urllib.error.HTTPError) as denied:
         _http(
             workshop.base_url + "/api/revert",
-            {"run_id": "WS-PENDING-1", "revert_run_id": "WS-REV-DENIED"},
+            {"run_id": "WS-PENDING-1-ACT", "revert_run_id": "WS-REV-DENIED"},
         )
     assert denied.value.code == 403
 
     reverted = _http(
         workshop.base_url + "/api/revert?role=finance_manager",
-        {"run_id": "WS-PENDING-1", "revert_run_id": "WS-REV-1"},
+        {"run_id": "WS-PENDING-1-ACT", "revert_run_id": "WS-REV-1"},
     )
     assert reverted["run"]["status"] == "COMMITTED"
     statuses = {
         run["run_id"]: run["status"]
         for run in _http(workshop.base_url + "/api/action-runs")["runs"]
     }
-    assert statuses["WS-PENDING-1"] == "REVERTED"
+    assert statuses["WS-PENDING-1-ACT"] == "REVERTED"
 
     # 4) 一键触发 evaluate_automations
     fired = _http(workshop.base_url + "/api/automations/run", {})

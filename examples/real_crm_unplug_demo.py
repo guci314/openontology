@@ -761,7 +761,7 @@ def main() -> dict[str, Any]:
         f" refunded={_money(refunded_order.refunded_cents)}"
     )
 
-    _section("7. Phase B — 大额退款触发 PENDING_APPROVAL + 经理放行")
+    _section("7. Phase B — 大额退款触发 M1 WorkCard (OPEN) + 经理结算放行")
     runtime.submit_action(
         "OFFLINE-BIG-CASE",
         "open_customer_case",
@@ -774,7 +774,8 @@ def main() -> dict[str, Any]:
         },
         dom.SUPPORT_AGENT,
     )
-    pending = runtime.submit_action(
+    pending = dom.submit_or_open_work_card(
+        runtime,
         "OFFLINE-REFUND-BIG",
         "resolve_case_with_refund",
         {
@@ -783,13 +784,23 @@ def main() -> dict[str, Any]:
             "reason": "customer changed mind",
         },
         dom.AI_AGENT,
+        target_object_type="SalesOrder",
+        target_object_id="SO-OFFLINE-001",
+        assignee_role="ops_manager",
+        card_id="OFFLINE-REFUND-BIG",
     )
     print(
-        f"  big refund submit status={pending['status']}"
+        f"  big refund submit status={pending['status']} ({pending['work_card_status']})"
         f" amount={_money(offline_order.total_cents)}"
     )
-    approved = runtime.approve_action("OFFLINE-REFUND-BIG", dom.OPS_MANAGER)
-    print(f"  approved by={approved['approved_by']} status={approved['status']}")
+    settled = dom.settle_work_card(
+        runtime,
+        "OFFLINE-REFUND-BIG",
+        dom.OPS_MANAGER,
+        action_run_id="OFFLINE-REFUND-BIG-ACT",
+    )
+    approved = settled.get("settled_action_run", settled)
+    print(f"  settled by={approved['actor_id']} status={approved['status']}")
     big_order = runtime.get_object(
         dom.SalesOrder, "SO-OFFLINE-001", dom.OPS_MANAGER
     )

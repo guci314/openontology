@@ -129,7 +129,7 @@ def _confirm_sales_order_action_bp(*extra_preconditions: InvariantRuleSpec) -> A
         name="confirm_sales_order",
         description="确认草稿销售订单",
         allowed_roles=["ai_agent", "finance_director", "admin"],
-        approver_roles=["finance_director", "admin"],
+        revert_roles=["finance_director", "admin"],
         affects_source=True,
         display_label="确认销售订单",
         params=[

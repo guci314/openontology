@@ -153,37 +153,68 @@ def test_quality_mismatch_rejected(base_demo):
 
 
 # ---------------------------------------------------------------------------
-# 4. New physical variety requires steward approval and only then appears
+# 4. New physical variety requires steward WorkCard + create_material_spec before SKU
 # ---------------------------------------------------------------------------
 def test_new_spec_requires_approval_then_creates_spec_and_sku(base_demo):
     runtime = base_demo.runtime
-    params = _new_spec_params()
+    params = _new_spec_params(mapped_by=steel.BUYER.actor_id)
 
     simulation = runtime.simulate_action(
         "register_contract_sku", params, steel.BUYER
     )
-    assert simulation.valid is True
-    assert simulation.requires_approval is True
-    created = {
-        (change.object_type, change.object_id, change.kind)
-        for change in simulation.diff.object_changes
-    }
-    assert ("ContractSKU", "ERP-SKU-9102", "create") in created
-    assert ("MaterialSpec", "SPEC-C", "create") in created
+    assert simulation.valid is False
+    assert simulation.error_code == "APPROVAL_REQUIRED_NEW_MATERIAL_SPEC"
     assert runtime.count_objects("MaterialSpec") == 2
 
-    pending = runtime.submit_action(
-        "REG-NEW-SPEC", "register_contract_sku", params, steel.BUYER
+    pending = steel.submit_or_open_work_card(
+        runtime,
+        "REG-NEW-SPEC",
+        "register_contract_sku",
+        params,
+        steel.BUYER,
+        target_object_type="ContractSKU",
+        target_object_id="ERP-SKU-9102",
+        assignee_role="mdm_steward",
+        card_id="REG-NEW-SPEC",
     )
-    assert pending["status"] == "PENDING_APPROVAL"
+    assert pending["status"] == "AWAITING_WORK_CARD"
+    assert pending["work_card_status"] == "OPEN"
+    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
     with pytest.raises(ObjectNotFoundError):
         runtime.get_object(steel.MaterialSpec, "SPEC-C", steel.STEWARD)
     with pytest.raises(ObjectNotFoundError):
         _sku(runtime, "ERP-SKU-9102")
 
-    approved = runtime.approve_action("REG-NEW-SPEC", steel.STEWARD)
+    runtime.submit_action(
+        "REG-NEW-SPEC-SPEC",
+        "create_material_spec",
+        {
+            "spec_id": "SPEC-C",
+            "name": "三级冶金焦 (CSR>=45%)",
+            "ash_max_pct": 14.0,
+            "sulfur_max_pct": 1.0,
+        },
+        steel.STEWARD,
+    )
+    settled = steel.settle_work_card(
+        runtime,
+        "REG-NEW-SPEC",
+        steel.STEWARD,
+        action_run_id="REG-NEW-SPEC-ACT",
+    )
+    approved = settled["settled_action_run"]
     assert approved["status"] == "COMMITTED"
-    assert approved["approved_by"] == steel.STEWARD.actor_id
+    assert approved["actor_id"] == steel.STEWARD.actor_id
+    runtime.submit_action(
+        "REG-NEW-SPEC-LINK",
+        "map_legacy_sku_to_spec",
+        {
+            "sku_id": "ERP-SKU-9102",
+            "canonical_spec_id": "SPEC-C",
+            "mapped_by": steel.BUYER.actor_id,
+        },
+        steel.STEWARD,
+    )
 
     new_spec = runtime.get_object(
         steel.MaterialSpec, "SPEC-C", steel.STEWARD
@@ -200,19 +231,59 @@ def test_new_spec_requires_approval_then_creates_spec_and_sku(base_demo):
 
 def test_revert_new_spec_removes_spec_sku_and_link(base_demo):
     runtime = base_demo.runtime
-    runtime.submit_action(
+    params = _new_spec_params(mapped_by=steel.BUYER.actor_id)
+    steel.submit_or_open_work_card(
+        runtime,
         "REG-NEW-SPEC",
         "register_contract_sku",
-        _new_spec_params(),
+        params,
         steel.BUYER,
+        target_object_type="ContractSKU",
+        target_object_id="ERP-SKU-9102",
+        assignee_role="mdm_steward",
+        card_id="REG-NEW-SPEC",
     )
-    runtime.approve_action("REG-NEW-SPEC", steel.STEWARD)
+    runtime.submit_action(
+        "REG-NEW-SPEC-SPEC",
+        "create_material_spec",
+        {
+            "spec_id": "SPEC-C",
+            "name": "三级冶金焦 (CSR>=45%)",
+            "ash_max_pct": 14.0,
+            "sulfur_max_pct": 1.0,
+        },
+        steel.STEWARD,
+    )
+    steel.settle_work_card(
+        runtime,
+        "REG-NEW-SPEC",
+        steel.STEWARD,
+        action_run_id="REG-NEW-SPEC-ACT",
+    )
+    runtime.submit_action(
+        "REG-NEW-SPEC-LINK",
+        "map_legacy_sku_to_spec",
+        {
+            "sku_id": "ERP-SKU-9102",
+            "canonical_spec_id": "SPEC-C",
+            "mapped_by": steel.BUYER.actor_id,
+        },
+        steel.STEWARD,
+    )
 
-    revert = runtime.revert_action(
-        "REG-NEW-SPEC", "REG-NEW-SPEC-REV", steel.STEWARD
+    rev_link = runtime.revert_action(
+        "REG-NEW-SPEC-LINK", "REG-NEW-SPEC-LINK-REV", steel.STEWARD
     )
-    assert revert["status"] == "COMMITTED"
-    assert runtime.get_action_run("REG-NEW-SPEC")["status"] == "REVERTED"
+    rev_act = runtime.revert_action(
+        "REG-NEW-SPEC-ACT", "REG-NEW-SPEC-ACT-REV", steel.STEWARD
+    )
+    rev_spec = runtime.revert_action(
+        "REG-NEW-SPEC-SPEC", "REG-NEW-SPEC-SPEC-REV", steel.STEWARD
+    )
+    assert rev_link["status"] == "COMMITTED"
+    assert rev_act["status"] == "COMMITTED"
+    assert rev_spec["status"] == "COMMITTED"
+    assert runtime.get_action_run("REG-NEW-SPEC-ACT")["status"] == "REVERTED"
 
     with pytest.raises(ObjectNotFoundError):
         runtime.get_object(steel.MaterialSpec, "SPEC-C", steel.STEWARD)
@@ -241,6 +312,17 @@ def test_existing_spec_registration_is_instant_and_linked(base_demo):
     )
     assert run["status"] == "COMMITTED"
     assert run["approved_by"] is None
+    link_run = runtime.submit_action(
+        "REG-EXISTING-LINK",
+        "map_legacy_sku_to_spec",
+        {
+            "sku_id": "ERP-SKU-9103",
+            "canonical_spec_id": "SPEC-B",
+            "mapped_by": steel.BUYER.actor_id,
+        },
+        steel.BUYER,
+    )
+    assert link_run["status"] == "COMMITTED"
 
     sku = _sku(runtime, "ERP-SKU-9103")
     assert sku.canonical_spec_id == "SPEC-B"

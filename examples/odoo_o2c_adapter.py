@@ -97,7 +97,6 @@ class OdooO2CAdapter:
         self._seen: set[str] = {
             run["run_id"]
             for run in runtime.list_action_runs()
-            if run["status"] != "PENDING_APPROVAL"
         }
         self._evidence_by_run: dict[str, dict[str, Any]] = {}
 
@@ -754,8 +753,6 @@ class OdooO2CAdapter:
         for run in self.runtime.list_action_runs():
             run_id = run["run_id"]
             if run_id in self._seen:
-                continue
-            if run["status"] == "PENDING_APPROVAL":
                 continue
             if run["status"] != "COMMITTED":
                 self._seen.add(run_id)
@@ -1579,17 +1576,28 @@ def main() -> dict[str, Any]:
         f" amount_residual={docs['amount_residual']}"
     )
 
-    _section("8. AI 提交超信用额度大单 -> 财务总监审批 -> 真实 Odoo 确认")
-    ai_run = runtime.submit_action(
+    _section("8. AI 提交超信用额度大单 -> 签发 WorkCard -> 财务总监结算 -> 真实 Odoo 确认")
+    ai_res = o2c.submit_or_open_work_card(
+        runtime,
         "O2C-CONFIRM-002",
         "confirm_sales_order",
         {"order": "O2C-SO-002"},
         o2c.AI_AGENT,
+        target_object_type="SalesOrder",
+        target_object_id="O2C-SO-002",
+        assignee_role="finance_director",
+        card_id="O2C-CONFIRM-002",
     )
-    print(f"  AI submit status={ai_run['status']}")
-    print(f"  Odoo while pending={adapter.order_row('O2C-SO-002')['state']}")
-    approved = runtime.approve_action("O2C-CONFIRM-002", o2c.FINANCE_DIRECTOR)
-    print(f"  approved by={approved['approved_by']} status={approved['status']}")
+    print(f"  AI submit status={ai_res['status']} card_status={ai_res['work_card_status']}")
+    print(f"  Odoo while open={adapter.order_row('O2C-SO-002')['state']}")
+    settled = o2c.settle_work_card(
+        runtime,
+        "O2C-CONFIRM-002",
+        o2c.FINANCE_DIRECTOR,
+        action_run_id="O2C-CONFIRM-002-ACT",
+    )
+    act_run = settled["settled_action_run"]
+    print(f"  settled by={act_run['actor_id']} status={act_run['status']}")
     for item in adapter.process_new_runs():
         print(f"  writeback {item}")
     print(f"  Odoo after approve={adapter.order_row('O2C-SO-002')['state']}")

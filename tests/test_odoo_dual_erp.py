@@ -190,7 +190,8 @@ def test_ai_large_cancel_requires_approval_then_writes_back(env):
     bridge = demo.OdooWritebackBridge(runtime, data)
     client = data.client("erp_south")
 
-    pending = runtime.submit_action(
+    pending = dom.submit_or_open_work_card(
+        runtime,
         "RUN-AI-LARGE",
         "cancel_order",
         {
@@ -200,17 +201,34 @@ def test_ai_large_cancel_requires_approval_then_writes_back(env):
             "order_total_cents": 6_000_000,
         },
         demo.AI_AGENT,
+        target_object_type="Order",
+        target_object_id="S-SO002",
+        assignee_role="ops_manager",
+        card_id="RUN-AI-LARGE",
     )
-    assert pending["status"] == "PENDING_APPROVAL"
+    assert pending["status"] == "AWAITING_WORK_CARD"
+    assert pending["work_card_status"] == "OPEN"
+    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
     assert bridge.process_new_runs() == []
     assert client.order_state("S-SO002") == "sale"
     assert runtime.get_object(
         dom.Order, "S-SO002", demo.OPS_MANAGER
     ).status == "pending"
 
-    approved = runtime.approve_action("RUN-AI-LARGE", demo.OPS_MANAGER)
+    settled = dom.settle_work_card(
+        runtime,
+        "RUN-AI-LARGE",
+        demo.OPS_MANAGER,
+        action_run_id="RUN-AI-LARGE-ACT",
+    )
+    approved = settled["settled_action_run"]
     assert approved["status"] == "COMMITTED"
-    assert approved["approved_by"] == "ops-manager"
+    assert approved["actor_id"] == "ops-manager"
+    assert (
+        runtime.get_object(dom.WorkCard, "RUN-AI-LARGE", demo.OPS_MANAGER)
+        .resolved_by_actor_id
+        == "ops-manager"
+    )
 
     evidence = bridge.process_new_runs()
     assert len(evidence) == 1

@@ -14,7 +14,11 @@ from examples.business_ontology import (
     EventVoucher,
     MasterEntity,
     ProcessDocument,
+    WorkCard,
+    register_work_card_primitives,
+    settle_work_card,
     spec as business_spec,
+    submit_or_open_work_card,
 )
 from open_ontology import (
     Actor,
@@ -220,29 +224,36 @@ def test_transition_invariant_supports_one_and_two_arg_handlers_and_approval_rec
 
     s.object_type(Counter)
 
+    register_work_card_primitives(s, opener_roles=("worker", "admin"), resolver_roles=("admin",))
+
     @s.action(
         "set_value",
         StepParams,
         allowed_roles=("worker", "admin"),
-        approver_roles=("admin",),
-        approval_rule=lambda p, _a: bool(p.needs_approval),
+        revert_roles=("admin",),
         affects_source=False,
     )
     def set_value(ctx, params):
+        if params.needs_approval and ctx.actor.role != "admin":
+            raise InvariantError("needs admin approval", code="APPROVAL_REQUIRED_STEP")
         c = ctx.require(Counter, params.cid)
         ctx.modify(c, value=params.target)
 
     @s.transition_invariant("monotonic_increase", code="NON_MONOTONIC")
     def monotonic_increase(diff) -> bool:
         for ch in diff.object_changes:
-            if ch.kind == "update" and ch.after["value"] <= ch.before["value"]:
+            if (
+                ch.object_type == "Counter"
+                and ch.kind == "update"
+                and ch.after["value"] <= ch.before["value"]
+            ):
                 return False
         return True
 
     @s.transition_invariant("cap_from_view", code="STEP_TOO_LARGE")
     def cap_from_view(diff, view) -> bool:
         for ch in diff.object_changes:
-            if ch.kind == "update":
+            if ch.object_type == "Counter" and ch.kind == "update":
                 live = view.get(Counter, ch.object_id)
                 if live is not None and (ch.after["value"] - ch.before["value"]) > 10:
                     return False
@@ -263,16 +274,24 @@ def test_transition_invariant_supports_one_and_two_arg_handlers_and_approval_rec
         assert sim_big.valid is False
         assert sim_big.error_code == "STEP_TOO_LARGE"
 
-        pending = rt.submit_action(
+        worker = Actor(actor_id="worker-01", role="worker", clearance_tags={"*"})
+        pending = submit_or_open_work_card(
+            rt,
             "RUN-PEND",
             "set_value",
             {"cid": "C-1", "target": 15, "needs_approval": True},
-            ADMIN,
+            worker,
+            target_object_type="Counter",
+            target_object_id="C-1",
+            assignee_role="admin",
+            card_id="RUN-PEND",
         )
-        assert pending["status"] == "PENDING_APPROVAL"
-        approved = rt.approve_action("RUN-PEND", ADMIN)
+        assert pending["status"] == "AWAITING_WORK_CARD"
+        assert pending["work_card_status"] == "OPEN"
+        approved = settle_work_card(rt, "RUN-PEND", ADMIN)
         assert approved["status"] == "COMMITTED"
         assert rt.get_object(Counter, "C-1", ADMIN).value == 15
+        assert rt.get_object(WorkCard, "RUN-PEND", ADMIN).status == "COMPLETED"
     finally:
         rt.close()
 

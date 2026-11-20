@@ -337,22 +337,40 @@ def test_offline_large_refund_needs_manager_approval(unplugged):
         },
         dom.SUPPORT_AGENT,
     )
-    pending = runtime.submit_action(
+    pending = dom.submit_or_open_work_card(
+        runtime,
         "T-BIG-REFUND",
         "resolve_case_with_refund",
         {"case_id": "CASE-BIG", "order_id": "SO-BIG"},
         dom.AI_AGENT,
+        target_object_type="SalesOrder",
+        target_object_id="SO-BIG",
+        assignee_role="ops_manager",
+        card_id="T-BIG-REFUND",
     )
-    assert pending["status"] == "PENDING_APPROVAL"
+    assert pending["status"] == "AWAITING_WORK_CARD"
+    assert pending["work_card_status"] == "OPEN"
+    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
 
-    # nothing changed while pending
+    # nothing changed while card is open
     order = runtime.get_object(dom.SalesOrder, "SO-BIG", dom.OPS_MANAGER)
     assert order.status == "confirmed"
     assert order.refunded_cents == 0
 
-    approved = runtime.approve_action("T-BIG-REFUND", dom.OPS_MANAGER)
+    settled = dom.settle_work_card(
+        runtime,
+        "T-BIG-REFUND",
+        dom.OPS_MANAGER,
+        action_run_id="T-BIG-REFUND-ACT",
+    )
+    approved = settled.get("settled_action_run", settled)
     assert approved["status"] == "COMMITTED"
-    assert approved["approved_by"] == dom.OPS_MANAGER.actor_id
+    assert approved["actor_id"] == dom.OPS_MANAGER.actor_id
+    assert (
+        runtime.get_object(dom.WorkCard, "T-BIG-REFUND", dom.OPS_MANAGER)
+        .resolved_by_actor_id
+        == dom.OPS_MANAGER.actor_id
+    )
 
     order = runtime.get_object(dom.SalesOrder, "SO-BIG", dom.OPS_MANAGER)
     assert order.status == "refunded"

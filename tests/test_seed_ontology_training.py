@@ -164,7 +164,7 @@ def test_business_seed_ontology_full_4_archetypes_and_balance_conservation_in_cr
                 ActionBlueprint(
                     name="post_invoice",
                     allowed_roles=["finance", "ai_agent"],
-                    approver_roles=["finance"],
+                    revert_roles=["finance"],
                     params=[
                         FieldSpec(name="order_id", field_type="str", required=True),
                         FieldSpec(name="ledger_id", field_type="str", required=True),
@@ -375,7 +375,7 @@ def test_domain_swap_clinical_seed_ontology_enforces_custom_axioms_and_bounds_se
                 ActionBlueprint(
                     name="prescribe_dose",
                     allowed_roles=["attending_physician", "ai_agent"] if use_valid_roles else ["sales_rep"],
-                    approver_roles=["attending_physician"] if use_valid_roles else ["sales_rep"],
+                    revert_roles=["attending_physician"] if use_valid_roles else ["sales_rep"],
                     params=[
                         FieldSpec(name="rx_id", field_type="str", required=True),
                         FieldSpec(name="dosage_mg", field_type="int", required=True),

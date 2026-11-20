@@ -36,13 +36,17 @@ from .steel_mdm_ontology import (
     RegisterSkuParams,
     SKU_MAPS_TO_SPEC,
     STEWARD,
+    WorkCard,
     consume_by_brand_fifo,
+    create_material_spec,
     map_legacy_sku_to_spec,
     receive_material_lot,
     recommend_spec_for_sku,
     reconcile_multi_view_ledger,
     register_contract_sku,
+    settle_work_card,
     spec,
+    submit_or_open_work_card,
 )
 
 
@@ -270,29 +274,63 @@ def main() -> dict[str, Any]:
     except InvariantError as exc:
         print(f"  blocked mismatch: code={exc.code}")
 
-    pending = runtime.submit_action(
+    new_sku_params = {
+        "sku_id": "ERP-SKU-9102",
+        "invoice_title": "河北焦化新规格试采购",
+        "brand_id": "BRAND-2",
+        "unit_price_ton": 1400,
+        "ash_pct": 14.0,
+        "sulfur_pct": 1.0,
+        "request_new_spec_id": "SPEC-C",
+        "request_new_spec_name": "三级冶金焦 (CSR>=45%)",
+        "mapped_by": BUYER.actor_id,
+    }
+    pending = submit_or_open_work_card(
+        runtime,
         "REG-NEW-SPEC",
         "register_contract_sku",
-        {
-            "sku_id": "ERP-SKU-9102",
-            "invoice_title": "河北焦化新规格试采购",
-            "brand_id": "BRAND-2",
-            "unit_price_ton": 1400,
-            "ash_pct": 14.0,
-            "sulfur_pct": 1.0,
-            "request_new_spec_id": "SPEC-C",
-            "request_new_spec_name": "三级冶金焦 (CSR>=45%)",
-        },
+        new_sku_params,
         BUYER,
+        target_object_type="ContractSKU",
+        target_object_id="ERP-SKU-9102",
+        assignee_role="mdm_steward",
+        card_id="REG-NEW-SPEC",
     )
-    print(f"  new spec request status={pending['status']}")
+    print(f"  new spec request status={pending['status']} card={pending['work_card_status']}")
     spec_c_exists = runtime.connection.execute(
         "SELECT 1 FROM ontology_objects "
         "WHERE object_type='MaterialSpec' AND object_id='SPEC-C'"
     ).fetchone() is not None
     print(f"  before approval: SPEC-C exists={spec_c_exists}")
-    approved = runtime.approve_action("REG-NEW-SPEC", STEWARD)
-    print(f"  approved by={approved['approved_by']} status={approved['status']}")
+    runtime.submit_action(
+        "REG-NEW-SPEC-SPEC",
+        "create_material_spec",
+        {
+            "spec_id": "SPEC-C",
+            "name": "三级冶金焦 (CSR>=45%)",
+            "ash_max_pct": 14.0,
+            "sulfur_max_pct": 1.0,
+        },
+        STEWARD,
+    )
+    settled = settle_work_card(
+        runtime,
+        "REG-NEW-SPEC",
+        STEWARD,
+        action_run_id="REG-NEW-SPEC-ACT",
+    )
+    runtime.submit_action(
+        "REG-NEW-SPEC-LINK",
+        "map_legacy_sku_to_spec",
+        {
+            "sku_id": "ERP-SKU-9102",
+            "canonical_spec_id": "SPEC-C",
+            "mapped_by": BUYER.actor_id,
+        },
+        STEWARD,
+    )
+    approved = settled["settled_action_run"]
+    print(f"  settled by={approved['actor_id']} status={approved['status']}")
     c_spec = runtime.get_object(MaterialSpec, "SPEC-C", STEWARD)
     c_sku = runtime.get_object(ContractSKU, "ERP-SKU-9102", STEWARD)
     print(

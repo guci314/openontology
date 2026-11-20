@@ -106,6 +106,7 @@ def test_spec_factory_matches_model_factory():
         "ShopOrder",
         "SupportTicket",
         "RefundRecord",
+        "WorkCard",
     }
     assert set(spec.object_properties) == {
         "customer_orders",
@@ -116,7 +117,15 @@ def test_spec_factory_matches_model_factory():
         "create_customer_and_order",
         "open_support_ticket",
         "ai_triage_ticket",
+        "mark_ticket_triaged",
         "process_return_and_refund",
+        "record_refund_voucher",
+        "open_work_card",
+        "claim_work_card",
+        "complete_work_card",
+        "reject_work_card",
+        "mark_work_card_sla_breached",
+        "cancel_work_card",
     }
     assert set(spec.functions) == {"workspace_overview"}
 
@@ -210,6 +219,12 @@ def test_ai_triage_writes_risk_fields_and_note(standalone):
         "T-TRIAGE-1",
         "ai_triage_ticket",
         {"ticket_id": "TKT-T1", "fraud_score": 33, "vip_tier": "VIP"},
+        AI,
+    )
+    rt.submit_action(
+        "T-TRIAGE-1-ST",
+        "mark_ticket_triaged",
+        {"ticket_id": "TKT-T1"},
         AI,
     )
     customer = rt.get_object(model.Customer, "CUST-T1", MANAGER)
@@ -321,9 +336,9 @@ def test_small_refund_is_auto_committed(standalone):
     model, rt = standalone
     _seed_customer_order(rt, model, amount=8_999, oid="ORD-S")
     _seed_ticket(rt, oid="ORD-S", cid="CUST-T1", amount=8_999, tid="TKT-S")
-    run = rt.submit_action(
+    run = demo.submit_refund_or_work_card(
+        rt,
         "T-REFUND-S",
-        "process_return_and_refund",
         {"ticket_id": "TKT-S", "refund_id": "RFD-S", "amount_cents": 8_999},
         AI,
     )
@@ -344,34 +359,37 @@ def test_big_refund_requires_manager_approval_then_commits(standalone):
     _seed_customer_order(rt, model, amount=32_000, oid="ORD-BIG")
     _seed_ticket(rt, oid="ORD-BIG", cid="CUST-T1", amount=32_000, tid="TKT-BIG")
 
-    pending = rt.submit_action(
+    pending = demo.submit_refund_or_work_card(
+        rt,
         "T-REFUND-BIG",
-        "process_return_and_refund",
         {"ticket_id": "TKT-BIG", "refund_id": "RFD-BIG", "amount_cents": 32_000},
         AI,
     )
-    assert pending["status"] == "PENDING_APPROVAL"
-    # 挂起期间绝不提前动账
+    assert pending["status"] == "AWAITING_WORK_CARD"
+    assert pending["work_card_status"] == "OPEN"
+    assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+    # 待签批期间绝不提前动账
     assert rt.get_object(model.ShopOrder, "ORD-BIG", MANAGER).status == "paid"
     assert (
         rt.get_object(model.Customer, "CUST-T1", MANAGER).lifetime_value_cents
         == 32_000
     )
 
-    approved = rt.approve_action("T-REFUND-BIG", MANAGER)
+    approved = demo.approve_refund_work_card(rt, "T-REFUND-BIG", MANAGER)
     assert approved["status"] == "COMMITTED"
-    assert approved["approved_by"] == MANAGER.actor_id
+    assert approved["actor_id"] == MANAGER.actor_id
+    assert rt.get_object(model.RefundRecord, "RFD-BIG", MANAGER).approved_by == MANAGER.actor_id
     assert rt.get_object(model.ShopOrder, "ORD-BIG", MANAGER).status == "refunded"
 
 
 def test_manager_submitted_big_refund_skips_approval(standalone):
-    """店长本人提交的大额退款不需要二次审批（approval_rule 只针对 ai_agent）。"""
+    """店长本人提交的大额退款不需要二次审批（precondition 只针对 ai_agent）。"""
     model, rt = standalone
     _seed_customer_order(rt, model, amount=32_000, oid="ORD-MGR")
     _seed_ticket(rt, oid="ORD-MGR", cid="CUST-T1", amount=32_000, tid="TKT-MGR")
-    run = rt.submit_action(
+    run = demo.submit_refund_or_work_card(
+        rt,
         "T-REFUND-MGR",
-        "process_return_and_refund",
         {"ticket_id": "TKT-MGR", "refund_id": "RFD-MGR", "amount_cents": 32_000},
         MANAGER,
     )
@@ -385,15 +403,15 @@ def test_revert_refund_restores_all_state(standalone):
     model, rt = standalone
     _seed_customer_order(rt, model, amount=32_000, oid="ORD-REV")
     _seed_ticket(rt, oid="ORD-REV", cid="CUST-T1", amount=32_000, tid="TKT-REV")
-    rt.submit_action(
+    demo.submit_refund_or_work_card(
+        rt,
         "T-REFUND-REV",
-        "process_return_and_refund",
         {"ticket_id": "TKT-REV", "refund_id": "RFD-REV", "amount_cents": 32_000},
         MANAGER,
     )
     assert rt.get_object(model.ShopOrder, "ORD-REV", MANAGER).status == "refunded"
 
-    reverted = rt.revert_action("T-REFUND-REV", "T-REFUND-REV-UNDO", MANAGER)
+    reverted = demo.revert_refund_runs(rt, "T-REFUND-REV", "T-REFUND-REV-UNDO", MANAGER)
     assert reverted["status"] == "COMMITTED"
 
     order = rt.get_object(model.ShopOrder, "ORD-REV", MANAGER)
@@ -420,9 +438,9 @@ def test_workspace_overview_reports_blocked_and_amounts(standalone):
     model, rt = standalone
     _seed_customer_order(rt, model, amount=8_999, oid="ORD-V1")
     _seed_ticket(rt, oid="ORD-V1", cid="CUST-T1", amount=8_999, tid="TKT-V1")
-    rt.submit_action(
+    demo.submit_refund_or_work_card(
+        rt,
         "T-REFUND-V1",
-        "process_return_and_refund",
         {"ticket_id": "TKT-V1", "refund_id": "RFD-V1", "amount_cents": 8_999},
         AI,
     )
@@ -501,7 +519,7 @@ def test_eval_suite_is_identical_across_modes():
     assert parasitic_result["expired"]["error"] == "RETURN_WINDOW_EXPIRED"
     assert parasitic_result["fraud"]["error"] == "HIGH_FRAUD_RISK_BLOCKED"
     assert (
-        parasitic_result["big_refund"]["submit_status"] == "PENDING_APPROVAL"
+        parasitic_result["big_refund"]["submit_status"] == "AWAITING_WORK_CARD"
     )
     assert parasitic_result["double_refund"]["error"] == "INVALID_REFUND_STATE"
     assert parasitic_result["revert"]["refund_exists"] is False

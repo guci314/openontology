@@ -320,6 +320,7 @@ class OntologyRuntime:
                         "description": action.description,
                         "allowed_roles": list(action.allowed_roles),
                         "approver_roles": list(action.approver_roles),
+                        "revert_roles": list(action.revert_roles),
                         "affects_source": action.affects_source,
                         "visibility": action.visibility,
                         "params_schema": action.params.model_json_schema(),

@@ -152,7 +152,7 @@ def test_studio_acts_1_to_4_restart_and_feishu_forward_real_odoo(tmp_path: Path)
         # 第三幕：超授信挂起在 W_lat，真实 Odoo T3B-SO-002 保持 draft，并发送飞书卡片
         r3 = app.run_act_3()
         a3 = r3["act_result"]
-        assert a3["latent_status"] == "PENDING_APPROVAL"
+        assert a3["latent_status"] == "OPEN"
         assert a3["odoo_order_state_before_approval"] == "draft"
         assert a3["mem_status_before_approval"] == "draft"
         assert a3["feishu_push_status"] == "sent"

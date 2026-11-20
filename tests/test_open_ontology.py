@@ -211,13 +211,30 @@ def test_rbac_rejects_wrong_roles(demo):
     with pytest.raises(PermissionDeniedError):
         runtime.submit_action("RUN-RBAC", "reroute_shipment", low_cost(), auditor)
 
-    runtime.submit_action("RUN-P", "reroute_shipment", high_cost(), cc.AI_AGENT)
+    cc.submit_or_open_work_card(
+        runtime,
+        "RUN-P",
+        "reroute_shipment",
+        high_cost(),
+        cc.AI_AGENT,
+        target_object_type="Shipment",
+        target_object_id="SHP-001",
+        assignee_role="ops_manager",
+        card_id="RUN-P",
+    )
     with pytest.raises(PermissionDeniedError):
-        runtime.approve_action("RUN-P", cc.DISPATCHER)
+        runtime.submit_action(
+            "RUN-P-BAD-COMP",
+            "complete_work_card",
+            {"card_id": "RUN-P"},
+            cc.DISPATCHER,
+        )
+    with pytest.raises(InvariantError):
+        cc.settle_work_card(runtime, "RUN-P", cc.DISPATCHER)
     with pytest.raises(PermissionDeniedError):
-        runtime.revert_action("RUN-P", "RUN-P-REV", auditor)
+        runtime.revert_action("RUN-P-OPEN", "RUN-P-REV", auditor)
 
-    assert runtime.get_action_run("RUN-P")["status"] == "PENDING_APPROVAL"
+    assert runtime.get_object(cc.WorkCard, "RUN-P", cc.OPS_MANAGER).status == "OPEN"
 
 
 # ---------------------------------------------------------------------------
@@ -279,13 +296,18 @@ def test_simulation_is_zero_write_and_requires_approval(demo):
     assert low.read_versions["Shipment:SHP-001"] == 1
 
     ai = runtime.simulate_action("reroute_shipment", high_cost(), cc.AI_AGENT)
-    assert ai.valid is True
-    assert ai.requires_approval is True
+    assert ai.valid is False
+    assert ai.error_code == "APPROVAL_REQUIRED_HIGH_COST_REROUTE"
+
+    mgr = runtime.simulate_action("reroute_shipment", high_cost(), cc.OPS_MANAGER)
+    assert mgr.valid is True
+    assert mgr.requires_approval is False
 
     # dispatcher spending 2400 is *not* subject to the ai_agent rule
     dispatcher_high = runtime.simulate_action(
         "reroute_shipment", high_cost(), cc.DISPATCHER
     )
+    assert dispatcher_high.valid is True
     assert dispatcher_high.requires_approval is False
 
     assert runtime.count_objects() == before_count
@@ -298,7 +320,7 @@ def test_simulation_is_zero_write_and_requires_approval(demo):
 # ---------------------------------------------------------------------------
 def test_diff_inversion_swaps_before_after_and_links(demo):
     runtime = demo.runtime
-    sim = runtime.simulate_action("reroute_shipment", high_cost(), cc.AI_AGENT)
+    sim = runtime.simulate_action("reroute_shipment", high_cost(), cc.OPS_MANAGER)
     diff = sim.diff
 
     shipment_change = next(
@@ -387,46 +409,81 @@ def test_submit_is_idempotent(demo):
 def test_approval_flow_pending_then_manager_commits(demo):
     runtime = demo.runtime
 
-    pending = runtime.submit_action(
-        "RUN-APPR", "reroute_shipment", high_cost(), cc.AI_AGENT
+    pending = cc.submit_or_open_work_card(
+        runtime,
+        "RUN-APPR",
+        "reroute_shipment",
+        high_cost(),
+        cc.AI_AGENT,
+        target_object_type="Shipment",
+        target_object_id="SHP-001",
+        assignee_role="ops_manager",
+        card_id="RUN-APPR",
     )
-    assert pending["status"] == "PENDING_APPROVAL"
-    assert pending["read_versions"]["Shipment:SHP-001"] == 1
+    assert pending["status"] == "AWAITING_WORK_CARD"
+    assert pending["work_card_status"] == "OPEN"
+    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
     assert shipment_version(runtime) == 1
     assert carriers(runtime) == ["TRK-001"]
-    assert len(runtime.list_action_runs()) == 1
     assert (
         runtime.get_object(cc.Shipment, "SHP-001", cc.OPS_MANAGER).status
         == "in_transit"
     )
 
-    approved = runtime.approve_action("RUN-APPR", cc.OPS_MANAGER)
+    settled = cc.settle_work_card(
+        runtime,
+        "RUN-APPR",
+        cc.OPS_MANAGER,
+        action_run_id="RUN-APPR-ACT",
+    )
+    approved = settled["settled_action_run"]
     assert approved["status"] == "COMMITTED"
-    assert approved["approved_by"] == "manager-01"
+    assert approved["actor_id"] == "manager-01"
     assert shipment_version(runtime) == 2
     assert carriers(runtime) == ["TRK-002"]
 
-    audited = runtime.get_action_run("RUN-APPR")
-    assert audited["approved_by"] == "manager-01"
+    card = runtime.get_object(cc.WorkCard, "RUN-APPR", cc.OPS_MANAGER)
+    assert card.status == "COMPLETED"
+    assert card.resolved_by_actor_id == "manager-01"
+    audited = runtime.get_action_run("RUN-APPR-ACT")
+    assert audited["actor_id"] == "manager-01"
     assert audited["object_diff"]["object_changes"]
 
-    with pytest.raises(GovernanceViolationError):
-        runtime.approve_action("RUN-APPR", cc.OPS_MANAGER)
+    with pytest.raises(InvariantError):
+        cc.settle_work_card(runtime, "RUN-APPR", cc.OPS_MANAGER)
 
 
 def test_approval_detects_concurrency_conflict(demo):
     runtime = demo.runtime
-    runtime.submit_action("RUN-CONF", "reroute_shipment", high_cost(), cc.AI_AGENT)
+    cc.submit_or_open_work_card(
+        runtime,
+        "RUN-CONF",
+        "reroute_shipment",
+        high_cost(),
+        cc.AI_AGENT,
+        target_object_type="Shipment",
+        target_object_id="SHP-001",
+        assignee_role="ops_manager",
+        card_id="RUN-CONF",
+        external_ref=f"occ:Shipment:SHP-001:v{shipment_version(runtime)}",
+    )
 
     shipment = runtime.get_object(cc.Shipment, "SHP-001", cc.OPS_MANAGER)
     runtime.ingest_object(shipment.model_copy(update={"status": "delayed"}))
     assert shipment_version(runtime) == 2
 
-    with pytest.raises(ConcurrencyConflictError):
-        runtime.approve_action("RUN-CONF", cc.OPS_MANAGER)
+    card = runtime.get_object(cc.WorkCard, "RUN-CONF", cc.OPS_MANAGER)
+    expected_ver = int(card.external_ref.rsplit(":v", 1)[1])
+    live_ver = shipment_version(runtime)
+    assert live_ver != expected_ver
 
-    run = runtime.get_action_run("RUN-CONF")
-    assert run["status"] == "PENDING_APPROVAL"
+    runtime.submit_action(
+        "RUN-CONF-CANCEL",
+        "cancel_work_card",
+        {"card_id": "RUN-CONF", "resolution_note": "并发版本漂移熔断"},
+        cc.AI_AGENT,
+    )
+    assert runtime.get_object(cc.WorkCard, "RUN-CONF", cc.OPS_MANAGER).status == "CANCELLED"
     current = runtime.get_object(cc.Shipment, "SHP-001", cc.OPS_MANAGER)
     assert current.status == "delayed"
     assert shipment_version(runtime) == 2
@@ -537,6 +594,12 @@ def test_export_llm_tools_schema(demo):
         "recommend_reroute",
         "reroute_shipment",
         "annotate_shipment",
+        "open_work_card",
+        "claim_work_card",
+        "complete_work_card",
+        "reject_work_card",
+        "mark_work_card_sla_breached",
+        "cancel_work_card",
     }
 
     function_tool = by_name["recommend_reroute"]
@@ -555,13 +618,15 @@ def test_export_llm_tools_schema(demo):
         "ai_agent",
         "ops_manager",
     ]
-    assert action_tool["x-approver-roles"] == ["ops_manager"]
+    assert action_tool["x-approver-roles"] == []
+    assert action_tool["x-revert-roles"] == ["ops_manager"]
     assert set(action_tool) == {
         "type",
         "function",
         "x-ontology-kind",
         "x-allowed-roles",
         "x-approver-roles",
+        "x-revert-roles",
     }
     action_schema = action_tool["function"]["parameters"]
     assert action_schema["type"] == "object"
@@ -591,12 +656,19 @@ def test_aip_executor_dispatch(demo):
     assert recommendation["ok"] is True
     assert recommendation["result"]["candidates"]
 
-    simulated = executor.dispatch(
+    simulated_high = executor.dispatch(
         "simulate_action",
         {"action": "reroute_shipment", "params": high_cost()},
     )
+    assert simulated_high["valid"] is False
+    assert simulated_high["error_code"] == "APPROVAL_REQUIRED_HIGH_COST_REROUTE"
+
+    simulated = executor.dispatch(
+        "simulate_action",
+        {"action": "reroute_shipment", "params": low_cost()},
+    )
     assert simulated["valid"] is True
-    assert simulated["requires_approval"] is True
+    assert simulated["requires_approval"] is False
 
     submitted = executor.dispatch(
         "submit_action",
@@ -659,7 +731,7 @@ def test_run_eval_suite_passes_and_detects_wrong_expectation(demo):
             "actor": cc.AI_AGENT,
             "action": "reroute_shipment",
             "params": high_cost(),
-            "expect": {"valid": True, "requires_approval": True},
+            "expect": {"valid": False, "error_contains": "ops_manager"},
         },
         {
             "name": "eta",
@@ -700,10 +772,10 @@ def test_spec_registry_is_persisted(demo):
     ).fetchall()
     counts = {row["kind"]: row["n"] for row in rows}
     assert counts == {
-        "object_type": 4,
+        "object_type": 5,
         "object_property": 3,
         "function": 1,
-        "action": 2,
+        "action": 8,
     }
 
     action_row = runtime.connection.execute(
@@ -711,7 +783,8 @@ def test_spec_registry_is_persisted(demo):
         ("reroute_shipment",),
     ).fetchone()
     spec_json = json.loads(action_row["spec_json"])
-    assert spec_json["approver_roles"] == ["ops_manager"]
+    assert spec_json["approver_roles"] == []
+    assert spec_json["revert_roles"] == ["ops_manager"]
     assert spec_json["affects_source"] is True
     assert "properties" in spec_json["params_schema"]
 
@@ -1449,6 +1522,7 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
         "handler",
         "allowed_roles",
         "approver_roles",
+        "revert_roles",
         "approval_rule",
         "affects_source",
         "visibility",

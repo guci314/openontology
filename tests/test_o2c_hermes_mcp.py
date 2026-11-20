@@ -153,7 +153,7 @@ def test_persistent_session_hydration_across_restarts_and_feishu_cards(tmp_path)
                 "fulfillment_note": "战略特批大客户",
             },
         )
-        assert act2["status_code"] == "PENDING_APPROVAL"
+        assert act2["status_code"] == "OPEN"
         assert act2["card_pushed"] is True
         confirm_run_id = act2["run_id"]
         confirm_msg_id = act2["card_message_id"]
@@ -279,7 +279,7 @@ def test_execute_feishu_card_slash_command_reloads_live_session_and_sends_text(t
                 "fulfillment_note": "战略特批大客户",
             }
         )
-        assert confirm_res["status_code"] == "PENDING_APPROVAL"
+        assert confirm_res["status_code"] == "OPEN"
         confirm_run_id = confirm_res["run_id"]
         card_msg_id = confirm_res["card_message_id"]
         assert live_session.adapter.order_row("O2C-SO-002")["state"] == "draft"
