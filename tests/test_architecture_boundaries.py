@@ -57,6 +57,9 @@ M1_ONTOLOGY_MODULES: tuple[tuple[str, str], ...] = (
     ("examples.o2c_ontology", "spec"),
     ("examples.odoo_orders_ontology", "spec"),
     ("examples.crm_unplug_ontology", "spec"),
+    ("examples.std_core_ontology", "spec"),
+    ("examples.std_crm_ontology", "spec"),
+    ("examples.std_o2c_ontology", "spec"),
 )
 
 _ALLOWED_M1_STDLIB_AND_SDK = frozenset(
@@ -74,7 +77,9 @@ _ALLOWED_M1_STDLIB_AND_SDK = frozenset(
         "pydantic",
         "open_ontology.spec",
         "open_ontology.induction.seed",
+        "open_ontology.induction.dsl",
         "examples.business_ontology",
+        "examples.std_core_ontology",
     }
 )
 
@@ -210,7 +215,7 @@ def test_gate1_m1_ontologies_strict_ast_import_whitelist() -> None:
                     )
             elif isinstance(node, ast.ImportFrom):
                 mod = node.module or ""
-                if node.level and mod == "business_ontology":
+                if node.level and mod in ("business_ontology", "std_core_ontology"):
                     continue
                 if mod in ("open_ontology",):
                     raise AssertionError(

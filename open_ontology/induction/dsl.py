@@ -8,7 +8,7 @@ import json
 import re
 import uuid
 from collections import defaultdict
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator, model_validator
 
@@ -40,11 +40,14 @@ __all__ = [
     "EvalSetupObjectSpec",
     "ProposedEvalCase",
     "EvolutionPatch",
+    "CustomerOverlaySpec",
     "blueprint_fingerprint",
     "count_ast_nodes",
     "expr_depth",
     "validate_predicate_ast",
     "eval_predicate",
+    "compose_blueprints",
+    "apply_overlay",
     "apply_evolution_patch",
     "apply_adapter_mapping_patch",
     "migrate_m0_snapshot",
@@ -231,6 +234,7 @@ class DeclarativeBlueprint(BaseModel):
     model_id: str
     version: str = "1.0.0"
     seed_ontology_id: str | None = None
+    imports: list[str] = Field(default_factory=list)
     description: str = ""
     object_types: list[ObjectTypeBlueprint] = Field(default_factory=list)
     actions: list[ActionBlueprint] = Field(default_factory=list)
@@ -320,6 +324,40 @@ class EvolutionPatch(BaseModel):
     update_entity_mappings: list[EntityMappingSpec] = Field(default_factory=list)
     add_action_bindings: list[ActionExecutionBinding] = Field(default_factory=list)
     update_action_bindings: list[ActionExecutionBinding] = Field(default_factory=list)
+
+
+class CustomerOverlaySpec(BaseModel):
+    """Additive-and-monotonic overlay specification layered atop standard ontologies."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    overlay_id: str = Field(default_factory=lambda: f"overlay-{uuid.uuid4().hex[:8]}")
+    base_model_id: str | None = None
+    target_version: str | None = None
+    description: str = ""
+    add_object_types: list[ObjectTypeBlueprint] = Field(default_factory=list)
+    add_fields: dict[str, list[FieldSpec]] = Field(default_factory=dict)
+    add_relations: dict[str, list[RelationSpec]] = Field(default_factory=dict)
+    update_transitions: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
+    add_actions: list[ActionBlueprint] = Field(default_factory=list)
+    update_actions: list[ActionBlueprint] = Field(default_factory=list)
+    add_action_preconditions: dict[str, list[InvariantRuleSpec]] = Field(default_factory=dict)
+    restrict_allowed_roles: dict[str, list[str]] = Field(default_factory=dict)
+    update_revert_roles: dict[str, list[str]] = Field(default_factory=dict)
+    add_invariants: list[InvariantRuleSpec] = Field(default_factory=list)
+    add_views: list[ScopedViewBlueprint] = Field(default_factory=list)
+    update_views: list[ScopedViewBlueprint] = Field(default_factory=list)
+    migrations: list[FieldMigrationSpec] = Field(default_factory=list)
+    display: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    # Explicit trap fields so destructive overrides fail with OVERLAY_BREAKS_STANDARD_CONTRACT
+    remove_object_types: list[str] = Field(default_factory=list)
+    remove_fields: dict[str, list[str]] = Field(default_factory=dict)
+    alter_fields: dict[str, list[FieldSpec]] = Field(default_factory=dict)
+    update_primary_keys: dict[str, str] = Field(default_factory=dict)
+    remove_invariants: list[str] = Field(default_factory=list)
+    remove_action_preconditions: dict[str, list[str]] = Field(default_factory=dict)
+    replace_transitions: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
 
 
 def blueprint_fingerprint(blueprint: DeclarativeBlueprint | str) -> str:
@@ -844,6 +882,619 @@ def _resolve_blueprint_action_subject(act: ActionBlueprint) -> str | None:
     for pre in act.preconditions:
         return pre.target_type
     return None
+
+
+def _coerce_blueprint(bp: DeclarativeBlueprint | Mapping[str, Any]) -> DeclarativeBlueprint:
+    if isinstance(bp, DeclarativeBlueprint):
+        return copy.deepcopy(bp)
+    if isinstance(bp, Mapping):
+        return DeclarativeBlueprint.model_validate(bp)
+    raise InvariantError(
+        f"expected DeclarativeBlueprint or mapping, got {type(bp).__name__}",
+        code="BLUEPRINT_COMPOSITION_CONFLICT",
+    )
+
+
+def _merge_unique_definitions(
+    items: Sequence[tuple[str, Sequence[BaseModel]]],
+    *,
+    key_attr: str,
+    kind: str,
+) -> tuple[list[Any], dict[str, Any]]:
+    merged: list[Any] = []
+    by_key: dict[str, tuple[str, Any]] = {}
+    for source_id, defs in items:
+        for item in defs:
+            key = str(getattr(item, key_attr))
+            if key not in by_key:
+                copied = copy.deepcopy(item)
+                merged.append(copied)
+                by_key[key] = (source_id, copied)
+                continue
+            prev_source, existing = by_key[key]
+            if existing.model_dump(mode="json") != item.model_dump(mode="json"):
+                raise InvariantError(
+                    f"conflicting {kind} definition for {key!r} between {prev_source!r} and {source_id!r}",
+                    code="BLUEPRINT_COMPOSITION_CONFLICT",
+                )
+    return merged, {k: v for k, (_, v) in by_key.items()}
+
+
+def compose_blueprints(
+    blueprints: Sequence[DeclarativeBlueprint | Mapping[str, Any]],
+    *,
+    model_id: str,
+    version: str = "1.0.0",
+    description: str = "",
+    seed_ontology_id: str | None = None,
+) -> DeclarativeBlueprint:
+    """Compose multiple DeclarativeBlueprints idempotently like module imports."""
+    _assert_safe_identifier(model_id, "model_id")
+    if not blueprints:
+        raise InvariantError(
+            "compose_blueprints requires at least one blueprint",
+            code="BLUEPRINT_COMPOSITION_CONFLICT",
+        )
+    coerced = [_coerce_blueprint(bp) for bp in blueprints]
+
+    seed_ids: list[str] = []
+    for bp in coerced:
+        if bp.seed_ontology_id is not None and bp.seed_ontology_id not in seed_ids:
+            seed_ids.append(bp.seed_ontology_id)
+    if seed_ontology_id is not None and seed_ontology_id not in seed_ids:
+        seed_ids.append(seed_ontology_id)
+    if len(seed_ids) > 1:
+        raise InvariantError(
+            f"conflicting seed_ontology_id values during composition: {seed_ids}",
+            code="BLUEPRINT_COMPOSITION_CONFLICT",
+        )
+    resolved_seed = seed_ids[0] if seed_ids else None
+
+    merged_imports: list[str] = []
+    seen_imports: set[str] = set()
+    for bp in coerced:
+        for inc in (*bp.imports, bp.model_id):
+            if inc and inc != model_id and inc not in seen_imports:
+                merged_imports.append(inc)
+                seen_imports.add(inc)
+
+    object_types, ot_by_name = _merge_unique_definitions(
+        [(bp.model_id, bp.object_types) for bp in coerced],
+        key_attr="name",
+        kind="object_type",
+    )
+    actions, _ = _merge_unique_definitions(
+        [(bp.model_id, bp.actions) for bp in coerced],
+        key_attr="name",
+        kind="action",
+    )
+    invariants, _ = _merge_unique_definitions(
+        [(bp.model_id, bp.invariants) for bp in coerced],
+        key_attr="name",
+        kind="invariant",
+    )
+    views, _ = _merge_unique_definitions(
+        [(bp.model_id, bp.views) for bp in coerced],
+        key_attr="name",
+        kind="scoped view",
+    )
+
+    merged_migrations: list[FieldMigrationSpec] = []
+    mig_by_sig: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for bp in coerced:
+        for mig in bp.migrations:
+            sig = (mig.object_type, mig.field, mig.op)
+            dumped = mig.model_dump(mode="json")
+            if sig not in mig_by_sig:
+                mig_by_sig[sig] = dumped
+                merged_migrations.append(copy.deepcopy(mig))
+            elif mig_by_sig[sig] != dumped:
+                raise InvariantError(
+                    f"conflicting migration {sig!r} during composition",
+                    code="BLUEPRINT_COMPOSITION_CONFLICT",
+                )
+
+    merged_display: dict[str, dict[str, str]] = {}
+    for bp in coerced:
+        for bucket, mapping in bp.display.items():
+            dest = merged_display.setdefault(bucket, {})
+            for key, label in mapping.items():
+                if not label:
+                    dest.setdefault(key, label)
+                elif key in dest and dest[key] and dest[key] != label:
+                    raise InvariantError(
+                        f"conflicting display label for {bucket}.{key!r}: {dest[key]!r} vs {label!r}",
+                        code="BLUEPRINT_COMPOSITION_CONFLICT",
+                    )
+                else:
+                    dest[key] = label
+
+    for ot in object_types:
+        for rel in ot.relations:
+            if rel.target_type not in ot_by_name:
+                raise InvariantError(
+                    f"relation {ot.name}.{rel.field} references unknown target {rel.target_type!r}",
+                    code="UNKNOWN_RELATION_TARGET",
+                )
+        for bal_field, (v_type, _v_link, _v_delta) in ot.voucher_delta_rules.items():
+            if v_type not in ot_by_name:
+                raise InvariantError(
+                    f"voucher_delta_rules on {ot.name}.{bal_field} references unknown voucher type {v_type!r}",
+                    code="UNKNOWN_VOUCHER_TYPE",
+                )
+
+    resolved_desc = description or " + ".join(bp.model_id for bp in coerced)
+    return DeclarativeBlueprint(
+        model_id=model_id,
+        version=version,
+        seed_ontology_id=resolved_seed,
+        imports=merged_imports,
+        description=resolved_desc,
+        object_types=object_types,
+        actions=actions,
+        invariants=invariants,
+        migrations=merged_migrations,
+        views=views,
+        display=merged_display,
+    )
+
+
+def _coerce_overlay(
+    overlay: CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any],
+) -> CustomerOverlaySpec:
+    if isinstance(overlay, CustomerOverlaySpec):
+        return copy.deepcopy(overlay)
+    if isinstance(overlay, EvolutionPatch):
+        return CustomerOverlaySpec(
+            overlay_id=overlay.patch_id,
+            target_version=overlay.target_version,
+            description=overlay.rationale,
+            add_object_types=copy.deepcopy(overlay.add_object_types),
+            add_fields=copy.deepcopy(overlay.add_fields),
+            remove_fields=copy.deepcopy(overlay.remove_fields),
+            add_relations=copy.deepcopy(overlay.add_relations),
+            update_transitions=copy.deepcopy(overlay.update_transitions),
+            add_actions=copy.deepcopy(overlay.add_actions),
+            update_actions=copy.deepcopy(overlay.update_actions),
+            add_invariants=copy.deepcopy(overlay.add_invariants),
+            remove_invariants=copy.deepcopy(overlay.remove_invariants),
+            update_revert_roles=copy.deepcopy(overlay.update_revert_roles),
+            add_views=copy.deepcopy(overlay.add_views),
+            update_views=copy.deepcopy(overlay.update_views),
+            migrations=copy.deepcopy(overlay.migrations),
+        )
+    if isinstance(overlay, Mapping):
+        return CustomerOverlaySpec.model_validate(overlay)
+    raise InvariantError(
+        f"expected CustomerOverlaySpec, EvolutionPatch, or mapping, got {type(overlay).__name__}",
+        code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+    )
+
+
+def _validate_fsm_monotonic(
+    ot_name: str,
+    base_transitions: dict[str, list[str]],
+    incoming_transitions: dict[str, list[str]],
+    *,
+    replace: bool,
+) -> dict[str, list[str]]:
+    if replace:
+        for state in base_transitions:
+            if state not in incoming_transitions:
+                raise InvariantError(
+                    f"overlay removes FSM state {ot_name}.{state!r} from standard contract",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+    merged = {} if replace else {k: list(v) for k, v in base_transitions.items()}
+    for state, new_targets in incoming_transitions.items():
+        if state in base_transitions:
+            std_targets = base_transitions[state]
+            if len(std_targets) == 0 and len(new_targets) > 0:
+                raise InvariantError(
+                    f"overlay reopens terminal FSM state {ot_name}.{state!r} with {new_targets}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            if not set(std_targets).issubset(set(new_targets)):
+                raise InvariantError(
+                    f"overlay drops standard FSM edges on {ot_name}.{state!r}: "
+                    f"expected superset of {std_targets}, got {new_targets}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+        merged[state] = list(new_targets)
+    return merged
+
+
+def _validate_action_preconditions_ast(
+    preconditions: Sequence[InvariantRuleSpec],
+    *,
+    ot_by_name: dict[str, ObjectTypeBlueprint],
+) -> None:
+    pre_roots = frozenset({"obj", "param", "actor"})
+    for pre in preconditions:
+        _assert_safe_identifier(pre.name, "precondition name")
+        if pre.target_type not in ot_by_name:
+            raise InvariantError(
+                f"precondition {pre.name!r} targets unknown object type {pre.target_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if pre.when is not None:
+            validate_predicate_ast(pre.when, allowed_roots=pre_roots, allow_view=True)
+        validate_predicate_ast(pre.must_hold, allowed_roots=pre_roots, allow_view=True)
+
+
+def _validate_action_mutations_ast(
+    act: ActionBlueprint,
+    *,
+    ot_by_name: dict[str, ObjectTypeBlueprint],
+) -> None:
+    param_names = {p.name for p in act.params}
+    has_subject = any(
+        (m.op != "create" and m.target_ref is None and m.id_param in param_names)
+        for m in act.mutations
+    ) or any(
+        (pre.id_param or (ot_by_name[pre.target_type].primary_key if pre.target_type in ot_by_name else "")) in param_names
+        for pre in act.preconditions
+    )
+    for mut in act.mutations:
+        if mut.object_type not in ot_by_name:
+            raise InvariantError(
+                f"action {act.name!r} mutates unknown object type {mut.object_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if mut.target_ref is not None:
+            mut_roots = frozenset({"obj", "source_obj", "param", "actor"})
+            if mut.target_ref.startswith("obj.") and not has_subject:
+                raise InvariantError(
+                    f"action {act.name!r} mutation target_ref {mut.target_ref!r} requires a primary subject object",
+                    code="UNAVAILABLE_REF_IN_CONTEXT",
+                )
+        elif mut.op == "create":
+            mut_roots = frozenset({"param", "actor"})
+        else:
+            mut_roots = frozenset({"obj", "param", "actor"})
+        for fv in mut.set_fields.values():
+            _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
+
+
+def _validate_action_update_monotonic(
+    base_act: ActionBlueprint,
+    upd_act: ActionBlueprint,
+) -> None:
+    if upd_act.affects_source != base_act.affects_source:
+        raise InvariantError(
+            f"overlay alters affects_source on standard action {base_act.name!r}",
+            code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+        )
+    if [m.model_dump(mode="json") for m in upd_act.mutations] != [
+        m.model_dump(mode="json") for m in base_act.mutations
+    ]:
+        raise InvariantError(
+            f"overlay alters mutations on standard action {base_act.name!r}",
+            code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+        )
+    upd_params = {p.name: p for p in upd_act.params}
+    for bp in base_act.params:
+        np = upd_params.get(bp.name)
+        if np is None or np.field_type != bp.field_type:
+            raise InvariantError(
+                f"overlay removes or re-types param {base_act.name}.{bp.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        if (bp.required and not np.required) or (bp.non_negative and not np.non_negative):
+            raise InvariantError(
+                f"overlay weakens param constraint on {base_act.name}.{bp.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+    if not upd_act.allowed_roles or not set(upd_act.allowed_roles).issubset(set(base_act.allowed_roles)):
+        raise InvariantError(
+            f"overlay expands or empties allowed_roles on standard action {base_act.name!r}: "
+            f"expected non-empty subset of {base_act.allowed_roles}, got {upd_act.allowed_roles}",
+            code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+        )
+    upd_pres = {pre.name: pre.model_dump(mode="json") for pre in upd_act.preconditions}
+    for base_pre in base_act.preconditions:
+        if upd_pres.get(base_pre.name) != base_pre.model_dump(mode="json"):
+            raise InvariantError(
+                f"overlay removes or weakens standard precondition {base_pre.name!r} on action {base_act.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+
+
+def apply_overlay(
+    base_blueprint: DeclarativeBlueprint | Mapping[str, Any],
+    overlay: CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any],
+    *,
+    target_version: str | None = None,
+) -> DeclarativeBlueprint:
+    """Layer a customer overlay onto a standard blueprint under monotonic只增不破 guards."""
+    base = _coerce_blueprint(base_blueprint)
+    spec_overlay = _coerce_overlay(overlay)
+    candidate = copy.deepcopy(base)
+
+    if spec_overlay.base_model_id and spec_overlay.base_model_id != base.model_id:
+        raise InvariantError(
+            f"overlay targets base_model_id={spec_overlay.base_model_id!r}, got {base.model_id!r}",
+            code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+        )
+
+    destructive_checks = (
+        ("remove_object_types", bool(spec_overlay.remove_object_types)),
+        ("remove_fields", bool(spec_overlay.remove_fields)),
+        ("update_primary_keys", bool(spec_overlay.update_primary_keys)),
+        ("remove_invariants", bool(spec_overlay.remove_invariants)),
+        ("remove_action_preconditions", bool(spec_overlay.remove_action_preconditions)),
+    )
+    for label, hit in destructive_checks:
+        if hit:
+            raise InvariantError(
+                f"overlay violates standard contract via forbidden directive {label!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+
+    base_ot_by_name = {ot.name: ot for ot in base.object_types}
+    ot_by_name = {ot.name: ot for ot in candidate.object_types}
+
+    for ot_name, mod_fields in spec_overlay.alter_fields.items():
+        if ot_name not in base_ot_by_name:
+            raise InvariantError(
+                f"overlay alter_fields targets non-standard object type {ot_name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        std_fields = {f.name: f for f in base_ot_by_name[ot_name].fields}
+        cand_fields = ot_by_name[ot_name].fields
+        for fld in mod_fields:
+            std_fld = std_fields.get(fld.name)
+            if std_fld is None:
+                raise InvariantError(
+                    f"overlay alter_fields targets unknown standard field {ot_name}.{fld.name!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            if (
+                fld.field_type != std_fld.field_type
+                or fld.primary_key != std_fld.primary_key
+                or fld.name == base_ot_by_name[ot_name].primary_key
+                or (std_fld.required and not fld.required)
+                or (std_fld.non_negative and not fld.non_negative)
+            ):
+                raise InvariantError(
+                    f"overlay weakens or breaks standard field {ot_name}.{fld.name!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            for idx, cur in enumerate(cand_fields):
+                if cur.name == fld.name:
+                    cand_fields[idx] = copy.deepcopy(fld)
+                    break
+
+    for new_ot in spec_overlay.add_object_types:
+        _assert_safe_identifier(new_ot.name, "object type")
+        if new_ot.name in ot_by_name:
+            raise InvariantError(
+                f"overlay cannot overwrite existing object type {new_ot.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        candidate.object_types.append(copy.deepcopy(new_ot))
+        ot_by_name[new_ot.name] = candidate.object_types[-1]
+
+    for ot_name, new_fields in spec_overlay.add_fields.items():
+        if ot_name not in ot_by_name:
+            raise InvariantError(
+                f"overlay adds field to unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        ot = ot_by_name[ot_name]
+        existing_names = {f.name for f in ot.fields} | {r.field for r in ot.relations} | {ot.primary_key}
+        for nf in new_fields:
+            _assert_safe_identifier(nf.name, "field name")
+            if nf.primary_key or nf.name in existing_names:
+                raise InvariantError(
+                    f"overlay cannot overwrite or redefine field {ot_name}.{nf.name!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            ot.fields.append(copy.deepcopy(nf))
+            existing_names.add(nf.name)
+
+    for ot_name, new_rels in spec_overlay.add_relations.items():
+        if ot_name not in ot_by_name:
+            raise InvariantError(
+                f"overlay adds relation to unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        ot = ot_by_name[ot_name]
+        existing_names = {f.name for f in ot.fields} | {r.field for r in ot.relations} | {ot.primary_key}
+        for nr in new_rels:
+            _assert_safe_identifier(nr.field, "relation field")
+            if nr.target_type not in ot_by_name:
+                raise InvariantError(
+                    f"relation {ot_name}.{nr.field} references unknown target {nr.target_type!r}",
+                    code="UNKNOWN_RELATION_TARGET",
+                )
+            if nr.field in existing_names:
+                raise InvariantError(
+                    f"overlay cannot overwrite relation or field {ot_name}.{nr.field!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            ot.relations.append(copy.deepcopy(nr))
+            existing_names.add(nr.field)
+
+    for ot_name, new_map in spec_overlay.replace_transitions.items():
+        if ot_name not in ot_by_name:
+            raise InvariantError(
+                f"overlay replaces transitions on unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        base_trans = base_ot_by_name[ot_name].transitions if ot_name in base_ot_by_name else ot_by_name[ot_name].transitions
+        ot_by_name[ot_name].transitions = _validate_fsm_monotonic(
+            ot_name, base_trans, new_map, replace=True
+        )
+
+    for ot_name, trans_map in spec_overlay.update_transitions.items():
+        if ot_name not in ot_by_name:
+            raise InvariantError(
+                f"overlay updates transitions on unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        base_trans = ot_by_name[ot_name].transitions
+        ot_by_name[ot_name].transitions = _validate_fsm_monotonic(
+            ot_name, base_trans, trans_map, replace=False
+        )
+
+    base_field_names = {
+        ot.name: ({f.name for f in ot.fields} | {r.field for r in ot.relations} | {ot.primary_key})
+        for ot in base.object_types
+    }
+    for mig in spec_overlay.migrations:
+        if (
+            mig.object_type in base_field_names
+            and mig.field in base_field_names[mig.object_type]
+            and mig.op in ("drop_field", "rename_field", "cast_type")
+        ):
+            raise InvariantError(
+                f"overlay migration {mig.op!r} cannot mutate standard field {mig.object_type}.{mig.field!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+    candidate.migrations.extend(copy.deepcopy(spec_overlay.migrations))
+
+    inv_roots = frozenset({"obj"})
+    base_inv_by_name = {inv.name: inv for inv in base.invariants}
+    inv_names = {inv.name for inv in candidate.invariants}
+    for new_inv in spec_overlay.add_invariants:
+        _assert_safe_identifier(new_inv.name, "invariant name")
+        if new_inv.target_type not in ot_by_name:
+            raise InvariantError(
+                f"invariant {new_inv.name!r} targets unknown object type {new_inv.target_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if new_inv.when is not None:
+            validate_predicate_ast(new_inv.when, allowed_roots=inv_roots, allow_view=True)
+        validate_predicate_ast(new_inv.must_hold, allowed_roots=inv_roots, allow_view=True)
+        if new_inv.name in base_inv_by_name:
+            if new_inv.model_dump(mode="json") != base_inv_by_name[new_inv.name].model_dump(mode="json"):
+                raise InvariantError(
+                    f"overlay cannot overwrite standard invariant {new_inv.name!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            continue
+        if new_inv.name in inv_names:
+            raise InvariantError(
+                f"duplicate invariant {new_inv.name!r} in overlay",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        candidate.invariants.append(copy.deepcopy(new_inv))
+        inv_names.add(new_inv.name)
+
+    base_act_by_name = {act.name: act for act in base.actions}
+    act_by_name = {act.name: act for act in candidate.actions}
+    for new_act in spec_overlay.add_actions:
+        _assert_safe_identifier(new_act.name, "action name")
+        if new_act.name in act_by_name:
+            raise InvariantError(
+                f"overlay cannot redefine existing action {new_act.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        _validate_action_preconditions_ast(new_act.preconditions, ot_by_name=ot_by_name)
+        _validate_action_mutations_ast(new_act, ot_by_name=ot_by_name)
+        candidate.actions.append(copy.deepcopy(new_act))
+        act_by_name[new_act.name] = candidate.actions[-1]
+
+    for upd_act in spec_overlay.update_actions:
+        if upd_act.name not in act_by_name:
+            raise InvariantError(
+                f"overlay updates unknown action {upd_act.name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        _validate_action_preconditions_ast(upd_act.preconditions, ot_by_name=ot_by_name)
+        _validate_action_mutations_ast(upd_act, ot_by_name=ot_by_name)
+        if upd_act.name in base_act_by_name:
+            _validate_action_update_monotonic(base_act_by_name[upd_act.name], upd_act)
+        idx = next(i for i, a in enumerate(candidate.actions) if a.name == upd_act.name)
+        candidate.actions[idx] = copy.deepcopy(upd_act)
+        act_by_name[upd_act.name] = candidate.actions[idx]
+
+    for act_name, extra_pres in spec_overlay.add_action_preconditions.items():
+        if act_name not in act_by_name:
+            raise InvariantError(
+                f"overlay adds preconditions to unknown action {act_name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        _validate_action_preconditions_ast(extra_pres, ot_by_name=ot_by_name)
+        target_act = act_by_name[act_name]
+        existing_pre_by_name = {p.name: p.model_dump(mode="json") for p in target_act.preconditions}
+        for pre in extra_pres:
+            if pre.name in existing_pre_by_name:
+                if existing_pre_by_name[pre.name] != pre.model_dump(mode="json"):
+                    raise InvariantError(
+                        f"overlay cannot overwrite precondition {pre.name!r} on action {act_name!r}",
+                        code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                    )
+                continue
+            target_act.preconditions.append(copy.deepcopy(pre))
+            existing_pre_by_name[pre.name] = pre.model_dump(mode="json")
+
+    for act_name, roles in spec_overlay.restrict_allowed_roles.items():
+        if act_name not in act_by_name:
+            raise InvariantError(
+                f"overlay restricts roles on unknown action {act_name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        dedup_roles = list(dict.fromkeys(roles))
+        current_roles = act_by_name[act_name].allowed_roles
+        if not dedup_roles or not set(dedup_roles).issubset(set(current_roles)):
+            raise InvariantError(
+                f"overlay expands or empties allowed_roles on {act_name!r}: "
+                f"expected non-empty subset of {current_roles}, got {dedup_roles}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        act_by_name[act_name].allowed_roles = dedup_roles
+
+    for act_name, roles in spec_overlay.update_revert_roles.items():
+        if act_name not in act_by_name:
+            raise InvariantError(
+                f"overlay updates revert_roles on unknown action {act_name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        dedup_roles = list(dict.fromkeys(roles))
+        if (
+            act_name in base_act_by_name
+            and base_act_by_name[act_name].revert_roles
+            and not set(dedup_roles).issubset(set(base_act_by_name[act_name].revert_roles))
+        ):
+            raise InvariantError(
+                f"overlay expands revert_roles beyond standard action {act_name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        act_by_name[act_name].revert_roles = dedup_roles
+
+    valid_ot_names = set(ot_by_name.keys())
+    valid_act_names = set(act_by_name.keys())
+    view_by_name = {v.name: idx for idx, v in enumerate(candidate.views)}
+    for new_view in spec_overlay.add_views:
+        _validate_scoped_view_bp(new_view, valid_ot_names=valid_ot_names, valid_act_names=valid_act_names)
+        if new_view.name in view_by_name:
+            raise InvariantError(
+                f"scoped view {new_view.name!r} already exists",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        candidate.views.append(copy.deepcopy(new_view))
+        view_by_name[new_view.name] = len(candidate.views) - 1
+    for upd_view in spec_overlay.update_views:
+        _validate_scoped_view_bp(upd_view, valid_ot_names=valid_ot_names, valid_act_names=valid_act_names)
+        if upd_view.name not in view_by_name:
+            raise InvariantError(
+                f"overlay updates unknown scoped view {upd_view.name!r}",
+                code="INVALID_SCOPED_VIEW",
+            )
+        candidate.views[view_by_name[upd_view.name]] = copy.deepcopy(upd_view)
+
+    for bucket, entries in spec_overlay.display.items():
+        dest = candidate.display.setdefault(bucket, {})
+        for key, label in entries.items():
+            if label:
+                dest[key] = label
+
+    resolved_ver = target_version or spec_overlay.target_version
+    if resolved_ver:
+        candidate.version = resolved_ver
+    return candidate
 
 
 def apply_evolution_patch(
