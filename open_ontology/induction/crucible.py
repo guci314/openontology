@@ -939,8 +939,8 @@ class SymbolicCrucible:
                         if inc.expect_blocked_or_approval and sim.valid and not sim.requires_approval:
                             ok = False
                             g3_errors.append(
-                                f"incident {inc.name!r}: expected rejection or approval gate, got "
-                                f"unguarded valid=True, requires_approval=False"
+                                f"incident {inc.name!r}: expected rejection (e.g. APPROVAL_REQUIRED_* precondition) "
+                                f"or approval gate, got unguarded valid=True, requires_approval=False"
                             )
                         if inc.expect_after is not None and sim.valid:
                             matched_after = False

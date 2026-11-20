@@ -62,7 +62,12 @@ from open_ontology.induction import (
 )
 from open_ontology.osdk import AIPAgentExecutor
 
-from .business_ontology import build_business_seed_ontology
+from .business_ontology import (
+    WorkCard,
+    build_business_seed_ontology,
+    register_work_card_primitives,
+    settle_work_card,
+)
 from .odoo_dual_erp_demo import DB_NORTH
 from .odoo_fde_autonomous_pipeline import AI_OPS_ACTOR, STEWARD_OPS_ACTOR
 from .odoo_fde_prober import EphemeralOdooSandbox
@@ -212,9 +217,6 @@ def build_o2c_v1_blueprint() -> DeclarativeBlueprint:
                 name="confirm_customer_order",
                 description="Confirm a draft CustomerSalesOrder with customer credit-limit approval gating.",
                 allowed_roles=["o2c_agent", "ai_agent", "steward", "admin"],
-                approver_roles=["steward", "admin"],
-                approval_target_type="CustomerSalesOrder",
-                approval_id_param="order_id",
                 affects_source=True,
                 view_tags=["o2c"],
                 params=[FieldSpec(name="order_id", field_type="str", required=True)],
@@ -225,20 +227,27 @@ def build_o2c_v1_blueprint() -> DeclarativeBlueprint:
                         target_type="CustomerSalesOrder",
                         id_param="order_id",
                         must_hold={"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "draft"}},
-                    )
-                ],
-                approval_rule={
-                    "op": "and",
-                    "args": [
-                        {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
-                        {"op": "gt", "left": {"ref": "obj.customer_profile.credit_limit"}, "right": {"lit": 0}},
-                        {
-                            "op": "gt",
-                            "left": {"ref": "obj.amount_total"},
-                            "right": {"ref": "obj.customer_profile.credit_limit"},
+                    ),
+                    InvariantRuleSpec(
+                        name="order_credit_limit_requires_steward",
+                        code="APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED",
+                        target_type="CustomerSalesOrder",
+                        id_param="order_id",
+                        when={
+                            "op": "and",
+                            "args": [
+                                {"op": "gt", "left": {"ref": "obj.customer_profile.credit_limit"}, "right": {"lit": 0}},
+                                {
+                                    "op": "gt",
+                                    "left": {"ref": "obj.amount_total"},
+                                    "right": {"ref": "obj.customer_profile.credit_limit"},
+                                },
+                            ],
                         },
-                    ],
-                },
+                        must_hold={"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
+                        description="Over-credit order confirmation requires Steward/Admin approval via M1 WorkCard.",
+                    ),
+                ],
                 mutations=[
                     ActionMutationSpec(
                         op="modify",
@@ -453,9 +462,6 @@ def build_p2p_grafting_patch() -> EvolutionPatch:
                 name="approve_purchase_order",
                 description="Approve a draft PurchaseOrder subject to supplier spend-limit gating.",
                 allowed_roles=["p2p_agent", "warehouse_agent", "ai_agent", "steward", "admin"],
-                approver_roles=["steward", "admin"],
-                approval_target_type="PurchaseOrder",
-                approval_id_param="po_id",
                 affects_source=True,
                 view_tags=["p2p", "p2p_buyer", "replenishment"],
                 params=[FieldSpec(name="po_id", field_type="str", required=True)],
@@ -466,20 +472,31 @@ def build_p2p_grafting_patch() -> EvolutionPatch:
                         target_type="PurchaseOrder",
                         id_param="po_id",
                         must_hold={"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "draft"}},
-                    )
-                ],
-                approval_rule={
-                    "op": "and",
-                    "args": [
-                        {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
-                        {"op": "gt", "left": {"ref": "obj.supplier_profile.approved_spend_limit"}, "right": {"lit": 0}},
-                        {
-                            "op": "gt",
-                            "left": {"ref": "obj.amount_total"},
-                            "right": {"ref": "obj.supplier_profile.approved_spend_limit"},
+                    ),
+                    InvariantRuleSpec(
+                        name="po_spend_limit_requires_steward",
+                        code="APPROVAL_REQUIRED_SPEND_LIMIT_EXCEEDED",
+                        target_type="PurchaseOrder",
+                        id_param="po_id",
+                        when={
+                            "op": "and",
+                            "args": [
+                                {
+                                    "op": "gt",
+                                    "left": {"ref": "obj.supplier_profile.approved_spend_limit"},
+                                    "right": {"lit": 0},
+                                },
+                                {
+                                    "op": "gt",
+                                    "left": {"ref": "obj.amount_total"},
+                                    "right": {"ref": "obj.supplier_profile.approved_spend_limit"},
+                                },
+                            ],
                         },
-                    ],
-                },
+                        must_hold={"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
+                        description="Over-spend-limit PurchaseOrder requires Steward/Admin approval via M1 WorkCard.",
+                    ),
+                ],
                 mutations=[
                     ActionMutationSpec(
                         op="modify",
@@ -1013,6 +1030,11 @@ def crystallize_and_graft_o2c_p2p() -> tuple[DeclarativeBlueprint, DeclarativeBl
         assert active_v2 is not None and active_v2.version == "2.0.0"
 
     compiled_v2 = compile_blueprint(active_v2, seed_ontology=seed)
+    register_work_card_primitives(
+        compiled_v2,
+        opener_roles=("o2c_agent", "p2p_agent", "warehouse_agent", "ai_agent", "steward", "admin"),
+        resolver_roles=("steward", "admin"),
+    )
     return active_v1, active_v2, compiled_v2
 
 
@@ -1208,6 +1230,60 @@ def run_o2c_p2p_grafting_demo(
         parent_bal = float(rt.get_object(bal_cls, "BAL-MAIN-WIDGET", WAREHOUSE_OPS_ACTOR).on_hand_qty)
         assert abs(parent_bal - 2.0) < 1e-6
 
+        # Over-spend-limit PO approval flows via M1 WorkCard + settle_work_card (zero PENDING_APPROVAL)
+        over_fork = rt.fork()
+        try:
+            over_fork.put_object(
+                po_cls(
+                    po_id="PO-OVER-LIMIT-1",
+                    po_number="P99001",
+                    entity="ENT-NORTH",
+                    supplier_profile="SUPP-PROF-ACME",
+                    product="PROD-WIDGET",
+                    target_balance="BAL-MAIN-WIDGET",
+                    ordered_qty=50.0,
+                    amount_total=35_000.0,
+                    status="draft",
+                )
+            )
+            over_err_code = ""
+            try:
+                over_fork.submit_action("WC-PO-BLK", "approve_purchase_order", {"po_id": "PO-OVER-LIMIT-1"}, P2P_OPS_ACTOR)
+                raise AssertionError("expected over-spend-limit PO approval by p2p_agent to fail")
+            except InvariantError as exc:
+                over_err_code = exc.code or ""
+            assert over_err_code == "APPROVAL_REQUIRED_SPEND_LIMIT_EXCEEDED"
+            assert over_fork.list_action_runs(status="PENDING_APPROVAL") == []
+
+            wc_open = over_fork.submit_action(
+                "WC-PO-OPEN",
+                "open_work_card",
+                {
+                    "card_id": "WC-P2P-OVR-1",
+                    "card_kind": "APPROVAL",
+                    "target_object_type": "PurchaseOrder",
+                    "target_object_id": "PO-OVER-LIMIT-1",
+                    "requested_action": "approve_purchase_order",
+                    "requested_params_json": '{"po_id": "PO-OVER-LIMIT-1"}',
+                    "assignee_role": "steward",
+                },
+                P2P_OPS_ACTOR,
+            )
+            assert wc_open["status"] == "COMMITTED"
+            wc_settled = settle_work_card(
+                over_fork,
+                "WC-P2P-OVR-1",
+                STEWARD_OPS_ACTOR,
+                resolution_note="steward approved over-limit procurement",
+            )
+            assert wc_settled["status"] == "COMMITTED"
+            assert wc_settled["settled_action_run"]["status"] == "COMMITTED"
+            assert over_fork.get_object(po_cls, "PO-OVER-LIMIT-1", STEWARD_OPS_ACTOR).status == "approved"
+            assert over_fork.get_object(WorkCard, "WC-P2P-OVR-1", STEWARD_OPS_ACTOR).status == "COMPLETED"
+            assert over_fork.list_action_runs(status="PENDING_APPROVAL") == []
+        finally:
+            over_fork.close()
+
         live_po_result: dict[str, Any] | None = None
         if not offline:
             live_po_result = _settle_live_erp_north_po(spec_v2, source_db=source_db)
@@ -1231,6 +1307,12 @@ def run_o2c_p2p_grafting_demo(
                 "fork_ending_on_hand_qty": 7.0,
                 "voucher_net_delta": 5.0,
                 "premature_bill_error_code": premature_bill_code,
+            },
+            "work_card_approval": {
+                "error_code": over_err_code,
+                "work_card_status": "COMPLETED",
+                "settled_status": wc_settled["status"],
+                "pending_approval_runs": 0,
             },
             "live_odoo_p2p_settlement": live_po_result,
         }

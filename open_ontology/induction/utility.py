@@ -265,9 +265,9 @@ def verify_anti_smuggling_parity(
     """Enforce Anti-Smuggling & Anti-Blackbox hard constraints in a pure offline :memory: sandbox.
 
     Checks two invariants without any external connector or network access:
-    1. Every rejection / approval suspension observed online MUST already occur inside
-       the isolated pure ``:memory:`` sandbox (otherwise business logic was smuggled
-       into the external connector or omitted from the ontology).
+    1. Every rejection / ``APPROVAL_REQUIRED_*`` gate (or legacy approval suspension) observed
+       online MUST already occur with matching semantics inside the isolated pure ``:memory:``
+       sandbox (otherwise business logic was smuggled into the external connector or omitted).
     2. Every committed mutating action MUST produce a non-empty ``object_diff``
        (blocking 1-bit black-box actions that hide causal state changes outside the ontology).
     """
@@ -331,7 +331,12 @@ def verify_anti_smuggling_parity(
                             ),
                         )
                     )
-                elif offline_status != probe.online_status:
+                elif offline_status != probe.online_status or (
+                    offline_status == "REJECTED"
+                    and probe.online_status == "REJECTED"
+                    and (probe.online_error_code or "").startswith("APPROVAL_REQUIRED_")
+                    and sim.error_code != probe.online_error_code
+                ):
                     violations.append(
                         AntiSmugglingViolation(
                             case_id=probe.case_id,

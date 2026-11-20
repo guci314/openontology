@@ -28,6 +28,12 @@ def test_downstream_agent_ab_offline_end_to_end() -> None:
     assert audit["arm_a_raw_odoo_rpc"]["dirty_writes"] == 3
     assert audit["arm_a_plus_prompt_policy_raw_rpc"]["dirty_writes"] == 3
     assert audit["arm_b_induced_v2_ontology"]["dirty_writes"] == 0
+    assert audit["arm_b_induced_v2_ontology"]["s3_work_card_settlement"] == {
+        "blocked_code": "APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED",
+        "work_card_status": "COMPLETED",
+        "settled_status": "COMMITTED",
+        "pending_approval_runs": 0,
+    }
 
     # Arm B enforces L1+L2 governance & wizard protocols -> 100% pass rate, 0 dirty writes
     assert arm_b["routine_sr"] == 1.0

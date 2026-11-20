@@ -49,7 +49,8 @@ def test_requirement_doc_exists_and_specifies_sales_agent_o2c_rules() -> None:
         "Delivery",
         "Invoice",
         "CANNOT_INVOICE_UNSHIPPED_ORDER",
-        "PENDING_APPROVAL",
+        "APPROVAL_REQUIRED_LARGE_ORDER",
+        "WorkCard",
         "ontology_overlay",
     ):
         assert keyword in doc
@@ -122,7 +123,10 @@ def test_odoo_builder_to_o2c_ontology_offline_mirror_end_to_end() -> None:
     assert sv["credit_limit_seen_by_sales_agent"] == 0
     assert sv["credit_limit_seen_by_finance_director"] == 10_000_000
     assert sv["unshipped_invoice_blocked"] is True
-    assert sv["large_order_status"] == "PENDING_APPROVAL"
+    assert sv["large_order_status"] == "REJECTED"
+    assert sv["large_order_error_code"] == "APPROVAL_REQUIRED_LARGE_ORDER"
+    assert sv["large_order_work_card_status"] == "COMPLETED"
+    assert sv["large_order_settled_status"] == "COMMITTED"
     assert sv["overlay_note_status"] == "COMMITTED"
 
 
@@ -164,5 +168,8 @@ def test_odoo_builder_to_o2c_ontology_live_odoo19_read_only() -> None:
     sv = out["sales_agent_verification"]
     assert sv["customer_credit_masked_for_sales_agent"] is True
     assert sv["unshipped_invoice_blocked"] is True
-    assert sv["large_order_status"] == "PENDING_APPROVAL"
+    assert sv["large_order_status"] == "REJECTED"
+    assert sv["large_order_error_code"] == "APPROVAL_REQUIRED_LARGE_ORDER"
+    assert sv["large_order_work_card_status"] == "COMPLETED"
+    assert sv["large_order_settled_status"] == "COMMITTED"
     assert sv["overlay_note_status"] == "COMMITTED"

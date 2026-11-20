@@ -885,8 +885,9 @@ def run_live_llm_genesis_purification_experiment(
             "expected_state_field, expected_state_after), with id_param matching the action's params[0].name and "
             "id_prefix matching the target entity's id_transform.prefix; keep action mutations, preconditions, "
             "transitions, and expected_state_after in the exact mapped status vocabulary.\n"
-            "4. Gate backward/reversal/cancellation transitions behind steward/admin approval (e.g. approval_rule "
-            "when actor.role not_in ['steward', 'admin']) AND enforce discovered cross-entity limit and "
+            "4. Gate backward/reversal/cancellation transitions behind steward/admin approval via role-conditional "
+            "action preconditions (e.g. must_hold actor.role in ['steward', 'admin'], code='APPROVAL_REQUIRED_<REASON>') "
+            "AND enforce discovered cross-entity limit and "
             "prerequisite fulfillment guardrails implied by the relations and gray-zone findings via clean action preconditions.\n"
             "5. Emit 2 to 4 self-contained ProposedEvalCase items using synthetic setup_objects."
         )
@@ -1281,9 +1282,7 @@ def run_live_llm_l2_architect_experiment(
                 action=confirm_b.action_name,
                 params={confirm_b.id_param: f"{confirm_b.id_prefix}{f_large.order_id}"},
                 actor=AI_OPS_ACTOR,
-                expect_valid=True,
-                expect_requires_approval=True,
-                expect_error_code=None,
+                expect_blocked_or_approval=True,
             ),
             IncidentCounterexample(
                 name="HIST-CX-UNSHIPPED-POST",

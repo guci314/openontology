@@ -850,3 +850,59 @@ def test_governance_pure_sync_zero_pending_approval_and_source_clean() -> None:
         assert gov.get_active_blueprint("sync_gov_test").version == "1.0.0"
 
         assert gov.runtime.list_action_runs(status="PENDING_APPROVAL") == []
+
+
+def test_complete_work_card_blocks_privilege_escalation_on_target_action() -> None:
+    """Completing an owned APPROVAL WorkCard must still enforce target_action.allowed_roles."""
+    spec, Customer, _SupportCase, SalesOrder = _build_o2c_work_card_spec()
+
+    class _AdminOverrideParams(BaseModel):
+        order_id: str
+
+    @spec.action(
+        "admin_override_order",
+        _AdminOverrideParams,
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+    def _admin_override_order(ctx: EditBatch, params: _AdminOverrideParams) -> None:
+        order = ctx.require(SalesOrder, params.order_id)
+        ctx.modify(order, status="confirmed")
+
+    admin_actor = Actor(actor_id="human:admin-1", role="admin", clearance_tags={"*"})
+    rt = OntologyRuntime(spec, db_path=":memory:")
+    try:
+        rt.put_object(Customer(customer_id="C-ESC", name="Esc Co", credit_limit=10000.0))
+        rt.put_object(SalesOrder(order_id="SO-ESC", customer="C-ESC", amount=99000.0, status="draft"))
+
+        rt.submit_action(
+            "ESC-OPEN",
+            "open_work_card",
+            {
+                "card_id": "WC-ESC-01",
+                "card_kind": "APPROVAL",
+                "target_object_type": "SalesOrder",
+                "target_object_id": "SO-ESC",
+                "requested_action": "admin_override_order",
+                "requested_params_json": '{"order_id": "SO-ESC"}',
+                "assignee_role": "ops",
+            },
+            AI_OPS,
+        )
+
+        # OPS_1 is allowed on complete_work_card and matches assignee_role='ops',
+        # but must NOT escalate privileges to invoke admin-only requested_action!
+        with pytest.raises(PermissionDeniedError):
+            rt.submit_action("ESC-TRY-COMP", "complete_work_card", {"card_id": "WC-ESC-01"}, OPS_1)
+        with pytest.raises(PermissionDeniedError):
+            settle_work_card(rt, "WC-ESC-01", OPS_1)
+
+        assert rt.get_object(SalesOrder, "SO-ESC", admin_actor).status == "draft"
+        assert rt.get_object(WorkCard, "WC-ESC-01", admin_actor).status == "OPEN"
+
+        ok = settle_work_card(rt, "WC-ESC-01", admin_actor, resolution_note="admin approved")
+        assert ok["status"] == "COMMITTED"
+        assert rt.get_object(SalesOrder, "SO-ESC", admin_actor).status == "confirmed"
+        assert rt.get_object(WorkCard, "WC-ESC-01", admin_actor).status == "COMPLETED"
+    finally:
+        rt.close()

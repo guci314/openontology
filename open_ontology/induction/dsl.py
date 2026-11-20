@@ -1969,9 +1969,12 @@ def dsl_schema_prompt_guide(
         ),
         "scope_rule": (
             "Global 'invariants' / 'add_invariants' run on all M0 records with ONLY 'obj' (no 'actor' or 'param'). "
-            "Action 'preconditions' and 'approval_rule' can access 'obj' (including relations obj.<rel>.<field>), "
-            "'param.*', 'actor.role', and cross-object quantifiers/aggregates; use 'approval_rule' when over-limit "
-            "or governed actions should pause in PENDING_APPROVAL for steward sign-off instead of hard-rejecting. "
+            "Action 'preconditions' can access 'obj' (including relations obj.<rel>.<field>), 'param.*', "
+            "'actor.role', and cross-object quantifiers/aggregates; encode over-limit, reversal, or human-approval "
+            "gates as role-conditional action preconditions (e.g., when=<condition>, "
+            "must_hold={'op': 'in', 'left': {'ref': 'actor.role'}, 'right': {'lit': ['steward', 'admin']}}, "
+            "code='APPROVAL_REQUIRED_<REASON>') so unprivileged roles are cleanly rejected with APPROVAL_REQUIRED_* "
+            "and escalated via M1 owned approval workflow objects before t1 re-execution. "
             "Mutations may use 'target_ref' (e.g. 'obj.customer') to update linked entities ('source_obj.*' refers to "
             "the primary anchor object). EvolutionPatch supports 'add_relations' and 'remove_fields' with reference checks."
         ),
@@ -1981,9 +1984,9 @@ def dsl_schema_prompt_guide(
             "Populate 'setup_objects' with self-contained synthetic records (using synthetic IDs such as "
             "'EVAL-CUST-1', 'EVAL-ORD-1') so the case executes deterministically in Gate 4 without depending on "
             "ephemeral M0 rows. Gate 4 immediately executes every proposed_eval_case against your candidate blueprint "
-            "before crystallization. In simulation, a triggered 'preconditions' rule yields "
-            "expect={'valid': false, 'error_code': '<code>'}, whereas a triggered 'approval_rule' yields "
-            "expect={'valid': true, 'requires_approval': true} (error_code=null)."
+            "before crystallization. In simulation, a triggered 'preconditions' rule (including 'APPROVAL_REQUIRED_*' "
+            "gates for non-privileged roles) yields expect={'valid': false, 'error_code': '<code>'}, whereas an "
+            "authorized actor or compliant record yields expect={'valid': true}."
         ),
     }
     if mode == "genesis":

@@ -22,7 +22,13 @@ from typing import Any, ClassVar, Literal, Sequence
 
 from pydantic import BaseModel
 
-from open_ontology.spec import AutoID, InvariantError, ObjectType, OntologySpec
+from open_ontology.spec import (
+    AutoID,
+    InvariantError,
+    ObjectType,
+    OntologySpec,
+    PermissionDeniedError,
+)
 
 __all__ = [
     "spec",
@@ -529,6 +535,14 @@ def register_work_card_primitives(
                             code="SOURCE_APPROVAL_REQUIRES_SETTLED_RUN",
                         )
                 else:
+                    if (
+                        target_action.allowed_roles
+                        and ctx.actor.role not in target_action.allowed_roles
+                    ):
+                        raise PermissionDeniedError(
+                            f"actor {ctx.actor.actor_id!r} role {ctx.actor.role!r} may not execute "
+                            f"{target_action.name!r}; allowed roles: {list(target_action.allowed_roles)}"
+                        )
                     target_params = target_action.params.model_validate_json(
                         card.requested_params_json or "{}"
                     )

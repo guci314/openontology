@@ -85,11 +85,19 @@ def test_autonomous_pipeline_end_to_end_offline_synthetic_clinic_erp() -> None:
 
 
 def test_autonomous_synthesis_promotes_joins_prunes_ui_noise_and_compiles_approval_rule() -> None:
-    from open_ontology import OntologyRuntime
+    import json
+
+    from open_ontology import InvariantError, OntologyRuntime
     from open_ontology.induction import compile_blueprint, project_external_phenomenon
-    from examples.business_ontology import build_business_seed_ontology
+    from examples.business_ontology import (
+        WorkCard,
+        build_business_seed_ontology,
+        register_work_card_primitives,
+        settle_work_card,
+    )
     from examples.odoo_fde_autonomous_pipeline import (
         AI_OPS_ACTOR,
+        STEWARD_OPS_ACTOR,
         build_auto_replay_factory,
         build_closed_phenomenon_profile,
         synthesize_from_fde_evidence,
@@ -138,12 +146,14 @@ def test_autonomous_synthesis_promotes_joins_prunes_ui_noise_and_compiles_approv
     assert "visit_origin" not in {f.name for f in pb_ot.fields}
 
     compiled = compile_blueprint(bundle.blueprint, seed_ontology=seed)
+    register_work_card_primitives(compiled)
     projected, proj_errors = project_external_phenomenon(profile, bundle.adapter_mapping)
     assert proj_errors == []
 
-    # Verify build_auto_replay_factory emits both normal and approval-gated ReplayEvents when applicable
-    pos_events, _ = build_auto_replay_factory(bundle, seed_ontology=seed)(projected)
-    assert any(ev.expected_requires_approval for ev in pos_events)
+    # Verify build_auto_replay_factory emits AI approval-gate denial + Steward approval replay events
+    pos_events, neg_events = build_auto_replay_factory(bundle, seed_ontology=seed)(projected)
+    assert any(ev.expected_error_code == "APPROVAL_REQUIRED_COVERAGE_LIMIT_EXCEEDED" for ev in neg_events)
+    assert any(ev.actor.role == "steward" and ev.action == "confirm_visit" for ev in pos_events)
 
     rt = OntologyRuntime(compiled, db_path=":memory:")
     try:
@@ -156,8 +166,30 @@ def test_autonomous_synthesis_promotes_joins_prunes_ui_noise_and_compiles_approv
         over_limit = next(v for v in rt.query_objects(visit_cls, AI_OPS_ACTOR) if v.state == "draft" and float(v.total_amount) > 500.0)
         within_limit = next(v for v in rt.query_objects(visit_cls, AI_OPS_ACTOR) if v.state == "draft" and float(v.total_amount) <= 500.0)
 
-        res_over = rt.submit_action("SYNTH-OVER", "confirm_visit", {"record_id": over_limit.record_id}, AI_OPS_ACTOR)
-        assert res_over["status"] == "PENDING_APPROVAL"
+        with pytest.raises(InvariantError) as exc_over:
+            rt.submit_action("SYNTH-OVER", "confirm_visit", {"record_id": over_limit.record_id}, AI_OPS_ACTOR)
+        assert exc_over.value.code == "APPROVAL_REQUIRED_COVERAGE_LIMIT_EXCEEDED"
+        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+
+        rt.submit_action(
+            "SYNTH-WC-OPEN",
+            "open_work_card",
+            {
+                "card_id": "WC-SYNTH-OVR",
+                "card_kind": "APPROVAL",
+                "target_object_type": "ClinicVisit",
+                "target_object_id": over_limit.record_id,
+                "requested_action": "confirm_visit",
+                "requested_params_json": json.dumps({"record_id": over_limit.record_id}),
+                "assignee_role": "steward",
+            },
+            AI_OPS_ACTOR,
+        )
+        settled = settle_work_card(rt, "WC-SYNTH-OVR", STEWARD_OPS_ACTOR, resolution_note="approved over limit")
+        assert settled["status"] == "COMMITTED"
+        assert settled["settled_action_run"]["status"] == "COMMITTED"
+        assert rt.get_object(WorkCard, "WC-SYNTH-OVR", STEWARD_OPS_ACTOR).status == "COMPLETED"
+        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
 
         res_ok = rt.submit_action("SYNTH-OK", "confirm_visit", {"record_id": within_limit.record_id}, AI_OPS_ACTOR)
         assert res_ok["status"] == "COMMITTED"

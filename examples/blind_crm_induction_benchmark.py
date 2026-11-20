@@ -74,7 +74,12 @@ from open_ontology.induction import (
     project_single_record,
 )
 
-from .business_ontology import build_business_seed_ontology
+from .business_ontology import (
+    WorkCard,
+    build_business_seed_ontology,
+    register_work_card_primitives,
+    settle_work_card,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 BOTTLECRM_SQLITE_PATH = ROOT / "vendor_crm" / "bottlecrm.sqlite3"
@@ -659,12 +664,12 @@ def _make_offline_crm_backends(scout_info: dict[str, Any]):
     lost_act.preconditions.append(
         InvariantRuleSpec(
             name="high_value_loss_requires_steward",
-            code="HIGH_VALUE_LOSS_REQUIRES_STEWARD",
+            code="APPROVAL_REQUIRED_HIGH_VALUE_LOSS",
             target_type="Opportunity",
             id_param="opportunity_id",
             when={"op": "gt", "left": {"ref": "obj.amount"}, "right": {"lit": 100000.0}},
-            must_hold={"op": "eq", "left": {"ref": "actor.role"}, "right": {"lit": "steward"}},
-            description="Closing opportunities above 100,000 as lost requires steward authority.",
+            must_hold={"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
+            description="Closing opportunities above 100,000 as lost requires steward or admin authority.",
         )
     )
     patch = EvolutionPatch(
@@ -726,6 +731,11 @@ def _sqlite_homomorphic_settlement_check(
     """Execute crystallized CRM v1.1.0 against an ephemeral temp copy of bottlecrm.sqlite3."""
     seed = build_business_seed_ontology()
     spec = compile_blueprint(blueprint, seed_ontology=seed)
+    register_work_card_primitives(
+        spec,
+        opener_roles=("ai_agent", "ops", "steward", "admin"),
+        resolver_roles=("steward", "admin"),
+    )
     projected, _ = project_external_phenomenon(profile, adapter_mapping)
 
     opp_em = next(em for em in adapter_mapping.entity_mappings if em.source_table == "opportunity")
@@ -760,15 +770,13 @@ def _sqlite_homomorphic_settlement_check(
                 cls = spec.get_object_type(item["object_type"])
                 rt.put_object(cls(**item["data"]))
 
-            def _try_crm_action(
-                run_id: str,
+            def _make_crm_bridge(
                 binding: ActionExecutionBinding,
                 em: EntityMappingSpec,
                 raw_uuid: str,
-                actor: Actor,
                 col_name: str,
                 new_val: str,
-            ) -> tuple[str, str | None, str]:
+            ) -> SourceBridge:
                 cid = f"{binding.id_prefix}{raw_uuid}"
 
                 def _actuate(mv: dict[str, Any]) -> None:
@@ -816,7 +824,22 @@ def _sqlite_homomorphic_settlement_check(
                     proj_after = project_single_record(em, raw_after)
                     return {binding.target_object_type: [proj_after]}
 
-                rt.bind_source_bridge(SourceBridge(actuate=_actuate, observe=_observe), world_mode="coupled")
+                return SourceBridge(actuate=_actuate, observe=_observe)
+
+            def _try_crm_action(
+                run_id: str,
+                binding: ActionExecutionBinding,
+                em: EntityMappingSpec,
+                raw_uuid: str,
+                actor: Actor,
+                col_name: str,
+                new_val: str,
+            ) -> tuple[str, str | None, str]:
+                cid = f"{binding.id_prefix}{raw_uuid}"
+                rt.bind_source_bridge(
+                    _make_crm_bridge(binding, em, raw_uuid, col_name, new_val),
+                    world_mode="coupled",
+                )
                 try:
                     run = rt.submit_action(run_id, binding.action_name, {binding.id_param: cid}, actor)
                     status = str(run["status"])
@@ -852,16 +875,51 @@ def _sqlite_homomorphic_settlement_check(
             st_acme_win, err_acme_win, db_acme_win = _try_crm_action(
                 "CRM-5-ACME-WIN-AFTER", win_b, opp_em, acme_opp_id, CRM_AI_ACTOR, "stage", "CLOSED_WON"
             )
+            # 5. Steward approval flow via M1 WorkCard for blocked Southstar 260k loss
+            assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+            south_cid = f"{lost_b.id_prefix}{south_opp_id}"
+            rt.bind_source_bridge(
+                _make_crm_bridge(lost_b, opp_em, south_opp_id, "stage", "CLOSED_LOST"),
+                world_mode="coupled",
+            )
+            rt.submit_action(
+                "CRM-6-SOUTH-WC-OPEN",
+                "open_work_card",
+                {
+                    "card_id": "WC-CRM-SOUTH-LOSS",
+                    "card_kind": "APPROVAL",
+                    "target_object_type": opp_em.target_object_type,
+                    "target_object_id": south_cid,
+                    "requested_action": lost_b.action_name,
+                    "requested_params_json": json.dumps({lost_b.id_param: south_cid}),
+                    "assignee_role": "steward",
+                },
+                CRM_AI_ACTOR,
+            )
+            south_settled = settle_work_card(
+                rt,
+                "WC-CRM-SOUTH-LOSS",
+                CRM_STEWARD_ACTOR,
+                resolution_note="steward approved 260k close-lost in SQLite sandbox",
+            )
+            db_south_after = str(
+                conn.execute(
+                    f'SELECT "stage" FROM "{lost_b.external_table}" WHERE id=?',
+                    (south_opp_id,),
+                ).fetchone()[0]
+            )
+            wc_south_done = rt.get_object(WorkCard, "WC-CRM-SOUTH-LOSS", CRM_STEWARD_ACTOR)
+            assert rt.list_action_runs(status="PENDING_APPROVAL") == []
 
             return {
                 "acme_blocked_while_high_case_open": {
-                    "passed": st_acme_blk in ("REJECTED", "PENDING_APPROVAL") and db_acme_blk == "NEGOTIATION",
+                    "passed": st_acme_blk == "REJECTED" and db_acme_blk == "NEGOTIATION",
                     "settled": st_acme_blk,
                     "error_code": err_acme_blk,
                     "sqlite_stage_after": db_acme_blk,
                 },
                 "southstar_260k_loss_blocked_for_ai": {
-                    "passed": st_south_blk in ("REJECTED", "PENDING_APPROVAL") and db_south_blk == "QUALIFICATION",
+                    "passed": st_south_blk == "REJECTED" and db_south_blk == "QUALIFICATION",
                     "settled": st_south_blk,
                     "error_code": err_south_blk,
                     "sqlite_stage_after": db_south_blk,
@@ -883,6 +941,17 @@ def _sqlite_homomorphic_settlement_check(
                     "case_sqlite_status": db_case_res,
                     "opp_settled": st_acme_win,
                     "opp_sqlite_stage": db_acme_win,
+                },
+                "southstar_work_card_steward_settlement": {
+                    "passed": (
+                        south_settled["status"] == "COMMITTED"
+                        and south_settled["settled_action_run"]["status"] == "COMMITTED"
+                        and wc_south_done.status == "COMPLETED"
+                        and db_south_after == "CLOSED_LOST"
+                    ),
+                    "work_card_status": wc_south_done.status,
+                    "sqlite_stage_after": db_south_after,
+                    "pending_approval_runs": len(rt.list_action_runs(status="PENDING_APPROVAL")),
                 },
             }
         finally:
@@ -1013,7 +1082,7 @@ def run_blind_crm_induction_benchmark(
                         f"({lost_b.action_name}) when commercial deal value exceeds 100,000; high-value losses require "
                         f"human steward or admin authority (blocked {south_opp_cid} valued at 260,000 for ai_agent, allowed for steward)."
                     ),
-                    error_code="HIGH_VALUE_LOSS_REQUIRES_STEWARD",
+                    error_code="APPROVAL_REQUIRED_HIGH_VALUE_LOSS",
                 ),
             ),
         )

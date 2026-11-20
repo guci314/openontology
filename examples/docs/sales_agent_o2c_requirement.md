@@ -34,7 +34,7 @@
 1. **确认销售订单（`confirm_sales_order`）**
    * 允许角色：`sales_agent`、`finance_director`、`admin`。
    * 强校验：入参订单金额必须与系统账面一致（`ORDER_AMOUNT_MISMATCH`）；草稿态订单才可确认。
-   * **大额审批铁律**：凡订单金额 **超过 ¥100,000（即 `> 10_000_000` 分）** 且调用方不是 `finance_director` 时，**严禁直接落库，必须自动挂起为 `PENDING_APPROVAL` 等待财务总监审批**。
+   * **大额审批铁律**：凡订单金额 **超过 ¥100,000（即 `> 10_000_000` 分）** 且调用方不是 `finance_director` / `admin` 时，**严禁直接落库，必须由本体前置校验当场拒止返回 `APPROVAL_REQUIRED_LARGE_ORDER`，再由发起方开立 `WorkCard` 交由财务总监在 $t_1$ 现场重算签批落库**。
 2. **完成交货出库（`ship_order_delivery`）**
    * 允许角色：`warehouse_ops`、`sales_agent`、`admin`。
    * **前置铁律**：关联销售订单必须已处于 `confirmed` 状态，未确认草稿单严禁出库（`ORDER_NOT_CONFIRMED`）。
@@ -54,4 +54,4 @@
 
 * **零侵扰勘察**：构建过程只能只读探测 Odoo 19，不得修改 Odoo 中任何一条业务数据。
 * **真实数据全拟合**：从现行 Odoo 19 抽取的真实客户、销售订单、交货单与客户发票，经映射投入 O2C 本体后必须 100% 通过类型校验、参照完整性与所有业务不变量（且自动过滤红字退款单、内部调拨单等脏数据）。
-* **反例全拦截 & 可用工具导出**：在真实 Odoo 采样订单上验证“未发货开票被红牌拦截”、“12 万大单被挂起审批”、“正常小单可顺畅推进”、“风控备注落入自有层”，并导出标准 OSDK Tool Schema 供销售 Agent 直接调用。
+* **反例全拦截 & 可用工具导出**：在真实 Odoo 采样订单上验证“未发货开票被红牌拦截”、“12 万大单返回 `APPROVAL_REQUIRED_LARGE_ORDER` 并经 M1 `WorkCard` 完成财务总监签批”、“正常小单可顺畅推进”、“风控备注落入自有层”，并导出标准 OSDK Tool Schema 供销售 Agent 直接调用。

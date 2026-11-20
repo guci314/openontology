@@ -124,6 +124,43 @@ def build_initial_o2c_m0_objects() -> list[dict[str, Any]]:
     ]
 
 
+def _confirm_sales_order_action_bp(*extra_preconditions: InvariantRuleSpec) -> ActionBlueprint:
+    return ActionBlueprint(
+        name="confirm_sales_order",
+        description="确认草稿销售订单",
+        allowed_roles=["ai_agent", "finance_director", "admin"],
+        approver_roles=["finance_director", "admin"],
+        affects_source=True,
+        display_label="确认销售订单",
+        params=[
+            FieldSpec(name="order_id", field_type="str", required=True),
+            FieldSpec(name="order_amount", field_type="int", required=True),
+        ],
+        preconditions=[
+            InvariantRuleSpec(
+                name="order_amount_matches_record",
+                code="ORDER_AMOUNT_MISMATCH",
+                target_type="SalesOrder",
+                must_hold={
+                    "op": "eq",
+                    "left": {"ref": "obj.amount"},
+                    "right": {"ref": "param.order_amount"},
+                },
+                description="动作入参金额必须与订单账面金额一致。",
+            ),
+            *extra_preconditions,
+        ],
+        mutations=[
+            ActionMutationSpec(
+                op="modify",
+                object_type="SalesOrder",
+                id_param="order_id",
+                set_fields={"status": {"lit": "confirmed"}},
+            )
+        ],
+    )
+
+
 def _base_o2c_blueprint(*, include_unshipped_invoice_guard: bool) -> dict[str, Any]:
     invariants: list[dict[str, Any]] = []
     if include_unshipped_invoice_guard:
@@ -214,39 +251,7 @@ def _base_o2c_blueprint(*, include_unshipped_invoice_guard: bool) -> dict[str, A
             ),
         ],
         actions=[
-            ActionBlueprint(
-                name="confirm_sales_order",
-                description="确认草稿销售订单",
-                allowed_roles=["ai_agent", "finance_director", "admin"],
-                approver_roles=["finance_director", "admin"],
-                affects_source=True,
-                display_label="确认销售订单",
-                params=[
-                    FieldSpec(name="order_id", field_type="str", required=True),
-                    FieldSpec(name="order_amount", field_type="int", required=True),
-                ],
-                preconditions=[
-                    InvariantRuleSpec(
-                        name="order_amount_matches_record",
-                        code="ORDER_AMOUNT_MISMATCH",
-                        target_type="SalesOrder",
-                        must_hold={
-                            "op": "eq",
-                            "left": {"ref": "obj.amount"},
-                            "right": {"ref": "param.order_amount"},
-                        },
-                        description="动作入参金额必须与订单账面金额一致。",
-                    )
-                ],
-                mutations=[
-                    ActionMutationSpec(
-                        op="modify",
-                        object_type="SalesOrder",
-                        id_param="order_id",
-                        set_fields={"status": {"lit": "confirmed"}},
-                    )
-                ],
-            ),
+            _confirm_sales_order_action_bp(),
             ActionBlueprint(
                 name="ship_sales_order",
                 description="确认订单出库发货",
@@ -306,7 +311,6 @@ def make_offline_builder_backend() -> CallableAbductionBackend:
                 "params": {"order_id": "SO-SMALL-01", "order_amount": 20000},
                 "expect": {
                     "valid": True,
-                    "requires_approval": False,
                     "object_changes": [
                         {
                             "object_type": "SalesOrder",
@@ -357,25 +361,28 @@ def make_offline_evolver_backend() -> CallableAbductionBackend:
                 "patch": EvolutionPatch(
                     base_version="1.0.0",
                     target_version="1.1.0",
-                    rationale="偷懒特判：只要求非总监处理涉事订单 SO-BIG-01 / SO-BIG-02 时审批。",
-                    update_approval_rules={
-                        "confirm_sales_order": {
-                            "op": "and",
-                            "args": [
-                                {
+                    rationale="偷懒特判：只要求非总监处理涉事订单 SO-BIG-01 / SO-BIG-02 时拦截审批。",
+                    update_actions=[
+                        _confirm_sales_order_action_bp(
+                            InvariantRuleSpec(
+                                name="overfit_big_order_ids",
+                                code="APPROVAL_REQUIRED_ORDER_AMOUNT_EXCEEDED",
+                                target_type="SalesOrder",
+                                id_param="order_id",
+                                when={
                                     "op": "in",
                                     "left": {"ref": "param.order_id"},
                                     "right": {"lit": ["SO-BIG-01", "SO-BIG-02"]},
                                 },
-                                {
-                                    "op": "ne",
+                                must_hold={
+                                    "op": "in",
                                     "left": {"ref": "actor.role"},
-                                    "right": {"lit": "finance_director"},
+                                    "right": {"lit": ["finance_director", "admin"]},
                                 },
-                            ],
-                        }
-                    },
-                    update_approver_roles={"confirm_sales_order": ["finance_director"]},
+                                description="仅针对具体订单号硬编码签批拦截。",
+                            )
+                        )
+                    ],
                 ).model_dump(mode="json")
             }
 
@@ -385,15 +392,23 @@ def make_offline_evolver_backend() -> CallableAbductionBackend:
                 "patch": EvolutionPatch(
                     base_version="1.0.0",
                     target_version="1.1.0",
-                    rationale="过度收紧：所有 ai_agent 提交的确认单全部强审批。",
-                    update_approval_rules={
-                        "confirm_sales_order": {
-                            "op": "eq",
-                            "left": {"ref": "actor.role"},
-                            "right": {"lit": "ai_agent"},
-                        }
-                    },
-                    update_approver_roles={"confirm_sales_order": ["finance_director"]},
+                    rationale="过度收紧：所有非财务总监提交的确认单全部强审批拦截。",
+                    update_actions=[
+                        _confirm_sales_order_action_bp(
+                            InvariantRuleSpec(
+                                name="block_all_ai_orders",
+                                code="APPROVAL_REQUIRED_ORDER_AMOUNT_EXCEEDED",
+                                target_type="SalesOrder",
+                                id_param="order_id",
+                                must_hold={
+                                    "op": "in",
+                                    "left": {"ref": "actor.role"},
+                                    "right": {"lit": ["finance_director", "admin"]},
+                                },
+                                description="无条件拦截非财务总监确认任意销售订单。",
+                            )
+                        )
+                    ],
                 ).model_dump(mode="json")
             }
 
@@ -402,7 +417,7 @@ def make_offline_evolver_backend() -> CallableAbductionBackend:
             "patch": EvolutionPatch(
                 base_version="1.0.0",
                 target_version="1.1.0",
-                rationale="通用法医修宪：非财务总监确认超 10 万大单自动挂起 PENDING_APPROVAL，并为存量订单补充 credit_review_note 治理字段。",
+                rationale="通用法医修宪：非财务总监确认超 10 万大单以 APPROVAL_REQUIRED_ORDER_AMOUNT_EXCEEDED 前置拦截（转 M1 审批流），并为存量订单补充 credit_review_note 治理字段。",
                 add_fields={
                     "SalesOrder": [
                         FieldSpec(
@@ -422,24 +437,27 @@ def make_offline_evolver_backend() -> CallableAbductionBackend:
                         default="",
                     )
                 ],
-                update_approval_rules={
-                    "confirm_sales_order": {
-                        "op": "and",
-                        "args": [
-                            {
+                update_actions=[
+                    _confirm_sales_order_action_bp(
+                        InvariantRuleSpec(
+                            name="big_order_requires_finance_director",
+                            code="APPROVAL_REQUIRED_ORDER_AMOUNT_EXCEEDED",
+                            target_type="SalesOrder",
+                            id_param="order_id",
+                            when={
                                 "op": "gt",
                                 "left": {"ref": "param.order_amount"},
                                 "right": {"lit": 100000},
                             },
-                            {
-                                "op": "ne",
+                            must_hold={
+                                "op": "in",
                                 "left": {"ref": "actor.role"},
-                                "right": {"lit": "finance_director"},
+                                "right": {"lit": ["finance_director", "admin"]},
                             },
-                        ],
-                    }
-                },
-                update_approver_roles={"confirm_sales_order": ["finance_director"]},
+                            description="超过 100,000 的订单确认需财务总监或管理员签批。",
+                        )
+                    )
+                ],
                 proposed_eval_cases=[
                     {
                         "name": "big_order_requires_finance_approval",
@@ -451,8 +469,8 @@ def make_offline_evolver_backend() -> CallableAbductionBackend:
                         "action": "confirm_sales_order",
                         "params": {"order_id": "SO-BIG-01", "order_amount": 150000},
                         "expect": {
-                            "valid": True,
-                            "requires_approval": True,
+                            "valid": False,
+                            "error_code": "APPROVAL_REQUIRED_ORDER_AMOUNT_EXCEEDED",
                         },
                     }
                 ],
@@ -625,16 +643,14 @@ def run_o2c_induction_demo(*, offline: bool = True) -> dict[str, Any]:
                         action="confirm_sales_order",
                         params={"order_id": "SO-BIG-01", "order_amount": 150000},
                         actor=AI_AGENT,
-                        expect_valid=True,
-                        expect_requires_approval=True,
+                        expect_blocked_or_approval=True,
                     ),
                     IncidentCounterexample(
                         name="inc_big_order_2_must_require_approval",
                         action="confirm_sales_order",
                         params={"order_id": "SO-BIG-02", "order_amount": 180000},
                         actor=AI_AGENT,
-                        expect_valid=True,
-                        expect_requires_approval=True,
+                        expect_blocked_or_approval=True,
                     ),
                     IncidentCounterexample(
                         name="inc_director_can_confirm_directly",
@@ -642,7 +658,6 @@ def run_o2c_induction_demo(*, offline: bool = True) -> dict[str, Any]:
                         params={"order_id": "SO-BIG-01", "order_amount": 150000},
                         actor=FINANCE_DIRECTOR,
                         expect_valid=True,
-                        expect_requires_approval=False,
                     ),
                 ],
                 default_actor=AI_AGENT,

@@ -37,7 +37,13 @@ import os
 from pathlib import Path
 from typing import Any
 
-from open_ontology import AIPAgentExecutor, Actor, OntologyRuntime, export_llm_tools
+from open_ontology import (
+    AIPAgentExecutor,
+    Actor,
+    InvariantError,
+    OntologyRuntime,
+    export_llm_tools,
+)
 from open_ontology.induction import (
     AbductionBackend,
     ActionBlueprint,
@@ -68,7 +74,12 @@ from open_ontology.induction import (
 )
 from open_ontology.model_views import describe_behavior, describe_tbox
 
-from .business_ontology import BUSINESS_SEED_ONTOLOGY
+from .business_ontology import (
+    BUSINESS_SEED_ONTOLOGY,
+    WorkCard,
+    register_work_card_primitives,
+    settle_work_card,
+)
 from .odoo_dual_erp_demo import DB_NORTH, OdooJSONRPC, OdooRPCError
 
 REQUIREMENT_DOC_PATH = Path(__file__).resolve().parent / "docs" / "sales_agent_o2c_requirement.md"
@@ -489,16 +500,8 @@ def _synthesize_o2c_blueprint(*, include_unshipped_guard: bool) -> dict[str, Any
         actions=[
             ActionBlueprint(
                 name="confirm_sales_order",
-                description="确认草稿销售订单；超 10 万元（10,000,000 分）且非财务总监提交时自动挂起审批。",
+                description="确认草稿销售订单；超 10 万元（10,000,000 分）且非财务总监提交时以 APPROVAL_REQUIRED_LARGE_ORDER 拦截并转 M1 签批。",
                 allowed_roles=["sales_agent", "finance_director", "admin"],
-                approver_roles=["finance_director", "admin"],
-                approval_rule={
-                    "op": "and",
-                    "args": [
-                        {"op": "gt", "left": {"ref": "param.order_amount_cents"}, "right": {"lit": 10000000}},
-                        {"op": "ne", "left": {"ref": "actor.role"}, "right": {"lit": "finance_director"}},
-                    ],
-                },
                 affects_source=True,
                 display_label="确认销售订单",
                 params=[
@@ -516,7 +519,24 @@ def _synthesize_o2c_blueprint(*, include_unshipped_guard: bool) -> dict[str, Any
                             "right": {"ref": "param.order_amount_cents"},
                         },
                         description="入参金额必须与订单账面金额精确一致。",
-                    )
+                    ),
+                    InvariantRuleSpec(
+                        name="large_order_requires_finance_director",
+                        code="APPROVAL_REQUIRED_LARGE_ORDER",
+                        target_type="SalesOrder",
+                        id_param="order_id",
+                        when={
+                            "op": "gt",
+                            "left": {"ref": "param.order_amount_cents"},
+                            "right": {"lit": 10000000},
+                        },
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "actor.role"},
+                            "right": {"lit": ["finance_director", "admin"]},
+                        },
+                        description="超过 100,000 元（10,000,000 分）的大额订单需财务总监或管理员签批放行。",
+                    ),
                 ],
                 mutations=[
                     ActionMutationSpec(
@@ -911,7 +931,6 @@ def build_replay_events_from_projected_odoo(
                 },
                 actor=SALES_AGENT,
                 expected_valid=True,
-                expected_requires_approval=False,
             )
         )
         # 对真实 Odoo 未发货草稿单强行开票 -> 必须被红牌拦截
@@ -933,17 +952,17 @@ def build_replay_events_from_projected_odoo(
         )
 
     if large_draft is not None:
-        pos.append(
+        neg.append(
             ReplayEvent(
-                name="pos_large_odoo_order_triggers_approval_for_sales_agent",
+                name="neg_large_odoo_order_requires_approval_for_sales_agent",
                 action="confirm_sales_order",
                 params={
                     "order_id": large_draft["order_id"],
                     "order_amount_cents": int(large_draft["amount_cents"]),
                 },
                 actor=SALES_AGENT,
-                expected_valid=True,
-                expected_requires_approval=True,
+                expected_valid=False,
+                expected_error_code="APPROVAL_REQUIRED_LARGE_ORDER",
             )
         )
         pos.append(
@@ -956,7 +975,6 @@ def build_replay_events_from_projected_odoo(
                 },
                 actor=FINANCE_DIRECTOR,
                 expected_valid=True,
-                expected_requires_approval=False,
             )
         )
 
@@ -1004,7 +1022,6 @@ def build_replay_events_from_projected_odoo(
                 },
                 actor=SALES_AGENT,
                 expected_valid=True,
-                expected_requires_approval=False,
             )
         )
 
@@ -1121,20 +1138,79 @@ def run_odoo_to_o2c_builder_demo(
                     },
                 )
 
-            # 4b) 销售 Agent 提交超 10 万真实大单确认 -> 自动挂起 PENDING_APPROVAL
-            large_order_run = None
+            # 4b) 销售 Agent 提交超 10 万真实大单确认 -> 同步返回 APPROVAL_REQUIRED_LARGE_ORDER，
+            # 再通过 M1 WorkCard + 财务总监 t1 settle_work_card 签批落地
+            large_order_status = None
+            large_order_error_code = None
+            large_order_wc_status = None
+            large_order_settled_status = None
             if large_draft is not None:
-                large_order_run = agent_exec.dispatch(
-                    "submit_action",
-                    {
-                        "run_id": "SALES-AGENT-LARGE-1",
-                        "action": "confirm_sales_order",
-                        "params": {
-                            "order_id": large_draft["order_id"],
-                            "order_amount_cents": large_draft["amount_cents"],
+                try:
+                    agent_exec.dispatch(
+                        "submit_action",
+                        {
+                            "run_id": "SALES-AGENT-LARGE-1",
+                            "action": "confirm_sales_order",
+                            "params": {
+                                "order_id": large_draft["order_id"],
+                                "order_amount_cents": large_draft["amount_cents"],
+                            },
                         },
-                    },
+                    )
+                    large_order_status = "COMMITTED"
+                except InvariantError as exc:
+                    large_order_status = "REJECTED"
+                    large_order_error_code = exc.code
+                assert o2c_rt.list_action_runs(status="PENDING_APPROVAL") == []
+
+                wc_spec = compile_blueprint(crystallized_bp, seed_ontology=BUSINESS_SEED_ONTOLOGY)
+                register_work_card_primitives(
+                    wc_spec,
+                    opener_roles=("sales_agent", "finance_director", "admin"),
+                    resolver_roles=("finance_director", "admin"),
                 )
+                wc_rt = OntologyRuntime(wc_spec, db_path=":memory:")
+                try:
+                    wc_rank = {name: i for i, name in enumerate(wc_spec.object_types)}
+                    for entry in sorted(
+                        result.projected_m0_objects,
+                        key=lambda e: wc_rank.get(e["object_type"], 999),
+                    ):
+                        cls = wc_spec.get_object_type(entry["object_type"])
+                        wc_rt.put_object(cls(**entry["data"]))
+
+                    wc_rt.submit_action(
+                        "BUILDER-WC-OPEN-1",
+                        "open_work_card",
+                        {
+                            "card_id": "WC-BUILDER-LARGE-1",
+                            "card_kind": "APPROVAL",
+                            "target_object_type": "SalesOrder",
+                            "target_object_id": large_draft["order_id"],
+                            "requested_action": "confirm_sales_order",
+                            "requested_params_json": json.dumps(
+                                {
+                                    "order_id": large_draft["order_id"],
+                                    "order_amount_cents": large_draft["amount_cents"],
+                                }
+                            ),
+                            "assignee_role": "finance_director",
+                        },
+                        SALES_AGENT,
+                    )
+                    settled_wc = settle_work_card(
+                        wc_rt,
+                        "WC-BUILDER-LARGE-1",
+                        FINANCE_DIRECTOR,
+                        resolution_note="finance director approved large Odoo O2C order",
+                    )
+                    large_order_settled_status = settled_wc["settled_action_run"]["status"]
+                    large_order_wc_status = wc_rt.get_object(
+                        WorkCard, "WC-BUILDER-LARGE-1", FINANCE_DIRECTOR
+                    ).status
+                    assert wc_rt.list_action_runs(status="PENDING_APPROVAL") == []
+                finally:
+                    wc_rt.close()
 
             # 4c) 销售 Agent 写客户自有风控备注 -> COMMITTED 进 ontology_overlay
             overlay_run = None
@@ -1205,7 +1281,10 @@ def run_odoo_to_o2c_builder_demo(
                         and unshipped_invoice_sim["valid"] is False
                         and "CANNOT_INVOICE_UNSHIPPED_ORDER" in str(unshipped_invoice_sim.get("error") or "")
                     ),
-                    "large_order_status": large_order_run["run"]["status"] if large_order_run else None,
+                    "large_order_status": large_order_status,
+                    "large_order_error_code": large_order_error_code,
+                    "large_order_work_card_status": large_order_wc_status,
+                    "large_order_settled_status": large_order_settled_status,
                     "overlay_note_status": overlay_run["run"]["status"] if overlay_run else None,
                 },
             }

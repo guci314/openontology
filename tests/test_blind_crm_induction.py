@@ -63,3 +63,6 @@ def test_blind_crm_induction_offline_bottlecrm_end_to_end() -> None:
     assert s["southstar_260k_loss_blocked_for_ai"]["passed"] is True
     assert s["northwind_medium_case_allows_win"]["passed"] is True
     assert s["acme_resolve_case_then_win"]["passed"] is True
+    assert s["southstar_work_card_steward_settlement"]["passed"] is True
+    assert s["southstar_work_card_steward_settlement"]["work_card_status"] == "COMPLETED"
+    assert s["southstar_work_card_steward_settlement"]["pending_approval_runs"] == 0

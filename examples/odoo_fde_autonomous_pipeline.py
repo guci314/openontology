@@ -44,6 +44,7 @@ from open_ontology import (
     Actor,
     DEVICE_STATE_MISMATCH,
     DeviceStateMismatchError,
+    InvariantError,
     OntologyRuntime,
     SourceBridge,
 )
@@ -80,7 +81,7 @@ from open_ontology.induction import (
     project_single_record,
 )
 
-from .business_ontology import build_business_seed_ontology
+from .business_ontology import build_business_seed_ontology, settle_work_card
 from .odoo_dual_erp_demo import DB_NORTH
 from .odoo_fde_prober import (
     ActionProbeObservation,
@@ -810,21 +811,45 @@ def synthesize_from_fde_evidence(
         multiple_dests = len(after_states_by_mm[(m, meth)]) > 1
         act_name = _semantic_action_name(meth, ot_name, sa, multiple_dests, used_action_names)
 
+        code = f"INVALID_STATE_FOR_{meth.upper()}"
+        act_preconditions: list[InvariantRuleSpec] = [
+            InvariantRuleSpec(
+                name=f"{act_name}_valid_state",
+                code=code,
+                target_type=ot_name,
+                id_param="record_id",
+                must_hold={
+                    "op": "in",
+                    "left": {"ref": f"obj.{sf}"},
+                    "right": {"lit": sorted(valid_befores)},
+                },
+                description=f"{ot_name}.{sf} must be in {sorted(valid_befores)} for {act_name}",
+            )
+        ]
+
         # Check if any edge of this action is flagged as a reversal/cancellation gray zone by Probe 2
         rev_pairs = reversal_transitions_by_model.get(m, set())
         is_reversal = any((sb, sa) in rev_pairs for sb in valid_befores) or any(
             kw in meth.lower() or kw in sa.lower() for kw in ("cancel", "reverse", "draft")
         )
-        approval_rule: dict[str, Any] | None = None
-        approval_target_type: str | None = None
-        approval_id_param: str | None = None
         if is_reversal:
             reversal_action_names.append(act_name)
-            approval_rule = {
-                "op": "ne",
-                "left": {"ref": "actor.role"},
-                "right": {"lit": "steward"},
-            }
+            act_preconditions.append(
+                InvariantRuleSpec(
+                    name=f"{act_name}_reversal_requires_steward",
+                    code=f"APPROVAL_REQUIRED_REVERSAL_{ot_name.upper()}",
+                    target_type=ot_name,
+                    id_param="record_id",
+                    must_hold={
+                        "op": "in",
+                        "left": {"ref": "actor.role"},
+                        "right": {"lit": ["steward", "admin"]},
+                    },
+                    description=(
+                        f"Reversal/cancellation on {ot_name} requires Steward or Admin approval."
+                    ),
+                )
+            )
         elif apply_gray_zone_approval_rules and limit_findings_by_model.get(m):
             target_ot = ot_by_name[ot_name]
             target_fields = {f.name for f in target_ot.fields}
@@ -837,19 +862,31 @@ def synthesize_from_fde_evidence(
                 if m_fld in target_fields and p_rel in target_rels and lim_fld:
                     rel_target_ot = ot_by_name.get(target_rels[p_rel].target_type)
                     if rel_target_ot is not None and any(f.name == lim_fld for f in rel_target_ot.fields):
-                        approval_target_type = ot_name
-                        approval_id_param = "record_id"
-                        approval_rule = {
-                            "op": "and",
-                            "args": [
-                                {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
-                                {"op": "gt", "left": {"ref": f"obj.{p_rel}.{lim_fld}"}, "right": {"lit": 0}},
-                                {"op": "gt", "left": {"ref": f"obj.{m_fld}"}, "right": {"ref": f"obj.{p_rel}.{lim_fld}"}},
-                            ],
-                        }
+                        act_preconditions.append(
+                            InvariantRuleSpec(
+                                name=f"{act_name}_limit_requires_steward",
+                                code=f"APPROVAL_REQUIRED_{lim_fld.upper()}_EXCEEDED",
+                                target_type=ot_name,
+                                id_param="record_id",
+                                when={
+                                    "op": "and",
+                                    "args": [
+                                        {"op": "gt", "left": {"ref": f"obj.{p_rel}.{lim_fld}"}, "right": {"lit": 0}},
+                                        {"op": "gt", "left": {"ref": f"obj.{m_fld}"}, "right": {"ref": f"obj.{p_rel}.{lim_fld}"}},
+                                    ],
+                                },
+                                must_hold={
+                                    "op": "in",
+                                    "left": {"ref": "actor.role"},
+                                    "right": {"lit": ["steward", "admin"]},
+                                },
+                                description=(
+                                    f"{ot_name}.{m_fld} exceeding {p_rel}.{lim_fld} requires Steward/Admin approval."
+                                ),
+                            )
+                        )
                         break
 
-        code = f"INVALID_STATE_FOR_{meth.upper()}"
         actions.append(
             ActionBlueprint(
                 name=act_name,
@@ -858,26 +895,9 @@ def synthesize_from_fde_evidence(
                     f"({sorted(valid_befores)} -> {sa})."
                 ),
                 allowed_roles=["ai_agent", "ops", "steward", "admin"],
-                approver_roles=["steward", "admin"],
-                approval_rule=approval_rule,
-                approval_target_type=approval_target_type,
-                approval_id_param=approval_id_param,
                 affects_source=True,
                 params=[FieldSpec(name="record_id", field_type="str", required=True)],
-                preconditions=[
-                    InvariantRuleSpec(
-                        name=f"{act_name}_valid_state",
-                        code=code,
-                        target_type=ot_name,
-                        id_param="record_id",
-                        must_hold={
-                            "op": "in",
-                            "left": {"ref": f"obj.{sf}"},
-                            "right": {"lit": sorted(valid_befores)},
-                        },
-                        description=f"{ot_name}.{sf} must be in {sorted(valid_befores)} for {act_name}",
-                    )
-                ],
+                preconditions=act_preconditions,
                 mutations=[
                     ActionMutationSpec(
                         op="modify",
@@ -943,7 +963,7 @@ def build_auto_replay_factory(
     valid_states_by_action: dict[str, set[str]] = {}
     approval_actions: set[str] = set()
     for act in bundle.blueprint.actions:
-        if act.approval_rule is not None and act.name not in reversal_set:
+        if any(pre.code.startswith("APPROVAL_REQUIRED_") for pre in act.preconditions):
             approval_actions.add(act.name)
         for pre in act.preconditions:
             right = pre.must_hold.get("right", {})
@@ -974,7 +994,7 @@ def build_auto_replay_factory(
 
         pos: list[ReplayEvent] = []
         neg: list[ReplayEvent] = []
-        seen_pos: set[tuple[str, str, bool]] = set()
+        seen_pos: set[tuple[str, str, str]] = set()
         seen_neg: set[tuple[str, str]] = set()
 
         try:
@@ -991,35 +1011,60 @@ def build_auto_replay_factory(
                         continue
                     if sim_rt is not None and binding.action_name in approval_actions:
                         for cand in state_matches:
-                            sim = sim_rt.simulate_action(
+                            rec_id = cand["record_id"]
+                            sim_ai = sim_rt.simulate_action(
                                 binding.action_name,
-                                {binding.id_param: cand["record_id"]},
+                                {binding.id_param: rec_id},
                                 actor=AI_OPS_ACTOR,
                             )
-                            if not sim.valid:
-                                continue
-                            key = (binding.action_name, obs.state_before, sim.requires_approval)
-                            if key in seen_pos:
-                                continue
-                            seen_pos.add(key)
-                            ev_prefix = (
-                                "auto_pos_approval"
-                                if sim.requires_approval
-                                else "auto_pos"
-                            )
-                            pos.append(
-                                ReplayEvent(
-                                    name=f"{ev_prefix}_{binding.action_name}_from_{obs.state_before}",
-                                    action=binding.action_name,
-                                    params={binding.id_param: cand["record_id"]},
-                                    actor=AI_OPS_ACTOR,
-                                    expected_valid=True,
-                                    expected_requires_approval=sim.requires_approval,
+                            if sim_ai.valid:
+                                key_ai = (binding.action_name, obs.state_before, AI_OPS_ACTOR.role)
+                                if key_ai not in seen_pos:
+                                    seen_pos.add(key_ai)
+                                    pos.append(
+                                        ReplayEvent(
+                                            name=f"auto_pos_{binding.action_name}_from_{obs.state_before}",
+                                            action=binding.action_name,
+                                            params={binding.id_param: rec_id},
+                                            actor=AI_OPS_ACTOR,
+                                            expected_valid=True,
+                                        )
+                                    )
+                            elif (sim_ai.error_code or "").startswith("APPROVAL_REQUIRED_"):
+                                neg_key = (binding.action_name, f"{obs.state_before}:{sim_ai.error_code}")
+                                if neg_key not in seen_neg:
+                                    seen_neg.add(neg_key)
+                                    neg.append(
+                                        ReplayEvent(
+                                            name=f"auto_neg_approval_gate_{binding.action_name}_from_{obs.state_before}",
+                                            action=binding.action_name,
+                                            params={binding.id_param: rec_id},
+                                            actor=AI_OPS_ACTOR,
+                                            expected_valid=False,
+                                            expected_error_code=sim_ai.error_code,
+                                        )
+                                    )
+                                sim_st = sim_rt.simulate_action(
+                                    binding.action_name,
+                                    {binding.id_param: rec_id},
+                                    actor=STEWARD_OPS_ACTOR,
                                 )
-                            )
+                                if sim_st.valid:
+                                    key_st = (binding.action_name, obs.state_before, STEWARD_OPS_ACTOR.role)
+                                    if key_st not in seen_pos:
+                                        seen_pos.add(key_st)
+                                        pos.append(
+                                            ReplayEvent(
+                                                name=f"auto_pos_steward_{binding.action_name}_from_{obs.state_before}",
+                                                action=binding.action_name,
+                                                params={binding.id_param: rec_id},
+                                                actor=STEWARD_OPS_ACTOR,
+                                                expected_valid=True,
+                                            )
+                                        )
                     else:
-                        req_appr = binding.action_name in reversal_set
-                        key = (binding.action_name, obs.state_before, req_appr)
+                        actor = STEWARD_OPS_ACTOR if binding.action_name in reversal_set else AI_OPS_ACTOR
+                        key = (binding.action_name, obs.state_before, actor.role)
                         if key in seen_pos:
                             continue
                         seen_pos.add(key)
@@ -1028,9 +1073,8 @@ def build_auto_replay_factory(
                                 name=f"auto_pos_{binding.action_name}_from_{obs.state_before}",
                                 action=binding.action_name,
                                 params={binding.id_param: state_matches[0]["record_id"]},
-                                actor=AI_OPS_ACTOR,
+                                actor=actor,
                                 expected_valid=True,
-                                expected_requires_approval=req_appr,
                             )
                         )
                 elif obs.outcome == "NATIVE_ERROR":
@@ -1416,15 +1460,50 @@ class DeclarativeOdooBridge:
             try:
                 run = self.memory_runtime.submit_action(run_id, action_name, params, actor)
                 staged_status = str(run["status"])
-                if staged_status == "PENDING_APPROVAL":
-                    if approver is None:
-                        raise RuntimeError(
-                            f"move {run_id!r} requires approval and no approver was supplied"
-                        )
-                    run = self.memory_runtime.approve_action(run_id, approver)
                 settled_status = str(run["status"])
                 error_code = run.get("error_code")
                 projected_row = self.get_last_observed(run_id) or {}
+            except InvariantError as exc:
+                err_code = exc.code or type(exc).__name__
+                if err_code.startswith("APPROVAL_REQUIRED_") and approver is not None:
+                    appr_rid = f"{run_id}-APPR"
+                    if "open_work_card" in self.memory_runtime.spec.actions:
+                        wc_id = f"WC-{run_id}"
+                        self.memory_runtime.submit_action(
+                            f"{run_id}-WC-OPEN",
+                            "open_work_card",
+                            {
+                                "card_id": wc_id,
+                                "card_kind": "APPROVAL",
+                                "target_object_type": binding.target_object_type,
+                                "target_object_id": canonical_id,
+                                "requested_action": action_name,
+                                "requested_params_json": json.dumps(params),
+                                "assignee_role": approver.role,
+                            },
+                            actor,
+                        )
+                        settled_wc = settle_work_card(
+                            self.memory_runtime,
+                            wc_id,
+                            approver,
+                            action_run_id=appr_rid,
+                            complete_run_id=f"{run_id}-WC-COMP",
+                        )
+                        run = settled_wc["settled_action_run"]
+                    else:
+                        run = self.memory_runtime.submit_action(
+                            appr_rid, action_name, params, approver
+                        )
+                    staged_status = "APPROVAL_REQUIRED"
+                    settled_status = str(run["status"])
+                    error_code = run.get("error_code")
+                    projected_row = self.get_last_observed(str(run.get("run_id") or appr_rid)) or {}
+                else:
+                    staged_status = "REJECTED"
+                    settled_status = "REJECTED"
+                    error_code = err_code
+                    projected_row = self.get_last_observed(run_id) or {}
             except DeviceStateMismatchError as exc:
                 settled_status = "REJECTED"
                 error_code = exc.code or DEVICE_STATE_MISMATCH
@@ -1614,13 +1693,18 @@ def run_autonomous_fde_end_to_end(
                             valid.update(str(x) for x in r_lit)
                     return valid
 
+                def _has_approval_gate(act_bp: ActionBlueprint) -> bool:
+                    return act_bp.approval_rule is not None or any(
+                        pre.code.startswith("APPROVAL_REQUIRED_") for pre in act_bp.preconditions
+                    )
+
                 used_records: set[tuple[str, str]] = set()
                 # Pass 1: one per distinct clean forward binding (prefers cross-model diversity)
                 for binding in active_mapping.action_bindings:
                     if len(homomorphic_results) >= 2:
                         break
                     act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
-                    if act_def.approval_rule is not None:
+                    if _has_approval_gate(act_def):
                         continue  # prefer clean forward actions first
                     valid_befores = _valid_befores_for(act_def)
                     cls = compiled_spec.get_object_type(binding.target_object_type)
@@ -1651,7 +1735,7 @@ def run_autonomous_fde_end_to_end(
                     next_pick: tuple[ActionExecutionBinding, Any] | None = None
                     for binding in active_mapping.action_bindings:
                         act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
-                        if act_def.approval_rule is not None:
+                        if _has_approval_gate(act_def):
                             continue
                         valid_befores = _valid_befores_for(act_def)
                         cls = compiled_spec.get_object_type(binding.target_object_type)
@@ -1679,7 +1763,7 @@ def run_autonomous_fde_end_to_end(
                 # Also prove DEVICE_STATE_MISMATCH protection on a live record when external drifts
                 for binding in active_mapping.action_bindings:
                     act_def = next(a for a in active_bp.actions if a.name == binding.action_name)
-                    if act_def.approval_rule is not None:
+                    if _has_approval_gate(act_def):
                         continue
                     valid_befores = _valid_befores_for(act_def)
                     cls = compiled_spec.get_object_type(binding.target_object_type)

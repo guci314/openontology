@@ -21,9 +21,11 @@ enterprise backends under a single ``OntologyRuntime``:
      Odoo order confirmation (``OPEN_CRITICAL_CRM_CASE_BLOCKS_ERP_ORDER``, zero Odoo write).
    - Scenario 2 (Cross-system unlock): Resolving the CRM case in temp BottleCRM SQLite
      unlocks within-credit Odoo confirmation (``COMMITTED``, Odoo ``sale.order.state='sale'``).
-   - Scenario 3 (Cumulative exposure Approval Gate + Steward settlement): Over-credit
-     order confirmation by ``ai_agent`` returns ``PENDING_APPROVAL`` (Odoo remains ``draft``);
-     Steward ``approve_action`` settles physically into Odoo (``COMMITTED``, ``state='sale'``).
+   - Scenario 3 (Cumulative exposure Approval Gate + M1 WorkCard settlement): Over-credit
+     order confirmation by ``ai_agent`` is synchronously blocked with
+     ``APPROVAL_REQUIRED_CUMULATIVE_CREDIT_EXCEEDED`` (Odoo remains ``draft``);
+     agent opens M1 ``WorkCard`` and Steward ``settle_work_card`` settles physically into
+     Odoo at ``t1`` (``COMMITTED``, ``state='sale'``, ``WorkCard.status='COMPLETED'``).
    - Scenario 4 (Drift detection): Out-of-band external mismatch triggers
      ``DEVICE_STATE_MISMATCH`` with zero memory corruption.
 """
@@ -31,6 +33,7 @@ enterprise backends under a single ``OntologyRuntime``:
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import sqlite3
 import tempfile
@@ -64,7 +67,12 @@ from open_ontology.induction import (
     compile_blueprint,
 )
 
-from .business_ontology import build_business_seed_ontology
+from .business_ontology import (
+    WorkCard,
+    build_business_seed_ontology,
+    register_work_card_primitives,
+    settle_work_card,
+)
 from .odoo_dual_erp_demo import DB_NORTH
 from .odoo_fde_autonomous_pipeline import AI_OPS_ACTOR, STEWARD_OPS_ACTOR
 from .odoo_fde_prober import EphemeralOdooSandbox
@@ -214,9 +222,6 @@ def build_heterogeneous_dual_mount_blueprint() -> DeclarativeBlueprint:
                 name="confirm_fulfillment_order",
                 description="Confirm a draft fulfillment order after verifying service-case clearance and customer credit exposure.",
                 allowed_roles=["ai_agent", "ops", "steward", "admin"],
-                approver_roles=["steward", "admin"],
-                approval_target_type="FulfillmentOrder",
-                approval_id_param="order_id",
                 affects_source=True,
                 params=[FieldSpec(name="order_id", field_type="str", required=True)],
                 preconditions=[
@@ -254,33 +259,40 @@ def build_heterogeneous_dual_mount_blueprint() -> DeclarativeBlueprint:
                         },
                         description="Fulfillment confirmation is synchronously blocked while an unclosed high-severity customer case exists.",
                     ),
-                ],
-                approval_rule={
-                    "op": "and",
-                    "args": [
-                        {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
-                        {"op": "gt", "left": {"ref": "obj.customer.credit_limit"}, "right": {"lit": 0}},
-                        {
-                            "op": "gt",
-                            "left": {
-                                "op": "sum",
-                                "object_type": "FulfillmentOrder",
-                                "field": {
-                                    "op": "if_else",
-                                    "cond": {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "confirmed"}},
-                                    "then": {"ref": "target.amount_total"},
-                                    "else": {"lit": 0.0},
+                    InvariantRuleSpec(
+                        name="require_steward_approval_over_cumulative_credit_limit",
+                        code="APPROVAL_REQUIRED_CUMULATIVE_CREDIT_EXCEEDED",
+                        target_type="FulfillmentOrder",
+                        id_param="order_id",
+                        when={
+                            "op": "and",
+                            "args": [
+                                {"op": "gt", "left": {"ref": "obj.customer.credit_limit"}, "right": {"lit": 0}},
+                                {
+                                    "op": "gt",
+                                    "left": {
+                                        "op": "sum",
+                                        "object_type": "FulfillmentOrder",
+                                        "field": {
+                                            "op": "if_else",
+                                            "cond": {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "confirmed"}},
+                                            "then": {"ref": "target.amount_total"},
+                                            "else": {"lit": 0.0},
+                                        },
+                                        "where": {"op": "eq", "left": {"ref": "target.customer"}, "right": {"ref": "obj.customer"}},
+                                    },
+                                    "right": {
+                                        "op": "sub",
+                                        "left": {"ref": "obj.customer.credit_limit"},
+                                        "right": {"ref": "obj.amount_total"},
+                                    },
                                 },
-                                "where": {"op": "eq", "left": {"ref": "target.customer"}, "right": {"ref": "obj.customer"}},
-                            },
-                            "right": {
-                                "op": "sub",
-                                "left": {"ref": "obj.customer.credit_limit"},
-                                "right": {"ref": "obj.amount_total"},
-                            },
+                            ],
                         },
-                    ],
-                },
+                        must_hold={"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
+                        description="Over-credit cumulative customer exposure requires Steward/Admin approval via WorkCard before confirmation.",
+                    ),
+                ],
                 mutations=[
                     ActionMutationSpec(
                         op="modify",
@@ -570,15 +582,22 @@ def _crystallize_dual_mount_blueprint(spec_bp: DeclarativeBlueprint) -> Ontology
                     expected_requires_approval=False,
                 ),
                 ReplayEvent(
-                    name="POS-CONFIRM-OVER-REQUIRES-APPROVAL",
+                    name="POS-CONFIRM-OVER-STEWARD",
                     action="confirm_fulfillment_order",
                     params={"order_id": "ORD-SYN-OVER"},
-                    actor=AI_OPS_ACTOR,
+                    actor=STEWARD_OPS_ACTOR,
                     expected_valid=True,
-                    expected_requires_approval=True,
                 ),
             ],
             negative_events=[
+                ReplayEvent(
+                    name="NEG-CONFIRM-OVER-REQUIRES-APPROVAL",
+                    action="confirm_fulfillment_order",
+                    params={"order_id": "ORD-SYN-OVER"},
+                    actor=AI_OPS_ACTOR,
+                    expected_valid=False,
+                    expected_error_code="APPROVAL_REQUIRED_CUMULATIVE_CREDIT_EXCEEDED",
+                ),
                 ReplayEvent(
                     name="NEG-OPEN-CRITICAL-CASE-BLOCKS",
                     action="confirm_fulfillment_order",
@@ -612,7 +631,8 @@ def _crystallize_dual_mount_blueprint(spec_bp: DeclarativeBlueprint) -> Ontology
         gov.approve_crystallization(cycle.pending_approval_run_id, STEWARD_ACTOR)
         active_bp = gov.get_active_blueprint("heterogeneous_crm_erp_o2c")
         assert active_bp is not None
-        return compile_blueprint(active_bp, seed_ontology=seed)
+        compiled_spec = compile_blueprint(active_bp, seed_ontology=seed)
+        return register_work_card_primitives(compiled_spec)
 
 
 def run_heterogeneous_dual_mount_demo(
@@ -672,7 +692,7 @@ def _execute_dual_mount_flow(
 
     # Seed 3 draft FulfillmentOrders in ephemeral Odoo clone/mirror for Acme:
     # 1) within credit limit (20,000 <= 100,000) -> blocked by CRM case, then unlocked!
-    # 2) over cumulative credit limit (+90,000 -> 110,200 > 100,000) -> PENDING_APPROVAL -> Steward settles!
+    # 2) over cumulative credit limit (+90,000 -> 110,200 > 100,000) -> APPROVAL_REQUIRED -> WorkCard -> Steward settles!
     # 3) extra draft within limit for Scenario 4 external drift detection
     f_within = harness.create_draft_order(
         partner_id=acme_pid, qty=2, unit_price=10_000.0, client_ref="DUAL-ACME-WITHIN"
@@ -827,16 +847,48 @@ def _execute_dual_mount_flow(
         s2_odoo_state = bridge.read_odoo_raw_state(within_oid)
         assert s2_odoo_state == "sale"
 
-        # Scenario 3: Over-credit cumulative order -> PENDING_APPROVAL (zero Odoo write), then Steward settles
-        r3_pending = rt.submit_action(
-            "DUAL-S3-OVER-CREDIT", "confirm_fulfillment_order", {"order_id": over_oid}, AI_OPS_ACTOR
+        # Scenario 3: Over-credit cumulative order -> APPROVAL_REQUIRED_* -> M1 WorkCard -> Steward settles
+        s3_err_code = ""
+        try:
+            rt.submit_action(
+                "DUAL-S3-OVER-CREDIT", "confirm_fulfillment_order", {"order_id": over_oid}, AI_OPS_ACTOR
+            )
+            raise AssertionError("expected over-credit confirmation by ai_agent to be blocked")
+        except InvariantError as exc:
+            s3_err_code = exc.code or ""
+        assert s3_err_code == "APPROVAL_REQUIRED_CUMULATIVE_CREDIT_EXCEEDED"
+        assert bridge.read_odoo_raw_state(over_oid) == "draft"
+        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+
+        r3_wc_open = rt.submit_action(
+            "DUAL-S3-WC-OPEN",
+            "open_work_card",
+            {
+                "card_id": "WC-DUAL-S3",
+                "card_kind": "APPROVAL",
+                "target_object_type": "FulfillmentOrder",
+                "target_object_id": over_oid,
+                "requested_action": "confirm_fulfillment_order",
+                "requested_params_json": json.dumps({"order_id": over_oid}),
+                "assignee_role": "steward",
+            },
+            AI_OPS_ACTOR,
         )
-        assert r3_pending["status"] == "PENDING_APPROVAL"
+        assert r3_wc_open["status"] == "COMMITTED"
         assert bridge.read_odoo_raw_state(over_oid) == "draft"
 
-        r3_approved = rt.approve_action("DUAL-S3-OVER-CREDIT", STEWARD_OPS_ACTOR)
-        assert r3_approved["status"] == "COMMITTED"
+        r3_settled = settle_work_card(
+            rt,
+            "WC-DUAL-S3",
+            STEWARD_OPS_ACTOR,
+            resolution_note="steward approved cumulative exposure",
+        )
+        assert r3_settled["status"] == "COMMITTED"
+        assert r3_settled["settled_action_run"]["status"] == "COMMITTED"
         assert bridge.read_odoo_raw_state(over_oid) == "sale"
+        wc_s3 = rt.get_object(WorkCard, "WC-DUAL-S3", STEWARD_OPS_ACTOR)
+        assert wc_s3.status == "COMPLETED"
+        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
 
         # Scenario 4: Out-of-band external mismatch triggers DEVICE_STATE_MISMATCH without memory corruption
         fp_before = rt.state_fingerprint()
@@ -867,9 +919,12 @@ def _execute_dual_mount_flow(
                 "odoo_state": s2_odoo_state,
             },
             "scenario_3_credit_approval": {
-                "pending_status": r3_pending["status"],
-                "approved_status": r3_approved["status"],
+                "blocked_status": "REJECTED",
+                "error_code": s3_err_code,
+                "work_card_status": wc_s3.status,
+                "approved_status": r3_settled["settled_action_run"]["status"],
                 "odoo_state": bridge.read_odoo_raw_state(over_oid),
+                "pending_approval_runs": len(rt.list_action_runs(status="PENDING_APPROVAL")),
             },
             "scenario_4_drift_guard": {
                 "error_code": drift_error_code,

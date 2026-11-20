@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from open_ontology import Actor, OntologyRuntime, PermissionDeniedError
+from open_ontology import Actor, InvariantError, OntologyRuntime, PermissionDeniedError
 from open_ontology.induction import (
     CallableAbductionBackend,
     CrucibleContext,
@@ -20,7 +20,12 @@ from open_ontology.induction import (
     project_external_phenomenon,
 )
 
-from examples.business_ontology import build_business_seed_ontology
+from examples.business_ontology import (
+    WorkCard,
+    build_business_seed_ontology,
+    register_work_card_primitives,
+    settle_work_card,
+)
 from examples.fde_disambiguation_loop import (
     GrayZoneDisambiguationGateway,
     extract_scout_gray_zone_ambiguities,
@@ -136,7 +141,7 @@ def _mock_feishu_transport(sent_calls: list[tuple[str, str, dict[str, Any]]]) ->
     "choice_id,expected_exceed_status,expected_within_status",
     [
         ("HARD_REJECT", "REJECTED", "COMMITTED"),
-        ("REQUIRE_APPROVAL", "PENDING_APPROVAL", "COMMITTED"),
+        ("REQUIRE_APPROVAL", "REJECTED", "COMMITTED"),
         ("ALLOW_AUTONOMOUS", "COMMITTED", "COMMITTED"),
     ],
 )
@@ -242,6 +247,7 @@ def test_gray_zone_disambiguation_e2e_all_three_steward_rulings(
 
         # Runtime behavioral check on crystallized v1.1.0 M1
         spec_v11 = compile_blueprint(res["blueprint"], seed_ontology=seed)
+        register_work_card_primitives(spec_v11)
         rt = OntologyRuntime(spec_v11, db_path=":memory:")
         try:
             order_rank = {name: i for i, name in enumerate(spec_v11.object_types)}
@@ -249,6 +255,7 @@ def test_gray_zone_disambiguation_e2e_all_three_steward_rulings(
                 cls = spec_v11.get_object_type(entry["object_type"])
                 rt.put_object(cls(**entry["data"]))
 
+            exc_code: str | None = None
             try:
                 out_exc = rt.submit_action(
                     "GZ-RT-EXC",
@@ -257,13 +264,43 @@ def test_gray_zone_disambiguation_e2e_all_three_steward_rulings(
                     AI_OPS_ACTOR,
                 )
                 exc_status = out_exc["status"]
-            except Exception:
+            except InvariantError as exc:
                 exc_status = "REJECTED"
+                exc_code = exc.code
             assert exc_status == expected_exceed_status
+            assert rt.list_action_runs(status="PENDING_APPROVAL") == []
 
-            if choice_id == "REQUIRE_APPROVAL":
-                settled = rt.approve_action("GZ-RT-EXC", STEWARD_OPS_ACTOR)
+            if choice_id == "HARD_REJECT":
+                assert exc_code == limit_amb.error_code
+            elif choice_id == "REQUIRE_APPROVAL":
+                assert exc_code == f"APPROVAL_REQUIRED_{limit_amb.error_code}"
+                wc_open = rt.submit_action(
+                    "GZ-WC-OPEN",
+                    "open_work_card",
+                    {
+                        "card_id": "WC-GZ-01",
+                        "card_kind": "APPROVAL",
+                        "target_object_type": limit_amb.target_object_type,
+                        "target_object_id": limit_amb.sample_exceeding_id,
+                        "requested_action": limit_amb.target_action,
+                        "requested_params_json": json.dumps(
+                            {limit_amb.id_param: limit_amb.sample_exceeding_id}
+                        ),
+                        "assignee_role": "steward",
+                    },
+                    AI_OPS_ACTOR,
+                )
+                assert wc_open["status"] == "COMMITTED"
+                settled = settle_work_card(
+                    rt,
+                    "WC-GZ-01",
+                    STEWARD_OPS_ACTOR,
+                    resolution_note="steward approved gray-zone exceedance",
+                )
                 assert settled["status"] == "COMMITTED"
+                assert settled["settled_action_run"]["status"] == "COMMITTED"
+                assert rt.get_object(WorkCard, "WC-GZ-01", STEWARD_OPS_ACTOR).status == "COMPLETED"
+                assert rt.list_action_runs(status="PENDING_APPROVAL") == []
 
             out_ok = rt.submit_action(
                 "GZ-RT-OK",

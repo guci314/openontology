@@ -52,9 +52,12 @@ def test_heterogeneous_crm_erp_dual_mount_offline_preserves_source_sqlite() -> N
         "odoo_state": "sale",
     }
     assert out["scenario_3_credit_approval"] == {
-        "pending_status": "PENDING_APPROVAL",
+        "blocked_status": "REJECTED",
+        "error_code": "APPROVAL_REQUIRED_CUMULATIVE_CREDIT_EXCEEDED",
+        "work_card_status": "COMPLETED",
         "approved_status": "COMMITTED",
         "odoo_state": "sale",
+        "pending_approval_runs": 0,
     }
     assert out["scenario_4_drift_guard"] == {
         "error_code": "DEVICE_STATE_MISMATCH",
@@ -95,8 +98,11 @@ def test_heterogeneous_crm_erp_dual_mount_live_odoo19_zero_leak() -> None:
     assert out["scenario_1_crm_block"]["error_code"] == "OPEN_CRITICAL_CRM_CASE_BLOCKS_ERP_ORDER"
     assert out["scenario_2_crm_unlock"]["order_status"] == "COMMITTED"
     assert out["scenario_2_crm_unlock"]["odoo_state"] == "sale"
-    assert out["scenario_3_credit_approval"]["pending_status"] == "PENDING_APPROVAL"
+    assert out["scenario_3_credit_approval"]["blocked_status"] == "REJECTED"
+    assert out["scenario_3_credit_approval"]["error_code"] == "APPROVAL_REQUIRED_CUMULATIVE_CREDIT_EXCEEDED"
+    assert out["scenario_3_credit_approval"]["work_card_status"] == "COMPLETED"
     assert out["scenario_3_credit_approval"]["approved_status"] == "COMMITTED"
     assert out["scenario_3_credit_approval"]["odoo_state"] == "sale"
+    assert out["scenario_3_credit_approval"]["pending_approval_runs"] == 0
     assert out["scenario_4_drift_guard"]["error_code"] == "DEVICE_STATE_MISMATCH"
     assert out["scenario_4_drift_guard"]["memory_uncorrupted"] is True

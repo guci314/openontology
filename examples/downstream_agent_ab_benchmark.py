@@ -52,11 +52,17 @@ from open_ontology.induction import (
     measure_raw_external_complexity,
 )
 
-from .business_ontology import build_business_seed_ontology
+from .business_ontology import (
+    WorkCard,
+    build_business_seed_ontology,
+    register_work_card_primitives,
+    settle_work_card,
+)
 from .live_llm_cegis_experiment import run_live_llm_l2_architect_experiment
 from .odoo_dual_erp_demo import DB_NORTH, _jsonrpc
 from .odoo_fde_autonomous_pipeline import (
     AI_OPS_ACTOR,
+    STEWARD_OPS_ACTOR,
     DeclarativeOdooBridge,
     build_closed_phenomenon_profile,
     synthesize_from_fde_evidence,
@@ -432,7 +438,8 @@ def _make_ontology_arm_runner(
         "4. submit_action: {\"action\": str, \"params\": dict}\n"
         "5. finish: {\"summary\": str}\n"
         "Use query_objects to locate target canonical IDs, execute valid actions via submit_action, "
-        "and if submit_action returns REJECTED or PENDING_APPROVAL respect the governance decision and call finish. "
+        "and if submit_action returns REJECTED (including APPROVAL_REQUIRED_* governance gates) respect "
+        "the governance decision and call finish. "
         "All domain TBox context is above and observations arrive in previous_tool_calls. Do NOT call any file/shell/search tools; output ONLY ONE raw JSON object in a single turn."
     )
 
@@ -494,20 +501,15 @@ def _make_ontology_arm_runner(
                     "updated_object": bridge.get_last_observed(run_id),
                 }
             except (InvariantError, PermissionDeniedError, GovernanceViolationError) as exc:
+                err_code = getattr(exc, "code", None) or type(exc).__name__
                 return {
                     "ok": False,
                     "status": "REJECTED",
-                    "error_code": getattr(exc, "code", None) or type(exc).__name__,
+                    "error_code": err_code,
+                    "requires_work_card": str(err_code).startswith("APPROVAL_REQUIRED_"),
                     "message": str(exc),
                 }
             st = str(run["status"])
-            if st == "PENDING_APPROVAL":
-                return {
-                    "ok": False,
-                    "status": "PENDING_APPROVAL",
-                    "error_code": "APPROVAL_REQUIRED",
-                    "message": "Action requires Steward approval; external ERP remains untouched.",
-                }
             return {
                 "ok": st == "COMMITTED",
                 "status": st,
@@ -855,9 +857,70 @@ def run_downstream_agent_ab_benchmark(
             g["runtime_status"] = obs.get("status")
             g["runtime_error_code"] = obs.get("error_code")
             ont_grades[sid] = g
+        # Also prove S3 over-credit order can escalate via M1 WorkCard + settle_work_card with zero PENDING_APPROVAL
+        s3_wc_seed = _seed_arm_scenarios(harness, f"AUD-WC-{uuid.uuid4().hex[:3]}")[2]
+        assert s3_wc_seed.scenario_id == "S3"
+        wc_spec = compile_blueprint(v2_bp, seed_ontology=seed)
+        register_work_card_primitives(wc_spec)
+        wc_rt = OntologyRuntime(wc_spec, db_path=":memory:")
+        s3_wc_lookup: dict[tuple[str, str, str], str] = {}
+        _sync_fixtures_into_autonomous_runtime(
+            runtime=wc_rt,
+            adapter_mapping=v2_map,
+            sandbox_client=sandbox_client,
+            table_ids={"res.partner": [s3_wc_seed.order.partner_id], "sale.order": [s3_wc_seed.order.order_id]},
+            lookup_index_out=s3_wc_lookup,
+        )
+        wc_bridge = DeclarativeOdooBridge(
+            memory_runtime=wc_rt,
+            adapter_mapping=v2_map,
+            sandbox=sandbox_client,
+            protocol_overrides=build_odoo_o2c_l2_protocol_map(v2_map, blueprint=v2_bp),
+            lookup_index=s3_wc_lookup,
+        )
+        try:
+            s3_cid = f"{confirm_b.id_prefix}{s3_wc_seed.order.order_id}"
+            s3_ai_err = ""
+            try:
+                wc_rt.submit_action("AUD-S3-BLK", confirm_b.action_name, {confirm_b.id_param: s3_cid}, AI_OPS_ACTOR)
+            except InvariantError as exc:
+                s3_ai_err = exc.code or ""
+            assert s3_ai_err == "APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED"
+            assert wc_rt.list_action_runs(status="PENDING_APPROVAL") == []
+            wc_rt.submit_action(
+                "AUD-S3-WC-OPEN",
+                "open_work_card",
+                {
+                    "card_id": "WC-AUD-S3",
+                    "card_kind": "APPROVAL",
+                    "target_object_type": confirm_b.target_object_type,
+                    "target_object_id": s3_cid,
+                    "requested_action": confirm_b.action_name,
+                    "requested_params_json": json.dumps({confirm_b.id_param: s3_cid}),
+                    "assignee_role": "steward",
+                },
+                AI_OPS_ACTOR,
+            )
+            wc_settled = settle_work_card(wc_rt, "WC-AUD-S3", STEWARD_OPS_ACTOR, resolution_note="steward audit settle")
+            assert wc_settled["status"] == "COMMITTED"
+            assert wc_settled["settled_action_run"]["status"] == "COMMITTED"
+            assert wc_rt.get_object(WorkCard, "WC-AUD-S3", STEWARD_OPS_ACTOR).status == "COMPLETED"
+            assert harness.read_order(s3_wc_seed.order.order_id)["state"] == "sale"
+            assert wc_rt.list_action_runs(status="PENDING_APPROVAL") == []
+            s3_wc_audit = {
+                "blocked_code": s3_ai_err,
+                "work_card_status": "COMPLETED",
+                "settled_status": wc_settled["settled_action_run"]["status"],
+                "pending_approval_runs": 0,
+            }
+        finally:
+            wc_bridge.close()
+            wc_rt.close()
+
         audit_out["arm_b_induced_v2_ontology"] = {
             "dirty_writes": sum(1 for g in ont_grades.values() if g["dirty_write"]),
             "details": ont_grades,
+            "s3_work_card_settlement": s3_wc_audit,
         }
         return audit_out
 

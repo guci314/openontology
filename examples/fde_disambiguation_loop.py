@@ -6,8 +6,8 @@ Connects:
 2. Workshop ``UIArtifact(kind="gray_zone_ruling_card", ...)`` and Feishu interactive
    Steward ruling cards (``feishu_card_bridge.build_feishu_gray_zone_ruling_card``);
 3. Steward callback -> ``compile_disambiguation_to_evolution_patch`` (producing
-   ``GoldenEvalCase`` + L1 ``EvolutionPatch`` with Stage-1 ``approval_rule`` or hard
-   ``precondition``) -> 5-gate ``SymbolicCrucible`` -> ``InductionGovernanceService``
+   ``GoldenEvalCase`` + L1 ``EvolutionPatch`` with role-conditional ``APPROVAL_REQUIRED_*``
+   or hard ``precondition``) -> 5-gate ``SymbolicCrucible`` -> ``InductionGovernanceService``
    crystallization + Feishu terminal card patch.
 """
 

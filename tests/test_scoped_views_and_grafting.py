@@ -80,6 +80,12 @@ def test_o2c_p2p_incremental_grafting_offline_end_to_end() -> None:
         "voucher_net_delta": 5.0,
         "premature_bill_error_code": "PO_GOODS_NOT_RECEIVED_FOR_BILL",
     }
+    assert out["work_card_approval"] == {
+        "error_code": "APPROVAL_REQUIRED_SPEND_LIMIT_EXCEEDED",
+        "work_card_status": "COMPLETED",
+        "settled_status": "COMMITTED",
+        "pending_approval_runs": 0,
+    }
 
 
 def test_o2c_p2p_incremental_grafting_live_erp_north_po_settlement() -> None:

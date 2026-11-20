@@ -4,8 +4,9 @@ Allows an induction workflow that has reached empirical structural certainty (~0
 while still holding unresolved policy gray zones (limit exceedances, reversal loops,
 or modal SOP wording) to present structured choices to a human steward and compile
 the chosen resolution deterministically into:
-1. L1 declarative guardrails (``precondition`` hard rejection, Stage-1 ``approval_rule``
-   pending-approval gate, or explicit waiver) packaged inside an ``EvolutionPatch``;
+1. L1 declarative guardrails (``precondition`` hard rejection, role-conditional
+   ``precondition`` approval gates returning ``APPROVAL_REQUIRED_*``, or explicit waiver)
+   packaged inside an ``EvolutionPatch``;
 2. Regression ``ProposedEvalCase`` / ``GoldenEvalCase`` entries locking the ruling in
    against future M1 evolution cycles through the 5-gate ``SymbolicCrucible``.
 
@@ -51,8 +52,8 @@ def default_disambiguation_options() -> list["DisambiguationOption"]:
         ),
         DisambiguationOption(
             choice_id="REQUIRE_APPROVAL",
-            label="挂起转人工签批（PENDING_APPROVAL）",
-            description="通过 approval_rule 动态校验对象关联字段，仅在越线时挂起等待 Steward 审批。",
+            label="签批门控拦截（APPROVAL_REQUIRED -> M1 审批流）",
+            description="通过角色条件 precondition 拦截非特权角色（返回 APPROVAL_REQUIRED_*），交由上层 M1 审批对象流与授权角色在 t1 重算执行。",
         ),
         DisambiguationOption(
             choice_id="ALLOW_AUTONOMOUS",
@@ -111,14 +112,6 @@ class StewardDisambiguationDecision:
     rationale: str = ""
 
 
-def _combine_or_ast(left: dict[str, Any] | None, right: dict[str, Any]) -> dict[str, Any]:
-    if left is None:
-        return copy.deepcopy(right)
-    if left == right:
-        return copy.deepcopy(left)
-    return {"op": "or", "args": [copy.deepcopy(left), copy.deepcopy(right)]}
-
-
 def compile_disambiguation_to_evolution_patch(
     *,
     base_blueprint: DeclarativeBlueprint,
@@ -163,6 +156,7 @@ def compile_disambiguation_to_evolution_patch(
         slug = amb.ambiguity_id.lower().replace("-", "_")
 
         if dec.choice_id == "HARD_REJECT":
+            act.allowed_roles = list(dict.fromkeys([*act.allowed_roles, *roles_lit]))
             act.preconditions.append(
                 InvariantRuleSpec(
                     name=f"disambig_{slug}",
@@ -201,7 +195,6 @@ def compile_disambiguation_to_evolution_patch(
                         "params": {amb.id_param: amb.sample_exceeding_id},
                         "actor": st_actor,
                         "expect_valid": True,
-                        "expect_requires_approval": False,
                     }
                 )
             if amb.sample_compliant_id:
@@ -212,22 +205,34 @@ def compile_disambiguation_to_evolution_patch(
                         "params": {amb.id_param: amb.sample_compliant_id},
                         "actor": ai_actor,
                         "expect_valid": True,
-                        "expect_requires_approval": False,
                     }
                 )
 
         elif dec.choice_id == "REQUIRE_APPROVAL":
-            gate_ast = {
-                "op": "and",
-                "args": [
-                    {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": roles_lit}},
-                    copy.deepcopy(amb.predicate_ast),
-                ],
-            }
-            act.approver_roles = list(dict.fromkeys([*act.approver_roles, *roles_lit]))
-            act.approval_target_type = amb.target_object_type
-            act.approval_id_param = amb.id_param
-            act.approval_rule = _combine_or_ast(act.approval_rule, gate_ast)
+            appr_code = (
+                amb.error_code
+                if amb.error_code.startswith("APPROVAL_REQUIRED_")
+                else f"APPROVAL_REQUIRED_{amb.error_code}"
+            )
+            act.allowed_roles = list(dict.fromkeys([*act.allowed_roles, *roles_lit]))
+            act.preconditions.append(
+                InvariantRuleSpec(
+                    name=f"disambig_approval_{slug}",
+                    code=appr_code,
+                    target_type=amb.target_object_type,
+                    id_param=amb.id_param,
+                    when=copy.deepcopy(amb.predicate_ast),
+                    must_hold={
+                        "op": "in",
+                        "left": {"ref": "actor.role"},
+                        "right": {"lit": roles_lit},
+                    },
+                    description=(
+                        dec.rationale
+                        or f"Steward approval-gate ruling on gray zone {amb.ambiguity_id}: {amb.summary}"
+                    ),
+                )
+            )
             if amb.target_action not in updated_action_names:
                 updated_action_names.append(amb.target_action)
             if amb.sample_exceeding_id:
@@ -237,8 +242,8 @@ def compile_disambiguation_to_evolution_patch(
                         "action": amb.target_action,
                         "params": {amb.id_param: amb.sample_exceeding_id},
                         "actor": ai_actor,
-                        "expect_valid": True,
-                        "expect_requires_approval": True,
+                        "expect_valid": False,
+                        "expect_error_code": appr_code,
                     }
                 )
                 proposed_cases.append(
@@ -248,7 +253,6 @@ def compile_disambiguation_to_evolution_patch(
                         "params": {amb.id_param: amb.sample_exceeding_id},
                         "actor": st_actor,
                         "expect_valid": True,
-                        "expect_requires_approval": False,
                     }
                 )
             if amb.sample_compliant_id:
@@ -259,7 +263,6 @@ def compile_disambiguation_to_evolution_patch(
                         "params": {amb.id_param: amb.sample_compliant_id},
                         "actor": ai_actor,
                         "expect_valid": True,
-                        "expect_requires_approval": False,
                     }
                 )
 
@@ -274,7 +277,6 @@ def compile_disambiguation_to_evolution_patch(
                         "params": {amb.id_param: amb.sample_exceeding_id},
                         "actor": ai_actor,
                         "expect_valid": True,
-                        "expect_requires_approval": False,
                     }
                 )
 
