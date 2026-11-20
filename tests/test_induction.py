@@ -549,15 +549,10 @@ def test_governance_enforces_separation_of_powers_and_steward_rollback() -> None
 
         # 3) 未经 Crucible 验证的提案严禁申请结晶
         with pytest.raises(InvariantError) as exc_unverified:
-            gov.runtime.submit_action(
-                "CHEAT-CRYSTAL",
-                "crystallize_model",
-                {"proposal_id": "PROP-1"},
-                BUILDER_ACTOR,
-            )
+            gov.request_crystallization("PROP-1", BUILDER_ACTOR, run_id="CHEAT-CRYSTAL")
         assert exc_unverified.value.code == "UNVERIFIED_PROPOSAL"
 
-        # 4) Crucible 签发通过报告后，Builder 申请结晶 -> 强制挂起 PENDING_APPROVAL
+        # 4) Crucible 签发通过报告后，Builder 申请结晶 -> 同步进入 AWAITING_APPROVAL（零 M2 PENDING_APPROVAL）
         gov.runtime.submit_action(
             "REAL-VERIFY-1",
             "record_falsification_report",
@@ -569,13 +564,10 @@ def test_governance_enforces_separation_of_powers_and_steward_rollback() -> None
             },
             CRUCIBLE_ACTOR,
         )
-        pending = gov.runtime.submit_action(
-            "CRYSTAL-1",
-            "crystallize_model",
-            {"proposal_id": "PROP-1"},
-            BUILDER_ACTOR,
-        )
-        assert pending["status"] == "PENDING_APPROVAL"
+        req_res = gov.request_crystallization("PROP-1", BUILDER_ACTOR, run_id="CRYSTAL-1")
+        assert req_res["status"] == "COMMITTED"
+        assert [p.proposal_id for p in gov.list_pending_crystallizations("erp_o2c")] == ["PROP-1"]
+        assert gov.runtime.list_action_runs(status="PENDING_APPROVAL") == []
         assert gov.get_active_blueprint("erp_o2c") is None  # 未批复前生效谱系零改动
 
         # 5) Builder / Evolver 严禁自我批复结晶
@@ -615,9 +607,10 @@ def test_governance_enforces_separation_of_powers_and_steward_rollback() -> None
             },
             CRUCIBLE_ACTOR,
         )
-        gov.runtime.submit_action("CRYSTAL-2", "crystallize_model", {"proposal_id": "PROP-2"}, EVOLVER_ACTOR)
+        gov.request_crystallization("PROP-2", EVOLVER_ACTOR, run_id="CRYSTAL-2")
         gov.approve_crystallization("CRYSTAL-2", STEWARD_ACTOR)
         assert gov.get_active_blueprint("erp_o2c").version == "1.1.0"
+        assert gov.runtime.list_action_runs(status="PENDING_APPROVAL") == []
 
         # Steward 一键回退至 1.0.0（同时不可变版本历史与报告仍完整保留）
         gov.rollback_crystallization("PROP-2", steward=STEWARD_ACTOR)
@@ -823,7 +816,7 @@ def test_p0_3_adapter_mapping_persistence_optimistic_lock_and_multistep_rollback
             },
             CRUCIBLE_ACTOR,
         )
-        gov.runtime.submit_action("C1", "crystallize_model", {"proposal_id": "PROP-V1"}, BUILDER_ACTOR)
+        gov.request_crystallization("PROP-V1", BUILDER_ACTOR, run_id="C1")
         gov.approve_crystallization("C1", STEWARD_ACTOR)
         saved_map = gov.get_active_adapter_mapping("erp_o2c")
         assert saved_map is not None and saved_map.mapping_id == "map-v1"
@@ -859,14 +852,16 @@ def test_p0_3_adapter_mapping_persistence_optimistic_lock_and_multistep_rollback
                 },
                 CRUCIBLE_ACTOR,
             )
-        gov.runtime.submit_action("C-V11", "crystallize_model", {"proposal_id": "PROP-V11"}, EVOLVER_ACTOR)
+        # 两个并发提案均在 v1.0.0 时申批；先批 PROP-V11 成功后，后批 PROP-V11-ALT 必须在 t1 重算时被乐观锁拦截（STALE_BASE_VERSION）
+        gov.request_crystallization("PROP-V11", EVOLVER_ACTOR, run_id="C-V11")
+        gov.request_crystallization("PROP-V11-ALT", EVOLVER_ACTOR, run_id="C-V11-ALT")
         gov.approve_crystallization("C-V11", STEWARD_ACTOR)
         assert gov.get_active_blueprint("erp_o2c").version == "1.1.0"
         assert gov.get_active_adapter_mapping("erp_o2c").mapping_id == "map-v1"
 
-        # 基于过期 base_version="1.0.0" 的第二个并发提案必须被拒绝（STALE_BASE_VERSION）
+        # 基于过期 base_version="1.0.0" 的第二个并发提案在 t1 批准与重新申批均必须被拒绝（STALE_BASE_VERSION）
         with pytest.raises(InvariantError) as exc_stale:
-            gov.runtime.submit_action("C-V11-ALT", "crystallize_model", {"proposal_id": "PROP-V11-ALT"}, EVOLVER_ACTOR)
+            gov.approve_crystallization("C-V11-ALT", STEWARD_ACTOR)
         assert exc_stale.value.code == "STALE_BASE_VERSION"
 
         # 3) 继续升级到 v1.2.0，再连续两步回滚 v1.2.0 -> v1.1.0 -> v1.0.0，且自动停用回滚版本的黄金用例
@@ -896,7 +891,7 @@ def test_p0_3_adapter_mapping_persistence_optimistic_lock_and_multistep_rollback
             },
             CRUCIBLE_ACTOR,
         )
-        gov.runtime.submit_action("C-V12", "crystallize_model", {"proposal_id": "PROP-V12"}, EVOLVER_ACTOR)
+        gov.request_crystallization("PROP-V12", EVOLVER_ACTOR, run_id="C-V12")
         gov.approve_crystallization("C-V12", STEWARD_ACTOR)
         assert [c["name"] for c in gov.get_golden_eval_cases("erp_o2c")] == ["case_v1", "case_v1_1", "case_v1_2"]
 
@@ -1212,7 +1207,7 @@ def test_strong_typed_proposed_eval_cases_self_check_and_multi_cycle_gate4_lock(
             },
             CRUCIBLE_ACTOR,
         )
-        gov.runtime.submit_action("C-GEN", "crystallize_model", {"proposal_id": "PROP-GEN"}, BUILDER_ACTOR)
+        gov.request_crystallization("PROP-GEN", BUILDER_ACTOR, run_id="C-GEN")
         gov.approve_crystallization("C-GEN", STEWARD_ACTOR)
 
         self_contained_setup = [

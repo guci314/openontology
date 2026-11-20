@@ -16,10 +16,13 @@
 
 from __future__ import annotations
 
+import uuid
 from collections import defaultdict
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, Sequence
 
-from open_ontology.spec import InvariantError, ObjectType, OntologySpec
+from pydantic import BaseModel
+
+from open_ontology.spec import AutoID, InvariantError, ObjectType, OntologySpec
 
 __all__ = [
     "spec",
@@ -27,6 +30,15 @@ __all__ = [
     "BalanceLedger",
     "ProcessDocument",
     "EventVoucher",
+    "WorkCardKind",
+    "WorkCardStatus",
+    "WorkCard",
+    "register_work_card_primitives",
+    "settle_work_card",
+    "build_work_card_object_blueprint",
+    "build_work_card_invariant_blueprints",
+    "build_work_card_action_blueprints",
+    "build_no_active_work_card_precondition",
     "build_business_seed_ontology",
     "BUSINESS_SEED_ONTOLOGY",
 ]
@@ -214,6 +226,794 @@ spec.display = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Unified M1 Collaboration WorkCard (Approval + Human Task + Dept Work)
+# ---------------------------------------------------------------------------
+WorkCardKind = Literal["APPROVAL", "HUMAN_TASK", "DEPT_WORK"]
+WorkCardStatus = Literal[
+    "OPEN",
+    "IN_PROGRESS",
+    "COMPLETED",
+    "REJECTED",
+    "SLA_BREACHED",
+    "CANCELLED",
+]
+
+_WORK_CARD_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "OPEN": ("IN_PROGRESS", "COMPLETED", "REJECTED", "SLA_BREACHED", "CANCELLED"),
+    "IN_PROGRESS": ("COMPLETED", "REJECTED", "SLA_BREACHED", "CANCELLED"),
+    "SLA_BREACHED": ("IN_PROGRESS", "COMPLETED", "REJECTED", "CANCELLED"),
+    "COMPLETED": (),
+    "REJECTED": (),
+    "CANCELLED": (),
+}
+
+
+class WorkCard(ProcessDocument):
+    """统一 M1 协作工单卡（收编审批卡、人工任务卡与跨部门协同卡）。
+
+    只承载原始意图与协作元数据，绝不缓存任何跨时间 ``object_diff_json``；
+    批准 ``APPROVAL`` 卡时在 $t_1$ 同一 ``EditBatch`` 事务内重新执行
+    ``requested_action``，完整重跑全部前置校验与全局不变量并以最新 OCC 版本号落库。
+    """
+
+    __primary_key__: ClassVar[str] = "card_id"
+    __title__: ClassVar[str] = "requested_action"
+    __aggregate_root__: ClassVar[bool] = True
+    __owned__: ClassVar[bool] = True
+    __status_field__: ClassVar[str] = "status"
+    __initial_statuses__: ClassVar[tuple[str, ...]] = ("OPEN",)
+    __transitions__: ClassVar[dict[str, tuple[str, ...]]] = _WORK_CARD_TRANSITIONS
+    __deletable_statuses__: ClassVar[tuple[str, ...]] = ("CANCELLED",)
+
+    card_id: AutoID
+    card_kind: WorkCardKind = "APPROVAL"
+    target_object_type: str
+    target_object_id: str
+    requested_action: str
+    requested_params_json: str = "{}"
+    requester_actor_id: str
+    assignee_role: str = "steward"
+    assignee_dept: str = ""
+    status: WorkCardStatus = "OPEN"
+    sla_due_at: str = ""
+    external_ref: str = ""
+    resolution_note: str = ""
+    claimed_by_actor_id: str = ""
+    resolved_by_actor_id: str = ""
+
+
+class OpenWorkCardParams(BaseModel):
+    card_id: str = ""
+    card_kind: WorkCardKind = "APPROVAL"
+    target_object_type: str
+    target_object_id: str
+    requested_action: str
+    requested_params_json: str = "{}"
+    assignee_role: str = "steward"
+    assignee_dept: str = ""
+    sla_due_at: str = ""
+    external_ref: str = ""
+
+
+class ClaimWorkCardParams(BaseModel):
+    card_id: str
+    external_ref: str = ""
+
+
+class CompleteWorkCardParams(BaseModel):
+    card_id: str
+    resolution_note: str = ""
+    external_ref: str = ""
+    settled_run_id: str = ""
+
+
+class RejectWorkCardParams(BaseModel):
+    card_id: str
+    resolution_note: str = ""
+
+
+class MarkWorkCardSlaBreachedParams(BaseModel):
+    card_id: str
+    resolution_note: str = ""
+
+
+class CancelWorkCardParams(BaseModel):
+    card_id: str
+    resolution_note: str = ""
+
+
+def _assert_work_card_assignee_and_sod(
+    ctx: Any,
+    card: WorkCard,
+    *,
+    enforce_sod: bool,
+) -> None:
+    if enforce_sod and ctx.actor.actor_id == card.requester_actor_id:
+        raise InvariantError(
+            f"SoD violation: requester {ctx.actor.actor_id!r} cannot self-resolve WorkCard:{card.card_id}",
+            code="SOD_SELF_APPROVAL_FORBIDDEN",
+        )
+    if card.assignee_role and ctx.actor.role not in (card.assignee_role, "admin"):
+        raise InvariantError(
+            f"WorkCard:{card.card_id} assigned to role {card.assignee_role!r}, "
+            f"cannot be handled by role {ctx.actor.role!r}",
+            code="WORK_CARD_ASSIGNEE_MISMATCH",
+        )
+
+
+def register_work_card_primitives(
+    target_spec: OntologySpec,
+    *,
+    opener_roles: Sequence[str] | None = None,
+    resolver_roles: Sequence[str] | None = None,
+) -> OntologySpec:
+    """将统一 M1 ``WorkCard``、职责分离/防重复不变量与 6 个同步动作注册到具体领域本体。"""
+    default_openers = (
+        "ai_agent",
+        "sales_rep",
+        "buyer",
+        "ops",
+        "clerk",
+        "warehouse",
+        "steward",
+        "admin",
+    )
+    default_resolvers = (
+        "steward",
+        "finance_director",
+        "sales_manager",
+        "dept_lead",
+        "warehouse",
+        "ops",
+        "admin",
+    )
+    declared_roles = set(target_spec.roles)
+    eff_openers = (
+        tuple(opener_roles)
+        if opener_roles is not None
+        else (
+            tuple(r for r in default_openers if not declared_roles or r in declared_roles)
+            or tuple(sorted(declared_roles))
+        )
+    )
+    eff_resolvers = (
+        tuple(resolver_roles)
+        if resolver_roles is not None
+        else (
+            tuple(r for r in default_resolvers if not declared_roles or r in declared_roles)
+            or tuple(sorted(declared_roles))
+        )
+    )
+
+    if "process_document_state_transitions" not in target_spec.transition_invariants:
+        target_spec.transition_invariant(
+            "process_document_state_transitions",
+            code="ILLEGAL_DOCUMENT_TRANSITION",
+            description="流程作业单据的创建初态、状态跃迁边及删除前置状态必须符合模型状态机声明。",
+        )(process_document_state_transitions)
+
+    if "WorkCard" not in target_spec.object_types:
+        target_spec.object_type(WorkCard)
+
+    if "work_card_unique_active_intent" not in target_spec.invariants:
+
+        @target_spec.invariant(
+            "work_card_unique_active_intent",
+            code="DUPLICATE_ACTIVE_WORK_CARD",
+            description="同一目标对象上的同类型同动作在途工单（OPEN/IN_PROGRESS）不得重复开卡。",
+        )
+        def _unique_active_work_card(view: Any) -> bool:
+            seen: dict[tuple[str, str, str, str], str] = {}
+            for card in view.query(WorkCard):
+                if card.status not in ("OPEN", "IN_PROGRESS"):
+                    continue
+                sig = (
+                    card.card_kind,
+                    card.target_object_type,
+                    card.target_object_id,
+                    card.requested_action,
+                )
+                prev_id = seen.get(sig)
+                if prev_id is not None and prev_id != card.card_id:
+                    raise InvariantError(
+                        f"duplicate active WorkCard for {sig}: {prev_id} and {card.card_id}",
+                        code="DUPLICATE_ACTIVE_WORK_CARD",
+                    )
+                seen[sig] = card.card_id
+            return True
+
+    if "work_card_segregation_of_duties" not in target_spec.invariants:
+
+        @target_spec.invariant(
+            "work_card_segregation_of_duties",
+            code="SOD_SELF_APPROVAL_FORBIDDEN",
+            description="职责分离（SoD）：WorkCard 的申请人（requester_actor_id）与批结人（resolved_by_actor_id）不得为同一身份。",
+        )
+        def _sod_invariant(view: Any) -> bool:
+            for card in view.query(WorkCard):
+                if (
+                    card.status in ("COMPLETED", "REJECTED")
+                    and card.resolved_by_actor_id
+                    and card.resolved_by_actor_id == card.requester_actor_id
+                ):
+                    raise InvariantError(
+                        f"SoD violation on WorkCard:{card.card_id}: "
+                        f"requester_actor_id == resolved_by_actor_id == {card.requester_actor_id!r}",
+                        code="SOD_SELF_APPROVAL_FORBIDDEN",
+                    )
+            return True
+
+    all_card_roles = tuple(dict.fromkeys([*eff_openers, *eff_resolvers]))
+
+    if "open_work_card" not in target_spec.actions:
+
+        @target_spec.action(
+            "open_work_card",
+            OpenWorkCardParams,
+            allowed_roles=eff_openers,
+            affects_source=False,
+            touched_object_types=("WorkCard",),
+            description="开立 M1 WorkCard（只记录原始意图与参数，绝不缓存 object_diff_json）。",
+        )
+        def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
+            cid = params.card_id.strip() or f"WC-{uuid.uuid4().hex[:10].upper()}"
+            if ctx.get(WorkCard, cid) is not None:
+                raise InvariantError(f"WorkCard:{cid} already exists", code="WORK_CARD_EXISTS")
+            if params.card_kind == "APPROVAL":
+                try:
+                    act_def = ctx.spec.get_action(params.requested_action)
+                    act_def.params.model_validate_json(params.requested_params_json or "{}")
+                except Exception as exc:
+                    raise InvariantError(
+                        f"invalid APPROVAL intent for action {params.requested_action!r}: {exc}",
+                        code="INVALID_WORK_CARD_INTENT",
+                    ) from exc
+            ctx.create(
+                WorkCard(
+                    card_id=cid,
+                    card_kind=params.card_kind,
+                    target_object_type=params.target_object_type,
+                    target_object_id=params.target_object_id,
+                    requested_action=params.requested_action,
+                    requested_params_json=params.requested_params_json or "{}",
+                    requester_actor_id=ctx.actor.actor_id,
+                    assignee_role=params.assignee_role,
+                    assignee_dept=params.assignee_dept,
+                    status="OPEN",
+                    sla_due_at=params.sla_due_at,
+                    external_ref=params.external_ref,
+                )
+            )
+
+    if "claim_work_card" not in target_spec.actions:
+
+        @target_spec.action(
+            "claim_work_card",
+            ClaimWorkCardParams,
+            allowed_roles=eff_resolvers,
+            affects_source=False,
+            touched_object_types=("WorkCard",),
+            description="认领推进 WorkCard（OPEN/SLA_BREACHED -> IN_PROGRESS）并记录外部回执号。",
+        )
+        def _claim_work_card(ctx: Any, params: ClaimWorkCardParams) -> None:
+            card = ctx.require(WorkCard, params.card_id)
+            _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=False)
+            ctx.modify(
+                card,
+                status="IN_PROGRESS",
+                claimed_by_actor_id=ctx.actor.actor_id,
+                external_ref=params.external_ref or card.external_ref,
+            )
+
+    if "complete_work_card" not in target_spec.actions:
+
+        @target_spec.action(
+            "complete_work_card",
+            CompleteWorkCardParams,
+            allowed_roles=eff_resolvers,
+            affects_source=False,
+            touched_object_types=("WorkCard",),
+            description="批结 WorkCard；若为 APPROVAL 卡且目标动作纯自有则在 t1 当场重算执行，源系统写动作须经 settle_work_card 提供 settled_run_id。",
+        )
+        def _complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> None:
+            card = ctx.require(WorkCard, params.card_id)
+            _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
+            if card.card_kind == "APPROVAL":
+                target_action = ctx.spec.get_action(card.requested_action)
+                if target_action.affects_source:
+                    if not params.settled_run_id.strip():
+                        raise InvariantError(
+                            f"APPROVAL WorkCard:{card.card_id} for source-backed action "
+                            f"{card.requested_action!r} requires settled_run_id via settle_work_card",
+                            code="SOURCE_APPROVAL_REQUIRES_SETTLED_RUN",
+                        )
+                else:
+                    target_params = target_action.params.model_validate_json(
+                        card.requested_params_json or "{}"
+                    )
+                    target_action.handler(ctx, target_params)
+            ctx.modify(
+                card,
+                status="COMPLETED",
+                resolved_by_actor_id=ctx.actor.actor_id,
+                resolution_note=params.resolution_note or card.resolution_note,
+                external_ref=params.external_ref or card.external_ref,
+            )
+
+    if "reject_work_card" not in target_spec.actions:
+
+        @target_spec.action(
+            "reject_work_card",
+            RejectWorkCardParams,
+            allowed_roles=eff_resolvers,
+            affects_source=False,
+            touched_object_types=("WorkCard",),
+            description="驳回 WorkCard（校验 SoD 后跃迁为 REJECTED）。",
+        )
+        def _reject_work_card(ctx: Any, params: RejectWorkCardParams) -> None:
+            card = ctx.require(WorkCard, params.card_id)
+            _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
+            ctx.modify(
+                card,
+                status="REJECTED",
+                resolved_by_actor_id=ctx.actor.actor_id,
+                resolution_note=params.resolution_note or card.resolution_note,
+            )
+
+    if "mark_work_card_sla_breached" not in target_spec.actions:
+
+        @target_spec.action(
+            "mark_work_card_sla_breached",
+            MarkWorkCardSlaBreachedParams,
+            allowed_roles=all_card_roles,
+            affects_source=False,
+            touched_object_types=("WorkCard",),
+            description="标记超时未处理 WorkCard 为 SLA_BREACHED。",
+        )
+        def _mark_sla_breached(ctx: Any, params: MarkWorkCardSlaBreachedParams) -> None:
+            card = ctx.require(WorkCard, params.card_id)
+            ctx.modify(
+                card,
+                status="SLA_BREACHED",
+                resolution_note=params.resolution_note or card.resolution_note,
+            )
+
+    if "cancel_work_card" not in target_spec.actions:
+
+        @target_spec.action(
+            "cancel_work_card",
+            CancelWorkCardParams,
+            allowed_roles=all_card_roles,
+            affects_source=False,
+            touched_object_types=("WorkCard",),
+            description="撤销不再需要的 WorkCard（仅原申请人或 steward/admin 可撤销）。",
+        )
+        def _cancel_work_card(ctx: Any, params: CancelWorkCardParams) -> None:
+            card = ctx.require(WorkCard, params.card_id)
+            if ctx.actor.actor_id != card.requester_actor_id and ctx.actor.role not in (
+                "steward",
+                "admin",
+            ):
+                raise InvariantError(
+                    f"actor {ctx.actor.actor_id!r} may not cancel WorkCard:{card.card_id}",
+                    code="WORK_CARD_CANCEL_FORBIDDEN",
+                )
+            ctx.modify(
+                card,
+                status="CANCELLED",
+                resolution_note=params.resolution_note or card.resolution_note,
+            )
+
+    return target_spec
+
+
+class _WorkCardActorContext:
+    def __init__(self, actor: Any, spec: Any) -> None:
+        self.actor = actor
+        self.spec = spec
+
+
+def settle_work_card(
+    rt_handle: Any,
+    card_id: str,
+    approver: Any,
+    *,
+    resolution_note: str = "",
+    external_ref: str = "",
+    action_run_id: str | None = None,
+    complete_run_id: str | None = None,
+) -> dict[str, Any]:
+    """按严格双面隔离语义结算一张 ``WorkCard``。
+
+    - 若目标动作纯自有（``affects_source=False``）或非 ``APPROVAL`` 卡：
+      直接单次提交 ``complete_work_card``，在同一个 ``EditBatch`` 内于 $t_1$ 重算落库。
+    - 若为 ``APPROVAL`` 卡且目标动作写回外部源（``affects_source=True``）：
+      先在内存校验状态流转、职责分离（SoD）与指派角色，再在 $t_1$ 单独提交
+      ``requested_action``（触发完整前置/不变量校验与 ``SourceBridge``），最后提交
+      ``complete_work_card`` 记录 ``settled_run_id`` 并合卡。
+    """
+    import uuid
+
+    card = rt_handle.get_object(WorkCard, card_id, approver)
+    if "COMPLETED" not in _WORK_CARD_TRANSITIONS.get(card.status, ()):
+        raise InvariantError(
+            f"WorkCard:{card.card_id} in status {card.status!r} cannot transition to 'COMPLETED'",
+            code="WORK_CARD_NOT_ACTIVE",
+        )
+
+    complete_action = rt_handle.spec.get_action("complete_work_card")
+    if complete_action.allowed_roles and approver.role not in complete_action.allowed_roles:
+        raise InvariantError(
+            f"role {approver.role!r} is not allowed to settle WorkCard:{card.card_id}",
+            code="WORK_CARD_RESOLVER_FORBIDDEN",
+        )
+
+    _assert_work_card_assignee_and_sod(
+        _WorkCardActorContext(approver, rt_handle.spec),
+        card,
+        enforce_sod=True,
+    )
+
+    comp_rid = complete_run_id or f"WC-COMP-{uuid.uuid4().hex[:12]}"
+    if card.card_kind == "APPROVAL":
+        target_action = rt_handle.spec.get_action(card.requested_action)
+        if target_action.affects_source:
+            target_params = target_action.params.model_validate_json(
+                card.requested_params_json or "{}"
+            )
+            act_rid = action_run_id or f"WC-ACT-{uuid.uuid4().hex[:12]}"
+            settled_run = rt_handle.submit_action(
+                act_rid,
+                card.requested_action,
+                target_params,
+                approver,
+            )
+            comp_run = rt_handle.submit_action(
+                comp_rid,
+                "complete_work_card",
+                {
+                    "card_id": card_id,
+                    "resolution_note": resolution_note,
+                    "external_ref": external_ref,
+                    "settled_run_id": settled_run.get("run_id", act_rid),
+                },
+                approver,
+            )
+            return {**comp_run, "settled_action_run": settled_run}
+
+    return rt_handle.submit_action(
+        comp_rid,
+        "complete_work_card",
+        {
+            "card_id": card_id,
+            "resolution_note": resolution_note,
+            "external_ref": external_ref,
+        },
+        approver,
+    )
+
+
+def build_work_card_object_blueprint() -> dict[str, Any]:
+    """返回符合 L1 ``ObjectTypeBlueprint`` 结构的纯声明式 ``WorkCard`` 定义。"""
+    return {
+        "name": "WorkCard",
+        "archetype": "ProcessDocument",
+        "primary_key": "card_id",
+        "title_field": "requested_action",
+        "aggregate_root": True,
+        "owned": True,
+        "status_field": "status",
+        "initial_statuses": ["OPEN"],
+        "transitions": {k: list(v) for k, v in _WORK_CARD_TRANSITIONS.items()},
+        "fields": [
+            {"name": "card_id", "field_type": "str", "primary_key": True, "auto_id": True},
+            {"name": "card_kind", "field_type": "str", "default": "APPROVAL", "required": True},
+            {"name": "target_object_type", "field_type": "str", "required": True},
+            {"name": "target_object_id", "field_type": "str", "required": True},
+            {"name": "requested_action", "field_type": "str", "required": True},
+            {"name": "requested_params_json", "field_type": "str", "default": "{}"},
+            {"name": "requester_actor_id", "field_type": "str", "required": True},
+            {"name": "assignee_role", "field_type": "str", "default": "steward"},
+            {"name": "assignee_dept", "field_type": "str", "default": ""},
+            {"name": "status", "field_type": "str", "default": "OPEN"},
+            {"name": "sla_due_at", "field_type": "str", "default": ""},
+            {"name": "external_ref", "field_type": "str", "default": ""},
+            {"name": "resolution_note", "field_type": "str", "default": ""},
+            {"name": "claimed_by_actor_id", "field_type": "str", "default": ""},
+            {"name": "resolved_by_actor_id", "field_type": "str", "default": ""},
+        ],
+    }
+
+
+def build_work_card_invariant_blueprints() -> list[dict[str, Any]]:
+    """返回与 M1 ``WorkCard`` 原生规则等价的 L1 声明式 ``InvariantRuleSpec`` 列表。"""
+    return [
+        {
+            "name": "work_card_unique_active_intent",
+            "code": "DUPLICATE_ACTIVE_WORK_CARD",
+            "target_type": "WorkCard",
+            "when": {"op": "in", "left": {"ref": "obj.status"}, "right": {"lit": ["OPEN", "IN_PROGRESS"]}},
+            "must_hold": {
+                "op": "not_exists",
+                "object_type": "WorkCard",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "ne", "left": {"ref": "target.card_id"}, "right": {"ref": "obj.card_id"}},
+                        {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"ref": "obj.card_kind"}},
+                        {
+                            "op": "eq",
+                            "left": {"ref": "target.target_object_type"},
+                            "right": {"ref": "obj.target_object_type"},
+                        },
+                        {
+                            "op": "eq",
+                            "left": {"ref": "target.target_object_id"},
+                            "right": {"ref": "obj.target_object_id"},
+                        },
+                        {
+                            "op": "eq",
+                            "left": {"ref": "target.requested_action"},
+                            "right": {"ref": "obj.requested_action"},
+                        },
+                        {
+                            "op": "in",
+                            "left": {"ref": "target.status"},
+                            "right": {"lit": ["OPEN", "IN_PROGRESS"]},
+                        },
+                    ],
+                },
+            },
+            "description": "同一目标对象上的同类型同动作在途工单不得重复开卡。",
+        },
+        {
+            "name": "work_card_segregation_of_duties",
+            "code": "SOD_SELF_APPROVAL_FORBIDDEN",
+            "target_type": "WorkCard",
+            "when": {
+                "op": "and",
+                "args": [
+                    {"op": "in", "left": {"ref": "obj.status"}, "right": {"lit": ["COMPLETED", "REJECTED"]}},
+                    {"op": "ne", "left": {"ref": "obj.resolved_by_actor_id"}, "right": {"lit": ""}},
+                ],
+            },
+            "must_hold": {
+                "op": "ne",
+                "left": {"ref": "obj.resolved_by_actor_id"},
+                "right": {"ref": "obj.requester_actor_id"},
+            },
+            "description": "职责分离（SoD）：禁止 WorkCard 申请人自批自结。",
+        },
+    ]
+
+
+def build_work_card_action_blueprints(
+    *,
+    opener_roles: Sequence[str] = ("ai_agent", "steward", "admin"),
+    resolver_roles: Sequence[str] = ("steward", "admin"),
+) -> list[dict[str, Any]]:
+    """返回符合 L1 ``ActionBlueprint`` 结构的 ``WorkCard`` 全生命周期声明式动作族。"""
+    sod_pre = {
+        "name": "sod_no_self_resolution",
+        "code": "SOD_SELF_APPROVAL_FORBIDDEN",
+        "target_type": "WorkCard",
+        "id_param": "card_id",
+        "must_hold": {
+            "op": "ne",
+            "left": {"ref": "actor.actor_id"},
+            "right": {"ref": "obj.requester_actor_id"},
+        },
+        "description": "SoD: approver/resolver actor_id must differ from WorkCard.requester_actor_id.",
+    }
+    assignee_pre = {
+        "name": "assignee_role_match",
+        "code": "WORK_CARD_ASSIGNEE_MISMATCH",
+        "target_type": "WorkCard",
+        "id_param": "card_id",
+        "when": {"op": "ne", "left": {"ref": "obj.assignee_role"}, "right": {"lit": ""}},
+        "must_hold": {
+            "op": "or",
+            "args": [
+                {"op": "eq", "left": {"ref": "actor.role"}, "right": {"ref": "obj.assignee_role"}},
+                {"op": "eq", "left": {"ref": "actor.role"}, "right": {"lit": "admin"}},
+            ],
+        },
+        "description": "Actor role must match WorkCard.assignee_role or admin.",
+    }
+    all_roles = list(dict.fromkeys([*opener_roles, *resolver_roles]))
+    return [
+        {
+            "name": "open_work_card",
+            "allowed_roles": list(opener_roles),
+            "affects_source": False,
+            "params": [
+                {"name": "card_id", "field_type": "str", "required": True},
+                {"name": "card_kind", "field_type": "str", "default": "APPROVAL"},
+                {"name": "target_object_type", "field_type": "str", "required": True},
+                {"name": "target_object_id", "field_type": "str", "required": True},
+                {"name": "requested_action", "field_type": "str", "required": True},
+                {"name": "requested_params_json", "field_type": "str", "default": "{}"},
+                {"name": "assignee_role", "field_type": "str", "default": "steward"},
+                {"name": "assignee_dept", "field_type": "str", "default": ""},
+                {"name": "sla_due_at", "field_type": "str", "default": ""},
+                {"name": "external_ref", "field_type": "str", "default": ""},
+            ],
+            "mutations": [
+                {
+                    "op": "create",
+                    "object_type": "WorkCard",
+                    "id_param": "card_id",
+                    "set_fields": {
+                        "card_id": {"ref": "param.card_id"},
+                        "card_kind": {"ref": "param.card_kind"},
+                        "target_object_type": {"ref": "param.target_object_type"},
+                        "target_object_id": {"ref": "param.target_object_id"},
+                        "requested_action": {"ref": "param.requested_action"},
+                        "requested_params_json": {"ref": "param.requested_params_json"},
+                        "requester_actor_id": {"ref": "actor.actor_id"},
+                        "assignee_role": {"ref": "param.assignee_role"},
+                        "assignee_dept": {"ref": "param.assignee_dept"},
+                        "status": {"lit": "OPEN"},
+                        "sla_due_at": {"ref": "param.sla_due_at"},
+                        "external_ref": {"ref": "param.external_ref"},
+                    },
+                }
+            ],
+        },
+        {
+            "name": "claim_work_card",
+            "allowed_roles": list(resolver_roles),
+            "affects_source": False,
+            "params": [
+                {"name": "card_id", "field_type": "str", "required": True},
+                {"name": "external_ref", "field_type": "str", "default": ""},
+            ],
+            "preconditions": [assignee_pre],
+            "mutations": [
+                {
+                    "op": "modify",
+                    "object_type": "WorkCard",
+                    "id_param": "card_id",
+                    "set_fields": {
+                        "status": {"lit": "IN_PROGRESS"},
+                        "claimed_by_actor_id": {"ref": "actor.actor_id"},
+                        "external_ref": {"ref": "param.external_ref"},
+                    },
+                }
+            ],
+        },
+        {
+            "name": "complete_work_card",
+            "allowed_roles": list(resolver_roles),
+            "affects_source": False,
+            "params": [
+                {"name": "card_id", "field_type": "str", "required": True},
+                {"name": "resolution_note", "field_type": "str", "default": ""},
+            ],
+            "preconditions": [sod_pre, assignee_pre],
+            "mutations": [
+                {
+                    "op": "modify",
+                    "object_type": "WorkCard",
+                    "id_param": "card_id",
+                    "set_fields": {
+                        "status": {"lit": "COMPLETED"},
+                        "resolved_by_actor_id": {"ref": "actor.actor_id"},
+                        "resolution_note": {"ref": "param.resolution_note"},
+                    },
+                }
+            ],
+        },
+        {
+            "name": "reject_work_card",
+            "allowed_roles": list(resolver_roles),
+            "affects_source": False,
+            "params": [
+                {"name": "card_id", "field_type": "str", "required": True},
+                {"name": "resolution_note", "field_type": "str", "default": ""},
+            ],
+            "preconditions": [sod_pre, assignee_pre],
+            "mutations": [
+                {
+                    "op": "modify",
+                    "object_type": "WorkCard",
+                    "id_param": "card_id",
+                    "set_fields": {
+                        "status": {"lit": "REJECTED"},
+                        "resolved_by_actor_id": {"ref": "actor.actor_id"},
+                        "resolution_note": {"ref": "param.resolution_note"},
+                    },
+                }
+            ],
+        },
+        {
+            "name": "mark_work_card_sla_breached",
+            "allowed_roles": all_roles,
+            "affects_source": False,
+            "params": [
+                {"name": "card_id", "field_type": "str", "required": True},
+                {"name": "resolution_note", "field_type": "str", "default": ""},
+            ],
+            "mutations": [
+                {
+                    "op": "modify",
+                    "object_type": "WorkCard",
+                    "id_param": "card_id",
+                    "set_fields": {
+                        "status": {"lit": "SLA_BREACHED"},
+                        "resolution_note": {"ref": "param.resolution_note"},
+                    },
+                }
+            ],
+        },
+        {
+            "name": "cancel_work_card",
+            "allowed_roles": all_roles,
+            "affects_source": False,
+            "params": [
+                {"name": "card_id", "field_type": "str", "required": True},
+                {"name": "resolution_note", "field_type": "str", "default": ""},
+            ],
+            "preconditions": [
+                {
+                    "name": "cancel_work_card_authority",
+                    "code": "WORK_CARD_CANCEL_FORBIDDEN",
+                    "target_type": "WorkCard",
+                    "id_param": "card_id",
+                    "must_hold": {
+                        "op": "or",
+                        "args": [
+                            {"op": "eq", "left": {"ref": "actor.actor_id"}, "right": {"ref": "obj.requester_actor_id"}},
+                            {"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward", "admin"]}},
+                        ],
+                    },
+                }
+            ],
+            "mutations": [
+                {
+                    "op": "modify",
+                    "object_type": "WorkCard",
+                    "id_param": "card_id",
+                    "set_fields": {
+                        "status": {"lit": "CANCELLED"},
+                        "resolution_note": {"ref": "param.resolution_note"},
+                    },
+                }
+            ],
+        },
+    ]
+
+
+def build_no_active_work_card_precondition(
+    *,
+    target_object_type: str,
+    id_param: str,
+    name: str = "no_active_work_card_on_target",
+    code: str = "ACTIVE_WORK_CARD_BLOCKS_ACTION",
+) -> dict[str, Any]:
+    """生成阻断带在途 ``WorkCard`` 单据被直接撤单/篡改的 L1 ``InvariantRuleSpec`` 字典。"""
+    return {
+        "name": name,
+        "code": code,
+        "target_type": target_object_type,
+        "id_param": id_param,
+        "must_hold": {
+            "op": "not_exists",
+            "object_type": "WorkCard",
+            "where": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "target.target_object_type"}, "right": {"lit": target_object_type}},
+                    {"op": "eq", "left": {"ref": "target.target_object_id"}, "right": {"ref": f"param.{id_param}"}},
+                    {"op": "in", "left": {"ref": "target.status"}, "right": {"lit": ["OPEN", "IN_PROGRESS"]}},
+                ],
+            },
+        },
+        "description": f"Cannot execute while active OPEN/IN_PROGRESS WorkCard exists for {target_object_type}.",
+    }
+
+
 def build_business_seed_ontology() -> Any:
     """将 ``business_ontology`` 封装为可供符号训练器插拔的企业领域种子本体论底座。"""
     from open_ontology.induction.seed import seed_from_spec
@@ -224,7 +1024,8 @@ def build_business_seed_ontology() -> Any:
         base_spec=spec,
         description=(
             "企业商业领域通用种子本体：提供 MasterEntity（主数据）、ProcessDocument（状态机单据）、"
-            "BalanceLedger（非负+账证守恒台账）、EventVoucher（只追加不可变凭证）四大原型及其可继承公理。"
+            "BalanceLedger（非负+账证守恒台账）、EventVoucher（只追加不可变凭证）四大原型，"
+            "以及统一协作工单 WorkCard（Approval / Human Task / Dept Work）及其 t1 现场重算执行范式。"
         ),
         archetype_role_hints={
             "MasterEntity": ("master_data", "low_frequency_reference", "aggregate_root"),
@@ -239,6 +1040,7 @@ def build_business_seed_ontology() -> Any:
             "Internal non-financial collaboration domains without shared pre-write guardrails belong in separate lightweight ontology specs.",
             "Anti-God-Object discipline: anchor shared counterparties and materials in lean MasterEntity types (e.g., Party + CustomerRole/SupplierRole facets) rather than wide 100-column tables.",
             "Expose role/context-filtered ScopedViewSpec projections to downstream agents to keep C_agent small without fracturing synchronous invariants.",
+            "Unified Collaboration WorkCard Principle: approvals, human tasks, and department work items use first-class M1 WorkCard(ProcessDocument) storing only raw intent (never cached object_diff_json), enforcing SoD (requester != resolver) and live t1 re-execution upon APPROVAL completion.",
             "Every BalanceLedger numeric balance field mutated by an action MUST declare "
             "voucher_delta_rules and emit matching EventVoucher delta records in the same transaction.",
             "Every ProcessDocument status field MUST follow declared finite-state transitions.",

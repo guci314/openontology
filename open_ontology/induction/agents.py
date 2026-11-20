@@ -354,11 +354,11 @@ class OntologyBuilderAgent:
 
             if report.passed:
                 pending_run_id = f"CRYSTAL-{pid}"
-                self.governance.runtime.submit_action(
-                    pending_run_id,
-                    "crystallize_model",
-                    {"proposal_id": pid, "approval_note": f"verified in round {r}"},
-                    self.actor,
+                self.governance.request_crystallization(
+                    pid,
+                    actor=self.actor,
+                    approval_note=f"verified in round {r}",
+                    run_id=pending_run_id,
                 )
                 break
 
@@ -610,11 +610,11 @@ class OntologyEvolverAgent:
 
             if report.passed:
                 pending_run_id = f"CRYSTAL-{pid}"
-                self.governance.runtime.submit_action(
-                    pending_run_id,
-                    "crystallize_model",
-                    {"proposal_id": pid, "approval_note": f"verified in round {r}"},
-                    self.actor,
+                self.governance.request_crystallization(
+                    pid,
+                    actor=self.actor,
+                    approval_note=f"verified in round {r}",
+                    run_id=pending_run_id,
                 )
                 break
 

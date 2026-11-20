@@ -118,7 +118,11 @@ class ModelProposal(ObjectType):
     patch_json: str = "{}"
     proposed_eval_cases_json: str = "[]"
     revision: int = 1
-    status: str = "DRAFT"  # DRAFT | REFUTED | VERIFIED | CRYSTALLIZED | ROLLED_BACK
+    status: str = "DRAFT"  # DRAFT | REFUTED | VERIFIED | AWAITING_APPROVAL | CRYSTALLIZED | REJECTED | ROLLED_BACK
+    requested_by: str = ""
+    approved_by: str = ""
+    approval_note: str = ""
+    rejection_reason: str = ""
     last_report_id: str = ""
     last_report_passed: bool = False
     last_report_blueprint_hash: str = ""
@@ -220,9 +224,19 @@ class _RecordFalsificationParams(BaseModel):
     report_json: str
 
 
-class _CrystallizeModelParams(BaseModel):
+class _RequestCrystallizationParams(BaseModel):
     proposal_id: str
     approval_note: str = ""
+
+
+class _ApproveCrystallizationParams(BaseModel):
+    proposal_id: str
+    approval_note: str = ""
+
+
+class _RejectCrystallizationParams(BaseModel):
+    proposal_id: str
+    reason: str = "rejected by steward"
 
 
 class _RollbackCrystallizationParams(BaseModel):
@@ -230,8 +244,8 @@ class _RollbackCrystallizationParams(BaseModel):
     reason: str = "steward rollback"
 
 
-def build_induction_governance_spec() -> OntologySpec:
-    """Build the M2 meta-governance OntologySpec that governs Builder/Evolver/Crucible/Steward."""
+def build_induction_governance_spec(*, allow_self_approval: bool = False) -> OntologySpec:
+    """Build the pure synchronous M2 meta-governance OntologySpec for Builder/Evolver/Crucible/Steward."""
     spec = OntologySpec()
     for cls in (
         ActiveModelHead,
@@ -258,7 +272,9 @@ def build_induction_governance_spec() -> OntologySpec:
             "propose_evolution_patch": "提议演化补丁 (Evolver)",
             "revise_proposal": "依据反例修订提案",
             "record_falsification_report": "签发符号证伪报告 (Crucible)",
-            "crystallize_model": "审批结晶新模型 (Steward)",
+            "request_crystallization": "申请结晶待批 (Builder/Evolver)",
+            "approve_crystallization": "批准并同步结晶新版本 (Steward)",
+            "reject_crystallization": "驳回结晶提案 (Steward)",
             "rollback_crystallization": "回退结晶版本 (Steward)",
         },
     }
@@ -444,9 +460,17 @@ def build_induction_governance_spec() -> OntologySpec:
                 )
         return head
 
-    def _crystallize_handler(ctx: EditBatch, params: _CrystallizeModelParams) -> None:
-        prop = ctx.require(ModelProposal, params.proposal_id)
-        if prop.status != "VERIFIED" or not prop.last_report_passed:
+    def _assert_version_available(ctx: EditBatch, prop: ModelProposal) -> str:
+        version_key = f"{prop.model_id}@{prop.target_version}"
+        if ctx.get(CrystallizedModelVersion, version_key) is not None:
+            raise InvariantError(
+                f"version {version_key!r} is already crystallized",
+                code="VERSION_ALREADY_CRYSTALLIZED",
+            )
+        return version_key
+
+    def _assert_verified_integrity(prop: ModelProposal) -> None:
+        if prop.status in ("DRAFT", "REFUTED") or not prop.last_report_passed:
             raise InvariantError(
                 f"proposal {prop.proposal_id!r} has not passed Symbolic Crucible verification",
                 code="UNVERIFIED_PROPOSAL",
@@ -457,18 +481,54 @@ def build_induction_governance_spec() -> OntologySpec:
                 f"proposal {prop.proposal_id!r} blueprint hash changed after falsification",
                 code="BLUEPRINT_HASH_MISMATCH",
             )
-        _assert_optimistic_base(ctx, prop)
-        ctx.modify(prop, status="CRYSTALLIZED")
 
-    def _crystallize_post_approval(ctx: EditBatch, params: _CrystallizeModelParams) -> None:
+    @spec.action(
+        "request_crystallization",
+        _RequestCrystallizationParams,
+        allowed_roles=("ontology_builder", "ontology_evolver", "steward"),
+        affects_source=False,
+        description="将五关全绿的提案同步推进为 AWAITING_APPROVAL 等待 Steward t1 签批",
+    )
+    def _request_crystallization(ctx: EditBatch, params: _RequestCrystallizationParams) -> None:
         prop = ctx.require(ModelProposal, params.proposal_id)
-        head = _assert_optimistic_base(ctx, prop)
-        version_key = f"{prop.model_id}@{prop.target_version}"
-        if ctx.get(CrystallizedModelVersion, version_key) is not None:
+        if prop.status != "VERIFIED" or not prop.last_report_passed:
             raise InvariantError(
-                f"version {version_key!r} is already crystallized",
-                code="VERSION_ALREADY_CRYSTALLIZED",
+                f"proposal {prop.proposal_id!r} has not passed Symbolic Crucible verification",
+                code="UNVERIFIED_PROPOSAL",
             )
+        _assert_verified_integrity(prop)
+        _assert_optimistic_base(ctx, prop)
+        _assert_version_available(ctx, prop)
+        ctx.modify(
+            prop,
+            status="AWAITING_APPROVAL",
+            requested_by=ctx.actor.actor_id,
+            approval_note=params.approval_note,
+        )
+
+    @spec.action(
+        "approve_crystallization",
+        _ApproveCrystallizationParams,
+        allowed_roles=("steward",),
+        affects_source=False,
+        description="Steward 在 t1 现场重算基线与哈希并同步结晶新模型版本（无跨期 diff 队列）",
+    )
+    def _approve_crystallization(ctx: EditBatch, params: _ApproveCrystallizationParams) -> None:
+        prop = ctx.require(ModelProposal, params.proposal_id)
+        _assert_verified_integrity(prop)
+        if prop.status != "AWAITING_APPROVAL":
+            raise InvariantError(
+                f"proposal {prop.proposal_id!r} status {prop.status!r} is not AWAITING_APPROVAL",
+                code="PROPOSAL_NOT_AWAITING_APPROVAL",
+            )
+        if not allow_self_approval and prop.requested_by and ctx.actor.actor_id == prop.requested_by:
+            raise InvariantError(
+                f"SoD violation: requester {prop.requested_by!r} cannot self-approve proposal {prop.proposal_id!r}",
+                code="SOD_SELF_APPROVAL_FORBIDDEN",
+            )
+
+        head = _assert_optimistic_base(ctx, prop)
+        version_key = _assert_version_available(ctx, prop)
         parent_ver = head.active_version if head is not None else ""
         # Inherit previous adapter_mapping_json if evolution patch did not replace it
         effective_mapping = prop.adapter_mapping_json
@@ -484,7 +544,7 @@ def build_induction_governance_spec() -> OntologySpec:
                 proposal=prop.proposal_id,
                 blueprint_json=prop.blueprint_json,
                 adapter_mapping_json=effective_mapping,
-                requested_by=ctx.actor.actor_id,
+                requested_by=prop.requested_by or prop.proposer_id or ctx.actor.actor_id,
             )
         )
         new_entry = {
@@ -537,16 +597,38 @@ def build_induction_governance_spec() -> OntologySpec:
                     )
                 )
 
-    spec.action(
-        "crystallize_model",
-        _CrystallizeModelParams,
-        allowed_roles=("ontology_builder", "ontology_evolver", "steward"),
-        approver_roles=("steward",),
-        approval_rule=lambda _params, _actor: True,
+        ctx.modify(
+            prop,
+            status="CRYSTALLIZED",
+            approved_by=ctx.actor.actor_id,
+            approval_note=params.approval_note or prop.approval_note,
+        )
+
+    @spec.action(
+        "reject_crystallization",
+        _RejectCrystallizationParams,
+        allowed_roles=("steward",),
         affects_source=False,
-        post_approval=_crystallize_post_approval,
-        description="申请将五关全绿的提案结晶为新 M1 版本（强制挂起 PENDING_APPROVAL 等待 Steward 批准）",
-    )(_crystallize_handler)
+        description="Steward 同步驳回处于 AWAITING_APPROVAL 状态的演进提案",
+    )
+    def _reject_crystallization(ctx: EditBatch, params: _RejectCrystallizationParams) -> None:
+        prop = ctx.require(ModelProposal, params.proposal_id)
+        if prop.status != "AWAITING_APPROVAL":
+            raise InvariantError(
+                f"proposal {prop.proposal_id!r} status {prop.status!r} is not AWAITING_APPROVAL",
+                code="PROPOSAL_NOT_AWAITING_APPROVAL",
+            )
+        if not allow_self_approval and prop.requested_by and ctx.actor.actor_id == prop.requested_by:
+            raise InvariantError(
+                f"SoD violation: requester {prop.requested_by!r} cannot self-reject proposal {prop.proposal_id!r}",
+                code="SOD_SELF_APPROVAL_FORBIDDEN",
+            )
+        ctx.modify(
+            prop,
+            status="REJECTED",
+            approved_by=ctx.actor.actor_id,
+            rejection_reason=params.reason,
+        )
 
     @spec.action(
         "rollback_crystallization",
@@ -594,11 +676,12 @@ def build_induction_governance_spec() -> OntologySpec:
 
 
 class InductionGovernanceService:
-    """Meta-bootstrapped 6-table governance runtime for Builder/Evolver/Crucible/Steward."""
+    """Meta-bootstrapped 6-table pure-sync governance runtime for Builder/Evolver/Crucible/Steward."""
 
-    def __init__(self, db_path: str = ":memory:") -> None:
-        self.spec = build_induction_governance_spec()
+    def __init__(self, db_path: str = ":memory:", *, allow_self_approval: bool = False) -> None:
+        self.spec = build_induction_governance_spec(allow_self_approval=allow_self_approval)
         self.runtime = OntologyRuntime(self.spec, db_path=db_path)
+        self._run_to_proposal: dict[str, str] = {}
 
     def close(self) -> None:
         self.runtime.close()
@@ -641,16 +724,99 @@ class InductionGovernanceService:
         filters = {"model_id": model_id} if model_id else None
         return self.runtime.query_objects(ModelProposal, STEWARD_ACTOR, filters=filters)
 
+    def list_pending_crystallizations(self, model_id: str | None = None) -> list[ModelProposal]:
+        filters: dict[str, Any] = {"status": "AWAITING_APPROVAL"}
+        if model_id:
+            filters["model_id"] = model_id
+        return self.runtime.query_objects(ModelProposal, STEWARD_ACTOR, filters=filters)
+
     def list_reports(self, proposal_id: str | None = None) -> list[FalsificationReport]:
         filters = {"proposal": proposal_id} if proposal_id else None
         return self.runtime.query_objects(FalsificationReport, STEWARD_ACTOR, filters=filters)
+
+    def _resolve_proposal_id(self, proposal_or_run_id: str) -> str:
+        if proposal_or_run_id in self._run_to_proposal:
+            return self._run_to_proposal[proposal_or_run_id]
+        try:
+            self.runtime.get_object(ModelProposal, proposal_or_run_id, STEWARD_ACTOR)
+            return proposal_or_run_id
+        except ObjectNotFoundError:
+            pass
+        run = self.runtime.get_action_run(proposal_or_run_id)
+        if run is not None:
+            pid = (run.get("params") or {}).get("proposal_id")
+            if isinstance(pid, str) and pid:
+                return pid
+        if proposal_or_run_id.startswith("CRYSTAL-"):
+            cand = proposal_or_run_id[len("CRYSTAL-") :]
+            try:
+                self.runtime.get_object(ModelProposal, cand, STEWARD_ACTOR)
+                return cand
+            except ObjectNotFoundError:
+                pass
+        return proposal_or_run_id
+
+    def request_crystallization(
+        self,
+        proposal_id: str,
+        actor: Actor = BUILDER_ACTOR,
+        *,
+        approval_note: str = "",
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        rid = run_id or f"REQ-CRYSTAL-{proposal_id}-{uuid.uuid4().hex[:6]}"
+        res = self.runtime.submit_action(
+            rid,
+            "request_crystallization",
+            {"proposal_id": proposal_id, "approval_note": approval_note},
+            actor,
+        )
+        self._run_to_proposal[rid] = proposal_id
+        out = dict(res)
+        out["proposal_id"] = proposal_id
+        return out
 
     def approve_crystallization(
         self,
         approval_run_id: str,
         approver: Actor = STEWARD_ACTOR,
+        *,
+        approval_note: str = "",
+        run_id: str | None = None,
     ) -> dict[str, Any]:
-        return self.runtime.approve_action(approval_run_id, approver)
+        proposal_id = self._resolve_proposal_id(approval_run_id)
+        rid = run_id or f"APPROVE-{proposal_id}-{uuid.uuid4().hex[:6]}"
+        res = self.runtime.submit_action(
+            rid,
+            "approve_crystallization",
+            {"proposal_id": proposal_id, "approval_note": approval_note},
+            approver,
+        )
+        out = dict(res)
+        out["approved_by"] = approver.actor_id
+        out["proposal_id"] = proposal_id
+        return out
+
+    def reject_crystallization(
+        self,
+        proposal_or_run_id: str,
+        steward: Actor = STEWARD_ACTOR,
+        *,
+        reason: str = "rejected by steward",
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        proposal_id = self._resolve_proposal_id(proposal_or_run_id)
+        rid = run_id or f"REJECT-{proposal_id}-{uuid.uuid4().hex[:6]}"
+        res = self.runtime.submit_action(
+            rid,
+            "reject_crystallization",
+            {"proposal_id": proposal_id, "reason": reason},
+            steward,
+        )
+        out = dict(res)
+        out["approved_by"] = steward.actor_id
+        out["proposal_id"] = proposal_id
+        return out
 
     def rollback_crystallization(
         self,
