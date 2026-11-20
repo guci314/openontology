@@ -354,6 +354,7 @@ class DriverDecompilerAgent:
         seed_ontology: SeedOntology | None = None,
         max_rounds: int = 4,
         proposal_id: str | None = None,
+        initial_feedback: str = "",
     ) -> DecompilationCycleResult:
         active_seed = (
             seed_ontology
@@ -379,7 +380,7 @@ class DriverDecompilerAgent:
         profile_summary = external_profile.summary_for_builder()
 
         traces: list[InductionRoundTrace] = []
-        last_feedback = ""
+        last_feedback = initial_feedback
         last_raw_proposal: dict[str, Any] | None = None
         last_report: CrucibleReport | None = None
         last_effective_bp: DeclarativeBlueprint | None = None

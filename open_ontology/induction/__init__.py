@@ -45,6 +45,17 @@ from .decompiler import (
     DriverDecompilerAgent,
     build_decompiler_system_prompt,
 )
+from .falsifier import (
+    AdversarialProbe,
+    DecompileAndFalsifyResult,
+    DifferentialFalsificationReport,
+    DifferentialFalsifier,
+    ExternalSandboxAdapter,
+    FalsificationCase,
+    FalsificationCounterexample,
+    VerdictKind,
+    decompile_and_falsify_driver,
+)
 from .disambiguation import (
     DisambiguationChoice,
     DisambiguationOption,
@@ -238,6 +249,16 @@ __all__ = [
     "DecompilationCycleResult",
     "build_decompiler_system_prompt",
     "DriverDecompilerAgent",
+    # Coverage-guided Popperian differential falsifier
+    "VerdictKind",
+    "ExternalSandboxAdapter",
+    "AdversarialProbe",
+    "FalsificationCase",
+    "FalsificationCounterexample",
+    "DifferentialFalsificationReport",
+    "DecompileAndFalsifyResult",
+    "DifferentialFalsifier",
+    "decompile_and_falsify_driver",
     # Pluggable domain seed ontology (inductive bias backbone)
     "SeedArchetypeHint",
     "SeedOntology",
