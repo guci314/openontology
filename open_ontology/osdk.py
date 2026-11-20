@@ -147,7 +147,6 @@ def export_llm_tools(
                 },
                 "x-ontology-kind": "action",
                 "x-allowed-roles": list(action.allowed_roles),
-                "x-approver-roles": list(action.approver_roles),
                 "x-revert-roles": list(action.revert_roles),
             }
         )
@@ -582,7 +581,6 @@ class AIPAgentExecutor:
                         "action": action_name,
                         "params": dict(params),
                         "status": run["status"],
-                        "requires_approval": run["status"] == "PENDING_APPROVAL",
                         "diff": run["object_diff"],
                     }
                 )
@@ -697,7 +695,7 @@ _BUILTIN_AGENT_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_action_runs",
-            "description": "List recent ontology action runs, optionally filtered by status (e.g. PENDING_APPROVAL).",
+            "description": "List recent ontology action runs, optionally filtered by status (e.g. COMMITTED, REJECTED, REVERTED).",
             "parameters": {
                 "type": "object",
                 "properties": {"status": {"type": "string"}},
@@ -792,26 +790,7 @@ def _deterministic_local_turn(
     artifacts: list[UIArtifact] = []
     selected_ids = _resolve_selected_ids(ui_context, ghost_events)
 
-    # 1. Pending approvals
-    if any(k in lower for k in ("审批", "approve", "approval", "待审")):
-        runs_res = executor.dispatch("list_action_runs", {"status": "PENDING_APPROVAL"})
-        tool_calls.append({"name": "list_action_runs", "arguments": {"status": "PENDING_APPROVAL"}})
-        pending = runs_res.get("runs") or []
-        if not pending:
-            return AgentTurnResult(
-                reply_text="当前没有待审批的动作记录。",
-                artifacts=[],
-                tool_calls=tool_calls,
-            )
-        for run in pending[:5]:
-            artifacts.append(executor.build_approval_card_artifact(run))
-        return AgentTurnResult(
-            reply_text=f"找到 {len(pending)} 条待审批记录，已生成审批卡片供您直接处理：",
-            artifacts=artifacts,
-            tool_calls=tool_calls,
-        )
-
-    # 2. UI focus / navigation command
+    # 1. UI focus / navigation command
     if any(k in lower for k in ("聚焦", "跳转", "打开拓扑", "focus", "topology")):
         if "拓扑" in lower or "topology" in lower:
             artifacts.append(executor.build_ui_command_artifact("open_topology"))
@@ -1462,12 +1441,11 @@ def run_eval_suite(
     Case shape::
 
         {
-          "name": "ai_agent_high_cost_needs_approval",
+          "name": "ai_agent_high_cost_check",
           "action": "reroute_shipment",
           "params": {...},
           "expect": {
               "valid": True,
-              "requires_approval": True,
               "object_changes": [
                   {"object_type": "Shipment", "object_id": "SHP-001",
                    "kind": "update", "after": {"status": "rerouted"}}
@@ -1513,13 +1491,6 @@ def run_eval_suite(
         if "valid" in expect and sim.valid != bool(expect["valid"]):
             failures.append(
                 f"valid: expected {expect['valid']}, got {sim.valid}"
-            )
-        if "requires_approval" in expect and (
-            sim.requires_approval != bool(expect["requires_approval"])
-        ):
-            failures.append(
-                "requires_approval: expected "
-                f"{expect['requires_approval']}, got {sim.requires_approval}"
             )
         if "error_contains" in expect:
             needle = str(expect["error_contains"])

@@ -3311,7 +3311,7 @@ def evaluate_handwritten_o2c_reference(
                     failure_diagnostic=(
                         ""
                         if not dirty23
-                        else "ApprovalGateAspect.revert_action permits any role in allowed_roles (including ai_agent) to revert confirmed orders without approver approval."
+                        else "HomomorphicSettlementAspect.settle_revert permits any role in allowed_roles (including ai_agent) to revert confirmed orders without revert_roles enforcement."
                     ),
                     triage_hint="none" if not dirty23 else "L2_structural_expressivity",
                     l2_capability_gap="" if not dirty23 else "revert_action_requires_approver_role",
@@ -3731,7 +3731,7 @@ def evaluate_handwritten_o2c_reference(
                     failure_diagnostic=(
                         ""
                         if not reverted_by_ai
-                        else "ApprovalGateAspect.revert_action permits any role in allowed_roles (including ai_agent) to revert confirmed orders without approver approval."
+                        else "HomomorphicSettlementAspect.settle_revert permits any role in allowed_roles (including ai_agent) to revert confirmed orders without revert_roles enforcement."
                     ),
                     triage_hint="none" if not reverted_by_ai else "L2_structural_expressivity",
                     l2_capability_gap="" if not reverted_by_ai else "revert_action_requires_approver_role",

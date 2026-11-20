@@ -179,7 +179,7 @@ def test_new_spec_requires_approval_then_creates_spec_and_sku(base_demo):
     )
     assert pending["status"] == "AWAITING_WORK_CARD"
     assert pending["work_card_status"] == "OPEN"
-    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
+    assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in runtime.list_action_runs())
     with pytest.raises(ObjectNotFoundError):
         runtime.get_object(steel.MaterialSpec, "SPEC-C", steel.STEWARD)
     with pytest.raises(ObjectNotFoundError):

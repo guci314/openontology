@@ -2,7 +2,7 @@
 
 覆盖：
 1. ``Automations``：入库触发条件反射、按 ``(name, object_id, version)`` 去重、
-   新版本可再次触发、处理器可开出 ``PENDING_APPROVAL`` 审批单；
+   新版本可再次触发、处理器可开出 M1 ``WorkCard`` 审批工单；
 2. ``Interfaces``：必填字段校验、``query_interface`` 跨类型多态、RLS 生效；
 3. ``Column-Level Masking``：非授权角色读不到明文、授权角色读到明文、
    底层存储不受影响、链接与接口查询同样脱敏；
@@ -425,7 +425,7 @@ def test_automation_can_open_pending_approval(rt):
         fired = rt2.evaluate_automations(OPS, automation="escalate_premium_price")
         assert len(fired) == 1
         assert fired[0]["result"]["status"] == "OPEN"
-        assert rt2.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt2.list_action_runs())
 
         card_id = fired[0]["result"]["card_id"]
         settled = settle_work_card(

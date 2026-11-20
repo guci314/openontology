@@ -1161,7 +1161,7 @@ def run_odoo_to_o2c_builder_demo(
                 except InvariantError as exc:
                     large_order_status = "REJECTED"
                     large_order_error_code = exc.code
-                assert o2c_rt.list_action_runs(status="PENDING_APPROVAL") == []
+                assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in o2c_rt.list_action_runs())
 
                 wc_spec = compile_blueprint(crystallized_bp, seed_ontology=BUSINESS_SEED_ONTOLOGY)
                 register_work_card_primitives(
@@ -1208,7 +1208,7 @@ def run_odoo_to_o2c_builder_demo(
                     large_order_wc_status = wc_rt.get_object(
                         WorkCard, "WC-BUILDER-LARGE-1", FINANCE_DIRECTOR
                     ).status
-                    assert wc_rt.list_action_runs(status="PENDING_APPROVAL") == []
+                    assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in wc_rt.list_action_runs())
                 finally:
                     wc_rt.close()
 

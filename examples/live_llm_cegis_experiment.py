@@ -1282,7 +1282,7 @@ def run_live_llm_l2_architect_experiment(
                 action=confirm_b.action_name,
                 params={confirm_b.id_param: f"{confirm_b.id_prefix}{f_large.order_id}"},
                 actor=AI_OPS_ACTOR,
-                expect_blocked_or_approval=True,
+                expect_valid=False,
             ),
             IncidentCounterexample(
                 name="HIST-CX-UNSHIPPED-POST",
@@ -1439,7 +1439,6 @@ def run_live_llm_l2_architect_experiment(
                         return SimulationResult(
                             valid=False,
                             diff=ObjectDiff(),
-                            requires_approval=False,
                             read_versions={},
                             error=str(exc),
                             error_code="PermissionDeniedError",
@@ -1451,9 +1450,9 @@ def run_live_llm_l2_architect_experiment(
                     {c_pay.id_param: f"{c_pay.id_prefix}901", amt_p: 10000.0},
                     AI_OPS_ACTOR,
                 )
-                if not s_part.valid or s_part.requires_approval:
+                if not s_part.valid:
                     errs.append(
-                        f"50% partial payment simulation should commit cleanly as ai_agent, got valid={s_part.valid}, approval={s_part.requires_approval}, err={s_part.error_code}"
+                        f"50% partial payment simulation should commit cleanly as ai_agent, got valid={s_part.valid}, err={s_part.error_code}"
                     )
                 else:
                     fk = rt.fork()
@@ -1473,7 +1472,7 @@ def run_live_llm_l2_architect_experiment(
                     {c_pay.id_param: f"{c_pay.id_prefix}902", amt_p: 20000.0},
                     AI_OPS_ACTOR,
                 )
-                if not s_full.valid or s_full.requires_approval:
+                if not s_full.valid:
                     errs.append(f"100% full payment must be valid for ai_agent, got err={s_full.error_code}")
                 else:
                     fk = rt.fork()
@@ -1507,7 +1506,7 @@ def run_live_llm_l2_architect_experiment(
                     {c_val.id_param: f"{c_val.id_prefix}901"},
                     AI_OPS_ACTOR,
                 )
-                if not s_val.valid or s_val.requires_approval:
+                if not s_val.valid:
                     errs.append(
                         f"Delivery validation {c_val.action_name!r} should commit cleanly for assigned picking, got valid={s_val.valid}, err={s_val.error_code}"
                     )
@@ -1521,14 +1520,14 @@ def run_live_llm_l2_architect_experiment(
                     finally:
                         fk.close()
 
-                # 5. Steward credit-note refund vs ai_agent blocked/approval
+                # 5. Steward credit-note refund vs ai_agent blocked
                 s_ref_ai = _sim_safe(
                     c_ref.action_name,
                     {c_ref.id_param: f"{c_ref.id_prefix}901"},
                     AI_OPS_ACTOR,
                 )
-                if s_ref_ai.valid and not s_ref_ai.requires_approval:
-                    errs.append("Credit-note refund MUST NOT commit unapproved for ai_agent.")
+                if s_ref_ai.valid:
+                    errs.append("Credit-note refund MUST NOT commit cleanly for ai_agent.")
                 s_ref_st = _sim_safe(
                     c_ref.action_name,
                     {c_ref.id_param: f"{c_ref.id_prefix}901"},

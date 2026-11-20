@@ -579,7 +579,6 @@ def _crystallize_dual_mount_blueprint(spec_bp: DeclarativeBlueprint) -> Ontology
                     params={"order_id": "ORD-SYN-OK"},
                     actor=AI_OPS_ACTOR,
                     expected_valid=True,
-                    expected_requires_approval=False,
                 ),
                 ReplayEvent(
                     name="POS-CONFIRM-OVER-STEWARD",
@@ -858,7 +857,7 @@ def _execute_dual_mount_flow(
             s3_err_code = exc.code or ""
         assert s3_err_code == "APPROVAL_REQUIRED_CUMULATIVE_CREDIT_EXCEEDED"
         assert bridge.read_odoo_raw_state(over_oid) == "draft"
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
         r3_wc_open = rt.submit_action(
             "DUAL-S3-WC-OPEN",
@@ -888,7 +887,7 @@ def _execute_dual_mount_flow(
         assert bridge.read_odoo_raw_state(over_oid) == "sale"
         wc_s3 = rt.get_object(WorkCard, "WC-DUAL-S3", STEWARD_OPS_ACTOR)
         assert wc_s3.status == "COMPLETED"
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
         # Scenario 4: Out-of-band external mismatch triggers DEVICE_STATE_MISMATCH without memory corruption
         fp_before = rt.state_fingerprint()
@@ -924,7 +923,7 @@ def _execute_dual_mount_flow(
                 "work_card_status": wc_s3.status,
                 "approved_status": r3_settled["settled_action_run"]["status"],
                 "odoo_state": bridge.read_odoo_raw_state(over_oid),
-                "pending_approval_runs": len(rt.list_action_runs(status="PENDING_APPROVAL")),
+                "pending_approval_runs": sum(1 for r in rt.list_action_runs() if r["status"] not in {"COMMITTED", "REJECTED", "REVERTED"}),
             },
             "scenario_4_drift_guard": {
                 "error_code": drift_error_code,

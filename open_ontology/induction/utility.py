@@ -215,7 +215,7 @@ class AntiSmugglingProbeSpec:
     action_name: str
     params: dict[str, Any]
     actor: Actor
-    online_status: Literal["COMMITTED", "PENDING_APPROVAL", "REJECTED"]
+    online_status: Literal["COMMITTED", "REJECTED"]
     online_error_code: str | None = None
     expect_state_mutation: bool = True
 
@@ -265,7 +265,7 @@ def verify_anti_smuggling_parity(
     """Enforce Anti-Smuggling & Anti-Blackbox hard constraints in a pure offline :memory: sandbox.
 
     Checks two invariants without any external connector or network access:
-    1. Every rejection / ``APPROVAL_REQUIRED_*`` gate (or legacy approval suspension) observed
+    1. Every rejection / ``APPROVAL_REQUIRED_*`` gate observed
        online MUST already occur with matching semantics inside the isolated pure ``:memory:``
        sandbox (otherwise business logic was smuggled into the external connector or omitted).
     2. Every committed mutating action MUST produce a non-empty ``object_diff``
@@ -310,14 +310,11 @@ def verify_anti_smuggling_parity(
             sandbox = base_rt.fork()
             try:
                 sim = sandbox.simulate_action(probe.action_name, probe.params, probe.actor)
-                if not sim.valid:
-                    offline_status: Literal["COMMITTED", "PENDING_APPROVAL", "REJECTED"] = "REJECTED"
-                elif sim.requires_approval:
-                    offline_status = "PENDING_APPROVAL"
-                else:
-                    offline_status = "COMMITTED"
+                offline_status: Literal["COMMITTED", "REJECTED"] = (
+                    "COMMITTED" if sim.valid else "REJECTED"
+                )
 
-                if offline_status == "COMMITTED" and probe.online_status in ("REJECTED", "PENDING_APPROVAL"):
+                if offline_status == "COMMITTED" and probe.online_status == "REJECTED":
                     violations.append(
                         AntiSmugglingViolation(
                             case_id=probe.case_id,

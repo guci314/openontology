@@ -3,11 +3,10 @@
 替代原持久隐空间队列测试，端到端验证统一进 ``OntologyRuntime`` 默认动作管线后的核心不变量：
 (a) ``coupled`` 模式未绑定 ``SourceBridge`` 时 fail-closed（``UNBOUND_SOURCE_BRIDGE``），
     而 ``affects_source=False`` 纯自有动作照常本地原子提交；
-(b) 撒谎执行器（``actuate`` 伪造成功返回值而物理状态未变/变错）在 **4 个公开入口**
-    （``runtime.submit_action`` / ``runtime.approve_action`` / ``WorkshopServer`` HTTP /
+(b) 撒谎执行器（``actuate`` 伪造成功返回值而物理状态未变/变错）在 **3 个公开入口**
+    （``runtime.submit_action`` / ``WorkshopServer`` HTTP ``/api/submit`` /
     ``AIPAgentExecutor``）均触发 ``DEVICE_STATE_MISMATCH``，内存世界零改动；
-(c) 审批阻塞态（``PENDING_APPROVAL``）仅存 ``W_mem`` 账本，``approve_action`` 的 Phase A
-    先于外部驱动校验 OCC 版本，陈旧审批单直接报 ``ConcurrencyConflictError`` 且
+(c) Phase A 先于外部驱动校验不变量与 OCC 版本，并发漂移或前置不变量失败直接 abort 且
     ``actuate_calls == 0``；
 (d) Phase B 无锁脱离 ``_write_gate()``：后台 ``load_snapshot`` 抢跑收敛至同终态时不误报并发冲突，
     唯有收敛至冲突第三值时判 ``REJECTED(DEVICE_STATE_MISMATCH)``；
@@ -112,20 +111,10 @@ def _build_settlement_spec() -> (
         ops_note: str
         memo_id: str | None = None
 
-    class TwoPhaseParams(BaseModel):
-        order_id: str
-        target_status: str = "confirmed"
-        approval_tag: str = "director-cleared"
-
-    def _needs_approval(params: ConfirmParams, _actor: Actor) -> bool:
-        return params.order_id.startswith("O-APPR")
-
     @spec.action(
         "confirm_order",
         ConfirmParams,
         allowed_roles=("ops", "director"),
-        approver_roles=("director",),
-        approval_rule=_needs_approval,
         affects_source=True,
     )
     def confirm_order(ctx: Any, params: ConfirmParams) -> None:
@@ -175,23 +164,6 @@ def _build_settlement_spec() -> (
         ctx.modify(doc, ops_note=params.ops_note)
         if params.memo_id:
             ctx.create(DecisionMemo(memo_id=params.memo_id, text=params.ops_note))
-
-    def _post_approval_stamp(ctx: Any, params: TwoPhaseParams) -> None:
-        doc = ctx.require(SalesOrder, params.order_id)
-        ctx.modify(doc, approval_tag=params.approval_tag)
-
-    @spec.action(
-        "confirm_with_stamp",
-        TwoPhaseParams,
-        allowed_roles=("ops", "director"),
-        approver_roles=("director",),
-        approval_rule=lambda _p, _a: False,
-        affects_source=True,
-        post_approval=_post_approval_stamp,
-    )
-    def confirm_with_stamp(ctx: Any, params: TwoPhaseParams) -> None:
-        doc = ctx.require(SalesOrder, params.order_id)
-        ctx.modify(doc, status=params.target_status)
 
     @spec.invariant(
         "order_qty_positive",
@@ -282,14 +254,6 @@ def test_coupled_unbound_bridge_fails_closed_while_owned_commits(tmp_path):
             rt.submit_action("RUN-UNBOUND", "confirm_order", {"order_id": "O-1"}, OPS)
         assert exc_info.value.code == UNBOUND_SOURCE_BRIDGE
         assert rt.get_object(SalesOrder, "O-1", OPS).status == "draft"
-
-        # PENDING_APPROVAL 挂起阶段仍可在 W_mem 暂存；但 approve_action 无桥时一样 fail-closed
-        pending = rt.submit_action("RUN-PEND", "confirm_order", {"order_id": "O-APPR-1"}, OPS)
-        assert pending["status"] == "PENDING_APPROVAL"
-        with pytest.raises(GovernanceViolationError) as app_exc:
-            rt.approve_action("RUN-PEND", DIRECTOR)
-        assert app_exc.value.code == UNBOUND_SOURCE_BRIDGE
-        assert rt.get_object(SalesOrder, "O-APPR-1", OPS).status == "draft"
 
         # affects_source=False 纯自有动作不依赖外部 SourceBridge，直接原子提交
         owned = rt.submit_action(
@@ -391,7 +355,7 @@ def test_readback_mismatch_matrix_rejects_and_preserves_memory(
         rt.close()
 
 
-def test_lying_actuator_caught_across_submit_approve_workshop_and_osdk(tmp_path):
+def test_lying_actuator_caught_across_submit_workshop_and_osdk(tmp_path):
     spec, SalesOrder, _, _ = _build_settlement_spec()
     lying_bridge = SourceBridge(
         actuate=lambda _mv: {"ok": True, "fake_success": True},
@@ -411,13 +375,11 @@ def test_lying_actuator_caught_across_submit_approve_workshop_and_osdk(tmp_path)
     _seed_world(rt)
     handle = start_workshop_server(rt, actor=OPS, port=0)
     try:
-        # 1) approve_action 入口捕获撒谎执行器
-        pend = rt.submit_action("APPR-LIE", "confirm_order", {"order_id": "O-APPR-1"}, OPS)
-        assert pend["status"] == "PENDING_APPROVAL"
+        # 1) Direct runtime.submit_action 入口捕获撒谎执行器
         with pytest.raises(DeviceStateMismatchError):
-            rt.approve_action("APPR-LIE", DIRECTOR)
-        assert rt.get_action_run("APPR-LIE")["status"] == "REJECTED"
-        assert rt.get_object(SalesOrder, "O-APPR-1", OPS).status == "draft"
+            rt.submit_action("SUB-LIE", "confirm_order", {"order_id": "O-1"}, OPS)
+        assert rt.get_action_run("SUB-LIE")["status"] == "REJECTED"
+        assert rt.get_object(SalesOrder, "O-1", OPS).status == "draft"
 
         # 2) Workshop HTTP /api/submit 入口捕获并返回非 200 结构化错误码
         st_sub, body_sub = _post_json(
@@ -429,21 +391,7 @@ def test_lying_actuator_caught_across_submit_approve_workshop_and_osdk(tmp_path)
         assert body_sub["error_code"] == DEVICE_STATE_MISMATCH
         assert rt.get_object(SalesOrder, "O-1", OPS).status == "draft"
 
-        # 3) Workshop HTTP /api/approve 入口同样拒绝并回标 REJECTED
-        st_pend, _ = _post_json(
-            handle.base_url + "/api/submit",
-            {"run_id": "WS-APPR-LIE", "action": "confirm_order", "params": {"order_id": "O-APPR-1"}},
-        )
-        assert st_pend == 200
-        st_app, body_app = _post_json(
-            handle.base_url + "/api/approve?role=director",
-            {"run_id": "WS-APPR-LIE"},
-        )
-        assert st_app == 400
-        assert body_app["error_code"] == DEVICE_STATE_MISMATCH
-        assert rt.get_object(SalesOrder, "O-APPR-1", OPS).status == "draft"
-
-        # 4) AIPAgentExecutor (OSDK) 入口抛出 DeviceStateMismatchError 且阻断多步推演混淆
+        # 3) AIPAgentExecutor (OSDK) 入口抛出 DeviceStateMismatchError 且阻断多步推演混淆
         executor = AIPAgentExecutor(rt, OPS)
         with pytest.raises(DeviceStateMismatchError) as osdk_exc:
             executor.dispatch(
@@ -458,9 +406,9 @@ def test_lying_actuator_caught_across_submit_approve_workshop_and_osdk(tmp_path)
 
 
 # ---------------------------------------------------------------------------
-# (c) approve_action Phase A 先检 OCC，过期单绝不触碰外部执行器
+# (c) Phase A 先检不变量与 OCC，失败绝不触碰外部执行器
 # ---------------------------------------------------------------------------
-def test_stale_pending_approval_aborts_before_actuate(tmp_path):
+def test_phase_a_validation_and_occ_abort_before_actuate(tmp_path):
     spec, SalesOrder, _, _ = _build_settlement_spec()
     act_calls = 0
 
@@ -474,22 +422,29 @@ def test_stale_pending_approval_aborts_before_actuate(tmp_path):
         world_mode="coupled",
         source_bridge=SourceBridge(
             actuate=_actuate,
-            observe=lambda: {"SalesOrder": [{"order_id": "O-APPR-1", "status": "confirmed", "qty": 8}]},
+            observe=lambda: {"SalesOrder": [{"order_id": "O-1", "status": "confirmed", "qty": 5}]},
         ),
     )
     _seed_world(rt)
     try:
-        pend = rt.submit_action("PEND-STALE", "confirm_order", {"order_id": "O-APPR-1"}, OPS)
-        assert pend["status"] == "PENDING_APPROVAL"
-
-        # 外部快照抢先推进版本，使挂起审批单的 read_versions 过期
-        rt.load_snapshot(
-            {"SalesOrder": [{"order_id": "O-APPR-1", "status": "draft", "qty": 99}]}
-        )
-        with pytest.raises(ConcurrencyConflictError):
-            rt.approve_action("PEND-STALE", DIRECTOR)
+        with pytest.raises(InvariantError):
+            rt.submit_action("BAD-PHASE-A", "confirm_order", {"order_id": "O-BAD"}, OPS)
         assert act_calls == 0
-        assert rt.get_object(SalesOrder, "O-APPR-1", OPS).status == "draft"
+
+        class _BumpParams(BaseModel):
+            order_id: str
+
+        @spec.action("confirm_with_concurrent_snapshot", _BumpParams, allowed_roles=("ops",), affects_source=True)
+        def _confirm_race(ctx: Any, params: _BumpParams) -> None:
+            doc = ctx.require(SalesOrder, params.order_id)
+            rt.load_snapshot({"SalesOrder": [{"order_id": params.order_id, "status": "draft", "qty": 99}]})
+            ctx.modify(doc, status="confirmed")
+
+        with pytest.raises(ConcurrencyConflictError):
+            rt.submit_action("OCC-RACE", "confirm_with_concurrent_snapshot", {"order_id": "O-1"}, OPS)
+        assert act_calls == 0
+        assert rt.get_object(SalesOrder, "O-1", OPS).qty == 99
+        assert rt.get_object(SalesOrder, "O-1", OPS).status == "draft"
     finally:
         rt.close()
 
@@ -543,8 +498,8 @@ def test_phase_b_runs_lock_free_and_converges_on_background_snapshot(tmp_path):
             try:
                 rt.submit_action(
                     "CONV-1",
-                    "confirm_with_stamp",
-                    {"order_id": "O-1", "approval_tag": "stamped-by-dir"},
+                    "confirm_order",
+                    {"order_id": "O-1"},
                     DIRECTOR,
                 )
             except BaseException as exc:  # pragma: no cover
@@ -577,7 +532,6 @@ def test_phase_b_runs_lock_free_and_converges_on_background_snapshot(tmp_path):
         assert o1.status == "confirmed"
         assert o1.qty == 50
         assert o1.ops_note == "keep-vip"
-        assert o1.approval_tag == "stamped-by-dir"
     finally:
         rt.close()
 

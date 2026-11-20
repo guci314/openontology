@@ -265,13 +265,8 @@ function topologyScene(m, W, H, fs) {
   }
   function roleLine(action) {
     const roles = ((action && action.allowed_roles) || []).map(zhRole);
-    const approvers = ((action && action.approver_roles) || []).map(zhRole);
     let text = roles.length ? roles.slice(0, 2).join(' / ') : '—';
     if (roles.length > 2) text += ' +' + (roles.length - 2);
-    if (approvers.length) {
-      text += ' · 审批 ' + approvers.slice(0, 1).join('');
-      if (approvers.length > 1) text += '+' + (approvers.length - 1);
-    }
     return text;
   }
 
@@ -461,14 +456,11 @@ function topologyScene(m, W, H, fs) {
       const innerW = roleCardW - 20 * fs;
       const tx = x + 10 * fs;
       const allowed = (roleDef.allowed_actions || []).map(zhAction);
-      const approvers = (roleDef.approver_actions || []).map(zhAction);
       const allowedText = allowed.length
         ? ('可执行(' + allowed.length + ')：' + allowed.slice(0, 2).join(' / ') +
           (allowed.length > 2 ? ' +' + (allowed.length - 2) : ''))
         : '可执行：无动作';
-      const extraText = approvers.length
-        ? ('审批：' + approvers.slice(0, 2).join(' / ') + (approvers.length > 2 ? ' +' + (approvers.length - 2) : ''))
-        : (roleDef.description || (roleDef.declared ? '显式 RoleDef' : '由动作推断'));
+      const extraText = roleDef.description || (roleDef.declared ? '显式 RoleDef' : '由动作推断');
       layerParts += '<g class="topo-item" data-topo-kind="role" data-topo-id="' + esc(roleDef.name) + '">' +
         '<rect class="role-node" x="' + x + '" y="' + y + '" width="' + roleCardW + '" height="' + roleCardH +
         '" rx="' + (10 * fs) + '" fill="rgba(34,197,94,.09)" stroke="rgba(34,197,94,.58)"/>' +
@@ -986,8 +978,7 @@ function renderActionInspector(a) {
 
   const govRows = [
     '<tr><td class="insp-name">可执行角色</td><td>' + esc((a.allowed_roles || []).map(zhRole).join(' / ') || '无限制') + '</td></tr>',
-    '<tr><td class="insp-name">审批角色</td><td>' + esc((a.approver_roles || []).map(zhRole).join(' / ') || '无需审批') + '</td></tr>',
-    '<tr><td class="insp-name">冲正角色</td><td>' + esc((a.revert_roles || []).map(zhRole).join(' / ') || '跟随可执行/审批角色') + '</td></tr>',
+    '<tr><td class="insp-name">冲正角色</td><td>' + esc((a.revert_roles || []).map(zhRole).join(' / ') || '跟随可执行角色') + '</td></tr>',
     '<tr><td class="insp-name">可见性 / 归属</td><td>' + (a.visibility === 'private' ? '🔒 私有（仅内部触发）' : '公开动作') + ' · ' + (a.affects_source ? '来自外部数据源' : '本体自有') + '</td></tr>'
   ].join('');
   parts.push('<div><div class="insp-sec-title"><span>治理与权限 · GOVERNANCE</span></div>' +
@@ -1052,10 +1043,6 @@ function renderRoleInspector(r) {
   if ((r.allowed_actions || []).length) {
     parts.push('<div><div class="insp-sec-title"><span>可执行动作 · ALLOWED ACTIONS</span><span>' + r.allowed_actions.length + ' 项</span></div>' +
       '<div class="insp-chips">' + r.allowed_actions.map(a => relChip('action', a, '🎯 ' + zhAction(a))).join('') + '</div></div>');
-  }
-  if ((r.approver_actions || []).length) {
-    parts.push('<div><div class="insp-sec-title"><span>可审批动作 · APPROVER</span><span>' + r.approver_actions.length + ' 项</span></div>' +
-      '<div class="insp-chips">' + r.approver_actions.map(a => relChip('action', a, '✅ ' + zhAction(a))).join('') + '</div></div>');
   }
   if ((r.masked_fields || []).length) {
     parts.push('<div><div class="insp-sec-title"><span>可见敏感字段 · MASKED FIELDS</span></div>' +

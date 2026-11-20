@@ -6,7 +6,7 @@
 (c) 执行器持续故障时触发 max_replans 干净停机（MAX_REPLANS_EXCEEDED），记忆零幻觉、被拒审计数准确；
     以及 UNREACHABLE / MAX_STEPS_EXCEEDED 边界；
 (d) 无持久队列马尔可夫冷重启恢复（``refresh_on_start=True`` 且零 ``w_lat.sqlite3``）与
-    ``PENDING_APPROVAL`` 暂停 / 批准续跑。
+    M1 ``WorkCard`` 外部协同等待 / 核销续跑。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from examples.business_ontology import (
 )
 from open_ontology import (
     DEVICE_STATE_MISMATCH,
-    MPC_AWAITING_APPROVAL,
+    MPC_AWAITING_EXTERNAL,
     MPC_GOAL_REACHED,
     MPC_MAX_REPLANS_EXCEEDED,
     MPC_MAX_STEPS_EXCEEDED,
@@ -573,16 +573,16 @@ def test_mpc_markov_crash_restart_and_approval_pause_resume(tmp_path):
             on_blocked_step=_escalate_to_work_card,
         )
         paused = ctrl_a.run()
-        assert paused.status == MPC_AWAITING_APPROVAL
+        assert paused.status == MPC_AWAITING_EXTERNAL
         assert paused.goal_reached is False
         assert paused.awaiting_run_id == "WC-T-1-assign_lane"
         assert appr_acts == []
         assert mem_a.get_object(DeliveryTask, "T-1", OPS).status == "pending"
         assert mem_a.get_object(WorkCard, paused.awaiting_run_id, DIRECTOR).status == "OPEN"
 
-        # 批准前再次运行控制器仍停留在同一步 AWAITING_APPROVAL（通过 pending_check 观测 M1 WorkCard）
+        # 批准前再次运行控制器仍停留在同一步 AWAITING_EXTERNAL（通过 pending_check 观测 M1 WorkCard）
         still_paused = ctrl_a.run()
-        assert still_paused.status == MPC_AWAITING_APPROVAL
+        assert still_paused.status == MPC_AWAITING_EXTERNAL
         assert still_paused.awaiting_run_id == paused.awaiting_run_id
         assert appr_acts == []
 

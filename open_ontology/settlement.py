@@ -1,7 +1,7 @@
 """同态闭环结算切面（Homomorphic Settlement Aspect · 纯 M2，领域无关）。
 
 将「反事实预测 → 无锁外部执行 → 独立传感器只读回读核验 → 同构收敛提交」收束为
-``OntologyRuntime`` 唯一的默认提交/批准/冲正管道：
+``OntologyRuntime`` 唯一的默认提交/冲正管道：
 
 1. **三元运行态隔离（``WorldMode``）**：
    * ``"standalone"``：纯本体世界（无外部耦合系统），受治理变更直接原子提交；
@@ -11,7 +11,7 @@
      确保 ``runtime.fork()`` 与 MCTS 多步推演对物理世界 100% 绝缘。
 2. **三阶段无锁外部结算**：
    * Phase A（写门禁前预检）：先校乐观锁版本号（``verify_read_versions``）并加 per-``run_id``
-     在途并发互斥锁，避免陈旧审批单或重复提交误触外部执行器；
+     在途并发互斥锁，避免过期读取或重复提交误触外部执行器；
    * Phase B（完全脱离 SQLite 写锁）：调用 ``bridge.actuate(move)`` 后**无条件丢弃返回值**，
      再调用独立只读通道 ``bridge.observe(...)`` 采样真实状态；
    * Phase C（进 ``_write_gate()`` 核验提升）：回读与预测补丁一致则经收敛合并校验
@@ -31,7 +31,6 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Sequence
 
 from .aspects import (
     AUDIT_STATUS_COMMITTED,
-    AUDIT_STATUS_PENDING,
     AUDIT_STATUS_REJECTED,
     AUDIT_STATUS_REVERTED,
     IdempotencyAndOCCAspect,
@@ -773,39 +772,23 @@ class HomomorphicSettlementAspect:
         readback_objects: dict[str, list[dict[str, Any]]],
         readback_links: dict[str, list[tuple[str, str]]] | None,
         approved_by: str | None = None,
-        update_pending: bool = False,
     ) -> None:
         msg = "; ".join(mismatches)
         with runtime._write_gate() as conn:
-            if update_pending:
-                conn.execute(
-                    "UPDATE ontology_action_runs SET status = ?, approved_by = ?, executed_at = ?, "
-                    "error_code = ?, error_message = ? WHERE run_id = ? AND status = ?",
-                    (
-                        AUDIT_STATUS_REJECTED,
-                        approved_by,
-                        runtime._utcnow(),
-                        DEVICE_STATE_MISMATCH,
-                        msg,
-                        run_id,
-                        AUDIT_STATUS_PENDING,
-                    ),
-                )
-            else:
-                insert_action_run(
-                    runtime,
-                    conn,
-                    run_id=run_id,
-                    action=action,
-                    actor=audit_actor,
-                    params_json=params_json,
-                    status=AUDIT_STATUS_REJECTED,
-                    read_versions=read_versions,
-                    diff=ObjectDiff(),
-                    approved_by=approved_by,
-                    error_code=DEVICE_STATE_MISMATCH,
-                    error_message=msg,
-                )
+            insert_action_run(
+                runtime,
+                conn,
+                run_id=run_id,
+                action=action,
+                actor=audit_actor,
+                params_json=params_json,
+                status=AUDIT_STATUS_REJECTED,
+                read_versions=read_versions,
+                diff=ObjectDiff(),
+                approved_by=approved_by,
+                error_code=DEVICE_STATE_MISMATCH,
+                error_message=msg,
+            )
         rejected_run = _notify_rejected(runtime, commit_actor, run_id)
         raise DeviceStateMismatchError(
             msg,
@@ -830,7 +813,6 @@ class HomomorphicSettlementAspect:
         readback_objects: dict[str, list[dict[str, Any]]],
         readback_links: dict[str, list[tuple[str, str]]] | None,
         approved_by: str | None = None,
-        update_pending: bool = False,
         reverted_target_run_id: str | None = None,
     ) -> None:
         savepoint = "homomorphic_settle_phase_c"
@@ -838,35 +820,20 @@ class HomomorphicSettlementAspect:
         inv_err: InvariantError | None = None
 
         def _write_rejection(conn: Any, code: str, message: str) -> None:
-            if update_pending:
-                conn.execute(
-                    "UPDATE ontology_action_runs SET status = ?, approved_by = ?, executed_at = ?, "
-                    "error_code = ?, error_message = ? WHERE run_id = ? AND status = ?",
-                    (
-                        AUDIT_STATUS_REJECTED,
-                        approved_by,
-                        runtime._utcnow(),
-                        code,
-                        message,
-                        run_id,
-                        AUDIT_STATUS_PENDING,
-                    ),
-                )
-            else:
-                insert_action_run(
-                    runtime,
-                    conn,
-                    run_id=run_id,
-                    action=action,
-                    actor=audit_actor,
-                    params_json=params_json,
-                    status=AUDIT_STATUS_REJECTED,
-                    read_versions=read_versions,
-                    diff=ObjectDiff(),
-                    approved_by=approved_by,
-                    error_code=code,
-                    error_message=message,
-                )
+            insert_action_run(
+                runtime,
+                conn,
+                run_id=run_id,
+                action=action,
+                actor=audit_actor,
+                params_json=params_json,
+                status=AUDIT_STATUS_REJECTED,
+                read_versions=read_versions,
+                diff=ObjectDiff(),
+                approved_by=approved_by,
+                error_code=code,
+                error_message=message,
+            )
 
         with runtime._write_gate() as conn:
             conn.execute(f"SAVEPOINT {savepoint}")
@@ -887,31 +854,18 @@ class HomomorphicSettlementAspect:
                             AUDIT_STATUS_COMMITTED,
                         ),
                     )
-                if update_pending:
-                    conn.execute(
-                        "UPDATE ontology_action_runs SET status = ?, approved_by = ?, executed_at = ? "
-                        "WHERE run_id = ? AND status = ?",
-                        (
-                            AUDIT_STATUS_COMMITTED,
-                            approved_by,
-                            runtime._utcnow(),
-                            run_id,
-                            AUDIT_STATUS_PENDING,
-                        ),
-                    )
-                else:
-                    insert_action_run(
-                        runtime,
-                        conn,
-                        run_id=run_id,
-                        action=action,
-                        actor=audit_actor,
-                        params_json=params_json,
-                        status=AUDIT_STATUS_COMMITTED,
-                        read_versions=read_versions,
-                        diff=diff,
-                        approved_by=approved_by,
-                    )
+                insert_action_run(
+                    runtime,
+                    conn,
+                    run_id=run_id,
+                    action=action,
+                    actor=audit_actor,
+                    params_json=params_json,
+                    status=AUDIT_STATUS_COMMITTED,
+                    read_versions=read_versions,
+                    diff=diff,
+                    approved_by=approved_by,
+                )
             except _ConvergenceConflictError as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -951,7 +905,7 @@ class HomomorphicSettlementAspect:
         diff: ObjectDiff,
         auto_trigger: bool = False,
     ) -> dict[str, Any]:
-        """直接提交（非审批分支）的统一同态结算入口。"""
+        """同步动作提交的统一同态结算入口。"""
         if (
             runtime.world_mode != "coupled"
             or not diff_touches_source(runtime.spec, action, diff)
@@ -1027,117 +981,6 @@ class HomomorphicSettlementAspect:
         return _notify_committed(runtime, actor, run_id, auto_trigger=auto_trigger)
 
     @classmethod
-    def settle_approval(
-        cls,
-        runtime: Any,
-        run_id: str,
-        approver: Actor,
-    ) -> dict[str, Any]:
-        """人工审批放行（``PENDING_APPROVAL -> COMMITTED/REJECTED``）的同态结算入口。"""
-        run = runtime.get_action_run(run_id)
-        if run is None:
-            raise ObjectNotFoundError(f"action run {run_id!r} not found")
-        if run["status"] != AUDIT_STATUS_PENDING:
-            raise GovernanceViolationError(
-                f"action run {run_id!r} is {run['status']}, not PENDING_APPROVAL"
-            )
-        action = runtime.spec.get_action(run["action_type"])
-        if approver.role not in action.approver_roles:
-            raise PermissionDeniedError(
-                f"actor {approver.actor_id!r} role {approver.role!r} may not approve "
-                f"{action.name!r}; required one of {list(action.approver_roles)}"
-            )
-
-        read_versions = dict(run["read_versions"])
-        diff = ObjectDiff.from_dict(run["object_diff"])
-
-        if (
-            runtime.world_mode != "coupled"
-            or not diff_touches_source(runtime.spec, action, diff)
-        ):
-            with runtime._write_gate() as conn:
-                IdempotencyAndOCCAspect.verify_read_versions(conn, read_versions)
-                IdempotencyAndOCCAspect.apply_diff(runtime, conn, diff)
-                runtime.check_invariants()
-                check_trans = getattr(runtime, "check_transition_invariants", None)
-                if callable(check_trans):
-                    check_trans(diff)
-                conn.execute(
-                    "UPDATE ontology_action_runs SET status = ?, approved_by = ?, executed_at = ? "
-                    "WHERE run_id = ? AND status = ?",
-                    (
-                        AUDIT_STATUS_COMMITTED,
-                        approver.actor_id,
-                        runtime._utcnow(),
-                        run_id,
-                        AUDIT_STATUS_PENDING,
-                    ),
-                )
-            return _notify_committed(runtime, approver, run_id)
-
-        bridge = cls._require_coupled_bridge(runtime, action.name)
-        with _inflight_guard(runtime, run_id):
-            latest = runtime.get_action_run(run_id)
-            if latest is None:
-                raise ObjectNotFoundError(f"action run {run_id!r} not found")
-            if latest["status"] != AUDIT_STATUS_PENDING:
-                raise GovernanceViolationError(
-                    f"action run {run_id!r} is {latest['status']}, not PENDING_APPROVAL"
-                )
-            # Phase A：先做 OCC 版本核对，避免过期审批单驱动外部动作
-            IdempotencyAndOCCAspect.verify_read_versions(runtime._conn, read_versions)
-
-            orig_actor = Actor(
-                actor_id=str(latest["actor_id"]),
-                role=str(latest["actor_role"]),
-                clearance_tags={"*"},
-            )
-            move = _build_move_envelope(
-                run_id=run_id,
-                action_name=action.name,
-                actor=orig_actor,
-                params_json=dict(latest["params"]),
-                read_versions=read_versions,
-                diff=diff,
-                approved_by=approver.actor_id,
-            )
-            readback_objects, readback_links, mismatches = cls._phase_b_actuate_and_observe(
-                runtime, bridge, move, diff
-            )
-
-            if mismatches:
-                cls._reject_on_mismatch(
-                    runtime,
-                    run_id=run_id,
-                    action=action,
-                    commit_actor=approver,
-                    audit_actor=orig_actor,
-                    params_json=dict(latest["params"]),
-                    read_versions=read_versions,
-                    mismatches=mismatches,
-                    readback_objects=readback_objects,
-                    readback_links=readback_links,
-                    approved_by=approver.actor_id,
-                    update_pending=True,
-                )
-
-            cls._commit_or_reject_phase_c(
-                runtime,
-                run_id=run_id,
-                action=action,
-                commit_actor=approver,
-                audit_actor=orig_actor,
-                params_json=dict(latest["params"]),
-                read_versions=read_versions,
-                diff=diff,
-                readback_objects=readback_objects,
-                readback_links=readback_links,
-                approved_by=approver.actor_id,
-                update_pending=True,
-            )
-        return _notify_committed(runtime, approver, run_id)
-
-    @classmethod
     def settle_revert(
         cls,
         runtime: Any,
@@ -1158,11 +1001,7 @@ class HomomorphicSettlementAspect:
         revert_roles = (
             set(action.revert_roles)
             if action.revert_roles
-            else (
-                set(action.approver_roles)
-                if action.approver_roles
-                else set(action.allowed_roles)
-            )
+            else set(action.allowed_roles)
         )
         if actor.role not in revert_roles:
             raise PermissionDeniedError(

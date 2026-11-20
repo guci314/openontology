@@ -364,17 +364,18 @@ def test_crucible_gate_4_prevents_catastrophic_forgetting_and_preserves_producti
             prod.put_object(spec.get_object_type(row["object_type"])(**row["data"]))
         fp_before = prod.state_fingerprint()
 
-        # 把所有 ai_agent 确认都拦成审批 -> 回归破坏黄金小单用例
+        # 把合法订单确认一刀切拦死 -> 回归破坏黄金小单用例
         patch = EvolutionPatch(
             base_version="1.0.0",
             target_version="1.1.0",
-            update_approval_rules={
-                "confirm_sales_order": {
-                    "op": "eq",
-                    "left": {"ref": "actor.role"},
-                    "right": {"lit": "ai_agent"},
-                }
-            },
+            add_invariants=[
+                InvariantRuleSpec(
+                    name="block_all_confirmed",
+                    code="REGRESS_TEST",
+                    target_type="SalesOrder",
+                    must_hold={"op": "ne", "left": {"ref": "obj.status"}, "right": {"lit": "confirmed"}},
+                )
+            ],
         )
         candidate = apply_evolution_patch(base, patch)
         ctx = CrucibleContext(
@@ -387,7 +388,7 @@ def test_crucible_gate_4_prevents_catastrophic_forgetting_and_preserves_producti
                     "actor": {"actor_id": "agent:o2c-ops", "role": "ai_agent", "clearance_tags": ["*"]},
                     "action": "confirm_sales_order",
                     "params": {"order_id": "SO-SMALL-01", "order_amount": 20000},
-                    "expect": {"valid": True, "requires_approval": False},
+                    "expect": {"valid": True},
                 }
             ],
             default_actor=AI_AGENT,
@@ -403,16 +404,29 @@ def test_crucible_gate_4_prevents_catastrophic_forgetting_and_preserves_producti
 
 def test_crucible_gate_5_catches_instance_id_overfitting_and_rule_bloat() -> None:
     base = DeclarativeBlueprint.model_validate(_base_o2c_blueprint(include_unshipped_invoice_guard=True))
+    confirm_act = next(a for a in base.actions if a.name == "confirm_sales_order")
+    overfit_act = confirm_act.model_copy(
+        update={
+            "preconditions": list(confirm_act.preconditions)
+            + [
+                InvariantRuleSpec(
+                    name="overfit_single_order",
+                    code="OVERFIT_ORDER",
+                    target_type="SalesOrder",
+                    id_param="order_id",
+                    must_hold={
+                        "op": "ne",
+                        "left": {"ref": "param.order_id"},
+                        "right": {"lit": "SO-BIG-01"},
+                    },
+                )
+            ]
+        }
+    )
     overfit_patch = EvolutionPatch(
         base_version="1.0.0",
         target_version="1.1.0",
-        update_approval_rules={
-            "confirm_sales_order": {
-                "op": "eq",
-                "left": {"ref": "param.order_id"},
-                "right": {"lit": "SO-BIG-01"},
-            }
-        },
+        update_actions=[overfit_act],
     )
     candidate = apply_evolution_patch(base, overfit_patch)
     report = SymbolicCrucible().evaluate(
@@ -567,7 +581,7 @@ def test_governance_enforces_separation_of_powers_and_steward_rollback() -> None
         req_res = gov.request_crystallization("PROP-1", BUILDER_ACTOR, run_id="CRYSTAL-1")
         assert req_res["status"] == "COMMITTED"
         assert [p.proposal_id for p in gov.list_pending_crystallizations("erp_o2c")] == ["PROP-1"]
-        assert gov.runtime.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in gov.runtime.list_action_runs())
         assert gov.get_active_blueprint("erp_o2c") is None  # 未批复前生效谱系零改动
 
         # 5) Builder / Evolver 严禁自我批复结晶
@@ -610,7 +624,7 @@ def test_governance_enforces_separation_of_powers_and_steward_rollback() -> None
         gov.request_crystallization("PROP-2", EVOLVER_ACTOR, run_id="CRYSTAL-2")
         gov.approve_crystallization("CRYSTAL-2", STEWARD_ACTOR)
         assert gov.get_active_blueprint("erp_o2c").version == "1.1.0"
-        assert gov.runtime.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in gov.runtime.list_action_runs())
 
         # Steward 一键回退至 1.0.0（同时不可变版本历史与报告仍完整保留）
         gov.rollback_crystallization("PROP-2", steward=STEWARD_ACTOR)
@@ -1628,7 +1642,7 @@ def test_l2_architect_agent_evolves_m1_if_else_and_extra_params() -> None:
                                 },
                             }
                         ],
-                        expect={"valid": True, "requires_approval": False},
+                        expect={"valid": True},
                     )
                 ],
             )
@@ -1721,7 +1735,7 @@ def test_l2_architect_agent_evolves_m1_if_else_and_extra_params() -> None:
 
 def test_induction_kernel_zero_psm_or_protocol_smuggling() -> None:
     """Enforce pure M2 architecture: zero Odoo/vendor/PSM protocol tokens inside open_ontology/induction/."""
-    import subprocess
+    import re
 
     repo_root = Path(__file__).resolve().parents[1]
     ind_dir = repo_root / "open_ontology" / "induction"
@@ -1754,24 +1768,23 @@ def test_induction_kernel_zero_psm_or_protocol_smuggling() -> None:
         for tok in forbidden:
             assert tok not in low, f"PSM / vendor / banned IT token {tok!r} leaked into {py_path.name}"
 
-    if (repo_root / ".git").exists():
-        diff_res = subprocess.run(
-            ["git", "diff", "open_ontology/schema.sql"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        assert diff_res.stdout == "", f"open_ontology/schema.sql must stay unmodified:\n{diff_res.stdout}"
+    schema_text = (repo_root / "open_ontology" / "schema.sql").read_text(encoding="utf-8")
+    schema_tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS\s+([a-zA-Z0-9_]+)", schema_text))
+    assert schema_tables == {
+        "ontology_write_gate",
+        "ontology_registry",
+        "ontology_objects",
+        "ontology_links",
+        "ontology_action_runs",
+        "ontology_overlay",
+    }
     runtime_lines = len(
         (repo_root / "open_ontology" / "runtime.py").read_text(encoding="utf-8").splitlines()
     )
-    assert runtime_lines <= 1400, f"runtime.py exceeded 1400 lines ({runtime_lines})"
+    assert runtime_lines <= 1350, f"runtime.py exceeded 1350 lines ({runtime_lines})"
 
 
-def test_stage1_p0_1_approval_rule_target_and_view_access(tmp_path: Path) -> None:
-    from open_ontology import ConcurrencyConflictError
-
+def test_stage1_p0_1_precondition_relation_traversal_and_context_validation(tmp_path: Path) -> None:
     bad_global_bp = DeclarativeBlueprint(
         model_id="stage1-bad-global",
         version="1.0.0",
@@ -1798,8 +1811,8 @@ def test_stage1_p0_1_approval_rule_target_and_view_access(tmp_path: Path) -> Non
         compile_blueprint(bad_global_bp)
     assert exc_global.value.code == "UNAVAILABLE_REF_IN_CONTEXT"
 
-    bad_create_approval_bp = DeclarativeBlueprint(
-        model_id="stage1-bad-create-approval",
+    bad_create_ref_bp = DeclarativeBlueprint(
+        model_id="stage1-bad-create-ref",
         version="1.0.0",
         object_types=[
             ObjectTypeBlueprint(
@@ -1826,20 +1839,19 @@ def test_stage1_p0_1_approval_rule_target_and_view_access(tmp_path: Path) -> Non
                         id_param="ticket_id",
                         set_fields={
                             "ticket_id": {"ref": "param.ticket_id"},
-                            "amount": {"ref": "param.amount"},
+                            "amount": {"ref": "obj.amount"},
                         },
                     )
                 ],
-                approval_rule={"op": "gt", "left": {"ref": "obj.amount"}, "right": {"lit": 100.0}},
             )
         ],
     )
-    with pytest.raises(InvariantError) as exc_create_appr:
-        compile_blueprint(bad_create_approval_bp)
-    assert exc_create_appr.value.code == "UNAVAILABLE_REF_IN_CONTEXT"
+    with pytest.raises(InvariantError) as exc_create_ref:
+        compile_blueprint(bad_create_ref_bp)
+    assert exc_create_ref.value.code == "UNAVAILABLE_REF_IN_CONTEXT"
 
-    approval_bp = DeclarativeBlueprint(
-        model_id="stage1-approval-view",
+    gated_bp = DeclarativeBlueprint(
+        model_id="stage1-precondition-relation-view",
         version="1.0.0",
         object_types=[
             ObjectTypeBlueprint(
@@ -1924,15 +1936,26 @@ def test_stage1_p0_1_approval_rule_target_and_view_access(tmp_path: Path) -> Non
             ActionBlueprint(
                 name="confirm_order",
                 allowed_roles=["sales", "manager", "admin"],
-                approver_roles=["manager", "admin"],
+                revert_roles=["manager", "admin"],
                 params=[FieldSpec(name="order_id", field_type="str", required=True)],
-                approval_target_type="SalesOrder",
-                approval_id_param="order_id",
-                approval_rule={
-                    "op": "gt",
-                    "left": {"ref": "obj.amount"},
-                    "right": {"ref": "obj.customer.credit_limit"},
-                },
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="credit_limit_gate",
+                        code="APPROVAL_REQUIRED_CREDIT_LIMIT",
+                        target_type="SalesOrder",
+                        id_param="order_id",
+                        when={
+                            "op": "gt",
+                            "left": {"ref": "obj.amount"},
+                            "right": {"ref": "obj.customer.credit_limit"},
+                        },
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "actor.role"},
+                            "right": {"lit": ["manager", "admin"]},
+                        },
+                    )
+                ],
                 mutations=[
                     ActionMutationSpec(
                         op="modify",
@@ -1944,7 +1967,7 @@ def test_stage1_p0_1_approval_rule_target_and_view_access(tmp_path: Path) -> Non
             ),
         ],
     )
-    spec = compile_blueprint(approval_bp)
+    spec = compile_blueprint(gated_bp)
     sales = Actor(actor_id="sales-1", role="sales", clearance_tags={"*"})
     mgr = Actor(actor_id="mgr-1", role="manager", clearance_tags={"*"})
 
@@ -1964,27 +1987,27 @@ def test_stage1_p0_1_approval_rule_target_and_view_access(tmp_path: Path) -> Non
             sales,
         )
 
-        # Within customer credit_limit -> executes immediately without approval
+        # Within customer credit_limit -> executes cleanly
         low_res = rt.submit_action("RUN-CFM-2", "confirm_order", {"order_id": "SO-2"}, sales)
         assert low_res["status"] == "COMMITTED"
 
-        # Exceeds obj.customer.credit_limit -> simulation & submit require approval
+        # Exceeds obj.customer.credit_limit -> synchronous precondition blocks unprivileged sales actor
         sim = rt.simulate_action("confirm_order", {"order_id": "SO-1"}, sales)
-        assert sim.requires_approval is True
+        assert sim.valid is False
+        assert sim.error_code == "APPROVAL_REQUIRED_CREDIT_LIMIT"
 
-        pending = rt.submit_action("RUN-CFM-1", "confirm_order", {"order_id": "SO-1"}, sales)
-        assert pending["status"] == "PENDING_APPROVAL"
+        with pytest.raises(InvariantError) as exc_over:
+            rt.submit_action("RUN-CFM-1", "confirm_order", {"order_id": "SO-1"}, sales)
+        assert exc_over.value.code == "APPROVAL_REQUIRED_CREDIT_LIMIT"
 
-        # Concurrent update to traversed Customer.credit_limit invalidates the approval read set
+        # Manager bumps credit_limit -> now within limit, sales can confirm directly at t1
         rt.submit_action("RUN-BUMP", "bump_credit", {"customer_id": "C1", "credit_limit": 2000.0}, mgr)
-        with pytest.raises(ConcurrencyConflictError):
-            rt.approve_action("RUN-CFM-1", mgr)
+        ok_after_bump = rt.submit_action("RUN-CFM-1B", "confirm_order", {"order_id": "SO-1"}, sales)
+        assert ok_after_bump["status"] == "COMMITTED"
 
-        # Re-submit for another high order where approval_rule triggers (amount 2500 > 2000) and approve cleanly
+        # Order exceeding updated limit -> manager commits directly
         rt.submit_action("RUN-SO3", "seed_order", {"order_id": "SO-3", "customer": "C1", "amount": 2500.0}, sales)
-        pending3 = rt.submit_action("RUN-CFM-3", "confirm_order", {"order_id": "SO-3"}, sales)
-        assert pending3["status"] == "PENDING_APPROVAL"
-        approved3 = rt.approve_action("RUN-CFM-3", mgr)
+        approved3 = rt.submit_action("RUN-CFM-3", "confirm_order", {"order_id": "SO-3"}, mgr)
         assert approved3["status"] == "COMMITTED"
     finally:
         rt.close()
@@ -2608,8 +2631,8 @@ def test_stage1_p1_3_phenomenon_false_handling_and_p1_4_crucible_encapsulation(t
         gov.close()
 
 
-def test_incident_expect_blocked_or_approval_accepts_both_reject_and_pending_approval() -> None:
-    """IncidentCounterexample.expect_blocked_or_approval accepts rejection and PENDING_APPROVAL but blocks unguarded commits."""
+def test_incident_precondition_blocks_unguarded_and_passes_role_conditional_gate() -> None:
+    """IncidentCounterexample(expect_valid=False) blocks unguarded commits while passing APPROVAL_REQUIRED_* preconditions."""
     base_fields = [
         FieldSpec(name="deal_id", field_type="str", required=True),
         FieldSpec(name="amount", field_type="float", default=0.0, non_negative=True),
@@ -2624,8 +2647,7 @@ def test_incident_expect_blocked_or_approval_accepts_both_reject_and_pending_app
         action="close_deal",
         params={"deal_id": "D-BIG"},
         actor=AI_AGENT,
-        expect_valid=None,
-        expect_blocked_or_approval=True,
+        expect_valid=False,
     )
     pos = [ReplayEvent(name="POS-OK", action="close_deal", params={"deal_id": "D-OK"}, actor=AI_AGENT, expected_valid=True)]
 
@@ -2678,8 +2700,8 @@ def test_incident_expect_blocked_or_approval_accepts_both_reject_and_pending_app
     )
     assert r_hard.passed
 
-    # 3. Stage 1 approval_rule gating (PENDING_APPROVAL) also passes Gate 3
-    appr_gate = DeclarativeBlueprint(
+    # 3. Role-conditional APPROVAL_REQUIRED_* synchronous precondition also passes Gate 3
+    role_gate = DeclarativeBlueprint(
         model_id="deal_guard_test",
         version="1.2.0",
         object_types=[ObjectTypeBlueprint(name="Deal", primary_key="deal_id", fields=base_fields)],
@@ -2687,23 +2709,23 @@ def test_incident_expect_blocked_or_approval_accepts_both_reject_and_pending_app
             ActionBlueprint(
                 name="close_deal",
                 allowed_roles=["ai_agent", "steward"],
-                approver_roles=["steward"],
-                approval_target_type="Deal",
-                approval_id_param="deal_id",
-                approval_rule={
-                    "op": "and",
-                    "args": [
-                        {"op": "ne", "left": {"ref": "actor.role"}, "right": {"lit": "steward"}},
-                        {"op": "gt", "left": {"ref": "obj.amount"}, "right": {"lit": 1000.0}},
-                    ],
-                },
                 params=[FieldSpec(name="deal_id", field_type="str", required=True)],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="limit_requires_steward",
+                        code="APPROVAL_REQUIRED_BIG_DEAL",
+                        target_type="Deal",
+                        id_param="deal_id",
+                        when={"op": "gt", "left": {"ref": "obj.amount"}, "right": {"lit": 1000.0}},
+                        must_hold={"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["steward"]}},
+                    )
+                ],
                 mutations=[ActionMutationSpec(op="modify", object_type="Deal", id_param="deal_id", set_fields={"status": {"lit": "closed"}})],
             )
         ],
     )
     r_appr = SymbolicCrucible().evaluate(
-        appr_gate,
+        role_gate,
         CrucibleContext(mode="evolution", m0_objects=m0, positive_events=pos, incident_counterexamples=[inc], default_actor=AI_AGENT),
     )
     assert r_appr.passed

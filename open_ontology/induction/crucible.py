@@ -59,7 +59,6 @@ class ReplayEvent:
     actor: Actor
     expected_valid: bool = True
     expected_error_code: str | None = None
-    expected_requires_approval: bool | None = None
     setup_objects: tuple[dict[str, Any], ...] = ()
 
 
@@ -71,8 +70,6 @@ class IncidentCounterexample:
     actor: Actor
     expect_valid: bool | None = None
     expect_error_code: str | None = None
-    expect_requires_approval: bool | None = None
-    expect_blocked_or_approval: bool = False
     expect_after: dict[str, Any] | None = None
     setup_objects: tuple[dict[str, Any], ...] = ()
 
@@ -485,7 +482,6 @@ def _simulate_action_with_rbac(
         return SimulationResult(
             valid=False,
             diff=ObjectDiff(),
-            requires_approval=False,
             read_versions={},
             error=str(exc),
             error_code="PermissionDeniedError",
@@ -544,7 +540,6 @@ def _run_single_eval_case(
         failures = list(res.failures)
         if (
             raw_expect.get("valid") is False
-            and not raw_expect.get("requires_approval")
             and len(failures) == 1
             and failures[0].startswith("simulate raised PermissionDeniedError:")
         ):
@@ -843,10 +838,7 @@ class SymbolicCrucible:
                             cls = compiled_spec.get_object_type(migrated_so["object_type"])
                             ev_rt.put_object(cls(**migrated_so["data"]))
                         sim = _simulate_action_with_rbac(ev_rt, ev.action, ev.params, ev.actor)
-                        if sim.valid == ev.expected_valid and (
-                            ev.expected_requires_approval is None
-                            or sim.requires_approval == ev.expected_requires_approval
-                        ):
+                        if sim.valid == ev.expected_valid:
                             pos_ok += 1
                         else:
                             g3_errors.append(
@@ -928,20 +920,6 @@ class SymbolicCrucible:
                                 f"incident {inc.name!r}: expected error_code {inc.expect_error_code!r}, "
                                 f"got code={sim.error_code!r} error={sim.error!r}"
                             )
-                        if inc.expect_requires_approval is not None and (
-                            sim.requires_approval != inc.expect_requires_approval
-                        ):
-                            ok = False
-                            g3_errors.append(
-                                f"incident {inc.name!r}: expected requires_approval="
-                                f"{inc.expect_requires_approval}, got {sim.requires_approval}"
-                            )
-                        if inc.expect_blocked_or_approval and sim.valid and not sim.requires_approval:
-                            ok = False
-                            g3_errors.append(
-                                f"incident {inc.name!r}: expected rejection (e.g. APPROVAL_REQUIRED_* precondition) "
-                                f"or approval gate, got unguarded valid=True, requires_approval=False"
-                            )
                         if inc.expect_after is not None and sim.valid:
                             matched_after = False
                             for ch in sim.diff.object_changes:
@@ -976,11 +954,7 @@ class SymbolicCrucible:
                             ev_rt.put_object(cls(**migrated_so["data"]))
                         sim = _simulate_action_with_rbac(ev_rt, ev.action, ev.params, ev.actor)
                         valid_ok = sim.valid == ev.expected_valid
-                        appr_ok = (
-                            ev.expected_requires_approval is None
-                            or sim.requires_approval == ev.expected_requires_approval
-                        )
-                        if valid_ok and appr_ok:
+                        if valid_ok:
                             evo_pos_ok += 1
                         else:
                             g3_errors.append(
@@ -1106,7 +1080,6 @@ class SymbolicCrucible:
                 _inspect_ast(inv.when, f"invariant:{inv.name}.when")
                 _inspect_ast(inv.must_hold, f"invariant:{inv.name}.must_hold")
             for act in candidate.actions:
-                _inspect_ast(act.approval_rule, f"action:{act.name}.approval_rule")
                 for pre in act.preconditions:
                     _inspect_ast(pre.when, f"action:{act.name}.pre:{pre.name}.when")
                     _inspect_ast(pre.must_hold, f"action:{act.name}.pre:{pre.name}.must_hold")
@@ -1126,7 +1099,6 @@ class SymbolicCrucible:
             if patch is not None:
                 patch_rule_count = (
                     len(patch.add_invariants)
-                    + len(patch.update_approval_rules)
                     + len(patch.add_actions)
                     + len(patch.update_actions)
                 )

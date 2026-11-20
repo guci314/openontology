@@ -169,7 +169,7 @@ def test_autonomous_synthesis_promotes_joins_prunes_ui_noise_and_compiles_approv
         with pytest.raises(InvariantError) as exc_over:
             rt.submit_action("SYNTH-OVER", "confirm_visit", {"record_id": over_limit.record_id}, AI_OPS_ACTOR)
         assert exc_over.value.code == "APPROVAL_REQUIRED_COVERAGE_LIMIT_EXCEEDED"
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
         rt.submit_action(
             "SYNTH-WC-OPEN",
@@ -189,7 +189,7 @@ def test_autonomous_synthesis_promotes_joins_prunes_ui_noise_and_compiles_approv
         assert settled["status"] == "COMMITTED"
         assert settled["settled_action_run"]["status"] == "COMMITTED"
         assert rt.get_object(WorkCard, "WC-SYNTH-OVR", STEWARD_OPS_ACTOR).status == "COMPLETED"
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
         res_ok = rt.submit_action("SYNTH-OK", "confirm_visit", {"record_id": within_limit.record_id}, AI_OPS_ACTOR)
         assert res_ok["status"] == "COMMITTED"

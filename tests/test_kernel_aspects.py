@@ -1,13 +1,13 @@
-"""TK-ONTO-KERNEL-SLIM-2 验收测试：五大系统调用切面。
+"""TK-ONTO-KERNEL-SLIM-2 验收测试：系统调用切面。
 
 覆盖：
 1. ``ColumnMaskingAspect`` —— 读出口脱敏，存储行不变，system 角色绕过；
 2. ``SecurityAndAuthorityAspect`` —— RBAC 角色门禁 + 字段主权三态校验 + overlay 持久化；
 3. ``IdempotencyAndOCCAspect`` —— 幂等短路 + MVCC 版本校验；
-4. ``ApprovalGateAspect`` —— 挂起不动对象 / 批准后落盘 / 时光机回滚；
+4. ``HomomorphicSettlementAspect`` —— 时光机回滚与 ``revert_roles`` 权限隔离；
 5. ``RejectionAuditAspect`` —— 被拒企图入账且对象零改动；
 6. ``AutomationReflexAspect`` —— 条件反射与去重；
-7. 切面与内核的委托关系：内核方法确实是薄封装，逻辑住在 aspects.py。
+7. 切面与内核的委托关系：内核方法确实是薄封装，逻辑住在 aspects.py / settlement.py。
 """
 
 from __future__ import annotations
@@ -31,11 +31,9 @@ from open_ontology import (
 )
 from open_ontology.aspects import (
     AUDIT_STATUS_COMMITTED,
-    AUDIT_STATUS_PENDING,
     AUDIT_STATUS_REJECTED,
     AUDIT_STATUS_REVERTED,
     MASKED_STRING,
-    ApprovalGateAspect,
     AutomationReflexAspect,
     ColumnMaskingAspect,
     IdempotencyAndOCCAspect,
@@ -127,7 +125,6 @@ def rename_account(ctx, params):
     "annotate_account",
     AnnotateParams,
     allowed_roles=("admin", "ops"),
-    approver_roles=("admin", "ops"),
     affects_source=False,
     description="写自有治理字段",
 )
@@ -361,45 +358,8 @@ def test_verify_read_versions_raises_on_stale(runtime):
 
 
 # ---------------------------------------------------------------------------
-# 4. ApprovalGateAspect
+# 4. 时光机回滚与 revert_roles 权限控制
 # ---------------------------------------------------------------------------
-def test_pending_approval_leaves_objects_untouched(runtime):
-    runtime.spec.get_action("annotate_account")
-    # 用 approval_rule 强制挂起
-    action = runtime.spec.actions["annotate_account"]
-    original = action.approval_rule
-    action.approval_rule = lambda params, actor: True
-    try:
-        run = runtime.submit_action(
-            "RUN-PENDING",
-            "annotate_account",
-            {"account_id": "A1", "note": "待批"},
-            ADMIN,
-        )
-        assert run["status"] == AUDIT_STATUS_PENDING
-        assert runtime.get_object(Account, "A1", ADMIN).internal_note == ""
-
-        approved = runtime.approve_action("RUN-PENDING", ADMIN)
-        assert approved["status"] == AUDIT_STATUS_COMMITTED
-        assert runtime.get_object(Account, "A1", ADMIN).internal_note == "待批"
-    finally:
-        action.approval_rule = original
-
-
-def test_approve_rejects_wrong_role(runtime):
-    action = runtime.spec.actions["annotate_account"]
-    original = action.approval_rule
-    action.approval_rule = lambda params, actor: True
-    try:
-        runtime.submit_action(
-            "RUN-P2", "annotate_account", {"account_id": "A1", "note": "x"}, ADMIN
-        )
-        with pytest.raises(PermissionDeniedError):
-            runtime.approve_action("RUN-P2", NOBODY)
-    finally:
-        action.approval_rule = original
-
-
 def test_revert_restores_previous_state(runtime):
     runtime.submit_action(
         "RUN-R1", "annotate_account", {"account_id": "A1", "note": "第一版"}, ADMIN
@@ -423,25 +383,8 @@ def test_revert_is_idempotent(runtime):
     assert first["run_id"] == second["run_id"]
 
 
-def test_revert_rejects_pending_run(runtime):
-    from open_ontology.spec import GovernanceViolationError
-
-    action = runtime.spec.actions["annotate_account"]
-    original = action.approval_rule
-    action.approval_rule = lambda params, actor: True
-    try:
-        runtime.submit_action(
-            "RUN-P3", "annotate_account", {"account_id": "A1", "note": "x"}, ADMIN
-        )
-        with pytest.raises(GovernanceViolationError):
-            runtime.revert_action("RUN-P3", "RUN-P3-REV", ADMIN)
-    finally:
-        action.approval_rule = original
-
-
-def test_revert_requires_approver_role_when_approver_roles_declared(runtime):
-    """动作声明了 approver_roles 时，普通 allowed_roles（如 ops）不得绕过审批权单方面撤回已提交记录。"""
-    # guarded_rename: allowed_roles=('admin', 'ops')? Let's verify using a dedicated governed action.
+def test_revert_requires_revert_role_when_revert_roles_declared(runtime):
+    """动作声明了 revert_roles 时，普通 allowed_roles（如 ops）不得绕过撤回权。"""
     class ControlledNoteParams(BaseModel):
         account_id: str
         note: str
@@ -451,7 +394,7 @@ def test_revert_requires_approver_role_when_approver_roles_declared(runtime):
             "controlled_note",
             ControlledNoteParams,
             allowed_roles=("ops", "admin"),
-            approver_roles=("admin",),
+            revert_roles=("admin",),
             affects_source=False,
         )
         def _controlled_note(ctx, params: ControlledNoteParams) -> None:
@@ -464,13 +407,11 @@ def test_revert_requires_approver_role_when_approver_roles_declared(runtime):
     assert run["status"] == AUDIT_STATUS_COMMITTED
     assert runtime.get_object(Account, "A1", ADMIN).internal_note == "由ops提交"
 
-    # Non-approver submitter role (ops) MUST be denied revert_action
     with pytest.raises(PermissionDeniedError):
         runtime.revert_action("RUN-CTRL-1", "RUN-CTRL-1-REV-OPS", OPS)
     assert runtime.get_action_run("RUN-CTRL-1")["status"] == AUDIT_STATUS_COMMITTED
     assert runtime.get_object(Account, "A1", ADMIN).internal_note == "由ops提交"
 
-    # Approver role (admin) succeeds cleanly
     reverted = runtime.revert_action("RUN-CTRL-1", "RUN-CTRL-1-REV-ADMIN", ADMIN)
     assert reverted["status"] == AUDIT_STATUS_COMMITTED
     assert runtime.get_action_run("RUN-CTRL-1")["status"] == AUDIT_STATUS_REVERTED
@@ -615,7 +556,7 @@ def test_kernel_delegates_to_aspects_not_reimplements():
         "ColumnMaskingAspect",
         "SecurityAndAuthorityAspect",
         "IdempotencyAndOCCAspect",
-        "ApprovalGateAspect",
+        "HomomorphicSettlementAspect",
         "RejectionAuditAspect",
         "AutomationReflexAspect",
     ):
@@ -631,11 +572,11 @@ def test_aspects_module_is_self_contained():
 
 
 def test_runtime_line_budget():
-    """微内核行数预算：1700 → 1400 以内。"""
+    """微内核行数预算：<= 1350。"""
     lines = len(
         (ROOT / "open_ontology" / "runtime.py").read_text(encoding="utf-8").splitlines()
     )
-    assert lines <= 1400, f"runtime.py 仍有 {lines} 行，超出微内核预算"
+    assert lines <= 1350, f"runtime.py 仍有 {lines} 行，超出微内核预算"
 
 
 # ---------------------------------------------------------------------------
@@ -678,9 +619,9 @@ def test_aspects_are_not_business_specific():
 
 
 def test_drivers_do_not_reimplement_governance():
-    """设备驱动不复制内核治理语义：不自己写写门禁、不做审批裁决。"""
+    """设备驱动不复制内核治理语义：不自己写写门禁、不做角色权责裁决。"""
     text = (ROOT / "open_ontology" / "ingestion.py").read_text(encoding="utf-8")
-    for token in ("UPDATE ontology_write_gate", "approval_rule", "allowed_roles"):
+    for token in ("UPDATE ontology_write_gate", "revert_roles", "allowed_roles"):
         assert token not in text, f"治理语义 {token!r} 被驱动复制"
 
 
@@ -694,7 +635,7 @@ def test_architecture_doc_declares_four_categories():
         "微内核",
         "ingestion.py",
         "aspects.py",
-        "1400",
+        "1350",
     ):
         assert token in text, f"架构文档缺少 {token!r}"
 
@@ -708,18 +649,19 @@ def test_architecture_doc_api_references_are_real():
     for symbol in (
         "load_snapshot",
         "load_mdo_snapshots",
-        "approve_action",
         "revert_action",
         "evaluate_automations",
     ):
         found = any(
             f"def {symbol}" in (pkg / name).read_text(encoding="utf-8")
-            for name in ("runtime.py", "ingestion.py", "aspects.py")
+            for name in ("runtime.py", "ingestion.py", "aspects.py", "settlement.py")
         )
         assert found, f"文档引用 {symbol} 但源码里没有定义"
 
-    # 已经改名的旧 API 不许再出现在文档里
+    # 已经改名或退役的旧 API 不许再出现在文档里
     for stale in (
+        "approve_action",
+        "ApprovalGateAspect",
         "approve_action_run",
         "revert_action_run",
         "ingest_snapshot",
@@ -883,212 +825,7 @@ def test_idle_aware_callback_flush_marks_failed_items():
 
 
 # ---------------------------------------------------------------------------
-# 10. 两相 post_approval 的主权门禁（C-KERNEL-SEC-01）
-# ---------------------------------------------------------------------------
-class PhaseParams(BaseModel):
-    account_id: str
-    name: str
-    note: str
-
-
-def _phase_write_source(ctx, params):
-    obj = ctx.get(Account, params.account_id)
-    ctx.modify(obj, name=params.name)
-
-
-def _phase_write_owned(ctx, params):
-    obj = ctx.get(Account, params.account_id)
-    ctx.modify(obj, internal_note=params.note)
-
-
-def _phase_write_mixed(ctx, params):
-    obj = ctx.get(Account, params.account_id)
-    ctx.modify(obj, name=f"{params.name}!", internal_note=params.note)
-
-
-spec.add_object_property(
-    ObjectProperty(
-        name="account_owned_links",
-        domain="Account",
-        range="Account",
-        cardinality="many-to-many",
-        owned=True,
-    )
-)
-
-#: 第一阶段写 source 平面，第二阶段（post_approval）只写自有平面。
-spec.action(
-    "phase_source_then_owned",
-    PhaseParams,
-    allowed_roles=("admin",),
-    affects_source=True,
-    post_approval=_phase_write_owned,
-)(_phase_write_source)
-
-#: 第一阶段写自有平面，第二阶段只写 source 平面。
-spec.action(
-    "phase_owned_then_source",
-    PhaseParams,
-    allowed_roles=("admin",),
-    affects_source=False,
-    post_approval=_phase_write_source,
-)(_phase_write_owned)
-
-#: 第二阶段在同一个对象上同时改 source 字段与自有字段 —— 必须被拒。
-spec.action(
-    "phase_mixed_second_stage",
-    PhaseParams,
-    allowed_roles=("admin",),
-    affects_source=True,
-    post_approval=_phase_write_mixed,
-)(_phase_write_source)
-
-
-def test_post_approval_second_stage_mixing_planes_is_rejected(runtime):
-    """post_approval 里的混写必须被 MIXED_AUTHORITY 拒绝，且对象零改动。"""
-    params = {"account_id": "A1", "name": "李四", "note": "治理备注"}
-
-    sim = runtime.simulate_action("phase_mixed_second_stage", params, ADMIN)
-    assert sim.valid is False
-    assert sim.error_code == "MIXED_AUTHORITY"
-
-    with pytest.raises(InvariantError) as excinfo:
-        runtime.submit_action("RUN-PHASE-MIXED", "phase_mixed_second_stage", params, ADMIN)
-    assert excinfo.value.code == "MIXED_AUTHORITY"
-
-    run = runtime.get_action_run("RUN-PHASE-MIXED")
-    assert run["status"] == AUDIT_STATUS_REJECTED
-    assert run["error_code"] == "MIXED_AUTHORITY"
-    account = runtime.get_object(Account, "A1", ADMIN)
-    assert account.name == "张三"
-    assert account.internal_note == ""
-
-
-def test_post_approval_second_stage_on_one_plane_is_allowed(runtime):
-    """两段各自只碰一个主权平面：这是 steel_mdm / saas_unplug 的合法两相。"""
-    run = runtime.submit_action(
-        "RUN-PHASE-SOURCE-FIRST",
-        "phase_source_then_owned",
-        {"account_id": "A1", "name": "李四", "note": "治理备注"},
-        ADMIN,
-    )
-    assert run["status"] == AUDIT_STATUS_COMMITTED
-    account = runtime.get_object(Account, "A1", ADMIN)
-    assert account.name == "李四"
-    assert account.internal_note == "治理备注"
-
-    run = runtime.submit_action(
-        "RUN-PHASE-OWNED-FIRST",
-        "phase_owned_then_source",
-        {"account_id": "A1", "name": "王五", "note": "另一条备注"},
-        ADMIN,
-    )
-    assert run["status"] == AUDIT_STATUS_COMMITTED
-    account = runtime.get_object(Account, "A1", ADMIN)
-    assert account.name == "王五"
-    assert account.internal_note == "另一条备注"
-
-
-def test_check_post_approval_authority_only_judges_the_incremental_delta():
-    """只有 post_approval 追加出来的增量参与判定，不含第一阶段 diff。"""
-    from open_ontology.sandbox import ObjectChange
-
-    action = spec.get_action("phase_source_then_owned")
-    pre = ObjectDiff(
-        object_changes=[
-            ObjectChange(
-                object_type="Account",
-                object_id="A1",
-                kind="update",
-                before={"name": "a", "internal_note": ""},
-                after={"name": "b", "internal_note": ""},
-            )
-        ]
-    )
-    owned_only = ObjectDiff(
-        object_changes=[
-            ObjectChange(
-                object_type="Account",
-                object_id="A1",
-                kind="update",
-                before={"name": "a", "internal_note": ""},
-                after={"name": "b", "internal_note": "n"},
-            )
-        ]
-    )
-    # 增量只碰自有字段：放行（即便整份 diff 横跨两个平面）。
-    SecurityAndAuthorityAspect.check_post_approval_authority(
-        spec, action, pre, owned_only
-    )
-
-    mixed = ObjectDiff(
-        object_changes=[
-            ObjectChange(
-                object_type="Account",
-                object_id="A1",
-                kind="update",
-                before={"name": "a", "internal_note": ""},
-                after={"name": "c", "internal_note": "n"},
-            )
-        ]
-    )
-    with pytest.raises(InvariantError) as excinfo:
-        SecurityAndAuthorityAspect.check_post_approval_authority(
-            spec, action, pre, mixed
-        )
-    assert excinfo.value.code == "MIXED_AUTHORITY"
-
-
-def test_check_post_approval_authority_detects_new_object_and_link_planes():
-    """post_approval 新建对象 / 新建关系同样要按平面判定。"""
-    from open_ontology.sandbox import LinkChange, ObjectChange
-
-    action = spec.get_action("phase_source_then_owned")
-    pre = ObjectDiff()
-    mixed_links = ObjectDiff(
-        link_changes=[
-            LinkChange(
-                link_type="account_links",
-                source_type="Account",
-                source_id="A1",
-                target_type="Account",
-                target_id="A2",
-                kind="create",
-            ),
-            LinkChange(
-                link_type="account_owned_links",
-                source_type="Account",
-                source_id="A1",
-                target_type="Account",
-                target_id="A2",
-                kind="create",
-            ),
-        ]
-    )
-    with pytest.raises(InvariantError) as excinfo:
-        SecurityAndAuthorityAspect.check_post_approval_authority(
-            spec, action, pre, mixed_links
-        )
-    assert excinfo.value.code == "MIXED_AUTHORITY"
-
-    new_source_object = ObjectDiff(
-        object_changes=[
-            ObjectChange(
-                object_type="Account",
-                object_id="A9",
-                kind="create",
-                after={"name": "新账户", "internal_note": ""},
-            )
-        ]
-    )
-    # 新对象是 source 侧行为，增量只有一个平面：放行。
-    SecurityAndAuthorityAspect.check_post_approval_authority(
-        spec, action, pre, new_source_object
-    )
-
-
-# ---------------------------------------------------------------------------
-# 11. 审计账本 / 注册表的写门禁触发器（C-KERNEL-SEC-01）
+# 10. 审计账本 / 注册表的写门禁触发器（C-KERNEL-SEC-01）
 # ---------------------------------------------------------------------------
 def test_action_runs_insert_and_update_are_gate_protected(runtime):
     conn = runtime.connection
@@ -1156,8 +893,6 @@ class GuardedParams(BaseModel):
     "guarded_rename",
     GuardedParams,
     allowed_roles=("admin",),
-    approver_roles=("admin",),
-    approval_rule=lambda params, actor: params.name.startswith("VIP"),
     affects_source=True,
 )
 def guarded_rename(ctx, params):
@@ -1167,8 +902,8 @@ def guarded_rename(ctx, params):
     ctx.modify(obj, name=params.name)
 
 
-def test_pending_approval_and_rejection_writes_pass_through_the_gate(runtime):
-    """挂起审批 / 拒绝入账 / 批准 / 回滚都在写门禁内落账。"""
+def test_commit_rejection_and_revert_writes_pass_through_the_gate(runtime):
+    """拒绝入账 / 同步提交 / 回滚都在写门禁内落账且零残留开启状态。"""
     with pytest.raises(InvariantError) as excinfo:
         runtime.submit_action(
             "RUN-REJECT", "guarded_rename", {"account_id": "A1", "name": ""}, ADMIN
@@ -1178,23 +913,19 @@ def test_pending_approval_and_rejection_writes_pass_through_the_gate(runtime):
     assert rejected["status"] == AUDIT_STATUS_REJECTED
     assert rejected["error_code"] == "EMPTY_NAME"
 
-    pending = runtime.submit_action(
-        "RUN-PENDING",
+    committed = runtime.submit_action(
+        "RUN-VIP",
         "guarded_rename",
         {"account_id": "A1", "name": "VIP-李四"},
         ADMIN,
     )
-    assert pending["status"] == AUDIT_STATUS_PENDING
-    assert runtime.get_object(Account, "A1", ADMIN).name == "张三"
-
-    approved = runtime.approve_action("RUN-PENDING", ADMIN)
-    assert approved["status"] == AUDIT_STATUS_COMMITTED
+    assert committed["status"] == AUDIT_STATUS_COMMITTED
     assert runtime.get_object(Account, "A1", ADMIN).name == "VIP-李四"
 
-    reverted = runtime.revert_action("RUN-PENDING", "RUN-PENDING-REV", ADMIN)
+    reverted = runtime.revert_action("RUN-VIP", "RUN-VIP-REV", ADMIN)
     assert reverted["status"] == AUDIT_STATUS_COMMITTED
     assert runtime.get_object(Account, "A1", ADMIN).name == "张三"
-    assert runtime.get_action_run("RUN-PENDING")["status"] == AUDIT_STATUS_REVERTED
+    assert runtime.get_action_run("RUN-VIP")["status"] == AUDIT_STATUS_REVERTED
     assert runtime.connection.execute(
         "SELECT is_open FROM ontology_write_gate WHERE id = 1"
     ).fetchone()["is_open"] == 0
@@ -1545,7 +1276,7 @@ def test_read_only_source_spec_blocks_action_source_writes_but_allows_snapshots_
 
 
 def test_object_level_read_only_source_protects_external_object_in_mixed_spec(tmp_path):
-    """混合主权模型中：__read_only_source__=True 锁定指定外部对象（含 post_approval 与非自有关系），不影响可写源对象。"""
+    """混合主权模型中：__read_only_source__=True 锁定指定外部对象（含非自有关系），不影响可写源对象。"""
     mixed_spec = OntologySpec()  # read_only_source=False
     mixed_spec.object_type(_ExternalCustomer)
     mixed_spec.object_type(_MutableOrder)
@@ -1587,22 +1318,6 @@ def test_object_level_read_only_source_protects_external_object_in_mixed_spec(tm
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         ctx.modify(cust, ops_tag=params.ops_tag)
 
-    def _post_approval_mutate_customer(ctx, params):
-        cust = ctx.get(_ExternalCustomer, params.customer_id)
-        ctx.modify(cust, credit_limit=9999)
-
-    @mixed_spec.action(
-        "two_phase_touches_ro_source",
-        _CustomerEditParams,
-        allowed_roles=("admin",),
-        approver_roles=("admin",),
-        affects_source=False,
-        post_approval=_post_approval_mutate_customer,
-    )
-    def two_phase_touches_ro_source(ctx, params):
-        cust = ctx.get(_ExternalCustomer, params.customer_id)
-        ctx.modify(cust, ops_tag=params.ops_tag)
-
     @mixed_spec.action(
         "link_customer_to_order",
         _LinkEditParams,
@@ -1634,10 +1349,9 @@ def test_object_level_read_only_source_protects_external_object_in_mixed_spec(tm
         rt.submit_action("RUN-CUST-OWNED", "tag_customer_only", {"customer_id": "C1", "ops_tag": "gold"}, ADMIN)
         assert rt.get_object(_ExternalCustomer, "C1", ADMIN).ops_tag == "gold"
 
-        # Source writes (even with affects_source=True), post_approval source writes, and source links fail
+        # Source writes (even with affects_source=True) and source links fail
         for action_name, payload in (
             ("rename_customer_with_true", {"customer_id": "C1", "name": "Changed"}),
-            ("two_phase_touches_ro_source", {"customer_id": "C1", "ops_tag": "silver"}),
             ("link_customer_to_order", {"customer_id": "C1"}),
         ):
             sim = rt.simulate_action(action_name, payload, ADMIN)

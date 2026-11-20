@@ -1253,7 +1253,7 @@ def run_o2c_p2p_grafting_demo(
             except InvariantError as exc:
                 over_err_code = exc.code or ""
             assert over_err_code == "APPROVAL_REQUIRED_SPEND_LIMIT_EXCEEDED"
-            assert over_fork.list_action_runs(status="PENDING_APPROVAL") == []
+            assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in over_fork.list_action_runs())
 
             wc_open = over_fork.submit_action(
                 "WC-PO-OPEN",
@@ -1280,7 +1280,7 @@ def run_o2c_p2p_grafting_demo(
             assert wc_settled["settled_action_run"]["status"] == "COMMITTED"
             assert over_fork.get_object(po_cls, "PO-OVER-LIMIT-1", STEWARD_OPS_ACTOR).status == "approved"
             assert over_fork.get_object(WorkCard, "WC-P2P-OVR-1", STEWARD_OPS_ACTOR).status == "COMPLETED"
-            assert over_fork.list_action_runs(status="PENDING_APPROVAL") == []
+            assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in over_fork.list_action_runs())
         finally:
             over_fork.close()
 

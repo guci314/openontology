@@ -643,14 +643,14 @@ def run_o2c_induction_demo(*, offline: bool = True) -> dict[str, Any]:
                         action="confirm_sales_order",
                         params={"order_id": "SO-BIG-01", "order_amount": 150000},
                         actor=AI_AGENT,
-                        expect_blocked_or_approval=True,
+                        expect_valid=False,
                     ),
                     IncidentCounterexample(
                         name="inc_big_order_2_must_require_approval",
                         action="confirm_sales_order",
                         params={"order_id": "SO-BIG-02", "order_amount": 180000},
                         actor=AI_AGENT,
-                        expect_blocked_or_approval=True,
+                        expect_valid=False,
                     ),
                     IncidentCounterexample(
                         name="inc_director_can_confirm_directly",

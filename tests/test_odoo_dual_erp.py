@@ -208,7 +208,7 @@ def test_ai_large_cancel_requires_approval_then_writes_back(env):
     )
     assert pending["status"] == "AWAITING_WORK_CARD"
     assert pending["work_card_status"] == "OPEN"
-    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
+    assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in runtime.list_action_runs())
     assert bridge.process_new_runs() == []
     assert client.order_state("S-SO002") == "sale"
     assert runtime.get_object(

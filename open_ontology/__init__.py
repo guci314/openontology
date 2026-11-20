@@ -29,7 +29,7 @@ from .settlement import (
     WorldMode,
 )
 from .mpc import (
-    MPC_AWAITING_APPROVAL,
+    MPC_AWAITING_EXTERNAL,
     MPC_GOAL_REACHED,
     MPC_MAX_REPLANS_EXCEEDED,
     MPC_MAX_STEPS_EXCEEDED,
@@ -153,7 +153,7 @@ __all__ = [
     "MPCResult",
     "MPCStepRecord",
     "MPC_GOAL_REACHED",
-    "MPC_AWAITING_APPROVAL",
+    "MPC_AWAITING_EXTERNAL",
     "MPC_MAX_REPLANS_EXCEEDED",
     "MPC_MAX_STEPS_EXCEEDED",
     "MPC_UNREACHABLE",

@@ -292,7 +292,7 @@ def test_ai_large_order_requires_finance_director(o2c_env):
     )
     assert pending["status"] == "AWAITING_WORK_CARD"
     assert pending["work_card_status"] == "OPEN"
-    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
+    assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in runtime.list_action_runs())
     assert adapter.process_new_runs() == []
     assert adapter.order_row("O2C-SO-002")["state"] == "draft"
     assert _order(runtime, "O2C-SO-002").status == "draft"

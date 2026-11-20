@@ -205,7 +205,7 @@ def resolve_scoped_names(
         if eff_role is not None:
             allowed = set(action.allowed_roles)
             if not public_only:
-                allowed |= set(action.approver_roles) | set(action.revert_roles)
+                allowed |= set(action.revert_roles)
             if allowed and eff_role not in allowed:
                 continue
         if view_spec is not None and view_spec.actions:
@@ -405,9 +405,8 @@ def _enrich_params_schema(params_cls: type[Any]) -> dict[str, Any]:
 # Behavior: declared contracts only
 # ---------------------------------------------------------------------------
 def _describe_roles(spec: OntologySpec) -> list[dict[str, Any]]:
-    """Role vocabulary + allowed/approver/revert action matrix + masked field grants."""
+    """Role vocabulary + allowed/revert action matrix + masked field grants."""
     allowed_map: dict[str, list[str]] = {}
-    approver_map: dict[str, list[str]] = {}
     revert_map: dict[str, list[str]] = {}
     masked_map: dict[str, list[str]] = {}
     seen_order: list[str] = []
@@ -423,9 +422,6 @@ def _describe_roles(spec: OntologySpec) -> list[dict[str, Any]]:
         for role_name in action.allowed_roles:
             ensure(role_name)
             allowed_map.setdefault(role_name, []).append(action.name)
-        for role_name in action.approver_roles:
-            ensure(role_name)
-            approver_map.setdefault(role_name, []).append(action.name)
         for role_name in action.revert_roles:
             ensure(role_name)
             revert_map.setdefault(role_name, []).append(action.name)
@@ -446,7 +442,6 @@ def _describe_roles(spec: OntologySpec) -> list[dict[str, Any]]:
                 "description": decl.description if decl is not None else "",
                 "declared": decl is not None,
                 "allowed_actions": allowed_map.get(role_name, []),
-                "approver_actions": approver_map.get(role_name, []),
                 "revert_actions": revert_map.get(role_name, []),
                 "masked_fields": masked_map.get(role_name, []),
             }
@@ -485,7 +480,6 @@ def describe_behavior(
                 "name": action.name,
                 "description": action.description,
                 "allowed_roles": list(action.allowed_roles),
-                "approver_roles": list(action.approver_roles),
                 "revert_roles": list(action.revert_roles),
                 "affects_source": action.affects_source,
                 "visibility": action.visibility,
@@ -751,7 +745,6 @@ def describe_openapi(
             },
             "responses": {"200": {"description": "ActionRun receipt or dry-run diff"}},
             "x-allowed-roles": list(action.allowed_roles),
-            "x-approver-roles": list(action.approver_roles),
             "x-revert-roles": list(action.revert_roles),
         }
         paths[f"{prefix}/actions/{action.name}"] = {"post": op}

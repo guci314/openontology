@@ -350,7 +350,7 @@ def test_offline_large_refund_needs_manager_approval(unplugged):
     )
     assert pending["status"] == "AWAITING_WORK_CARD"
     assert pending["work_card_status"] == "OPEN"
-    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
+    assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in runtime.list_action_runs())
 
     # nothing changed while card is open
     order = runtime.get_object(dom.SalesOrder, "SO-BIG", dom.OPS_MANAGER)

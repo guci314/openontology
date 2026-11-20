@@ -144,12 +144,11 @@ _DEFAULT_DOC_FILES: dict[str, tuple[str, str, str]] = {
     ),
 }
 
-#: 八大全景治理切面（Core 之上的系统调用切面层）。
+#: 七大全景治理切面（Core 之上的系统调用切面层）。
 RUNTIME_ASPECTS = [
     "ColumnMaskingAspect",
     "SecurityAndAuthorityAspect",
     "IdempotencyAndOCCAspect",
-    "ApprovalGateAspect",
     "RejectionAuditAspect",
     "AutomationReflexAspect",
     "IdleAwareCallbackAspect",
@@ -351,7 +350,6 @@ class _SimulationLedger:
                 params_json TEXT NOT NULL,
                 prior_steps_json TEXT NOT NULL,
                 valid INTEGER NOT NULL,
-                requires_approval INTEGER NOT NULL,
                 error_code TEXT,
                 error_message TEXT,
                 diff_json TEXT NOT NULL,
@@ -376,7 +374,6 @@ class _SimulationLedger:
         params: dict[str, Any],
         prior_steps: list[dict[str, Any]],
         valid: bool,
-        requires_approval: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
         diff: dict[str, Any] | None = None,
@@ -391,9 +388,9 @@ class _SimulationLedger:
                 INSERT INTO sandbox_simulations (
                     sim_id, workspace_id, session_id, step_index, action_type,
                     actor_id, actor_role, params_json, prior_steps_json,
-                    valid, requires_approval, error_code, error_message,
+                    valid, error_code, error_message,
                     diff_json, base_fingerprint, committed_run_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                 """,
                 (
                     sim_id,
@@ -406,7 +403,6 @@ class _SimulationLedger:
                     json.dumps(params, ensure_ascii=False, default=str),
                     json.dumps(prior_steps, ensure_ascii=False, default=str),
                     1 if valid else 0,
-                    1 if requires_approval else 0,
                     error_code,
                     error_message,
                     json.dumps(diff or {"object_changes": [], "link_changes": []}, ensure_ascii=False, default=str),
@@ -485,7 +481,6 @@ class _SimulationLedger:
                     "params": json.loads(row["params_json"]),
                     "prior_steps": json.loads(row["prior_steps_json"]),
                     "valid": bool(row["valid"]),
-                    "requires_approval": bool(row["requires_approval"]),
                     "error_code": row["error_code"],
                     "error_message": row["error_message"],
                     "diff": json.loads(row["diff_json"]),
@@ -1074,7 +1069,7 @@ def _ontology_roles(
 
     1. ``spec.roles`` 中显式声明的模型角色（``RoleDef``）；
     2. 该蓝图下各实例的 ``default_actor.role``；
-    3. ``spec.actions`` 中每个动作的 ``allowed_roles``、``approver_roles`` 与 ``revert_roles``；
+    3. ``spec.actions`` 中每个动作的 ``allowed_roles`` 与 ``revert_roles``；
     4. ``spec.object_types`` 中各对象类型的 ``__masked_fields__`` 白名单角色。
 
     均为空时回退 ``["admin"]``，保证前端下拉框永远有可选项。
@@ -1093,8 +1088,6 @@ def _ontology_roles(
             add(actor.role)
     for action in spec.actions.values():
         for role in action.allowed_roles:
-            add(role)
-        for role in action.approver_roles:
             add(role)
         for role in action.revert_roles:
             add(role)
@@ -1316,7 +1309,6 @@ pre{margin:0;font-family:"SF Mono",Menlo,monospace;font-size:10.6px;line-height:
 .run .id{font-family:"SF Mono",Menlo,monospace;color:#a5e4ff;font-size:10.5px}
 .tag{font-size:9.5px;font-weight:700;padding:2px 6px;border-radius:5px;letter-spacing:.3px}
 .t-COMMITTED{color:#bbf7d0;background:rgba(34,197,94,.2)}
-.t-PENDING_APPROVAL{color:#fde68a;background:rgba(245,165,36,.2)}
 .t-REJECTED{color:#fecaca;background:rgba(239,68,68,.2)}
 .t-REVERTED{color:#ddd6fe;background:rgba(167,139,250,.2)}
 .stat{display:flex;justify-content:space-between;font-size:11px;color:var(--dim);padding:2px 0}
@@ -1700,21 +1692,19 @@ function renderOntologyView(detail) {
       '<div class="badges">' + fields + '</div>' +
       '<div class="badges"><span class="badge c">可执行角色 ' + esc((a.allowed_roles||[]).map(zhRole).join(' / ')) + '</span>' +
       (a.visibility === 'private' ? '<span class="badge a">🔒 私有 · 仅内部触发</span>' : '') +
-      '<span class="badge a">审批角色 ' + esc((a.approver_roles||[]).map(zhRole).join(' / ') || '无需审批') + '</span>' +
       ((a.revert_roles||[]).length ? '<span class="badge v">冲正角色 ' + esc((a.revert_roles||[]).map(zhRole).join(' / ')) + '</span>' : '') +
       '<span class="badge">' + (a.affects_source ? '来自外部数据源' : '本体自有') + '</span></div></div>';
   }).join('') || '<div class="hint">无。</div>';
 
   const roleCards = (m.role_defs || []).map(r => {
     const allowed = (r.allowed_actions || []).map(a => '<span class="badge c">' + esc(zhAction(a)) + '</span>').join(' ');
-    const approvers = (r.approver_actions || []).map(a => '<span class="badge a">审批：' + esc(zhAction(a)) + '</span>').join(' ');
     const reverts = (r.revert_actions || []).map(a => '<span class="badge v">冲正：' + esc(zhAction(a)) + '</span>').join(' ');
     const masked = (r.masked_fields || []).map(f => '<span class="badge r">🔒 ' + esc(f) + '</span>').join(' ');
     return '<div class="obj"><h4>🎭 ' + esc(zhRole(r.name)) + ' <span class="en">' + esc(r.name) + '</span>' +
       (r.declared ? ' <span class="badge v">显式 RoleDef</span>' : ' <span class="badge">动作推断</span>') + '</h4>' +
       (r.description ? '<div class="sub hint">' + esc(r.description) + '</div>' : '') +
       '<div class="badges">' + (allowed || '<span class="hint">无可执行动作</span>') +
-      (approvers ? ' ' + approvers : '') + (reverts ? ' ' + reverts : '') + (masked ? ' ' + masked : '') + '</div></div>';
+      (reverts ? ' ' + reverts : '') + (masked ? ' ' + masked : '') + '</div></div>';
   }).join('') || '<div class="hint">无。</div>';
 
   $('stage').innerHTML =
@@ -2804,8 +2794,7 @@ async function simulate() {
     if (el) el.innerHTML = '<b class="' + (data.valid ? 'ok' : 'err') + '">沙盘预演 → ' +
       (data.valid ? '通过' : '被拒绝 ' + esc(data.error_code || '')) + '</b>' +
       (data.error ? '<div class="err">' + esc(data.error) + '</div>' : '') +
-      '<div class="hint">需要审批：' + (data.requires_approval ? '是' : '否') +
-      (data.sim_id ? (' · 已存库 ' + esc(data.sim_id)) : '') + '</div>' + diffTable(data.diff);
+      (data.sim_id ? ('<div class="hint">已存库 ' + esc(data.sim_id) + '</div>') : '') + diffTable(data.diff);
     applySimPreview(actionName, data, params);
     const simsRes = await api('/api/simulations').catch(() => null);
     if (simsRes) { S.simulations = simsRes.simulations || []; renderSimulations(); }
@@ -2942,14 +2931,6 @@ async function commitMcts() {
   } catch (e) { toast(e.message, true); }
 }
 
-async function approveRun(runId) {
-  try {
-    const data = await api('/api/approve', {run_id: runId});
-    toast('已批准 ' + runId + ' → ' + zhStatus(data.run.status));
-    await refreshInstance();
-  } catch (e) { toast(e.message, true); }
-}
-
 async function revertRun(runId) {
   try {
     const data = await api('/api/revert', {run_id: runId});
@@ -2994,7 +2975,6 @@ function renderRuns(runs) {
   if (!runs.length) { box.innerHTML = '<div class="hint">动作执行记录为空。</div>'; return; }
   box.innerHTML = runs.slice().reverse().map(r => {
     const ops = [];
-    if (r.status === 'PENDING_APPROVAL') ops.push('<button class="g" onclick="approveRun(\'' + esc(r.run_id) + '\')">✅ 批准</button>');
     if (r.status === 'COMMITTED') ops.push('<button class="r" onclick="revertRun(\'' + esc(r.run_id) + '\')">↩️ 撤回</button>');
     return '<div class="run"><div class="id">' + esc(r.run_id) + ' <span class="tag t-' + esc(r.status) + '">' +
       esc(zhStatus(r.status)) + '</span></div><div class="kv"><span>' + esc(zhAction(r.action_type)) + '</span><span>' +
@@ -3252,16 +3232,14 @@ function renderArtifactHtml(art) {
     const btn = sim.valid
       ? '<button class="g" style="margin-top:6px" onclick="agentSubmitCard(\'' + esc(p.action || '') + '\', \'' + paramsJson + '\')">✅ 确认提交</button>'
       : '';
-    return head + '<div class="row">' + okBadge +
-      (sim.requires_approval ? '<span class="badge a">需审批</span>' : '') + '</div>' +
+    return head + '<div class="row">' + okBadge + '</div>' +
       (sim.error ? '<div class="err">' + esc(sim.error) + '</div>' : '') +
       diffTable(sim.diff) + btn;
   }
 
   if (art.kind === 'approval_card') {
     return head + '<div class="hint">单号：' + esc(p.run_id || '') + ' · 动作：' + esc(zhAction(p.action || '')) + '</div>' +
-      diffTable(p.diff) +
-      '<button class="g" style="margin-top:6px" onclick="agentApproveCard(\'' + esc(p.run_id || '') + '\')">✅ 批准执行</button>';
+      diffTable(p.diff);
   }
 
   if (art.kind === 'metric_chart') {
@@ -3346,26 +3324,7 @@ async function agentSubmitCard(action, paramsJson) {
     const params = JSON.parse(paramsJson || '{}');
     const data = await api('/api/submit', {run_id: 'AGENT-' + Date.now(), action, params, scope});
     const run = data.run || {};
-    if (run.status === 'PENDING_APPROVAL') {
-      appendAgentBubble('bot', '动作已提交，命中审批门禁，请审批：', [{
-        artifact_id: 'apr-' + Date.now(),
-        kind: 'approval_card',
-        title: '待审批：' + zhAction(action),
-        payload: {run_id: run.run_id, action: run.action_type, status: run.status, diff: run.object_diff},
-      }]);
-    } else {
-      appendAgentBubble('bot', '正式执行成功：<b>' + esc(zhStatus(run.status)) + '</b>（' + esc(run.run_id) + '）');
-    }
-    if (scope === 'platform') await loadAll();
-    else await refreshInstance();
-  } catch (e) { toast(e.message, true); }
-}
-
-async function agentApproveCard(runId) {
-  const scope = currentAgentScope();
-  try {
-    const data = await api('/api/approve', {run_id: runId, scope});
-    appendAgentBubble('bot', '审批完成：' + esc(runId) + ' → ' + esc(zhStatus((data.run || {}).status || '')));
+    appendAgentBubble('bot', '正式执行成功：<b>' + esc(zhStatus(run.status)) + '</b>（' + esc(run.run_id) + '）');
     if (scope === 'platform') await loadAll();
     else await refreshInstance();
   } catch (e) { toast(e.message, true); }
@@ -4534,17 +4493,12 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                 try:
                     for idx, step in enumerate(prior_steps, start=1):
                         step_run_id = f"SIM-PRIOR-{idx}-{uuid.uuid4().hex[:6]}"
-                        run = sim_fork.submit_action(
+                        sim_fork.submit_action(
                             step_run_id,
                             step["action"],
                             step.get("params") or {},
                             actor,
                         )
-                        if (run or {}).get("status") == "PENDING_APPROVAL":
-                            sim_fork.approve_action(
-                                step_run_id,
-                                Actor(actor_id="sim-approver", role="system"),
-                            )
                     sim = sim_fork.simulate_action(action_name, params, actor)
                 finally:
                     sim_fork.close()
@@ -4560,7 +4514,6 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                 params=params,
                 prior_steps=prior_steps,
                 valid=False,
-                requires_approval=False,
                 error_code=getattr(exc, "code", None) or type(exc).__name__,
                 error_message=str(exc),
                 base_fingerprint=fp_hash,
@@ -4577,7 +4530,6 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             params=params,
             prior_steps=prior_steps,
             valid=sim.valid,
-            requires_approval=sim.requires_approval,
             error_code=sim.error_code,
             error_message=sim.error,
             diff=sim_dict.get("diff"),
@@ -4676,13 +4628,6 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
                 self._registry.simulation_ledger.mark_first_step_committed(
                     entry, session_id=sim_sess, run_id=str(run["run_id"])
                 )
-            if is_platform and meta_admin is not None and run.get("status") == "COMMITTED":
-                meta_admin.sync_to_registry()
-            self._send_json(200, {"ok": True, "run": run})
-            return
-
-        if path == "/api/approve":
-            run = runtime.approve_action(body["run_id"], actor)
             if is_platform and meta_admin is not None and run.get("status") == "COMMITTED":
                 meta_admin.sync_to_registry()
             self._send_json(200, {"ok": True, "run": run})

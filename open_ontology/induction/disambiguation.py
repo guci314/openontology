@@ -85,7 +85,7 @@ class GrayZoneAmbiguity(BaseModel):
     sop_excerpt: str = ""
     predicate_ast: dict[str, Any]
     error_code: str
-    approver_roles: list[str] = Field(default_factory=lambda: ["steward", "admin"])
+    privileged_roles: list[str] = Field(default_factory=lambda: ["steward", "admin"])
     counterexample_samples: list[dict[str, Any]] = Field(default_factory=list)
     sample_exceeding_id: str | None = None
     sample_compliant_id: str | None = None
@@ -143,7 +143,7 @@ def compile_disambiguation_to_evolution_patch(
         amb = amb_map.get(dec.ambiguity_id)
         if amb is None:
             raise ValueError(f"unknown ambiguity_id {dec.ambiguity_id!r}")
-        if dec.decided_by.role not in amb.approver_roles and dec.decided_by.role != "admin":
+        if dec.decided_by.role not in amb.privileged_roles and dec.decided_by.role != "admin":
             raise PermissionDeniedError(
                 f"actor role {dec.decided_by.role!r} is not authorized to resolve gray zone {amb.ambiguity_id!r}"
             )
@@ -152,7 +152,7 @@ def compile_disambiguation_to_evolution_patch(
                 f"ambiguity {amb.ambiguity_id!r} references unknown action {amb.target_action!r}"
             )
         act: ActionBlueprint = act_map[amb.target_action]
-        roles_lit = list(dict.fromkeys(amb.approver_roles or ["steward", "admin"]))
+        roles_lit = list(dict.fromkeys(amb.privileged_roles or ["steward", "admin"]))
         slug = amb.ambiguity_id.lower().replace("-", "_")
 
         if dec.choice_id == "HARD_REJECT":
@@ -346,7 +346,7 @@ def crystallize_disambiguated_patch(
     # or gated by Steward disambiguation rulings (those records are verified by Gate 4).
     gated_targets: set[tuple[str, str, str]] = set()
     for case in patch.proposed_eval_cases:
-        if not case.expect.valid or bool(case.expect.requires_approval):
+        if not case.expect.valid:
             for p_key, p_val in case.params.items():
                 gated_targets.add((case.action, str(p_key), str(p_val)))
     if gated_targets and evo_ctx.positive_events:
@@ -355,7 +355,6 @@ def crystallize_disambiguated_patch(
             for ev in evo_ctx.positive_events
             if not (
                 getattr(ev, "expected_valid", True)
-                and not getattr(ev, "expected_requires_approval", False)
                 and any((ev.action, str(k), str(v)) in gated_targets for k, v in ev.params.items())
             )
         ]

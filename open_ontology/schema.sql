@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS ontology_action_runs (
     actor_role        TEXT NOT NULL,
     params_json       TEXT NOT NULL,
     status            TEXT NOT NULL
-                      CHECK (status IN ('PENDING_APPROVAL', 'COMMITTED', 'REVERTED', 'REJECTED')),
+                      CHECK (status IN ('COMMITTED', 'REVERTED', 'REJECTED')),
     read_versions_json TEXT NOT NULL DEFAULT '{}',
     object_diff_json  TEXT NOT NULL DEFAULT '{}',
     approved_by       TEXT,

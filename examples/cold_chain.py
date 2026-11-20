@@ -270,7 +270,6 @@ def main() -> dict[str, Any]:
             },
             "expect": {
                 "valid": True,
-                "requires_approval": False,
                 "object_changes": [
                     {
                         "object_type": "Shipment",
@@ -401,7 +400,7 @@ def main() -> dict[str, Any]:
     simulation = runtime.simulate_action("reroute_shipment", high_cost, OPS_MANAGER)
     version_before_sim = runtime.list_objects("Shipment")[0]["version"]
     print(f"  ai valid={sim_ai.valid} error_code={sim_ai.error_code}")
-    print(f"  mgr valid={simulation.valid} requires_approval={simulation.requires_approval}")
+    print(f"  mgr valid={simulation.valid}")
     print(f"  diff: {simulation.diff.summary()}")
     print(f"  read_versions={simulation.read_versions}")
     print(f"  db shipment version after simulate="

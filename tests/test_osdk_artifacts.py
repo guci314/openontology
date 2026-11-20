@@ -40,13 +40,14 @@ def _build_runtime() -> tuple[OntologyRuntime, Actor]:
         name="close_item",
         params=_CloseItemParams,
         allowed_roles=["admin", "ops"],
-        approver_roles=["admin"],
-        approval_rule=lambda params, actor: params.item_id == "ITM-2",
+        revert_roles=["admin"],
     )
     def _close_handler(ctx, params: _CloseItemParams) -> dict:
         obj = ctx.get(_DemoItem, params.item_id)
         if obj.status == "CLOSED":
             raise InvariantError("item is already closed", code="ALREADY_CLOSED")
+        if params.item_id == "ITM-2" and ctx.actor.role != "admin":
+            raise InvariantError("admin approval required", code="APPROVAL_REQUIRED_ADMIN")
         ctx.modify(obj, status="CLOSED")
         return {"closed": params.item_id}
 
@@ -108,13 +109,12 @@ def test_run_agent_turn_deterministic_flows() -> None:
         assert t2.artifacts[0].kind == "action_form"
         assert t2.artifacts[0].payload["prefill_params"] == {"item_id": "ITM-1"}
 
-        # 3. 触发一条待审批动作 -> approval_card
+        # 3. 构造并发送 approval_card UIArtifact（M1 协同审批卡）
         run = rt.submit_action("RUN-APR-1", "close_item", {"item_id": "ITM-2"}, admin)
-        assert run["status"] == "PENDING_APPROVAL"
-        t3 = run_agent_turn(executor, "查看待审批记录")
-        assert len(t3.artifacts) == 1
-        assert t3.artifacts[0].kind == "approval_card"
-        assert t3.artifacts[0].payload["run_id"] == "RUN-APR-1"
+        assert run["status"] == "COMMITTED"
+        art = executor.build_approval_card_artifact(run)
+        assert art.kind == "approval_card"
+        assert art.payload["run_id"] == "RUN-APR-1"
     finally:
         rt.close()
 

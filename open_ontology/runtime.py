@@ -5,8 +5,8 @@ It owns four responsibilities:
 
 1. **Object state placement** with content-hash idempotency.
 2. **Governed queries** with strict RBAC + row level security.
-3. **Simulation** (zero writes) and **atomic submission** with optimistic
-   locking and approval interception.
+3. **Simulation** (zero writes) and **synchronous atomic submission** with optimistic
+   locking.
 4. **Append-only business audit / time-machine revert.**
 
 The physical write gate lives in SQLite itself: every object or link mutation
@@ -29,7 +29,6 @@ from typing import Any, Callable, Iterator
 from pydantic import BaseModel
 
 from .aspects import (
-    ApprovalGateAspect,
     AutomationReflexAspect,
     ColumnMaskingAspect,
     MASKED_STRING as _MASKED_STRING,
@@ -103,7 +102,6 @@ def _content_hash(properties: dict[str, Any]) -> str:
 class SimulationResult:
     valid: bool
     diff: ObjectDiff
-    requires_approval: bool
     read_versions: dict[str, int]
     error: str | None = None
     error_code: str | None = None
@@ -111,7 +109,6 @@ class SimulationResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "valid": self.valid,
-            "requires_approval": self.requires_approval,
             "read_versions": dict(self.read_versions),
             "diff": self.diff.to_dict(),
             "error": self.error,
@@ -319,7 +316,6 @@ class OntologyRuntime:
                         "name": name,
                         "description": action.description,
                         "allowed_roles": list(action.allowed_roles),
-                        "approver_roles": list(action.approver_roles),
                         "revert_roles": list(action.revert_roles),
                         "affects_source": action.affects_source,
                         "visibility": action.visibility,
@@ -1065,11 +1061,6 @@ class OntologyRuntime:
         action.handler(batch, model)
         pre_diff = batch.build_diff()
         self._check_authority(action, pre_diff)
-        if action.post_approval is not None:
-            action.post_approval(batch, model)
-            SecurityAndAuthorityAspect.check_post_approval_authority(
-                self.spec, action, pre_diff, batch.build_diff()
-            )
         batch.validate_object_properties()
         batch.validate_invariants()
         final_diff = batch.build_diff()
@@ -1112,30 +1103,22 @@ class OntologyRuntime:
         self._check_role(action, actor)
         model = self._build_params(action.params, params)
 
-        approval_view = EditBatch(self.spec, self, actor) if action.approval_rule is not None else None
         batch = EditBatch(self.spec, self, actor)
         try:
             diff = self._run_handler(action, model, actor, batch=batch)
-            requires_approval = action.requires_approval(model, actor, view=approval_view)
         except InvariantError as exc:
             return SimulationResult(
                 valid=False,
                 diff=ObjectDiff(),
-                requires_approval=False,
                 read_versions=dict(batch.read_versions),
                 error=str(exc),
                 error_code=exc.code,
             )
 
-        read_versions = dict(batch.read_versions)
-        if approval_view is not None:
-            for k, v in approval_view.read_versions.items():
-                read_versions.setdefault(k, v)
         return SimulationResult(
             valid=True,
             diff=diff,
-            requires_approval=requires_approval,
-            read_versions=read_versions,
+            read_versions=dict(batch.read_versions),
         )
 
     # -- submit ------------------------------------------------------------
@@ -1148,11 +1131,10 @@ class OntologyRuntime:
         *,
         auto_trigger: bool = False,
     ) -> dict[str, Any]:
-        """Idempotent governed submission.
+        """Idempotent synchronous governed submission.
 
-        * no approval required -> single atomic transaction, status COMMITTED
-        * approval required    -> diff stored, status PENDING_APPROVAL,
-          objects untouched until :meth:`approve_action`
+        * validation passed -> homomorphic settlement / single atomic transaction (COMMITTED)
+        * invariant/role error -> rejected and audited (REJECTED)
         """
         existing = IdempotencyAndOCCAspect.check_idempotent_run(self, run_id)
         if existing is not None:
@@ -1163,11 +1145,9 @@ class OntologyRuntime:
         model = self._build_params(action.params, params)
         params_json = model.model_dump(mode="json")
 
-        approval_view = EditBatch(self.spec, self, actor) if action.approval_rule is not None else None
         batch = EditBatch(self.spec, self, actor)
         try:
             diff = self._run_handler(action, model, actor, batch=batch)
-            requires_approval = action.requires_approval(model, actor, view=approval_view)
         except InvariantError as exc:
             # Refusal auditing: persist the failed attempt, then re-raise.
             self._record_rejection(
@@ -1184,27 +1164,6 @@ class OntologyRuntime:
             raise
 
         read_versions = dict(batch.read_versions)
-        if approval_view is not None:
-            for k, v in approval_view.read_versions.items():
-                read_versions.setdefault(k, v)
-        diff_json = diff.to_dict()
-
-        if requires_approval:
-            ApprovalGateAspect.stage_pending_approval(
-                self,
-                run_id=run_id,
-                action=action,
-                actor=actor,
-                params_json=params_json,
-                read_versions=read_versions,
-                diff=diff,
-            )
-            if auto_trigger:
-                self.evaluate_automations(actor)
-            pending_run = self.get_action_run(run_id)
-            if pending_run is not None:
-                self._notify_run_event(actor, pending_run)
-            return pending_run  # type: ignore[return-value]
 
         return HomomorphicSettlementAspect.settle_submission(
             self,
@@ -1217,17 +1176,6 @@ class OntologyRuntime:
             auto_trigger=auto_trigger,
         )
 
-    # -- approve & reject --------------------------------------------------
-    def approve_action(self, run_id: str, approver: Actor) -> dict[str, Any]:
-        """批准挂起单：委托给 :class:`ApprovalGateAspect`。"""
-        return ApprovalGateAspect.approve_action(self, run_id, approver)
-
-    def reject_action(
-        self, run_id: str, approver: Actor, reason: str = "rejected by approver"
-    ) -> dict[str, Any]:
-        """驳回挂起单：委托给 :class:`ApprovalGateAspect`。"""
-        return ApprovalGateAspect.reject_action(self, run_id, approver, reason=reason)
-
     # -- revert (time machine) --------------------------------------------
     def revert_action(
         self,
@@ -1235,8 +1183,10 @@ class OntologyRuntime:
         revert_run_id: str,
         actor: Actor,
     ) -> dict[str, Any]:
-        """时光机回滚：委托给 :class:`ApprovalGateAspect`。"""
-        return ApprovalGateAspect.revert_action(self, run_id, revert_run_id, actor)
+        """时光机回滚：委托给 :class:`HomomorphicSettlementAspect`。"""
+        return HomomorphicSettlementAspect.settle_revert(
+            self, run_id, revert_run_id, actor
+        )
 
     # -- apply diff --------------------------------------------------------
     def _apply_diff(self, conn: sqlite3.Connection, diff: ObjectDiff) -> None:

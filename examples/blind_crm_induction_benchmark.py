@@ -876,7 +876,7 @@ def _sqlite_homomorphic_settlement_check(
                 "CRM-5-ACME-WIN-AFTER", win_b, opp_em, acme_opp_id, CRM_AI_ACTOR, "stage", "CLOSED_WON"
             )
             # 5. Steward approval flow via M1 WorkCard for blocked Southstar 260k loss
-            assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+            assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
             south_cid = f"{lost_b.id_prefix}{south_opp_id}"
             rt.bind_source_bridge(
                 _make_crm_bridge(lost_b, opp_em, south_opp_id, "stage", "CLOSED_LOST"),
@@ -909,7 +909,7 @@ def _sqlite_homomorphic_settlement_check(
                 ).fetchone()[0]
             )
             wc_south_done = rt.get_object(WorkCard, "WC-CRM-SOUTH-LOSS", CRM_STEWARD_ACTOR)
-            assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+            assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
             return {
                 "acme_blocked_while_high_case_open": {
@@ -951,7 +951,7 @@ def _sqlite_homomorphic_settlement_check(
                     ),
                     "work_card_status": wc_south_done.status,
                     "sqlite_stage_after": db_south_after,
-                    "pending_approval_runs": len(rt.list_action_runs(status="PENDING_APPROVAL")),
+                    "pending_approval_runs": sum(1 for r in rt.list_action_runs() if r["status"] not in {"COMMITTED", "REJECTED", "REVERTED"}),
                 },
             }
         finally:
@@ -1137,8 +1137,7 @@ def run_blind_crm_induction_benchmark(
                         action=lost_b.action_name,
                         params={lost_b.id_param: south_opp_cid},
                         actor=CRM_AI_ACTOR,
-                        expect_valid=None,
-                        expect_blocked_or_approval=True,
+                        expect_valid=False,
                     ),
                 ],
                 default_actor=CRM_AI_ACTOR,

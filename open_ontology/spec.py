@@ -15,7 +15,6 @@ No SQL and no mutation lives here.
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 import types as _types
 from typing import (
@@ -558,36 +557,12 @@ class ActionDef(BaseModel):
     params: Any  # type[BaseModel]
     handler: Any  # Callable[[EditBatch, BaseModel], None]
     allowed_roles: tuple[str, ...] = ()
-    approver_roles: tuple[str, ...] = ()
     revert_roles: tuple[str, ...] = ()
-    approval_rule: Any = None  # Callable[[BaseModel, Actor], bool] | Callable[..., bool]
     affects_source: bool = True
     visibility: Literal["public", "private"] = "public"
-    post_approval: Any = None  # optional Callable[[EditBatch, BaseModel], None]
     description: str = ""
     view_tags: tuple[str, ...] = ()
     touched_object_types: tuple[str, ...] = ()
-
-    def requires_approval(
-        self,
-        params: BaseModel,
-        actor: Actor,
-        view: Any = None,
-    ) -> bool:
-        if self.approval_rule is None:
-            return False
-        if getattr(self.approval_rule, "_accepts_view", False):
-            return bool(self.approval_rule(params, actor, view))
-        sig = inspect.signature(self.approval_rule)
-        positional = [
-            p
-            for p in sig.parameters.values()
-            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
-        if has_varargs or len(positional) >= 3 or "view" in sig.parameters:
-            return bool(self.approval_rule(params, actor, view))
-        return bool(self.approval_rule(params, actor))
 
 
 class AutomationDef(BaseModel):
@@ -1222,13 +1197,10 @@ class OntologySpec:
         name: str,
         params: type[BaseModel],
         allowed_roles: Sequence[str] = (),
-        approver_roles: Sequence[str] = (),
         revert_roles: Sequence[str] = (),
-        approval_rule: Callable[..., bool] | None = None,
         description: str = "",
         affects_source: bool = True,
         visibility: Literal["public", "private"] = "public",
-        post_approval: Callable[[Any, Any], None] | None = None,
         view_tags: Iterable[str] = (),
         touched_object_types: Iterable[str] = (),
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -1239,7 +1211,6 @@ class OntologySpec:
             )
         _validate_params(params, name)
         self._validate_roles(allowed_roles, context=f"action {name!r} allowed_roles")
-        self._validate_roles(approver_roles, context=f"action {name!r} approver_roles")
         self._validate_roles(revert_roles, context=f"action {name!r} revert_roles")
         self._rebuild_model(params)
 
@@ -1249,12 +1220,9 @@ class OntologySpec:
                 params=params,
                 handler=handler,
                 allowed_roles=tuple(allowed_roles),
-                approver_roles=tuple(approver_roles),
                 revert_roles=tuple(revert_roles),
-                approval_rule=approval_rule,
                 affects_source=affects_source,
                 visibility=visibility,
-                post_approval=post_approval,
                 description=description or (handler.__doc__ or "").strip(),
                 view_tags=tuple(view_tags),
                 touched_object_types=tuple(touched_object_types),

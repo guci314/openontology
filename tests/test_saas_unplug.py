@@ -367,7 +367,7 @@ def test_big_refund_requires_manager_approval_then_commits(standalone):
     )
     assert pending["status"] == "AWAITING_WORK_CARD"
     assert pending["work_card_status"] == "OPEN"
-    assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+    assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
     # 待签批期间绝不提前动账
     assert rt.get_object(model.ShopOrder, "ORD-BIG", MANAGER).status == "paid"
     assert (

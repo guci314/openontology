@@ -283,14 +283,13 @@ def test_row_level_security_filters_get_query_and_links(demo):
 # ---------------------------------------------------------------------------
 # 5. Simulation is zero-write + approval decision
 # ---------------------------------------------------------------------------
-def test_simulation_is_zero_write_and_requires_approval(demo):
+def test_simulation_is_zero_write(demo):
     runtime = demo.runtime
     before_count = runtime.count_objects()
     before_version = shipment_version(runtime)
 
     low = runtime.simulate_action("reroute_shipment", low_cost(), cc.DISPATCHER)
     assert low.valid is True
-    assert low.requires_approval is False
     assert low.error is None
     assert not low.diff.is_empty()
     assert low.read_versions["Shipment:SHP-001"] == 1
@@ -301,14 +300,11 @@ def test_simulation_is_zero_write_and_requires_approval(demo):
 
     mgr = runtime.simulate_action("reroute_shipment", high_cost(), cc.OPS_MANAGER)
     assert mgr.valid is True
-    assert mgr.requires_approval is False
 
-    # dispatcher spending 2400 is *not* subject to the ai_agent rule
     dispatcher_high = runtime.simulate_action(
         "reroute_shipment", high_cost(), cc.DISPATCHER
     )
     assert dispatcher_high.valid is True
-    assert dispatcher_high.requires_approval is False
 
     assert runtime.count_objects() == before_count
     assert shipment_version(runtime) == before_version
@@ -422,7 +418,7 @@ def test_approval_flow_pending_then_manager_commits(demo):
     )
     assert pending["status"] == "AWAITING_WORK_CARD"
     assert pending["work_card_status"] == "OPEN"
-    assert runtime.list_action_runs(status="PENDING_APPROVAL") == []
+    assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in runtime.list_action_runs())
     assert shipment_version(runtime) == 1
     assert carriers(runtime) == ["TRK-001"]
     assert (
@@ -618,14 +614,13 @@ def test_export_llm_tools_schema(demo):
         "ai_agent",
         "ops_manager",
     ]
-    assert action_tool["x-approver-roles"] == []
+    assert "x-approver-roles" not in action_tool
     assert action_tool["x-revert-roles"] == ["ops_manager"]
     assert set(action_tool) == {
         "type",
         "function",
         "x-ontology-kind",
         "x-allowed-roles",
-        "x-approver-roles",
         "x-revert-roles",
     }
     action_schema = action_tool["function"]["parameters"]
@@ -668,7 +663,6 @@ def test_aip_executor_dispatch(demo):
         {"action": "reroute_shipment", "params": low_cost()},
     )
     assert simulated["valid"] is True
-    assert simulated["requires_approval"] is False
 
     submitted = executor.dispatch(
         "submit_action",
@@ -707,7 +701,6 @@ def test_run_eval_suite_passes_and_detects_wrong_expectation(demo):
             "params": low_cost(),
             "expect": {
                 "valid": True,
-                "requires_approval": False,
                 "object_changes": [
                     {
                         "object_type": "Shipment",
@@ -783,7 +776,7 @@ def test_spec_registry_is_persisted(demo):
         ("reroute_shipment",),
     ).fetchone()
     spec_json = json.loads(action_row["spec_json"])
-    assert spec_json["approver_roles"] == []
+    assert "approver_roles" not in spec_json
     assert spec_json["revert_roles"] == ["ops_manager"]
     assert spec_json["affects_source"] is True
     assert "properties" in spec_json["params_schema"]
@@ -1289,7 +1282,7 @@ def test_valid_source_action_does_not_touch_overlay(authority_runtime):
     ).fetchone()["n"] == 0
 
 
-def test_rejected_run_cannot_be_approved_or_reverted(authority_runtime):
+def test_rejected_run_cannot_be_reverted(authority_runtime):
     runtime = authority_runtime
     with pytest.raises(InvariantError):
         runtime.submit_action(
@@ -1298,8 +1291,6 @@ def test_rejected_run_cannot_be_approved_or_reverted(authority_runtime):
             {"device_id": "D1"},
             OPS,
         )
-    with pytest.raises(GovernanceViolationError):
-        runtime.approve_action("RUN-REJ", OPS)
     with pytest.raises(GovernanceViolationError):
         runtime.revert_action("RUN-REJ", "RUN-REJ-BACK", OPS)
 
@@ -1521,12 +1512,9 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
         "params",
         "handler",
         "allowed_roles",
-        "approver_roles",
         "revert_roles",
-        "approval_rule",
         "affects_source",
         "visibility",
-        "post_approval",
         "description",
         "view_tags",
         "touched_object_types",

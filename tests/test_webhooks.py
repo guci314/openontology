@@ -20,6 +20,7 @@ from examples.webhook_codebuddy_listener import (
 from open_ontology import (
     Actor,
     CommandCenterRegistry,
+    InvariantError,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
@@ -165,10 +166,11 @@ def test_http_webhooks_crud_permission_and_approval_delivery():
         "create_item",
         params=_ApproveItemParams,
         allowed_roles=("worker", "admin"),
-        approver_roles=("manager",),
-        approval_rule=lambda p, actor: actor.role == "worker",
+        revert_roles=("manager",),
     )
     def create_item(ctx: Any, params: _ApproveItemParams) -> None:
+        if ctx.actor.role == "worker":
+            raise InvariantError("worker requires manager override", code="APPROVAL_REQUIRED_MANAGER")
         ctx.create(_ApprovalItem(item_id=params.item_id, status="ready"))
 
     runtime = OntologyRuntime(spec)
@@ -261,25 +263,27 @@ def test_http_webhooks_crud_permission_and_approval_delivery():
         sub_id = created_sub["subscription"]["sub_id"]
         assert created_sub["subscription"]["has_secret"] is True
 
-        # worker 提交需审批动作 -> PENDING_APPROVAL，尚未提交，不应触发 webhook
-        pending = _http(
-            "/api/worlds/ws-item/actions/create_item",
-            method="POST",
-            payload={"item_id": "IT-1"},
-            token="tok-worker",
-        )
-        assert pending["run"]["status"] == "PENDING_APPROVAL"
+        # worker 提交受阻触发 REJECTED（HTTP 400），不应触发 COMMITTED webhook
+        with pytest.raises(urllib.error.HTTPError) as exc400:
+            _http(
+                "/api/worlds/ws-item/actions/create_item",
+                method="POST",
+                payload={"item_id": "IT-1"},
+                token="tok-worker",
+            )
+        assert exc400.value.code == 400
+        exc400.value.close()
         assert registry.webhooks.flush(timeout=2.0)
         assert not caught_event_flag.is_set()
 
-        # manager 批准后提交 -> 触发 webhook 到达 listener 并唤醒执行器
-        approved = _http(
-            "/api/approve",
+        # admin 同步提交 -> 触发 webhook 到达 listener 并唤醒执行器
+        committed = _http(
+            "/api/worlds/ws-item/actions/create_item",
             method="POST",
-            payload={"workspace": "ws-item", "run_id": pending["run"]["run_id"]},
-            token="tok-mgr",
+            payload={"item_id": "IT-1"},
+            token="tok-admin",
         )
-        assert approved["run"]["status"] == "COMMITTED"
+        assert committed["run"]["status"] == "COMMITTED"
         assert caught_event_flag.wait(timeout=3.0)
         assert registry.webhooks.flush(timeout=2.0)
 

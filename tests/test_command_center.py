@@ -208,7 +208,7 @@ def test_simulate_is_side_effect_free(base):
         },
     )
     assert sim["valid"] is True
-    assert sim["requires_approval"] is False
+    assert "requires_approval" not in sim
     assert sim["diff"]["object_changes"]
     after = _get(base, "/api/fingerprint", instance="coldchain-wave3")
     assert before == after
@@ -567,7 +567,8 @@ def test_catalog_carries_runtimes_and_dual_device_registry(base):
     default = runtimes["rt-default-memory"]
     assert default["storage_kind"] == "memory"
     assert default["db_uri"] == "sqlite://:memory:"
-    assert len(default["aspects"]) == 8
+    assert len(default["aspects"]) == 7
+    assert "ApprovalGateAspect" not in default["aspects"]
     assert "IdleAwareCallbackAspect" in default["aspects"]
     assert "HomomorphicSettlementAspect" in default["aspects"]
 
@@ -635,7 +636,7 @@ def test_fork_registers_its_own_runtime_and_devices(base):
     forked_runtime = runtimes[f"rt-{new_id}"]
     assert forked_runtime["storage_kind"] == "memory"  # 克隆沙盘纯内存
     assert forked_runtime["instance_ids"] == [new_id]
-    assert len(forked_runtime["aspects"]) == 8
+    assert len(forked_runtime["aspects"]) == 7
 
     devices = _get(base, "/api/devices")
     cloned = [

@@ -65,7 +65,7 @@ def test_reject_action_and_run_event_hooks():
         )
         assert pending["status"] == "AWAITING_WORK_CARD"
         assert pending["work_card_status"] == "OPEN"
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
         assert ("RUN-OVER-001", "REJECTED") in events
         assert ("RUN-OVER-001-OPEN", "COMMITTED") in events
 
@@ -294,7 +294,7 @@ def test_four_act_real_odoo_feishu_approve_and_revert_loop(live_o2c_gateway):
     assert rt.get_action_run("LIVE-ACT1-INV")["status"] == "REJECTED"
     assert adapter.invoice_row("O2C-SO-001") is None
 
-    # Act 2: AI annotates overlay + submits 120k order -> PENDING_APPROVAL, Odoo still draft
+    # Act 2: AI annotates overlay + escalates 120k order -> M1 WorkCard OPEN, Odoo still draft
     rt.submit_action(
         "LIVE-ACT2-NOTE",
         "annotate_o2c_governance",

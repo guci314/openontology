@@ -299,7 +299,7 @@ def test_camel_cbr_south_large_ai_approval(stack: CamelStack):
     )
     assert pending["status"] == "AWAITING_WORK_CARD"
     assert pending["work_card_status"] == "OPEN"
-    assert stack.runtime.list_action_runs(status="PENDING_APPROVAL") == []
+    assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in stack.runtime.list_action_runs())
 
     before = stack.writeback()
     assert before["count"] == 0

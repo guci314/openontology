@@ -203,22 +203,13 @@ class ActionBlueprint(BaseModel):
     name: str
     description: str = ""
     allowed_roles: list[str] = Field(default_factory=lambda: ["admin", "ai_agent"])
-    approver_roles: list[str] = Field(default_factory=list)
     revert_roles: list[str] = Field(default_factory=list)
-    approval_rule: dict[str, Any] | None = None
-    approval_target_type: str | None = None
-    approval_id_param: str | None = None
     affects_source: bool = True
     params: list[FieldSpec] = Field(default_factory=list)
     preconditions: list[InvariantRuleSpec] = Field(default_factory=list)
     mutations: list[ActionMutationSpec] = Field(default_factory=list)
     view_tags: list[str] = Field(default_factory=list)
     display_label: str = ""
-
-    @field_validator("approval_rule", mode="before")
-    @classmethod
-    def _empty_approval_rule_to_none(cls, v: Any) -> Any:
-        return None if v == {} else v
 
 
 class ScopedViewBlueprint(BaseModel):
@@ -261,7 +252,6 @@ class EvalExpectationSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     valid: bool
-    requires_approval: bool | None = None
     error_code: str | None = None
     error_contains: str | None = None
     no_changes: bool | None = None
@@ -293,10 +283,7 @@ class ProposedEvalCase(BaseModel):
         if (
             isinstance(data, dict)
             and "expect" not in data
-            and any(
-                k in data
-                for k in ("expect_valid", "expect_error_code", "expect_requires_approval")
-            )
+            and any(k in data for k in ("expect_valid", "expect_error_code"))
         ):
             copied = dict(data)
             expect: dict[str, Any] = {}
@@ -304,8 +291,6 @@ class ProposedEvalCase(BaseModel):
                 expect["valid"] = copied.pop("expect_valid")
             if "expect_error_code" in copied:
                 expect["error_code"] = copied.pop("expect_error_code")
-            if "expect_requires_approval" in copied:
-                expect["requires_approval"] = copied.pop("expect_requires_approval")
             copied["expect"] = expect
             return copied
         return data
@@ -327,8 +312,6 @@ class EvolutionPatch(BaseModel):
     update_actions: list[ActionBlueprint] = Field(default_factory=list)
     add_invariants: list[InvariantRuleSpec] = Field(default_factory=list)
     remove_invariants: list[str] = Field(default_factory=list)
-    update_approval_rules: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    update_approver_roles: dict[str, list[str]] = Field(default_factory=dict)
     update_revert_roles: dict[str, list[str]] = Field(default_factory=dict)
     add_views: list[ScopedViewBlueprint] = Field(default_factory=list)
     update_views: list[ScopedViewBlueprint] = Field(default_factory=list)
@@ -392,23 +375,6 @@ def validate_predicate_ast(
         )
     _validate_expr_node(expr, expect_bool=True, allowed_roots=allowed_roots, allow_view=allow_view)
     return depth
-
-
-def _collect_ref_roots(node: Any) -> set[str]:
-    roots: set[str] = set()
-    if isinstance(node, dict):
-        if set(node.keys()) == {"lit"}:
-            return roots
-        if set(node.keys()) == {"ref"} and isinstance(node["ref"], str) and node["ref"]:
-            roots.add(node["ref"].split(".")[0])
-            return roots
-        for k, v in node.items():
-            if k != "lit":
-                roots.update(_collect_ref_roots(v))
-    elif isinstance(node, list):
-        for item in node:
-            roots.update(_collect_ref_roots(item))
-    return roots
 
 
 def _iter_ast_refs(node: Any) -> list[str]:
@@ -872,8 +838,6 @@ def _expr_removed_field_hit(
 
 
 def _resolve_blueprint_action_subject(act: ActionBlueprint) -> str | None:
-    if act.approval_target_type:
-        return act.approval_target_type
     for mut in act.mutations:
         if mut.op != "create" and mut.target_ref is None:
             return mut.object_type
@@ -974,22 +938,6 @@ def apply_evolution_patch(
             )
         candidate.actions[act_by_name[upd_act.name]] = copy.deepcopy(upd_act)
 
-    for act_name, rule_expr in patch.update_approval_rules.items():
-        if act_name not in act_by_name:
-            raise InvariantError(
-                f"patch sets approval_rule on unknown action {act_name!r}",
-                code="UNKNOWN_ACTION",
-            )
-        candidate.actions[act_by_name[act_name]].approval_rule = copy.deepcopy(rule_expr)
-
-    for act_name, roles in patch.update_approver_roles.items():
-        if act_name not in act_by_name:
-            raise InvariantError(
-                f"patch sets approver_roles on unknown action {act_name!r}",
-                code="UNKNOWN_ACTION",
-            )
-        candidate.actions[act_by_name[act_name]].approver_roles = list(roles)
-
     for act_name, roles in patch.update_revert_roles.items():
         if act_name not in act_by_name:
             raise InvariantError(
@@ -1082,18 +1030,6 @@ def apply_evolution_patch(
                             f"cannot remove {hit[0]}.{hit[1]} referenced by precondition {pre.name!r}",
                             code="FIELD_IN_USE",
                         )
-            if act.approval_rule is not None and anchor_type is not None:
-                hit = _expr_removed_field_hit(
-                    act.approval_rule,
-                    removed_by_type=removed_by_type,
-                    ot_by_name=ot_by_name,
-                    root_types={"obj": anchor_type},
-                )
-                if hit is not None:
-                    raise InvariantError(
-                        f"cannot remove {hit[0]}.{hit[1]} referenced by approval_rule on {act.name!r}",
-                        code="FIELD_IN_USE",
-                    )
             for mut in act.mutations:
                 if mut.target_ref and anchor_type is not None:
                     hit = _ref_hits_removed_field(
@@ -1647,21 +1583,6 @@ def compile_blueprint(
         action_bp: ActionBlueprint,
         pdefs: dict[str, Any],
     ) -> tuple[type[ObjectType] | None, str | None]:
-        if action_bp.approval_target_type is not None:
-            if action_bp.approval_target_type not in created_classes:
-                raise InvariantError(
-                    f"action {action_bp.name!r} approval_target_type references unknown "
-                    f"{action_bp.approval_target_type!r}",
-                    code="UNKNOWN_OBJECT_TYPE",
-                )
-            s_cls = created_classes[action_bp.approval_target_type]
-            s_idp = action_bp.approval_id_param or s_cls.__primary_key__
-            if s_idp not in pdefs:
-                raise InvariantError(
-                    f"action {action_bp.name!r} approval_id_param {s_idp!r} not in params",
-                    code="MISSING_ID_PARAM",
-                )
-            return s_cls, s_idp
         for m in action_bp.mutations:
             if m.op != "create" and m.target_ref is None and m.id_param in pdefs:
                 return created_classes[m.object_type], m.id_param
@@ -1731,61 +1652,6 @@ def compile_blueprint(
                 mut_roots = frozenset({"obj", "param", "actor"})
             for fv in mut.set_fields.values():
                 _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
-
-        approval_fn: Callable[..., bool] | None = None
-        if act.approval_rule is not None:
-            approval_roots = (
-                frozenset({"obj", "param", "actor"})
-                if subject_cls is not None
-                else frozenset({"param", "actor"})
-            )
-            validate_predicate_ast(act.approval_rule, allowed_roots=approval_roots, allow_view=True)
-            rule_ast = copy.deepcopy(act.approval_rule)
-            ast_needs_obj = "obj" in _collect_ref_roots(rule_ast)
-
-            def _make_approval(
-                ast_node: dict[str, Any],
-                subj_cls: type[ObjectType] | None,
-                subj_id_param: str | None,
-                needs_obj: bool,
-            ) -> Callable[..., bool]:
-                def _needs_approval(
-                    params: BaseModel,
-                    actor: Actor,
-                    view: EditBatch | InvariantView | None = None,
-                ) -> bool:
-                    eval_ctx: dict[str, Any] = {"param": params, "actor": actor}
-                    if needs_obj:
-                        if view is None:
-                            raise InvariantError(
-                                "approval_rule referencing 'obj' requires an active sandbox view",
-                                code="MISSING_SANDBOX_VIEW",
-                            )
-                        assert subj_cls is not None and subj_id_param is not None
-                        target_id = getattr(params, subj_id_param, None)
-                        if target_id is None:
-                            raise InvariantError(
-                                f"approval_rule missing non-null {subj_id_param!r}",
-                                code="MISSING_ID_PARAM",
-                            )
-                        eval_ctx["obj"] = view.require(subj_cls, str(target_id))
-                    elif (
-                        view is not None
-                        and subj_cls is not None
-                        and subj_id_param is not None
-                        and hasattr(params, subj_id_param)
-                    ):
-                        target_id = getattr(params, subj_id_param, None)
-                        if target_id is not None:
-                            loaded = view.get(subj_cls, str(target_id))
-                            if loaded is not None:
-                                eval_ctx["obj"] = loaded
-                    return eval_predicate(ast_node, eval_ctx, view)
-
-                _needs_approval._accepts_view = True  # type: ignore[attr-defined]
-                return _needs_approval
-
-            approval_fn = _make_approval(rule_ast, subject_cls, subject_id_param, ast_needs_obj)
 
         def _make_action_handler(
             action_bp: ActionBlueprint,
@@ -1904,15 +1770,11 @@ def compile_blueprint(
         touched_types = {mut.object_type for mut in act.mutations} | {
             pre.target_type for pre in act.preconditions
         }
-        if act.approval_target_type is not None:
-            touched_types.add(act.approval_target_type)
         spec.action(
             act.name,
             params_cls,
             allowed_roles=tuple(act.allowed_roles),
-            approver_roles=tuple(act.approver_roles),
             revert_roles=tuple(act.revert_roles),
-            approval_rule=approval_fn,
             affects_source=act.affects_source,
             description=act.description,
             view_tags=tuple(act.view_tags),

@@ -886,7 +886,7 @@ def run_downstream_agent_ab_benchmark(
             except InvariantError as exc:
                 s3_ai_err = exc.code or ""
             assert s3_ai_err == "APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED"
-            assert wc_rt.list_action_runs(status="PENDING_APPROVAL") == []
+            assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in wc_rt.list_action_runs())
             wc_rt.submit_action(
                 "AUD-S3-WC-OPEN",
                 "open_work_card",
@@ -906,7 +906,7 @@ def run_downstream_agent_ab_benchmark(
             assert wc_settled["settled_action_run"]["status"] == "COMMITTED"
             assert wc_rt.get_object(WorkCard, "WC-AUD-S3", STEWARD_OPS_ACTOR).status == "COMPLETED"
             assert harness.read_order(s3_wc_seed.order.order_id)["state"] == "sale"
-            assert wc_rt.list_action_runs(status="PENDING_APPROVAL") == []
+            assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in wc_rt.list_action_runs())
             s3_wc_audit = {
                 "blocked_code": s3_ai_err,
                 "work_card_status": "COMPLETED",

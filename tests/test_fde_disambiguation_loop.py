@@ -170,7 +170,6 @@ def test_gray_zone_disambiguation_e2e_all_three_steward_rulings(
                 params={limit_amb.id_param: limit_amb.sample_compliant_id},
                 actor=AI_OPS_ACTOR,
                 expected_valid=True,
-                expected_requires_approval=False,
             ),
         ]
         evo_ctx = CrucibleContext(
@@ -268,7 +267,7 @@ def test_gray_zone_disambiguation_e2e_all_three_steward_rulings(
                 exc_status = "REJECTED"
                 exc_code = exc.code
             assert exc_status == expected_exceed_status
-            assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+            assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
             if choice_id == "HARD_REJECT":
                 assert exc_code == limit_amb.error_code
@@ -300,7 +299,7 @@ def test_gray_zone_disambiguation_e2e_all_three_steward_rulings(
                 assert settled["status"] == "COMMITTED"
                 assert settled["settled_action_run"]["status"] == "COMMITTED"
                 assert rt.get_object(WorkCard, "WC-GZ-01", STEWARD_OPS_ACTOR).status == "COMPLETED"
-                assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+                assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
             out_ok = rt.submit_action(
                 "GZ-RT-OK",

@@ -10,9 +10,8 @@
    :class:`DeviceStateMismatchError`，先用携带的真实观测刷新记忆棋盘，再基于新棋盘
    触发重规划。
 
-严格遵守马尔可夫无队列状态原则：不维护第二套待执行棋步队列，挂起审批仅保留在
-``ontology_action_runs (status='PENDING_APPROVAL')``，控制器冷重启后可从物理快照直接
-续算。
+严格遵守马尔可夫无队列状态原则：不维护第二套待执行棋步队列，挂起协同状态仅存在于
+M1 领域的协同工单/工作卡实体中，控制器冷重启后可从物理快照直接续算。
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
-from .aspects import AUDIT_STATUS_COMMITTED, AUDIT_STATUS_PENDING, AUDIT_STATUS_REJECTED
+from .aspects import AUDIT_STATUS_COMMITTED, AUDIT_STATUS_REJECTED
 from .mcts import (
     CandidateAction,
     CandidateGenerator,
@@ -45,14 +44,14 @@ __all__ = [
     "MPCResult",
     "MPCStepRecord",
     "MPC_GOAL_REACHED",
-    "MPC_AWAITING_APPROVAL",
+    "MPC_AWAITING_EXTERNAL",
     "MPC_MAX_REPLANS_EXCEEDED",
     "MPC_MAX_STEPS_EXCEEDED",
     "MPC_UNREACHABLE",
 ]
 
 MPC_GOAL_REACHED = "GOAL_REACHED"
-MPC_AWAITING_APPROVAL = "AWAITING_APPROVAL"
+MPC_AWAITING_EXTERNAL = "AWAITING_EXTERNAL"
 MPC_MAX_REPLANS_EXCEEDED = "MAX_REPLANS_EXCEEDED"
 MPC_MAX_STEPS_EXCEEDED = "MAX_STEPS_EXCEEDED"
 MPC_UNREACHABLE = "UNREACHABLE"
@@ -290,20 +289,14 @@ class ClosedLoopMPCController:
                 snapshots_refreshed += 1
 
         while True:
-            # 1) 领域无关的在途协同/审批等待检查（优先 M1 工作卡回调，兼容 Phase 3 遗留 PENDING_APPROVAL）
+            # 1) 领域无关的在途外部协同等待检查（M1 工作卡回调等）
             if self.pending_check is not None:
                 pending_id = self.pending_check(self.runtime)
                 if pending_id:
                     return _result(
-                        MPC_AWAITING_APPROVAL,
+                        MPC_AWAITING_EXTERNAL,
                         awaiting_run_id=str(pending_id),
                     )
-            awaiting = self.runtime.list_action_runs(status=AUDIT_STATUS_PENDING)
-            if awaiting:
-                return _result(
-                    MPC_AWAITING_APPROVAL,
-                    awaiting_run_id=str(awaiting[0]["run_id"]),
-                )
 
             # 2) 目标判据满足 -> 收敛结束
             if self._is_goal_reached():
@@ -364,7 +357,7 @@ class ClosedLoopMPCController:
                                 run_id=rid,
                                 action_type=first.action,
                                 params=dict(first.params),
-                                status=MPC_AWAITING_APPROVAL,
+                                status=MPC_AWAITING_EXTERNAL,
                                 planned_horizon=len(plan),
                                 resumed=False,
                                 snapshot_refreshed=False,
@@ -373,7 +366,7 @@ class ClosedLoopMPCController:
                             )
                         )
                         return _result(
-                            MPC_AWAITING_APPROVAL,
+                            MPC_AWAITING_EXTERNAL,
                             awaiting_run_id=str(escalated_id),
                         )
                 trajectory.append(
@@ -393,19 +386,6 @@ class ClosedLoopMPCController:
                     return _result(MPC_MAX_REPLANS_EXCEEDED)
                 replans_used += 1
                 continue
-
-            if outcome["status"] == AUDIT_STATUS_PENDING:
-                trajectory.append(
-                    MPCStepRecord(
-                        run_id=rid,
-                        action_type=first.action,
-                        params=dict(first.params),
-                        status=AUDIT_STATUS_PENDING,
-                        planned_horizon=len(plan),
-                        resumed=False,
-                    )
-                )
-                return _result(MPC_AWAITING_APPROVAL, awaiting_run_id=rid)
 
             trajectory.append(
                 MPCStepRecord(

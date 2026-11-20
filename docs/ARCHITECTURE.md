@@ -40,7 +40,7 @@ flowchart TB
     subgraph RUNTIME["3. Runtime / 执行引擎（世界模拟器与治理宿体）"]
         direction TB
         CORE["① Runtime.Core 微内核｜EditBatch 内存沙箱 · ObjectDiff · fork() 平行世界推演 · ontology_write_gate 写门禁"]
-        ASPECT["② Runtime.Aspect 八大系统调用切面｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 审批 / 时光机 · 被拒审计 · 反射 · 忙闲回调 · 同态结算"]
+        ASPECT["② Runtime.Aspect 七大系统调用切面｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 被拒审计 · 反射 · 忙闲回调 · 同态结算"]
         ADAPTER["③ Runtime.DeviceAdapter 设备驱动｜SnapshotIngestionDriver"]
         CORE <--> ASPECT
         CORE <--> ADAPTER
@@ -89,8 +89,8 @@ World <world_id / workspace_id>（M0 隔离业务世界）
 | **TBox 结构** | **`InterfaceType`** | `spec.interface(name, required_fields=...)` | 跨对象类型的多态接口契约；实现该接口的 `ObjectType` 必须在 `__interfaces__` 中显式声明，并在注册时强校验 `required_fields` 齐全。 |
 | **TBox 结构** | **`ObjectProperty`** | 字段注解 `ObjectProperty[Target]` / `ObjectProperty[tuple[Target, ...]]` 或 `spec.object_property(...)` | OWL 对象属性：声明有向强类型关系 `domain` → `range`、基数 `cardinality`（`one-to-one` / `one-to-many` / `many-to-one` / `many-to-many`）及 `owned` 连边主权标记；动作提交时自动同步关系三元组并强制引用完整性（`TARGET_NOT_FOUND`）。 |
 | **Behavior 行为** | **`FunctionDef`** | `@spec.function(name, params=...)` | 严格只读计算（`read_only=True`）：接收强类型 Pydantic `params`，在注入列级脱敏的沙箱内执行查询/聚合，任何暂存写变更一律丢弃。 |
-| **Behavior 行为** | **`ActionDef`** | `@spec.action(name, params=..., allowed_roles=...)` | **唯一合法的状态变迁入口**：声明 RBAC 角色授权、条件审批规则（`approval_rule` / `approver_roles`）、`affects_source`、`post_approval` 两段式钩子，并在处理器内以 `InvariantError` 强制业务不变量。 |
-| **Behavior 行为** | **`InvariantDef` / `TransitionInvariantDef`** | `@spec.invariant` / `@spec.transition_invariant` | 声明式公理门禁：前者校验后置快照终态，后者校验单次 `ObjectDiff` 状态跃迁合法性与守恒律；在模拟、提交与审批恢复时统一强制。 |
+| **Behavior 行为** | **`ActionDef`** | `@spec.action(name, params=..., allowed_roles=...)` | **唯一合法的状态变迁入口**：声明同步 RBAC 角色授权（`allowed_roles` / `revert_roles`）、`affects_source` 与可见性，并在处理器内以 `InvariantError` 强制业务不变量（协同审批由 M1 领域协同实体如 `WorkCard` 显式建模）。 |
+| **Behavior 行为** | **`InvariantDef` / `TransitionInvariantDef`** | `@spec.invariant` / `@spec.transition_invariant` | 声明式公理门禁：前者校验后置快照终态，后者校验单次 `ObjectDiff` 状态跃迁合法性与守恒律；在模拟与同步提交时统一强制。 |
 | **Behavior 行为** | **`AutomationDef`** | `@spec.automation(name, watch_object_type=..., condition=...)` | 提交后事件驱动条件反射：监听目标 `ObjectType` 变更，满足 `condition(obj)` 时由 `AutomationReflexAspect` 按对象版本号去重触发 `handler(runtime, obj, actor)`。 |
 | **安全与沙箱** | **`Actor`** | `Actor(actor_id, role, clearance_tags)` | 显式零信任调用方身份：`role` 参与 RBAC 与列级脱敏判断，`clearance_tags`（或通配符 `"*"`）驱动 RLS 行级可见性过滤。 |
 | **集合代数** | **`ObjectSet`** | `query.py`（`ObjectSet` / `AggregationResult`） | 按主键去重、保持源顺序的只读对象集合容器，支撑集合检索、链式遍历与聚合计算。 |
@@ -99,7 +99,7 @@ World <world_id / workspace_id>（M0 隔离业务世界）
 **各核心原语的关键契约约束**：
 1. **`ObjectType` 的类级元数据**：`__primary_key__`（主键字段，默认 `"id"`）、`__title__`（标题字段）、`__abstract__`（仅看当前类自身 `__dict__` 的抽象基类标记，不沿 MRO 自动传递）、`__append_only__`（只追加不可变事实标记，禁止 `Action` 对存量行执行改/删）、`__aggregate_root__`（显式聚合根标记，默认 `False`）、`__owned__`（字段主权标记：`bool | dict[str, Any]`）、`__interfaces__`（实现的接口名元组）、`__security_tag_fields__`（自动派生 `field:value` 行级安全标签的字段元组）与 `__masked_fields__` / `__mask_defaults__`（列级脱敏白名单 `{字段名: (明文角色, ...)}` 与自定义掩码值）；其中 `__interfaces__`、`__masked_fields__`、`__mask_defaults__` 与 `__owned__` 沿继承链自动合并。
 2. **`FunctionDef` 与 `ActionDef` 的严格隔离**：所有业务查询与计算封装在 `FunctionDef`（读出口脱敏开启、物理表零变更）；所有写入封装在 `ActionDef`（读出口脱敏关闭、先经 `EditBatch` 沙箱与 `InvariantError` 校验再编译 `ObjectDiff`，禁止跳过 `ActionDef` 直接执行裸 CRUD）。
-3. **两段式动作与自动化闭环**：当 `ActionDef` 挂起为 `PENDING_APPROVAL` 并经 `approve_action` 批准后，若声明了 `post_approval(batch, params)` 钩子，仅对其新增增量再做主权校验并合并落库；每次 `COMMITTED` 落库后，内核自动委托 `evaluate_automations` 评估匹配的 `AutomationDef`。
+3. **同步提交与自动化闭环**：`ActionDef` 为纯同步确定性状态转移（不存在任何 M2 异步挂起态，协同审批或异常升级由 M1 实体状态机显式承载）；每次 `COMMITTED` 落库后，内核自动委托 `evaluate_automations` 评估匹配的 `AutomationDef`。
 
 ```mermaid
 flowchart LR
@@ -114,7 +114,7 @@ flowchart LR
         end
         subgraph BEHAV_BOX["Behavior 行为原语"]
             FN["FunctionDef｜read_only 只读计算 · 脱敏投影"]
-            ACT["ActionDef｜唯一合法写入口 · RBAC · 审批 · InvariantError"]
+            ACT["ActionDef｜唯一合法写入口 · RBAC · 冲正 · InvariantError"]
             AUTO["AutomationDef｜提交后条件反射 · 版本去重触发"]
         end
     end
@@ -125,7 +125,7 @@ flowchart LR
     DIFF["ObjectDiff｜精确可逆对象/连边变更集"]
 
     ACTOR -->|"授权与可见性校验"| FN
-    ACTOR -->|"授权与审批校验"| ACT
+    ACTOR -->|"RBAC 与权限校验"| ACT
     FN -->|"只读执行（丢弃写入）"| BATCH
     BATCH -->|"集合检索与聚合"| OSET
     ACT -->|"沙箱暂存读写与不变量校验"| BATCH
@@ -181,11 +181,9 @@ sequenceDiagram
 
     User->>R: 调用 ActionDef（simulate_action / submit_action）
     R->>R: 1.幂等短路 -> 2.RBAC -> 3.Schema -> 4.EditBatch 沙箱（RLS + 不变量）-> 5.字段主权门禁
-    alt 违反不变量（InvariantError）
+    alt 违反不变量或权限门禁（InvariantError）
         R->>W: RejectionAuditAspect 记入 REJECTED 审计（ABox 事实零改动）
-    else 需要审批
-        R->>W: ApprovalGateAspect 挂起为 PENDING_APPROVAL
-    else 门禁通过
+    else 门禁与回读核验通过
         R->>W: 开启 ontology_write_gate + OCC 版本复核 -> 原子写入 ABox 与 COMMITTED 审计
     end
 ```
@@ -216,11 +214,10 @@ sequenceDiagram
 │   ColumnMaskingAspect          读出口列级脱敏投影                    │
 │   SecurityAndAuthorityAspect   RBAC / 字段主权门禁（__owned__）      │
 │   IdempotencyAndOCCAspect      幂等短路 / MVCC 乐观锁                │
-│   ApprovalGateAspect           审批软中断 / 批准恢复 / 时光机回滚    │
 │   RejectionAuditAspect         不变量被拒企图入账                    │
 │   AutomationReflexAspect       提交后条件反射与版本去重              │
 │   IdleAwareCallbackAspect      忙闲感知回调（忙时入队、闲时 FIFO）   │
-│   HomomorphicSettlementAspect  三阶段无锁同态回读核销与收敛提交      │
+│   HomomorphicSettlementAspect  三阶段无锁同态回读核销与时光机冲正      │
 ├──────────────────────────────────────────────────────────────────────┤
 │ ③ 设备驱动 / Runtime.DeviceAdapter (Device Drivers)                  │
 │   ingestion.py        SnapshotIngestionDriver 快照摄入与多源列拼接   │
@@ -243,12 +240,12 @@ sequenceDiagram
 |---|---|
 | 它描述某个具体业务领域的类型、关系或沙箱内状态转移规则吗？ | **用户程序**（独立 M1 Model 模块） |
 | 它是所有工作空间共享的对象页表、沙箱 `EditBatch`/`ObjectDiff` 或 `fork()` 骨架吗？ | **微内核**（`Runtime.Core`） |
-| 它是对每次读写/提交无条件生效的权限、脱敏、幂等、审批、审计或回调切面吗？ | **系统调用切面**（`Runtime.Aspect`） |
+| 它是对每次读写/提交无条件生效的权限、脱敏、幂等、审计或同态结算切面吗？ | **系统调用切面**（`Runtime.Aspect`） |
 | 它适配外部 OpenAPI 系统快照或外部协议通信吗？ | **设备驱动**（`Runtime.DeviceAdapter`） |
 | 它是领域无关的树搜索规划、工具导出、工作空间目录或 HTTP/UI 通用展示协议吗？ | **内核外围 M2 支撑与传输边界** |
 
 **微内核行数预算与依赖方向约束**：
-* **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1400 行**（`test_runtime_line_budget` 硬门禁）。超出预算时必须审视逻辑是否属于 `aspects.py`、驱动层或外围支撑层，严禁放宽预算阈值。
+* **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1350 行**（`test_runtime_line_budget` 硬门禁）。超出预算时必须审视逻辑是否属于 `aspects.py`、驱动层或外围支撑层，严禁放宽预算阈值。
 * **单向依赖铁律**：切面（`aspects.py`）与设备驱动只能通过微内核既定入口（`spec` / `_write_gate()` / `_apply_diff()` / `get_action_run()` / `load_snapshot` / `submit_action`）工作，严禁反向 `import` `runtime.py`（`test_aspects_module_is_self_contained`），也不得绕过治理管线直改底层表。微内核除保留 `SnapshotIngestionDriver` 快照门面委托外，不得新增对外部协议驱动或 HTTP 传输层的静态依赖；`examples/kanban.py` 与历史包内的 `dev_factory.py` 严禁进入 `open_ontology/__init__.py` 导出表。
 
 ---
@@ -277,28 +274,28 @@ sequenceDiagram
   2. **RBAC 角色授权**（校验 `actor.role in action.allowed_roles`）
   3. **Pydantic 入参 Schema 校验**（构造强类型参数模型）
   4. **沙箱处理器执行**（期间按访问动态执行 **RLS 行级安全标签校验**——读不可见行隐藏、写无权限行抛错——以及领域 **`InvariantError` 业务不变量校验**；若在 `submit_action` 中违反不变量则由 `RejectionAuditAspect` 记录 `REJECTED` 审计并重抛）
-  5. **字段主权门禁**（`SecurityAndAuthorityAspect` 校验变更未越界混写 Source-Backed 与 `__owned__` 字段）。若动作声明了 `post_approval` 钩子，则第一段 `handler` 的 diff 先受检，钩子执行后再由 `SecurityAndAuthorityAspect.check_post_approval_authority` **只针对钩子追加出来的增量**（新对象/新连边，以及既有对象在钩子前后的字段差）复检：两段各自只允许落在**一个**主权平面上，钩子增量自身跨平面即抛 `MIXED_AUTHORITY`，而合并后的整份 diff 不参与跨平面比对（同平面两段式提交是合法的）。
-  6. **审批软中断或 OCC 原子提交**：需审批时挂起为 `PENDING_APPROVAL`（对象表零改动）；无需审批（或后续 `approve_action` 批准）时，在写门禁事务内执行 **OCC 乐观并发版本复核（`ConcurrencyConflictError`）** 并原子写入对象、连边与 `COMMITTED` 审计记录。
+  5. **字段主权门禁**（`SecurityAndAuthorityAspect` 校验变更未越界混写 Source-Backed 与 `__owned__` 字段，同时校验全局与跃迁不变量）。
+  6. **同步同态结算与 OCC 原子提交**：M2 内核不设异步挂起态，门禁通过后直接经 `HomomorphicSettlementAspect`（或独立模式下写门禁事务内）完成 **OCC 乐观并发版本复核（`ConcurrencyConflictError`）** 与同态回读核验，原子写入对象、连边与 `COMMITTED` 审计记录（协同挂起态由 M1 协同工作卡等域内实体承载）。
 * **显式 `Actor` 零信任约束**：面向 HTTP 路由、指挥台 UI、工作空间枚举或外部 Agent 的一切查询与 `FunctionDef` 调用，必须显式传入真实调用方 `Actor`，严禁在外部可达入口依赖缺省 `system` 角色绕过 RLS 或列级脱敏。
 * **读出口脱敏的作用面**：`EditBatch` 可注入读脱敏回调，但只有**只读** `FunctionDef` 批处理会注入；动作批处理永不脱敏，确保暂存 diff 只会写入真实值，绝不会把 `***MASKED***` 落库。
 
 ### 3.3 反事实空间推演、双世界同态结算与闭环规划（Counterfactual Space & Continual Planning）
 * **同一世界模型下的运行模式边界（同构 6 表不变量）**：`OntologyRuntime` 通过显式 `world_mode`（`standalone` / `coupled` / `counterfactual`）复用同一套 6 表世界模型，并强制划分事实世界与想象空间的物理边界：
   * **`world_mode="standalone"`**：独立实然世界状态，无外部 `SourceBridge`，动作直接经 OCC 原子提交；
-  * **`world_mode="coupled"`**：耦合实然世界状态，绑定 `SourceBridge`，凡触碰非自有（source-backed）对象的提交/审批/冲正统一走 `HomomorphicSettlementAspect` 闭环；
+  * **`world_mode="coupled"`**：耦合实然世界状态，绑定 `SourceBridge`，凡触碰非自有（source-backed）对象的提交/冲正统一走 `HomomorphicSettlementAspect` 闭环；
   * **`world_mode="counterfactual"`**：反事实想象空间，严格强制 `db_path=":memory:"` 且 `source_bridge=None`，物理绝缘外部设备与磁盘状态。
 * **反事实空间隔离分叉（`runtime.fork()`）**：复用同一 `OntologySpec`，通过 SQLite backup 将当前世界状态与历史克隆至独立 `:memory:` 且 `world_mode="counterfactual"` 的推演沙盘（与实然世界状态及外部设备物理隔离、零写入承诺）。
 * **前瞻树搜索与价值函数评估（`OntologyMCTSPlanner`）**：**规划器（Planner）** 在 `fork()` 反事实空间上枚举候选动作序列，自动剪除违反 `InvariantError` 的非法分支与死局状态（`dead_end`），依据**价值函数（Value Function，`@spec.function` 显式效用算分与树节点 `Q(s, a)` 动作价值估计）**择优决策。
-* **默认无锁三阶段同态结算（`HomomorphicSettlementAspect` 与 `SourceBridge`，实现在 `open_ontology/settlement.py`）**：彻底淘汰独立持久队列文件，将“反事实预测 → 外部驱动 → 独立只读回读核验 → 原子提交或零污染拒收”内化为 `OntologyRuntime.submit_action`、`approve_action` 与 `revert_action` 的默认通道——Phase A 在纯内存沙箱推演预期差集 $\hat{\Delta}$ 并通过权责与不变量门控（需审批直接停在 `PENDING_APPROVAL`，不触发外写）；Phase B 完全释放 SQLite 写门禁后调用 `SourceBridge.actuate` 并**丢弃写响应文本**，仅采信独立 `SourceBridge.observe` 回读到的物理终态；Phase C 逐项比对非自有字段与连边，一致则原子提升入主世界并记 `COMMITTED`（支持并发快照抢跑收敛至同一终态时的无损合并），失配则主库事实零改动记 `REJECTED`（`DEVICE_STATE_MISMATCH`）并抛出 `DeviceStateMismatchError`；`coupled` 下的 `revert_action` 默认禁止自动反冲外部源（`SOURCE_REVERT_FORBIDDEN`），仅当 `SourceBridge(allow_source_revert=True)` 时走同态冲正闭环。
+* **默认无锁三阶段同态结算（`HomomorphicSettlementAspect` 与 `SourceBridge`，实现在 `open_ontology/settlement.py`）**：彻底淘汰独立持久队列文件与 M2 异步挂起态，将“反事实预测 → 外部驱动 → 独立只读回读核验 → 原子提交或零污染拒收”内化为 `OntologyRuntime.submit_action` 与 `revert_action` 的唯一同步通道——Phase A 在纯内存沙箱推演预期差集 $\hat{\Delta}$ 并通过权责与不变量门控（不越权不触外写）；Phase B 完全释放 SQLite 写门禁后调用 `SourceBridge.actuate` 并**丢弃写响应文本**，仅采信独立 `SourceBridge.observe` 回读到的物理终态；Phase C 逐项比对非自有字段与连边，一致则原子提升入主世界并记 `COMMITTED`（支持并发快照抢跑收敛至同一终态时的无损合并），失配则主库事实零改动记 `REJECTED`（`DEVICE_STATE_MISMATCH`）并抛出 `DeviceStateMismatchError`；`coupled` 下的 `revert_action` 默认禁止自动反冲外部源（`SOURCE_REVERT_FORBIDDEN`），仅当 `SourceBridge(allow_source_revert=True)` 时走同态冲正闭环。
 * **无状态滚动时域闭环规划器（`ClosedLoopMPCController`，实现在 `open_ontology/mpc.py`）**：直接驱动主 `OntologyRuntime` 执行“多步想象、单步承诺、独立核销、滚动重算”，不依赖本地待执行队列；若 `observe_fn` 揭示外部偏离预期，先执行 `load_snapshot` 刷新实然信念态再在线重规划（支持 `refresh_on_start=True` 马尔可夫冷重启恢复），并受 `max_replans` 与 `max_steps` 护栏封顶。
-* **因果账本与逆向冲正（`runtime.approve_action` / `runtime.revert_action`，委托 `ApprovalGateAspect` / `HomomorphicSettlementAspect`）**：基于持久化 `ObjectDiff` 与版本号执行带冲突检测的精确逆向回滚，并支持提交后 `evaluate_automations` 条件反射与版本级去重。
-* **指挥台运行视角**：`Runtime · 算力与治理宿体` 展示宿体配置与已挂载的八大 `Aspect` 链路（含 `HomomorphicSettlementAspect`）。
+* **因果账本与逆向冲正（`runtime.revert_action`，委托 `HomomorphicSettlementAspect.settle_revert`）**：基于持久化 `ObjectDiff` 与版本号执行带 `revert_roles` 校验与冲突检测的精确逆向回滚，并支持提交后 `evaluate_automations` 条件反射与版本级去重。
+* **指挥台运行视角**：`Runtime · 算力与治理宿体` 展示宿体配置与已挂载的七大 `Aspect` 链路（含 `HomomorphicSettlementAspect`）。
 
 ### 3.4 指挥台四展示视角与领域无关图形协议（4-View Command Center）
 * **指挥台展示视角**（一级标签升级为 `Model / Runtime / World / Device`，代码与 HTTP 兼容映射见第 6 节）：
   1. **Model / 领域模型视角**（`Model · 领域模型`）：查看结构 TBox、Behavior 操作契约及 `/topology` 全景矢量图（对象、关系、动作、函数及可选自动化规则）；
   2. **Runtime / 执行引擎视角**（`Runtime · 算力与治理宿体`）：查看运行宿体配置（`:memory:` / `.sqlite3`、已挂载的七大 `Aspect` 与适配器）；
-  3. **World / 世界状态视角**（`World · 世界状态`，代码兼容别名 `Workspace`）：选择业务世界及聚合根入口，查看 ABox 事实，执行干跑、正式提交、`fork()` / MCTS 推演、审批与时光机回滚；
+  3. **World / 世界状态视角**（`World · 世界状态`，代码兼容别名 `Workspace`）：选择业务世界及聚合根入口，查看 ABox 事实，执行干跑、同步提交、`fork()` / MCTS 推演与时光机回滚；
   4. **Device / 外部设备视角**（`Device · 外部工具与设备`）：检视外部系统与工具契约（OpenAPI Schema）。
 * **展示词条自治（`OntologySpec.display`）**：内核 `ui_display.json` 仅保留跨领域通用界面词汇；各 M1 模型必须在自身 `spec.display` 中自带中文词条。TBox/ABox 为逻辑投影，不拆成两个一级标签页。
 
@@ -324,7 +321,7 @@ sequenceDiagram
 2. **内核词典零业务膨胀**：新增或修改 M1 业务模型必须在自身 `spec.display` 中携带中文标签，严禁修改 `open_ontology/ui_display.json`（`test_business_display_terms_live_in_their_own_spec`）。
 3. **通用 UI 引擎零领域泄漏**：`open_ontology/workshop.py` 与 `open_ontology/workshop_ui.py` 严禁出现任何特定 M1 业务领域的私有字段名或专属流程图路由（`test_ui_kernel_has_no_board_domain_fields`、`test_m2_workshop_has_no_process_flow_pollution`）。
 4. **数据库六表纯洁性与无损预检**：`open_ontology/schema.sql` 严格保持 5 张业务治理表加 1 张写门禁表，不混入行业私有列或外部消息队列表（`test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts`）；无损重开已有 SQLite 文件前必须完整校验六表齐全，禁止静默修补半成品库。
-5. **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1400** 行（`test_runtime_line_budget`）。
+5. **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1350** 行（`test_runtime_line_budget`）。
 6. **切面零反向依赖**：`open_ontology/aspects.py` 不得 `import` 内核运行时，微内核不得重写已委托给切面的治理逻辑（`test_aspects_module_is_self_contained`、`test_kernel_delegates_to_aspects_not_reimplements`）。
 
 ---

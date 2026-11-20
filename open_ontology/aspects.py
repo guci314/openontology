@@ -3,7 +3,7 @@
 **架构定位**：本模块是「计算机切片」，不是微内核本体。
 
 微内核（``spec.py`` / ``sandbox.py`` / ``runtime.py``）负责状态页表与系统
-调用管线；本模块把散落在管线里的**横切关注点**收拢成五个具名切面：
+调用管线；本模块把散落在管线里的**横切关注点**收拢成具名切面：
 
 ===================================  ========================================
 切面                                  负责什么
@@ -11,7 +11,6 @@
 ``ColumnMaskingAspect``               读出口列级脱敏（列级 RLS 投影）
 ``SecurityAndAuthorityAspect``        RBAC 角色门禁 + 字段主权边界校验
 ``IdempotencyAndOCCAspect``           幂等短路 + MVCC 乐观锁版本校验
-``ApprovalGateAspect``                审批软中断挂起 / 批准恢复 / 时光机回滚
 ``RejectionAuditAspect``              业务不变量被拒时的入账审计
 ``AutomationReflexAspect``            提交后自动化条件反射与去重
 ``IdleAwareCallbackAspect``           忙闲感知的回调投递（忙时暂存、闲时重放）
@@ -48,20 +47,17 @@ __all__ = [
     "ColumnMaskingAspect",
     "SecurityAndAuthorityAspect",
     "IdempotencyAndOCCAspect",
-    "ApprovalGateAspect",
     "RejectionAuditAspect",
     "AutomationReflexAspect",
     "IdleAwareCallbackAspect",
     "insert_action_run",
     "AUDIT_STATUS_REJECTED",
-    "AUDIT_STATUS_PENDING",
     "AUDIT_STATUS_COMMITTED",
     "AUDIT_STATUS_REVERTED",
 ]
 
 #: 被拒运行的审计状态值。
 AUDIT_STATUS_REJECTED = "REJECTED"
-AUDIT_STATUS_PENDING = "PENDING_APPROVAL"
 AUDIT_STATUS_COMMITTED = "COMMITTED"
 AUDIT_STATUS_REVERTED = "REVERTED"
 
@@ -302,109 +298,6 @@ class SecurityAndAuthorityAspect:
             if isinstance(dom_owned, dict):
                 return bool(dom_owned.get(decl.field, False))
         return False
-
-    @classmethod
-    def _incremental_side(cls, spec: Any, pre: Any, full: Any) -> str | None:
-        """``post_approval`` 在既有变更之上追加出来的那部分属于哪个平面。"""
-        obj_cls = spec.get_object_type(full.object_type)
-        if obj_cls.is_fully_owned():
-            return "ontology"
-        if full.kind == "delete" or pre.kind == "delete":
-            # 追加阶段删掉 / 重建底表行：结构性变化属于 source 侧行为
-            return "source"
-        return cls._field_side(obj_cls, pre.after or {}, full.after or {})
-
-    @classmethod
-    def check_post_approval_authority(
-        cls,
-        spec: Any,
-        action: ActionDef,
-        pre_diff: ObjectDiff,
-        full_diff: ObjectDiff,
-    ) -> None:
-        """只判定 ``post_approval`` 追加出来的增量是否跨主权平面。
-
-        两相动作的第一阶段（``handler``）与第二阶段（``post_approval``）各自
-        只允许触碰一个主权平面：第二阶段是「另一平面的第二次单相提交」。
-        因此这里既不用合并后的 diff 去比对 ``action.affects_source``，也不把
-        第一阶段已校验过的平面计入判定，只看第二阶段的增量本身。
-        """
-        sides: set[str] = set()
-        pre_objects = {
-            (change.object_type, change.object_id): change
-            for change in pre_diff.object_changes
-        }
-        full_objects = {
-            (change.object_type, change.object_id): change
-            for change in full_diff.object_changes
-        }
-        for key, change in full_objects.items():
-            cls._assert_append_only_respected(spec, action, change)
-            pre = pre_objects.get(key)
-            side = (
-                cls.object_change_side(spec, change)
-                if pre is None
-                else cls._incremental_side(spec, pre, change)
-            )
-            if side == "mixed":
-                raise InvariantError(
-                    f"action {action.name!r} post_approval touches source and "
-                    f"ontology-owned fields of {change.object_type}:"
-                    f"{change.object_id}",
-                    code="MIXED_AUTHORITY",
-                )
-            if side is not None:
-                if side == "source":
-                    cls._assert_source_object_writable(
-                        spec, action, change.object_type, change.object_id
-                    )
-                sides.add(side)
-        for key, pre in pre_objects.items():
-            if key not in full_objects:
-                side = cls.object_change_side(spec, pre)
-                if side is not None:
-                    if side == "source":
-                        cls._assert_source_object_writable(
-                            spec, action, pre.object_type, pre.object_id
-                        )
-                    sides.add("source" if side == "mixed" else side)
-
-        pre_links = {
-            (
-                change.link_type,
-                change.source_type,
-                change.source_id,
-                change.target_type,
-                change.target_id,
-                change.kind,
-            )
-            for change in pre_diff.link_changes
-        }
-        full_links = {
-            (
-                change.link_type,
-                change.source_type,
-                change.source_id,
-                change.target_type,
-                change.target_id,
-                change.kind,
-            )
-            for change in full_diff.link_changes
-        }
-        for key in full_links ^ pre_links:
-            decl = spec.get_object_property(key[0])
-            link_side = "ontology" if cls._property_is_owned(spec, decl) else "source"
-            if link_side == "source":
-                cls._assert_source_link_writable(spec, action, decl, key[1], key[3])
-            sides.add(link_side)
-
-        if len(sides) > 1:
-            raise InvariantError(
-                f"action {action.name!r} post_approval touches both source and "
-                f"ontology-owned state: {sorted(sides)}",
-                code="MIXED_AUTHORITY",
-            )
-
 
     # -- field-level ownership persistence --------------------------------
     @staticmethod
@@ -906,119 +799,7 @@ class IdempotencyAndOCCAspect:
 
 
 # ---------------------------------------------------------------------------
-# 4. ApprovalGateAspect —— 审批软中断挂起与批准恢复
-# ---------------------------------------------------------------------------
-class ApprovalGateAspect:
-    """审批流切面：挂起只落 diff 不动对象；批准时再校验版本并落盘。"""
-
-    @staticmethod
-    def stage_pending_approval(
-        runtime: Any,
-        *,
-        run_id: str,
-        action: ActionDef,
-        actor: Actor,
-        params_json: dict[str, Any],
-        read_versions: dict[str, int],
-        diff: ObjectDiff,
-    ) -> None:
-        """把需要审批的动作挂起为 ``PENDING_APPROVAL``，对象保持不动。"""
-        dumps = runtime._dumps
-        with runtime._write_gate() as conn:
-            conn.execute(
-                """
-                INSERT INTO ontology_action_runs (
-                    run_id, action_type, actor_id, actor_role, params_json,
-                    status, read_versions_json, object_diff_json,
-                    approved_by, reverted_by_run_id, executed_at,
-                    error_code, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL)
-                """,
-                (
-                    run_id,
-                    action.name,
-                    actor.actor_id,
-                    actor.role,
-                    dumps(params_json),
-                    AUDIT_STATUS_PENDING,
-                    dumps(read_versions),
-                    dumps(diff.to_dict()),
-                    runtime._utcnow(),
-                ),
-            )
-
-    @staticmethod
-    def approve_action(runtime: Any, run_id: str, approver: Actor) -> dict[str, Any]:
-        """批准一张挂起单：委托给 :class:`HomomorphicSettlementAspect` 完成三阶段核验结算。"""
-        from .settlement import HomomorphicSettlementAspect
-
-        return HomomorphicSettlementAspect.settle_approval(runtime, run_id, approver)
-
-    @staticmethod
-    def reject_action(
-        runtime: Any,
-        run_id: str,
-        approver: Actor,
-        *,
-        reason: str = "rejected by approver",
-    ) -> dict[str, Any]:
-        """驳回一张挂起单：校验审批角色并原子更新为 REJECTED，对象零改动。"""
-        run = runtime.get_action_run(run_id)
-        if run is None:
-            raise ObjectNotFoundError(f"action run {run_id!r} not found")
-        if run["status"] != AUDIT_STATUS_PENDING:
-            raise GovernanceViolationError(
-                f"action run {run_id!r} is {run['status']}, not PENDING_APPROVAL"
-            )
-
-        action = runtime.spec.get_action(run["action_type"])
-        if approver.role not in action.approver_roles:
-            raise PermissionDeniedError(
-                f"actor {approver.actor_id!r} role {approver.role!r} may not reject "
-                f"{action.name!r}; required one of {list(action.approver_roles)}"
-            )
-
-        with runtime._write_gate() as conn:
-            conn.execute(
-                """
-                UPDATE ontology_action_runs
-                SET status = ?, approved_by = ?, executed_at = ?,
-                    error_code = ?, error_message = ?
-                WHERE run_id = ? AND status = ?
-                """,
-                (
-                    AUDIT_STATUS_REJECTED,
-                    approver.actor_id,
-                    runtime._utcnow(),
-                    "APPROVAL_REJECTED",
-                    str(reason or "rejected by approver"),
-                    run_id,
-                    AUDIT_STATUS_PENDING,
-                ),
-            )
-        rejected = runtime.get_action_run(run_id)
-        notify = getattr(runtime, "_notify_run_event", None)
-        if rejected is not None and callable(notify):
-            notify(approver, rejected)
-        return rejected  # type: ignore[return-value]
-
-    @staticmethod
-    def revert_action(
-        runtime: Any,
-        run_id: str,
-        revert_run_id: str,
-        actor: Actor,
-    ) -> dict[str, Any]:
-        """时光机回滚：委托给 :class:`HomomorphicSettlementAspect` 完成逆向补丁核验提交。"""
-        from .settlement import HomomorphicSettlementAspect
-
-        return HomomorphicSettlementAspect.settle_revert(
-            runtime, run_id, revert_run_id, actor
-        )
-
-
-# ---------------------------------------------------------------------------
-# 审计账本写入原语（被 RejectionAudit 与 ApprovalGate 共用）
+# 审计账本写入原语（被 RejectionAudit 与 HomomorphicSettlement 共用）
 # ---------------------------------------------------------------------------
 def insert_action_run(
     runtime: Any,

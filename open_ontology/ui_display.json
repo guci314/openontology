@@ -43,7 +43,6 @@
     "resolved": "已解决",
     "closed": "已关闭",
     "COMMITTED": "已执行",
-    "PENDING_APPROVAL": "待批准",
     "REJECTED": "已拒绝",
     "REVERTED": "已撤回",
     "CONNECTED": "已连接",

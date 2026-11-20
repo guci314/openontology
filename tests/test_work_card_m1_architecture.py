@@ -258,7 +258,7 @@ def test_phantom_read_defense_live_t1_recomputation() -> None:
             AI_OPS,
         )
         assert open_res["status"] == "COMMITTED"
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
         so_ver_t0 = _object_version(rt, "SalesOrder", "SO-01")
         cust_ver_t0 = _object_version(rt, "Customer", "C-01")
@@ -288,7 +288,7 @@ def test_phantom_read_defense_live_t1_recomputation() -> None:
         card_mid = rt.get_object(WorkCard, "WC-APPR-01", STEWARD_1)
         assert card_mid.status == "OPEN"
         assert card_mid.resolved_by_actor_id == ""
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
 
         # Resolve SupportCase -> Steward approves again -> succeeds cleanly with atomic OCC
         rt.submit_action("RUN-CASE-RESOLVE", "resolve_support_case", {"case_id": "CASE-URGENT-1"}, OPS_1)
@@ -305,7 +305,7 @@ def test_phantom_read_defense_live_t1_recomputation() -> None:
         card_done = rt.get_object(WorkCard, "WC-APPR-01", STEWARD_1)
         assert card_done.status == "COMPLETED"
         assert card_done.resolved_by_actor_id == STEWARD_1.actor_id
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
     finally:
         rt.close()
 
@@ -416,7 +416,7 @@ def test_coupled_source_work_card_phantom_read_zero_external_actuation() -> None
         assert card_done.status == "COMPLETED"
         assert card_done.resolved_by_actor_id == STEWARD_1.actor_id
         assert card_done.external_ref == "feishu:ok_001"
-        assert rt.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in rt.list_action_runs())
     finally:
         rt.close()
 
@@ -849,7 +849,7 @@ def test_governance_pure_sync_zero_pending_approval_and_source_clean() -> None:
         gov.rollback_crystallization("PE-A", steward=STEWARD_ACTOR)
         assert gov.get_active_blueprint("sync_gov_test").version == "1.0.0"
 
-        assert gov.runtime.list_action_runs(status="PENDING_APPROVAL") == []
+        assert all(r["status"] in {"COMMITTED", "REJECTED", "REVERTED"} for r in gov.runtime.list_action_runs())
 
 
 def test_complete_work_card_blocks_privilege_escalation_on_target_action() -> None:

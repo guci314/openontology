@@ -80,8 +80,7 @@ def _build_spec() -> OntologySpec:
         "activate_widget",
         params=WidgetActionParams,
         allowed_roles=("ops",),
-        approver_roles=("manager",),
-        approval_rule=lambda params, actor: True,
+        revert_roles=("manager",),
         description="激活部件",
     )
     def activate_widget(runtime: Any, params: WidgetActionParams) -> None:
@@ -189,7 +188,6 @@ def test_describe_behavior_keeps_existing_contract_shape():
         "name",
         "description",
         "allowed_roles",
-        "approver_roles",
         "revert_roles",
         "affects_source",
         "visibility",
@@ -198,8 +196,7 @@ def test_describe_behavior_keeps_existing_contract_shape():
     assert action["visibility"] == "public"
     assert action["name"] == "activate_widget"
     assert action["allowed_roles"] == ["ops"]
-    assert action["approver_roles"] == ["manager"]
-    assert action["revert_roles"] == []
+    assert action["revert_roles"] == ["manager"]
     assert action["affects_source"] is True
     assert set(action["params"]["properties"]) == {"widget_id", "reason"}
 
@@ -371,12 +368,12 @@ def test_role_def_validation_and_behavior_projection():
     with pytest.raises(UnknownRoleError):
 
         @strict_spec.action(
-            "bad_approver",
+            "bad_revert_role",
             params=WidgetActionParams,
             allowed_roles=("operator",),
-            approver_roles=("missing_mgr",),
+            revert_roles=("missing_mgr",),
         )
-        def bad_approver(runtime: Any, params: WidgetActionParams) -> None:
+        def bad_revert_role(runtime: Any, params: WidgetActionParams) -> None:
             return None
 
     behavior = describe_behavior(strict_spec)
@@ -386,7 +383,6 @@ def test_role_def_validation_and_behavior_projection():
             "description": "值守操作员",
             "declared": True,
             "allowed_actions": ["do_op"],
-            "approver_actions": [],
             "revert_actions": [],
             "masked_fields": [],
         }
