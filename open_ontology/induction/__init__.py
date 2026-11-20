@@ -40,6 +40,11 @@ from .crucible import (
     ReplayEvent,
     SymbolicCrucible,
 )
+from .decompiler import (
+    DecompilationCycleResult,
+    DriverDecompilerAgent,
+    build_decompiler_system_prompt,
+)
 from .disambiguation import (
     DisambiguationChoice,
     DisambiguationOption,
@@ -229,6 +234,10 @@ __all__ = [
     "OntologyBuilderAgent",
     "OntologyEvolverAgent",
     "OntologyL2ArchitectAgent",
+    # Driver decompiler (fixed target ABI)
+    "DecompilationCycleResult",
+    "build_decompiler_system_prompt",
+    "DriverDecompilerAgent",
     # Pluggable domain seed ontology (inductive bias backbone)
     "SeedArchetypeHint",
     "SeedOntology",

@@ -538,6 +538,11 @@ def _run_single_eval_case(
         rep: EvalReport = run_eval_suite(case_rt, default_actor, [osdk_case])
         res = rep.results[0]
         failures = list(res.failures)
+        if raw_expect.get("valid") is True and res.simulation and not res.simulation.get("valid"):
+            sim = res.simulation
+            failures.append(
+                f"actual_error_code={sim.get('error_code')!r}, actual_error={sim.get('error')!r}"
+            )
         if (
             raw_expect.get("valid") is False
             and len(failures) == 1
