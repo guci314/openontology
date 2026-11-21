@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: open-ontology-pg
+    environment:
+      POSTGRES_DB: open_ontology
+      POSTGRES_USER: open_ontology
+      POSTGRES_PASSWORD: ${OPEN_ONTOLOGY_PG_PASS:-open_ontology_dev}
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - open_ontology_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U open_ontology -d open_ontology"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  open_ontology_pg_data:

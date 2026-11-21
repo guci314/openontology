@@ -129,6 +129,7 @@ class OntologyRuntime:
         *,
         world_mode: WorldMode | None = None,
         source_bridge: SourceBridge | None = None,
+        connection: Any | None = None,
     ) -> None:
         self.spec = spec
         self.db_path = str(db_path)
@@ -138,7 +139,7 @@ class OntologyRuntime:
         if resolved_mode not in VALID_WORLD_MODES:
             raise ValueError(f"unsupported world_mode {resolved_mode!r}; expected one of {VALID_WORLD_MODES}")
         if resolved_mode == "counterfactual":
-            if self.db_path != ":memory:":
+            if self.db_path != ":memory:" or connection is not None:
                 raise ValueError("counterfactual world_mode requires db_path=':memory:'")
             if source_bridge is not None:
                 raise GovernanceViolationError("counterfactual world cannot bind a SourceBridge")
@@ -146,20 +147,15 @@ class OntologyRuntime:
         self._source_bridge: SourceBridge | None = source_bridge
         self._inflight_lock = threading.Lock()
         self._inflight_runs: set[str] = set()
-        self._conn = sqlite3.connect(
-            self.db_path,
-            isolation_level=None,  # explicit BEGIN/COMMIT
-            check_same_thread=False,
-        )
-        self._conn.row_factory = sqlite3.Row
-        existing_tables = {
-            str(row[0])
-            for row in self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if not _CORE_SCHEMA_TABLES <= existing_tables:
-            self._conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        if connection is not None:
+            self._conn = connection
+        else:
+            self._conn = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+        if not getattr(self._conn, "is_initialized", False):
+            rows = self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            if not _CORE_SCHEMA_TABLES <= {str(row[0]) for row in rows}:
+                self._conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         self._closed = False
         # Automation de-duplication ledger: (name, object_id, version) -> record.
         self._automation_fires: dict[tuple[str, str, int], dict[str, Any]] = {}
@@ -206,7 +202,8 @@ class OntologyRuntime:
         fork = OntologyRuntime(
             self.spec, db_path=":memory:", world_mode="counterfactual", source_bridge=None
         )
-        self._conn.backup(fork._conn)
+        copy_fn = getattr(self._conn, "copy_to_sqlite", None)
+        (copy_fn if callable(copy_fn) else self._conn.backup)(fork._conn)
         return fork
 
     @property

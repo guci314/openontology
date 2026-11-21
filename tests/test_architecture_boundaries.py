@@ -635,15 +635,8 @@ def test_gate4_fictional_domain_blind_m2_contract() -> None:
 # Gate 5: 纯同步无挂起 M2 铁笼（schema 约束 + 退役审批符号零命中）
 # ---------------------------------------------------------------------------
 def test_gate5_pure_synchronous_non_suspending_m2_kernel() -> None:
-    """schema.sql 仅保留 6 表且无异步挂起状态；open_ontology/** 对退役 M2 挂起符号零命中。"""
-    schema_text = (PKG_ROOT / "schema.sql").read_text(encoding="utf-8")
-    tables = set(
-        re.findall(
-            r"CREATE TABLE IF NOT EXISTS\s+([a-zA-Z0-9_]+)",
-            schema_text,
-        )
-    )
-    assert tables == {
+    """schema.sql 与 schema_pg.sql 仅保留 6 表且无异步挂起状态；open_ontology/** 对退役 M2 挂起符号零命中。"""
+    expected_tables = {
         "ontology_write_gate",
         "ontology_registry",
         "ontology_objects",
@@ -651,19 +644,28 @@ def test_gate5_pure_synchronous_non_suspending_m2_kernel() -> None:
         "ontology_action_runs",
         "ontology_overlay",
     }
+    for schema_name in ("schema.sql", "schema_pg.sql"):
+        schema_text = (PKG_ROOT / schema_name).read_text(encoding="utf-8")
+        tables = set(
+            re.findall(
+                r"CREATE TABLE IF NOT EXISTS\s+([a-zA-Z0-9_]+)",
+                schema_text,
+            )
+        )
+        assert tables == expected_tables, f"{schema_name} 物理表集合漂移: {tables}"
 
-    check_match = re.search(
-        r"CREATE TABLE IF NOT EXISTS ontology_action_runs\b.*?CHECK\s*\(\s*status IN\s*\(([^)]+)\)\s*\)",
-        schema_text,
-        re.DOTALL,
-    )
-    assert check_match is not None, "schema.sql 缺少 ontology_action_runs.status CHECK 约束"
-    statuses = set(re.findall(r"'([^']+)'", check_match.group(1)))
-    assert statuses == {"COMMITTED", "REVERTED", "REJECTED"}, (
-        f"ontology_action_runs.status 仅允许纯同步状态集，实际：{statuses}"
-    )
-    for forbidden_state in ("PENDING_APPROVAL", "IN_FLIGHT", "WAITING_CALLBACK"):
-        assert forbidden_state not in schema_text
+        check_match = re.search(
+            r"CREATE TABLE IF NOT EXISTS ontology_action_runs\b.*?CHECK\s*\(\s*status IN\s*\(([^)]+)\)\s*\)",
+            schema_text,
+            re.DOTALL,
+        )
+        assert check_match is not None, f"{schema_name} 缺少 ontology_action_runs.status CHECK 约束"
+        statuses = set(re.findall(r"'([^']+)'", check_match.group(1)))
+        assert statuses == {"COMMITTED", "REVERTED", "REJECTED"}, (
+            f"{schema_name} ontology_action_runs.status 仅允许纯同步状态集，实际：{statuses}"
+        )
+        for forbidden_state in ("PENDING_APPROVAL", "IN_FLIGHT", "WAITING_CALLBACK"):
+            assert forbidden_state not in schema_text, f"{schema_name} 禁止出现 {forbidden_state}"
 
     retired_re = re.compile(
         r"(?<![A-Za-z0-9_])("
@@ -749,6 +751,9 @@ _FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
         "mpc",
         "autonomy",
         "reconciliation",
+        "postgres_backend",
+        "psycopg",
+        "psycopg2",
     }
 )
 
@@ -908,6 +913,7 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
             "mpc",
             "autonomy",
             "reconciliation",
+            "postgres_backend",
         ]
     )
     probe_code = (
@@ -920,7 +926,8 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
         "extra = sorted(loaded - allowed); "
         "assert not extra, f'unexpected modules loaded by open_ontology: {extra}'; "
         "leaked = [m for m in loaded if any(m == f'open_ontology.{b}' or m.startswith(f'open_ontology.{b}.') for b in banned)]; "
-        "assert not leaked, f'banned modules loaded: {leaked}'"
+        "assert not leaked, f'banned modules loaded: {leaked}'; "
+        "assert 'psycopg' not in sys.modules and 'psycopg2' not in sys.modules, 'import open_ontology must not load psycopg'"
     )
     proc = subprocess.run(
         [sys.executable, "-c", probe_code],
@@ -939,7 +946,8 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
         f"allowed = set({allowed_literal}); "
         "loaded = {m for m in sys.modules if m == 'open_ontology' or m.startswith('open_ontology.')}; "
         "extra = sorted(loaded - allowed); "
-        "assert not extra, f'runtime loaded extra modules: {extra}'"
+        "assert not extra, f'runtime loaded extra modules: {extra}'; "
+        "assert 'psycopg' not in sys.modules and 'psycopg2' not in sys.modules, 'runtime must not load psycopg'"
     )
     drv_proc = subprocess.run(
         [sys.executable, "-c", drv_probe],
