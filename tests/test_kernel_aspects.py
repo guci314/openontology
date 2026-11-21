@@ -637,9 +637,14 @@ def test_architecture_doc_declares_four_categories():
         "aspects.py",
     ):
         assert token in text, f"架构文档缺少 {token!r}"
-    assert any(budget in text for budget in ("1,331", "1331", "1350")), (
-        "架构文档缺少微内核行数预算/规模说明"
+    runtime_lines = len(
+        (ROOT / "open_ontology" / "runtime.py").read_text(encoding="utf-8").splitlines()
     )
+    assert any(
+        tok in text for tok in (f"{runtime_lines:,}", str(runtime_lines))
+    ) and any(
+        budget in text for budget in ("1,335", "1335", "1350")
+    ), "架构文档缺少微内核行数预算/规模说明或与实际行数漂移"
 
 
 def test_architecture_doc_api_references_are_real():

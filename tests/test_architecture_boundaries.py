@@ -753,6 +753,7 @@ _FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
         "autonomy",
         "reconciliation",
         "mdm_plugin",
+        "org_authority",
         "postgres_backend",
         "psycopg",
         "psycopg2",
@@ -916,6 +917,7 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
             "autonomy",
             "reconciliation",
             "mdm_plugin",
+            "org_authority",
             "postgres_backend",
         ]
     )
@@ -931,6 +933,7 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
         "leaked = [m for m in loaded if any(m == f'open_ontology.{b}' or m.startswith(f'open_ontology.{b}.') for b in banned)]; "
         "assert not leaked, f'banned modules loaded: {leaked}'; "
         "assert 'open_ontology.mdm_plugin' not in loaded and 'open_ontology.induction.resolution' not in loaded, 'mdm plugin leaked on root import'; "
+        "assert 'open_ontology.org_authority' not in loaded, 'org_authority leaked on root import'; "
         "assert 'psycopg' not in sys.modules and 'psycopg2' not in sys.modules, 'import open_ontology must not load psycopg'"
     )
     proc = subprocess.run(
