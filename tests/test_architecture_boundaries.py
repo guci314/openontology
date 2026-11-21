@@ -66,6 +66,7 @@ M1_ONTOLOGY_MODULES: tuple[tuple[str, str], ...] = (
     ("examples.std_crm_ontology", "spec"),
     ("examples.std_o2c_ontology", "spec"),
     ("examples.std_p2p_ontology", "spec"),
+    ("examples.steel_mdm_plugin", "spec"),
 )
 
 _ALLOWED_M1_STDLIB_AND_SDK = frozenset(
@@ -199,7 +200,7 @@ def test_gate1_m1_ontologies_strict_ast_import_whitelist() -> None:
     discovered_m1 = {
         f"examples.{p.stem}"
         for p in (REPO_ROOT / "examples").glob("*_ontology.py")
-    } | {"examples.kanban"}
+    } | {"examples.kanban", "examples.steel_mdm_plugin"}
     registered_m1 = {mod_name for mod_name, _ in M1_ONTOLOGY_MODULES}
     assert discovered_m1 == registered_m1, (
         "M1 本体自动发现清单与 M1_ONTOLOGY_MODULES 不一致："
@@ -751,6 +752,7 @@ _FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
         "mpc",
         "autonomy",
         "reconciliation",
+        "mdm_plugin",
         "postgres_backend",
         "psycopg",
         "psycopg2",
@@ -913,6 +915,7 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
             "mpc",
             "autonomy",
             "reconciliation",
+            "mdm_plugin",
             "postgres_backend",
         ]
     )
@@ -927,6 +930,7 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
         "assert not extra, f'unexpected modules loaded by open_ontology: {extra}'; "
         "leaked = [m for m in loaded if any(m == f'open_ontology.{b}' or m.startswith(f'open_ontology.{b}.') for b in banned)]; "
         "assert not leaked, f'banned modules loaded: {leaked}'; "
+        "assert 'open_ontology.mdm_plugin' not in loaded and 'open_ontology.induction.resolution' not in loaded, 'mdm plugin leaked on root import'; "
         "assert 'psycopg' not in sys.modules and 'psycopg2' not in sys.modules, 'import open_ontology must not load psycopg'"
     )
     proc = subprocess.run(
