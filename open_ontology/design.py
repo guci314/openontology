@@ -9,8 +9,11 @@ falsification) entry points for external engineering agents and CI harnesses.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import importlib
+import importlib.util
+import inspect
 import json
 import os
 import re
@@ -19,7 +22,7 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -54,13 +57,15 @@ from .induction import (
 )
 from .induction.decompiler import _validate_decompiled_alignment
 from .induction.phenomenon import _apply_field_transform
-from .settlement import SourceBridge
-from .spec import InvariantError, OntologySpec, OpenOntologyError
+from .settlement import DEVICE_STATE_MISMATCH, DeviceStateMismatchError, SourceBridge, call_observe
+from .spec import Actor, InvariantError, OntologySpec, OpenOntologyError
 
 __all__ = [
     "DesignDeviceSpec",
     "scout_readonly_sqlite_profile",
     "DeclarativeSQLiteDriverBridge",
+    "audit_thin_driver_ast",
+    "verify_thin_driver_on_hidden_world",
     "run_design_check",
     "run_design_verify",
     "main",
@@ -72,6 +77,124 @@ _CHECK_IN_RE = re.compile(
 )
 _CATEGORICAL_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_ \-]{0,30}$")
 _SKIP_FRAMEWORK_PREFIXES = ("sqlite_", "django_", "auth_")
+
+_ALLOWED_THIN_DRIVER_MODULES: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "abc",
+        "base64",
+        "collections",
+        "collections.abc",
+        "contextlib",
+        "copy",
+        "dataclasses",
+        "datetime",
+        "decimal",
+        "enum",
+        "functools",
+        "hashlib",
+        "hmac",
+        "http.client",
+        "itertools",
+        "json",
+        "logging",
+        "math",
+        "numbers",
+        "operator",
+        "re",
+        "sqlite3",
+        "ssl",
+        "string",
+        "time",
+        "types",
+        "typing",
+        "urllib.error",
+        "urllib.parse",
+        "urllib.request",
+        "uuid",
+        "xmlrpc.client",
+        "open_ontology.settlement",
+        "open_ontology.spec",
+        "open_ontology.drivers",
+        "open_ontology.induction.phenomenon",
+        "open_ontology.induction.dsl",
+    }
+)
+_ALLOWED_THIN_DRIVER_ROOT_EXPORTS: dict[str, frozenset[str]] = {
+    "urllib": frozenset({"error", "parse", "request"}),
+    "http": frozenset({"client"}),
+    "xmlrpc": frozenset({"client"}),
+    "open_ontology": frozenset(
+        {
+            "SourceBridge",
+            "DeviceStateMismatchError",
+            "GovernanceViolationError",
+            "InvariantError",
+            "settlement",
+            "spec",
+            "drivers",
+        }
+    ),
+    "open_ontology.induction": frozenset(
+        {
+            "ActionExecutionBinding",
+            "AdapterMappingSpec",
+            "EntityMappingSpec",
+            "ExternalEntityProfile",
+            "ExternalFieldProfile",
+            "ExternalPhenomenonProfile",
+            "FieldTransformSpec",
+            "project_external_phenomenon",
+            "project_single_record",
+            "toposort_entity_mappings",
+        }
+    ),
+}
+_FORBIDDEN_DYN_CALL_NAMES = frozenset(
+    {"eval", "exec", "compile", "__import__", "breakpoint"}
+)
+_FORBIDDEN_DYN_ATTRS = frozenset(
+    {"system", "popen", "__import__", "import_module"}
+)
+_FORBIDDEN_GETATTR_TARGETS = frozenset(
+    {
+        "__import__",
+        "eval",
+        "exec",
+        "compile",
+        "system",
+        "popen",
+        "open",
+        "write_text",
+        "write_bytes",
+        "unlink",
+        "import_module",
+        "__builtins__",
+        "__subclasses__",
+        "__globals__",
+    }
+)
+_FORBIDDEN_FS_WRITE_METHODS = frozenset(
+    {
+        "write_text",
+        "write_bytes",
+        "unlink",
+        "chmod",
+        "mkdir",
+        "makedirs",
+        "rmdir",
+        "rename",
+        "replace",
+        "touch",
+        "symlink_to",
+        "hardlink_to",
+        "remove",
+        "rmtree",
+        "copyfile",
+        "copy2",
+        "move",
+    }
+)
 
 
 class DesignDeviceSpec(BaseModel):
@@ -86,6 +209,12 @@ class DesignDeviceSpec(BaseModel):
     db_path: str = ""
     mapping_path: str
     profile_path: str | None = None
+    driver_module_path: str | None = None
+    endpoint_config: dict[str, Any] = Field(default_factory=dict)
+    endpoint_config_path: str | None = None
+    forbidden_literals: list[str] = Field(default_factory=list)
+    max_driver_lines: int = 350
+    reset_hook: str | None = None
     owned_object_types: list[str] = Field(default_factory=list)
     shared_object_types: list[str] = Field(default_factory=list)
     handled_actions: list[str] = Field(default_factory=list)
@@ -164,12 +293,12 @@ def _load_seed_arg(arg: str | None) -> SeedOntology | None:
 
 
 def _load_device_arg(arg: str) -> tuple[DesignDeviceSpec, Path | None]:
-    p = Path(arg)
-    if p.is_file():
-        return DesignDeviceSpec.model_validate(_load_json_file(p)), p.resolve().parent
     stripped = arg.strip()
     if stripped.startswith("{"):
         return DesignDeviceSpec.model_validate(json.loads(stripped)), None
+    p = Path(arg)
+    if len(arg) < 1024 and p.is_file():
+        return DesignDeviceSpec.model_validate(_load_json_file(p)), p.resolve().parent
     raise FileNotFoundError(f"device config file not found: {arg}")
 
 
@@ -611,6 +740,10 @@ class _LoadedDeviceContext:
         handled_actions: tuple[str, ...],
         owned_object_types: tuple[str, ...],
         shared_object_types: tuple[str, ...],
+        driver_path: Path | None = None,
+        driver_factory: Callable[[Mapping[str, Any], AdapterMappingSpec], SourceBridge] | None = None,
+        endpoint_config: dict[str, Any] | None = None,
+        reset_fn: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         self.spec = spec
         self.mapping = mapping
@@ -619,7 +752,279 @@ class _LoadedDeviceContext:
         self.handled_actions = handled_actions
         self.owned_object_types = owned_object_types
         self.shared_object_types = shared_object_types
+        self.driver_path = driver_path
+        self.driver_factory = driver_factory
+        self.endpoint_config = dict(endpoint_config or {})
+        self.reset_fn = reset_fn
         self.projected_objects: list[dict[str, Any]] = []
+
+
+def audit_thin_driver_ast(
+    driver_path: Path | str,
+    *,
+    forbidden_literals: Sequence[str] = (),
+    max_lines: int = 350,
+) -> list[str]:
+    """Fail-closed static AST security & anti-cheat scanner for external thin protocol drivers."""
+    resolved = Path(driver_path).resolve()
+    if not resolved.is_file():
+        return [f"DRIVER_FILE_NOT_FOUND: thin driver file not found: {resolved}"]
+
+    source = resolved.read_text(encoding="utf-8")
+    issues: list[str] = []
+    line_count = len(source.splitlines())
+    if max_lines > 0 and line_count > max_lines:
+        issues.append(
+            f"DRIVER_EXCEEDS_LINE_BUDGET: thin driver has {line_count} lines (max {max_lines})"
+        )
+
+    try:
+        tree = ast.parse(source, filename=str(resolved))
+    except SyntaxError as exc:
+        issues.append(f"DRIVER_SYNTAX_ERROR: line {exc.lineno}: {exc.msg}")
+        return issues
+
+    clean_literals = [str(lit).strip() for lit in forbidden_literals if str(lit).strip()]
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in _ALLOWED_THIN_DRIVER_MODULES:
+                    issues.append(
+                        f"FORBIDDEN_DRIVER_IMPORT: line {node.lineno}: import {alias.name!r} is not allowed"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if node.level > 0:
+                issues.append(
+                    f"FORBIDDEN_DRIVER_IMPORT: line {node.lineno}: relative import {mod!r} is forbidden"
+                )
+            elif mod in _ALLOWED_THIN_DRIVER_ROOT_EXPORTS:
+                allowed_syms = _ALLOWED_THIN_DRIVER_ROOT_EXPORTS[mod]
+                for alias in node.names:
+                    if alias.name == "*" or alias.name not in allowed_syms:
+                        issues.append(
+                            f"FORBIDDEN_DRIVER_IMPORT: line {node.lineno}: "
+                            f"from {mod} import {alias.name!r} is not allowed"
+                        )
+            elif mod not in _ALLOWED_THIN_DRIVER_MODULES:
+                issues.append(
+                    f"FORBIDDEN_DRIVER_IMPORT: line {node.lineno}: from {mod!r} import ... is not allowed"
+                )
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name):
+                if fn.id in _FORBIDDEN_DYN_CALL_NAMES:
+                    issues.append(
+                        f"FORBIDDEN_DYNAMIC_EXEC: line {node.lineno}: call to {fn.id}() is forbidden"
+                    )
+                elif fn.id == "getattr" and len(node.args) >= 2:
+                    attr_arg = node.args[1]
+                    if isinstance(attr_arg, ast.Constant) and attr_arg.value in _FORBIDDEN_GETATTR_TARGETS:
+                        issues.append(
+                            f"FORBIDDEN_DYNAMIC_EXEC: line {node.lineno}: getattr(..., {attr_arg.value!r}) is forbidden"
+                        )
+                    elif (
+                        isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in {"__builtins__", "builtins", "os"}
+                    ):
+                        issues.append(
+                            f"FORBIDDEN_DYNAMIC_EXEC: line {node.lineno}: getattr on {node.args[0].id!r} is forbidden"
+                        )
+                elif fn.id == "open":
+                    mode_nodes = [
+                        kw.value for kw in node.keywords if kw.arg == "mode"
+                    ]
+                    if len(node.args) >= 2:
+                        mode_nodes.append(node.args[1])
+                    for mnode in mode_nodes:
+                        if not isinstance(mnode, ast.Constant) or not isinstance(mnode.value, str):
+                            issues.append(
+                                f"FORBIDDEN_FILESYSTEM_WRITE: line {node.lineno}: non-constant open() mode"
+                            )
+                        elif any(ch in mnode.value for ch in ("w", "a", "x", "+")):
+                            issues.append(
+                                f"FORBIDDEN_FILESYSTEM_WRITE: line {node.lineno}: write open() mode {mnode.value!r} is forbidden"
+                            )
+            elif isinstance(fn, ast.Attribute):
+                if fn.attr in _FORBIDDEN_DYN_ATTRS or fn.attr.startswith(("spawn", "execv", "execl")):
+                    issues.append(
+                        f"FORBIDDEN_DYNAMIC_EXEC: line {node.lineno}: call to .{fn.attr}() is forbidden"
+                    )
+                elif fn.attr in _FORBIDDEN_FS_WRITE_METHODS:
+                    issues.append(
+                        f"FORBIDDEN_FILESYSTEM_WRITE: line {node.lineno}: filesystem write call .{fn.attr}() is forbidden"
+                    )
+                elif fn.attr == "open":
+                    mode_nodes = [kw.value for kw in node.keywords if kw.arg == "mode"]
+                    if node.args:
+                        first = node.args[0]
+                        if (
+                            isinstance(fn.value, ast.Name)
+                            and fn.value.id == "io"
+                            and len(node.args) >= 2
+                        ):
+                            mode_nodes.append(node.args[1])
+                        elif (
+                            isinstance(first, ast.Constant)
+                            and isinstance(first.value, str)
+                            and any(ch in first.value for ch in ("w", "a", "x", "+"))
+                        ):
+                            mode_nodes.append(first)
+                    for mnode in mode_nodes:
+                        if not isinstance(mnode, ast.Constant) or not isinstance(mnode.value, str):
+                            issues.append(
+                                f"FORBIDDEN_FILESYSTEM_WRITE: line {node.lineno}: non-constant open() mode"
+                            )
+                        elif any(ch in mnode.value for ch in ("w", "a", "x", "+")):
+                            issues.append(
+                                f"FORBIDDEN_FILESYSTEM_WRITE: line {node.lineno}: write open() mode {mnode.value!r} is forbidden"
+                            )
+        elif isinstance(node, ast.Name) and node.id == "__import__":
+            issues.append(
+                f"FORBIDDEN_DYNAMIC_EXEC: line {node.lineno}: referencing '__import__' is forbidden"
+            )
+        elif clean_literals and isinstance(node, ast.Constant) and isinstance(node.value, str):
+            sval = node.value
+            sval_low = sval.lower()
+            for lit in clean_literals:
+                matched = lit in sval or (len(lit) >= 4 and lit.lower() in sval_low)
+                if matched:
+                    issues.append(
+                        f"FORBIDDEN_HARDCODED_SAMPLE: line {node.lineno}: forbidden literal {lit!r} found in string constant"
+                    )
+
+    return issues
+
+
+def _load_thin_driver_factory(
+    driver_path: Path,
+) -> Callable[[Mapping[str, Any], AdapterMappingSpec], SourceBridge]:
+    resolved = Path(driver_path).resolve()
+    stat = resolved.stat()
+    mod_name = f"_oo_thin_drv_{abs(hash((str(resolved), stat.st_mtime_ns, stat.st_size)))}"
+    mod_spec = importlib.util.spec_from_file_location(mod_name, str(resolved))
+    if mod_spec is None or mod_spec.loader is None:
+        raise InvariantError(
+            f"unable to load thin driver module {resolved}",
+            code="INVALID_DRIVER_MODULE",
+        )
+    mod = importlib.util.module_from_spec(mod_spec)
+    sys.modules[mod_name] = mod
+    try:
+        mod_spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+
+    factory = getattr(mod, "build_device_bridge", None)
+    if not callable(factory):
+        raise InvariantError(
+            f"thin driver {resolved.name!r} must expose callable build_device_bridge(endpoint_config, mapping)",
+            code="MISSING_DRIVER_FACTORY",
+        )
+    sig = inspect.signature(factory)
+    pos_params = [
+        p
+        for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
+    if not has_varargs and len(pos_params) < 2:
+        raise InvariantError(
+            f"build_device_bridge in {resolved.name!r} must accept (endpoint_config, mapping)",
+            code="INVALID_DRIVER_SIGNATURE",
+        )
+    return factory
+
+
+def _load_reset_hook(
+    hook_spec: str,
+    *,
+    base_dir: Path | None = None,
+) -> Callable[[Mapping[str, Any]], None]:
+    if ":" not in hook_spec:
+        raise ValueError(f"reset_hook {hook_spec!r} must be 'path.py:callable' or 'module:callable'")
+    target_mod, attr_name = hook_spec.split(":", 1)
+    candidate_path = _resolve_existing_path(target_mod, base_dir=base_dir)
+    if candidate_path.is_file() or target_mod.endswith(".py"):
+        if not candidate_path.is_file():
+            raise FileNotFoundError(f"reset_hook file not found: {target_mod}")
+        stat = candidate_path.stat()
+        mod_name = f"_oo_reset_hook_{abs(hash((str(candidate_path), stat.st_mtime_ns)))}"
+        mod_spec = importlib.util.spec_from_file_location(mod_name, str(candidate_path))
+        if mod_spec is None or mod_spec.loader is None:
+            raise ImportError(f"cannot load reset_hook module {candidate_path}")
+        mod = importlib.util.module_from_spec(mod_spec)
+        sys.modules[mod_name] = mod
+        mod_spec.loader.exec_module(mod)
+    else:
+        mod = importlib.import_module(target_mod)
+    fn = getattr(mod, attr_name, None)
+    if not callable(fn):
+        raise ValueError(f"reset_hook {hook_spec!r} does not resolve to a callable")
+    return fn
+
+
+def _build_declared_profile(
+    mapping: AdapterMappingSpec,
+    *,
+    source_kind: str,
+    endpoint_label: str,
+) -> ExternalPhenomenonProfile:
+    tables = sorted(
+        {
+            *(em.source_table for em in mapping.entity_mappings if em.source_table),
+            *(ab.external_table for ab in mapping.action_bindings if ab.external_table),
+        }
+    )
+    entities = [
+        ExternalEntityProfile(table_name=tbl, row_count=1, fields=[], sample_rows=[])
+        for tbl in tables
+    ]
+    return ExternalPhenomenonProfile(
+        source_kind=source_kind,
+        source_locator=endpoint_label or "protocol://endpoint",
+        entities=entities,
+    )
+
+
+def _observe_payload_to_m0_objects(
+    obs_objects: Mapping[str, Sequence[Mapping[str, Any]]],
+    spec: OntologySpec,
+    *,
+    validate_models: bool = True,
+) -> list[dict[str, Any]]:
+    objects: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for tname, rows in obs_objects.items():
+        if tname not in spec.object_types:
+            if validate_models:
+                raise InvariantError(
+                    f"thin driver observe() emitted unknown object type {tname!r}",
+                    code="UNKNOWN_OBSERVED_OBJECT_TYPE",
+                )
+            continue
+        cls = spec.get_object_type(tname)
+        pk_field = cls.primary_key_name()
+        for raw_row in rows:
+            row_dict = dict(raw_row)
+            if validate_models:
+                inst = cls(**row_dict)
+                oid = inst.primary_key_value()
+                data = inst.to_properties()
+            else:
+                oid = str(row_dict.get(pk_field) or "")
+                data = row_dict
+            key = (tname, oid)
+            if key in seen_keys:
+                raise InvariantError(
+                    f"thin driver observe() emitted duplicate canonical key {tname}:{oid!r}",
+                    code="DUPLICATE_OBSERVED_OBJECT",
+                )
+            seen_keys.add(key)
+            objects.append({"object_type": tname, "object_id": oid, "data": data})
+    return objects
 
 
 def _prepare_design_context(
@@ -631,6 +1036,9 @@ def _prepare_design_context(
     devices: Sequence[str] = (),
     resolution_spec: str | None = None,
     decisions: str | None = None,
+    forbidden_literals: Sequence[str] = (),
+    max_driver_lines: int | None = None,
+    reset_hooks: Mapping[str, Callable[[Mapping[str, Any]], None]] | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     error_codes: list[str] = []
@@ -733,6 +1141,62 @@ def _prepare_design_context(
             resolved_db: Path | None = None
             if dev_spec.db_path:
                 resolved_db = _resolve_existing_path(dev_spec.db_path, base_dir=dev_base_dir)
+
+            resolved_driver_path: Path | None = None
+            driver_factory: Callable[[Mapping[str, Any], AdapterMappingSpec], SourceBridge] | None = None
+            resolved_ep_config: dict[str, Any] = {}
+            resolved_reset_fn: Callable[[Mapping[str, Any]], None] | None = (
+                dict(reset_hooks).get(dev_spec.device_id) if reset_hooks else None
+            )
+
+            if dev_spec.driver_module_path:
+                resolved_driver_path = _resolve_existing_path(
+                    dev_spec.driver_module_path, base_dir=dev_base_dir
+                )
+                eff_forbidden = list(
+                    dict.fromkeys([*dev_spec.forbidden_literals, *forbidden_literals])
+                )
+                eff_max_lines = (
+                    max_driver_lines
+                    if max_driver_lines is not None
+                    else dev_spec.max_driver_lines
+                )
+                ast_issues = audit_thin_driver_ast(
+                    resolved_driver_path,
+                    forbidden_literals=eff_forbidden,
+                    max_lines=eff_max_lines,
+                )
+                if ast_issues:
+                    for ast_msg in ast_issues:
+                        _add_error(
+                            errors,
+                            error_codes,
+                            f"[{dev_spec.device_id}] {ast_msg}",
+                            code=_extract_error_code(ast_msg),
+                        )
+                    continue
+
+                driver_factory = _load_thin_driver_factory(resolved_driver_path)
+                if dev_spec.endpoint_config_path:
+                    ep_path = _resolve_existing_path(
+                        dev_spec.endpoint_config_path, base_dir=dev_base_dir
+                    )
+                    if not ep_path.is_file():
+                        raise FileNotFoundError(
+                            f"endpoint_config_path not found: {dev_spec.endpoint_config_path}"
+                        )
+                    loaded_ep = _load_json_file(ep_path)
+                    if not isinstance(loaded_ep, Mapping):
+                        raise ValueError("endpoint_config_path must contain a JSON object")
+                    resolved_ep_config.update(dict(loaded_ep))
+                if dev_spec.endpoint_config:
+                    resolved_ep_config.update(copy.deepcopy(dev_spec.endpoint_config))
+
+                if resolved_reset_fn is None and dev_spec.reset_hook:
+                    resolved_reset_fn = _load_reset_hook(
+                        dev_spec.reset_hook, base_dir=dev_base_dir
+                    )
+
             if dev_spec.profile_path:
                 prof_path = _resolve_existing_path(dev_spec.profile_path, base_dir=dev_base_dir)
                 profile = ExternalPhenomenonProfile.model_validate(_load_json_file(prof_path))
@@ -742,8 +1206,19 @@ def _prepare_design_context(
                     source_kind=mapping.source_kind or dev_spec.kind,
                     include_tables=include_tbls,
                 )
+            elif driver_factory is not None:
+                ep_label = dev_spec.endpoint or str(
+                    resolved_ep_config.get("url") or f"{dev_spec.kind}://{dev_spec.device_id}"
+                )
+                profile = _build_declared_profile(
+                    mapping,
+                    source_kind=mapping.source_kind or dev_spec.kind,
+                    endpoint_label=ep_label,
+                )
             else:
-                raise ValueError(f"device {dev_spec.device_id!r} requires db_path or profile_path")
+                raise ValueError(
+                    f"device {dev_spec.device_id!r} requires db_path, profile_path, or driver_module_path"
+                )
 
             handled = tuple(
                 dev_spec.handled_actions
@@ -768,6 +1243,10 @@ def _prepare_design_context(
                     handled_actions=handled,
                     owned_object_types=owned,
                     shared_object_types=shared,
+                    driver_path=resolved_driver_path,
+                    driver_factory=driver_factory,
+                    endpoint_config=resolved_ep_config,
+                    reset_fn=resolved_reset_fn,
                 )
             )
         except (ValidationError, Exception) as exc:
@@ -887,10 +1366,58 @@ def _prepare_design_context(
             dev_errors.append(msg)
             _add_error(errors, error_codes, msg, code=str(code))
 
-        projected_objs, proj_errors = project_external_phenomenon(dctx.profile, dctx.mapping)
-        for pe in proj_errors:
-            dev_errors.append(pe)
-            _add_error(errors, error_codes, f"[{dctx.spec.device_id}] {pe}", code=_extract_error_code(pe))
+        if (
+            dctx.driver_factory is not None
+            and dctx.endpoint_config
+            and not dctx.spec.profile_path
+            and dctx.db_path is None
+        ):
+            try:
+                if dctx.reset_fn is not None:
+                    dctx.reset_fn(copy.deepcopy(dctx.endpoint_config))
+                live_bridge = dctx.driver_factory(
+                    copy.deepcopy(dctx.endpoint_config),
+                    dctx.mapping,
+                )
+                obs_objs, _ = call_observe(live_bridge, None, spec=compiled_spec)
+                projected_objs = _observe_payload_to_m0_objects(
+                    obs_objs, compiled_spec, validate_models=True
+                )
+                present_types = {str(e.get("object_type") or "") for e in projected_objs}
+                for req_ot in dict.fromkeys([*dctx.owned_object_types, *dctx.shared_object_types]):
+                    ot_cls = compiled_spec.get_object_type(req_ot)
+                    if not ot_cls.is_fully_owned() and req_ot not in present_types:
+                        msg = (
+                            f"EMPTY_DRIVER_PROJECTION: thin driver observe() returned 0 records for {req_ot!r}"
+                        )
+                        dev_errors.append(msg)
+                        _add_error(
+                            errors,
+                            error_codes,
+                            f"[{dctx.spec.device_id}] {msg}",
+                            code="EMPTY_DRIVER_PROJECTION",
+                        )
+            except Exception as exc:
+                code = getattr(exc, "code", None) or type(exc).__name__
+                msg = f"{code}: live thin driver observe() failed: {exc}"
+                dev_errors.append(msg)
+                _add_error(
+                    errors,
+                    error_codes,
+                    f"[{dctx.spec.device_id}] {msg}",
+                    code=str(code),
+                )
+                projected_objs = []
+        else:
+            projected_objs, proj_errors = project_external_phenomenon(dctx.profile, dctx.mapping)
+            for pe in proj_errors:
+                dev_errors.append(pe)
+                _add_error(
+                    errors,
+                    error_codes,
+                    f"[{dctx.spec.device_id}] {pe}",
+                    code=_extract_error_code(pe),
+                )
 
         req_ots = list(dict.fromkeys([*dctx.owned_object_types, *dctx.shared_object_types]))
         raw_align_errors = _validate_decompiled_alignment(
@@ -947,8 +1474,46 @@ def _prepare_design_context(
     }
 
 
+class _CountingThinBridge:
+    """Adapter wrapper counting external write attempts and marking dirty device state."""
+
+    def __init__(
+        self,
+        inner: SourceBridge,
+        on_actuate: Callable[[], None],
+        spec: OntologySpec,
+    ) -> None:
+        self._inner = inner
+        self._on_actuate = on_actuate
+        self._spec = spec
+        self.write_count = 0
+
+    def close(self) -> None:
+        close_fn = getattr(self._inner, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def as_source_bridge(self) -> SourceBridge:
+        def _act(move: dict[str, Any]) -> Any:
+            self._on_actuate()
+            self.write_count += 1
+            return self._inner.actuate(move)
+
+        def _obs(move: dict[str, Any] | None = None) -> Any:
+            objs, links = call_observe(self._inner, move, spec=self._spec)
+            if links is not None:
+                return objs, links
+            return objs
+
+        return SourceBridge(
+            actuate=_act,
+            observe=_obs,
+            allow_source_revert=self._inner.allow_source_revert,
+        )
+
+
 class _MultiDeviceSandboxAdapter:
-    """Isolated multi-device SQLite ExternalSandboxAdapter backed by DeviceDriverRegistry."""
+    """Isolated multi-device ExternalSandboxAdapter backed by DeviceDriverRegistry."""
 
     def __init__(
         self,
@@ -968,22 +1533,27 @@ class _MultiDeviceSandboxAdapter:
         self.effective_bp = effective_bp
         self._baseline_dbs: dict[str, Path] = {}
         self._work_dbs: dict[str, Path] = {}
-        self._open_bridges: list[DeclarativeSQLiteDriverBridge] = []
+        self._dirty_thin_devices: dict[str, bool] = {}
+        self._open_bridges: list[Any] = []
         self._historical_writes = 0
 
         for idx, dctx in enumerate(self.device_contexts):
-            if dctx.db_path is None:
-                raise ValueError(
-                    f"device {dctx.spec.device_id!r} has no db_path; design verify requires SQLite sandbox copy"
+            if dctx.db_path is not None:
+                base_copy = self.work_root / f"baseline_{idx}_{dctx.spec.device_id}.sqlite3"
+                work_copy = self.work_root / f"work_{idx}_{dctx.spec.device_id}.sqlite3"
+                shutil.copy2(dctx.db_path, base_copy)
+                os.chmod(base_copy, 0o600)
+                shutil.copy2(base_copy, work_copy)
+                os.chmod(work_copy, 0o600)
+                self._baseline_dbs[dctx.spec.device_id] = base_copy
+                self._work_dbs[dctx.spec.device_id] = work_copy
+            elif dctx.driver_factory is not None and dctx.endpoint_config:
+                self._dirty_thin_devices[dctx.spec.device_id] = False
+            else:
+                raise InvariantError(
+                    f"device {dctx.spec.device_id!r} requires db_path or non-empty endpoint_config",
+                    code="MISSING_ENDPOINT_CONFIG",
                 )
-            base_copy = self.work_root / f"baseline_{idx}_{dctx.spec.device_id}.sqlite3"
-            work_copy = self.work_root / f"work_{idx}_{dctx.spec.device_id}.sqlite3"
-            shutil.copy2(dctx.db_path, base_copy)
-            os.chmod(base_copy, 0o600)
-            shutil.copy2(base_copy, work_copy)
-            os.chmod(work_copy, 0o600)
-            self._baseline_dbs[dctx.spec.device_id] = base_copy
-            self._work_dbs[dctx.spec.device_id] = work_copy
 
     def _close_bridges(self) -> None:
         while self._open_bridges:
@@ -998,30 +1568,48 @@ class _MultiDeviceSandboxAdapter:
         self._close_bridges()
         for dctx in self.device_contexts:
             dev_id = dctx.spec.device_id
-            wdb = self._work_dbs[dev_id]
-            for suffix in ("", "-wal", "-shm", "-journal"):
-                Path(f"{wdb}{suffix}").unlink(missing_ok=True)
-            shutil.copy2(self._baseline_dbs[dev_id], wdb)
-            os.chmod(wdb, 0o600)
+            if dev_id in self._work_dbs:
+                wdb = self._work_dbs[dev_id]
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    Path(f"{wdb}{suffix}").unlink(missing_ok=True)
+                shutil.copy2(self._baseline_dbs[dev_id], wdb)
+                os.chmod(wdb, 0o600)
+            elif self._dirty_thin_devices.get(dev_id, False):
+                if dctx.reset_fn is not None:
+                    dctx.reset_fn(copy.deepcopy(dctx.endpoint_config))
+                self._dirty_thin_devices[dev_id] = False
 
     def snapshot_m0(self) -> list[dict[str, Any]]:
         per_device: list[list[dict[str, Any]]] = []
         for dctx in self.device_contexts:
-            wdb = self._work_dbs[dctx.spec.device_id]
-            include_tbls = [em.source_table for em in dctx.mapping.entity_mappings if em.source_table]
-            prof = scout_readonly_sqlite_profile(
-                wdb,
-                source_kind=dctx.mapping.source_kind or dctx.spec.kind,
-                include_tables=include_tbls,
-                max_samples_per_table=0,
-            )
-            proj, _ = project_external_phenomenon(
-                prof,
-                dctx.mapping,
-                require_non_empty_per_entity=False,
-            )
-            per_device.append(proj)
-        return merge_projected_phenomena(per_device)
+            dev_id = dctx.spec.device_id
+            if dev_id in self._work_dbs:
+                wdb = self._work_dbs[dev_id]
+                include_tbls = [em.source_table for em in dctx.mapping.entity_mappings if em.source_table]
+                prof = scout_readonly_sqlite_profile(
+                    wdb,
+                    source_kind=dctx.mapping.source_kind or dctx.spec.kind,
+                    include_tables=include_tbls,
+                    max_samples_per_table=0,
+                )
+                proj, _ = project_external_phenomenon(
+                    prof,
+                    dctx.mapping,
+                    require_non_empty_per_entity=False,
+                )
+                per_device.append(proj)
+            elif dctx.driver_factory is not None:
+                drv_bridge = dctx.driver_factory(
+                    copy.deepcopy(dctx.endpoint_config),
+                    dctx.mapping,
+                )
+                obs_objs, _ = call_observe(drv_bridge, None, spec=self.spec)
+                per_device.append(
+                    _observe_payload_to_m0_objects(
+                        obs_objs, self.spec, validate_models=False
+                    )
+                )
+        return merge_projected_phenomena(per_device) if per_device else []
 
     def make_source_bridge(
         self,
@@ -1032,32 +1620,52 @@ class _MultiDeviceSandboxAdapter:
         self._close_bridges()
         bus = DeviceDriverRegistry(spec=spec)
         for dctx in self.device_contexts:
-            wdb = self._work_dbs[dctx.spec.device_id]
-            include_tbls = [em.source_table for em in dctx.mapping.entity_mappings if em.source_table]
-            prof = scout_readonly_sqlite_profile(
-                wdb,
-                source_kind=dctx.mapping.source_kind or dctx.spec.kind,
-                include_tables=include_tbls,
-                max_samples_per_table=0,
-            )
-            drv = DeclarativeSQLiteDriverBridge(
-                wdb,
-                spec=spec,
-                profile=prof,
-                adapter_mapping=dctx.mapping,
-            )
-            self._open_bridges.append(drv)
+            dev_id = dctx.spec.device_id
+            if dctx.driver_factory is not None and (dev_id not in self._work_dbs or dctx.endpoint_config):
+                ep_cfg = copy.deepcopy(dctx.endpoint_config)
+                if dev_id in self._work_dbs and "db_path" not in ep_cfg:
+                    ep_cfg["db_path"] = str(self._work_dbs[dev_id])
+                inner_bridge = dctx.driver_factory(ep_cfg, dctx.mapping)
+
+                def _mark_dirty(target_id: str = dev_id) -> None:
+                    self._dirty_thin_devices[target_id] = True
+
+                wrapped = _CountingThinBridge(inner_bridge, _mark_dirty, spec)
+                self._open_bridges.append(wrapped)
+                mount_bridge = wrapped.as_source_bridge()
+                mount_ep = dctx.spec.endpoint or str(
+                    ep_cfg.get("url") or f"{dctx.spec.kind}://{dev_id}"
+                )
+            else:
+                wdb = self._work_dbs[dev_id]
+                include_tbls = [em.source_table for em in dctx.mapping.entity_mappings if em.source_table]
+                prof = scout_readonly_sqlite_profile(
+                    wdb,
+                    source_kind=dctx.mapping.source_kind or dctx.spec.kind,
+                    include_tables=include_tbls,
+                    max_samples_per_table=0,
+                )
+                drv = DeclarativeSQLiteDriverBridge(
+                    wdb,
+                    spec=spec,
+                    profile=prof,
+                    adapter_mapping=dctx.mapping,
+                )
+                self._open_bridges.append(drv)
+                mount_bridge = drv.as_source_bridge()
+                mount_ep = f"sqlite://{wdb.name}"
+
             bus.mount(
                 MountedDevice(
-                    device_id=dctx.spec.device_id,
-                    name=dctx.spec.name or dctx.spec.device_id,
+                    device_id=dev_id,
+                    name=dctx.spec.name or dev_id,
                     kind=dctx.spec.kind,
-                    endpoint=f"sqlite://{wdb.name}",
-                    bridge=drv.as_source_bridge(),
+                    endpoint=mount_ep,
+                    bridge=mount_bridge,
                     handled_actions=dctx.handled_actions,
                     owned_object_types=dctx.owned_object_types,
                     shared_object_types=dctx.shared_object_types,
-                    allow_source_revert=dctx.spec.allow_source_revert,
+                    allow_source_revert=dctx.spec.allow_source_revert or mount_bridge.allow_source_revert,
                 )
             )
         return bus.as_source_bridge()
@@ -1075,6 +1683,9 @@ def run_design_check(
     devices: Sequence[str] = (),
     resolution_spec: str | None = None,
     decisions: str | None = None,
+    forbidden_literals: Sequence[str] = (),
+    max_driver_lines: int | None = None,
+    reset_hooks: Mapping[str, Callable[[Mapping[str, Any]], None]] | None = None,
 ) -> dict[str, Any]:
     """Execute deterministic Design-Time compilation and alignment checks (``javac``)."""
     prep = _prepare_design_context(
@@ -1085,6 +1696,9 @@ def run_design_check(
         devices=devices,
         resolution_spec=resolution_spec,
         decisions=decisions,
+        forbidden_literals=forbidden_literals,
+        max_driver_lines=max_driver_lines,
+        reset_hooks=reset_hooks,
     )
     return {
         "ok": prep["ok"],
@@ -1111,6 +1725,9 @@ def run_design_verify(
     min_transition_coverage: float = 0.8,
     max_waves: int = 3,
     target_actions: Sequence[str] | None = None,
+    forbidden_literals: Sequence[str] = (),
+    max_driver_lines: int | None = None,
+    reset_hooks: Mapping[str, Callable[[Mapping[str, Any]], None]] | None = None,
 ) -> dict[str, Any]:
     """Execute full Crucible + Multi-Device DifferentialFalsifier referee checks (``JUnit``)."""
     prep = _prepare_design_context(
@@ -1121,6 +1738,9 @@ def run_design_verify(
         devices=devices,
         resolution_spec=resolution_spec,
         decisions=decisions,
+        forbidden_literals=forbidden_literals,
+        max_driver_lines=max_driver_lines,
+        reset_hooks=reset_hooks,
     )
     errors = list(prep["errors"])
     error_codes = list(prep["error_codes"])
@@ -1256,6 +1876,287 @@ def run_design_verify(
             sandbox.close()
 
 
+def verify_thin_driver_on_hidden_world(
+    *,
+    blueprints: Sequence[str],
+    driver_path: Path | str,
+    mapping_path: Path | str | AdapterMappingSpec,
+    hidden_endpoint_config: Mapping[str, Any],
+    forbidden_literals: Sequence[str] = (),
+    max_driver_lines: int = 350,
+    model_id: str | None = None,
+    overlay: str | None = None,
+    seed: str | None = None,
+    device_id: str = "hidden_protocol_device",
+    device_kind: str = "protocol",
+    owned_object_types: Sequence[str] = (),
+    shared_object_types: Sequence[str] = (),
+    handled_actions: Sequence[str] = (),
+    allow_source_revert: bool = False,
+    reset_fn: Callable[[Mapping[str, Any]], None] | None = None,
+    oob_tamper_check: Callable[[Mapping[str, Any], Sequence[dict[str, Any]]], Mapping[str, Any]] | None = None,
+    min_action_coverage: float = 0.8,
+    min_transition_coverage: float = 0.8,
+    max_waves: int = 3,
+    target_actions: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Pure M2 blind falsification gate injecting unseen endpoint credentials into a thin driver."""
+    from .runtime import OntologyRuntime
+
+    resolved_driver = Path(driver_path).resolve()
+    ast_errors = audit_thin_driver_ast(
+        resolved_driver,
+        forbidden_literals=forbidden_literals,
+        max_lines=max_driver_lines,
+    )
+    if ast_errors:
+        errors: list[str] = []
+        error_codes: list[str] = []
+        for msg in ast_errors:
+            _add_error(errors, error_codes, msg, code=_extract_error_code(msg))
+        return {
+            "ok": False,
+            "command": "hidden_verify",
+            "verdict": "FALSIFIED",
+            "errors": errors,
+            "error_codes": error_codes,
+            "ast_errors": ast_errors,
+            "blueprint_fingerprint": None,
+            "roles": [],
+            "device_reports": [],
+            "mounted_devices": [],
+            "resolution_summary": None,
+            "crucible_passed": False,
+            "crucible_feedback": "\n".join(ast_errors),
+            "falsification": None,
+            "oob_tamper_result": None,
+        }
+
+    ep_copy = copy.deepcopy(dict(hidden_endpoint_config))
+    if not ep_copy:
+        return {
+            "ok": False,
+            "command": "hidden_verify",
+            "verdict": "FALSIFIED",
+            "errors": ["MISSING_ENDPOINT_CONFIG: hidden_endpoint_config must not be empty"],
+            "error_codes": ["MISSING_ENDPOINT_CONFIG"],
+            "ast_errors": [],
+            "blueprint_fingerprint": None,
+            "roles": [],
+            "device_reports": [],
+            "mounted_devices": [],
+            "resolution_summary": None,
+            "crucible_passed": False,
+            "crucible_feedback": "hidden_endpoint_config must not be empty",
+            "falsification": None,
+            "oob_tamper_result": None,
+        }
+
+    with tempfile.TemporaryDirectory(prefix="oo_hidden_verify_") as tmpdir:
+        tmp_path = Path(tmpdir)
+        if isinstance(mapping_path, AdapterMappingSpec):
+            mapping_obj = mapping_path
+            resolved_mapping_file = tmp_path / "mapping.json"
+            resolved_mapping_file.write_text(
+                json.dumps(mapping_obj.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            resolved_mapping_file = Path(mapping_path).resolve()
+            if not resolved_mapping_file.is_file():
+                raise FileNotFoundError(f"mapping file not found: {mapping_path}")
+            mapping_obj = AdapterMappingSpec.model_validate(_load_json_file(resolved_mapping_file))
+
+        dev_payload = {
+            "device_id": device_id,
+            "name": f"Hidden Blind Target ({device_id})",
+            "kind": device_kind,
+            "endpoint": str(ep_copy.get("url") or f"{device_kind}://{device_id}"),
+            "mapping_path": str(resolved_mapping_file),
+            "driver_module_path": str(resolved_driver),
+            "endpoint_config": ep_copy,
+            "forbidden_literals": list(forbidden_literals),
+            "max_driver_lines": max_driver_lines,
+            "owned_object_types": list(owned_object_types),
+            "shared_object_types": list(shared_object_types),
+            "handled_actions": list(handled_actions),
+            "allow_source_revert": bool(allow_source_revert),
+        }
+        hidden_dev_file = tmp_path / "hidden_device.json"
+        hidden_dev_file.write_text(json.dumps(dev_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        ver_res = run_design_verify(
+            blueprints=blueprints,
+            model_id=model_id,
+            overlay=overlay,
+            seed=seed,
+            devices=[str(hidden_dev_file)],
+            min_action_coverage=min_action_coverage,
+            min_transition_coverage=min_transition_coverage,
+            max_waves=max_waves,
+            target_actions=target_actions,
+            forbidden_literals=forbidden_literals,
+            max_driver_lines=max_driver_lines,
+            reset_hooks={device_id: reset_fn} if reset_fn is not None else None,
+        )
+
+    oob_result: dict[str, Any] | None = None
+    errors = list(ver_res["errors"])
+    error_codes = list(ver_res["error_codes"])
+    ok = bool(ver_res["ok"])
+    verdict = str(ver_res["verdict"])
+
+    if ok and oob_tamper_check is not None:
+        if reset_fn is not None:
+            reset_fn(copy.deepcopy(ep_copy))
+        prep = _prepare_design_context(
+            blueprints=blueprints,
+            model_id=model_id,
+            overlay=overlay,
+            seed=seed,
+            devices=(),
+        )
+        compiled_spec: OntologySpec | None = prep.get("compiled_spec")
+        if compiled_spec is None:
+            _add_error(
+                errors,
+                error_codes,
+                "OOB_TAMPER_SETUP_FAILED: unable to compile OntologySpec",
+                code="OOB_TAMPER_SETUP_FAILED",
+            )
+            ok = False
+            verdict = "FALSIFIED"
+        else:
+            driver_factory = _load_thin_driver_factory(resolved_driver)
+            drv_bridge = driver_factory(copy.deepcopy(ep_copy), mapping_obj)
+            eff_handled = tuple(
+                handled_actions
+                if handled_actions
+                else [b.action_name for b in mapping_obj.action_bindings]
+            )
+            if owned_object_types or shared_object_types:
+                eff_owned = tuple(owned_object_types)
+                eff_shared = tuple(shared_object_types)
+            else:
+                eff_owned = tuple(dict.fromkeys(em.target_object_type for em in mapping_obj.entity_mappings))
+                eff_shared = ()
+
+            bus = DeviceDriverRegistry(spec=compiled_spec)
+            bus.mount(
+                MountedDevice(
+                    device_id=device_id,
+                    name=device_id,
+                    kind=device_kind,
+                    endpoint=str(ep_copy.get("url") or f"{device_kind}://{device_id}"),
+                    bridge=drv_bridge,
+                    handled_actions=eff_handled,
+                    owned_object_types=eff_owned,
+                    shared_object_types=eff_shared,
+                    allow_source_revert=allow_source_revert or drv_bridge.allow_source_revert,
+                )
+            )
+            bus_bridge = bus.as_source_bridge()
+            obs_before, _ = call_observe(bus_bridge, None, spec=compiled_spec)
+            m0_before = _observe_payload_to_m0_objects(
+                obs_before, compiled_spec, validate_models=True
+            )
+            coupled_rt = OntologyRuntime(
+                compiled_spec,
+                db_path=":memory:",
+                world_mode="coupled",
+                source_bridge=bus_bridge,
+            )
+            try:
+                type_order = {name: idx for idx, name in enumerate(compiled_spec.object_types)}
+                for entry in sorted(
+                    m0_before,
+                    key=lambda item: type_order.get(str(item.get("object_type") or ""), 9999),
+                ):
+                    tname = str(entry["object_type"])
+                    cls = compiled_spec.get_object_type(tname)
+                    coupled_rt.put_object(cls(**entry["data"]))
+
+                audit_actor = Actor(
+                    actor_id="referee:audit", role="admin", clearance_tags={"*"}
+                )
+                abox_before = {
+                    ot_name: {
+                        obj.primary_key_value(): obj.to_properties()
+                        for obj in coupled_rt.query_objects(ot_name, audit_actor)
+                    }
+                    for ot_name in compiled_spec.object_types
+                }
+
+                probe = dict(oob_tamper_check(copy.deepcopy(ep_copy), m0_before))
+                probe_action = str(probe["action"])
+                probe_params = dict(probe["params"])
+                probe_role = str(probe.get("actor_role") or "admin")
+                probe_actor = Actor(actor_id="referee:oob_tamper", role=probe_role)
+                run_id = "WO14-OOB-TAMPER"
+
+                caught_code: str | None = None
+                caught_msg = ""
+                committed_unexpectedly = False
+                try:
+                    submit_res = coupled_rt.submit_action(
+                        run_id, probe_action, probe_params, probe_actor
+                    )
+                    committed_unexpectedly = submit_res.get("status") == "COMMITTED"
+                except DeviceStateMismatchError as exc:
+                    caught_code = getattr(exc, "code", None) or DEVICE_STATE_MISMATCH
+                    caught_msg = str(exc)
+                except Exception as exc:
+                    caught_code = getattr(exc, "code", None) or type(exc).__name__
+                    caught_msg = str(exc)
+
+                abox_after = {
+                    ot_name: {
+                        obj.primary_key_value(): obj.to_properties()
+                        for obj in coupled_rt.query_objects(ot_name, audit_actor)
+                    }
+                    for ot_name in compiled_spec.object_types
+                }
+                abox_unchanged = abox_after == abox_before
+                audit_row = coupled_rt.get_action_run(run_id)
+                audit_status = audit_row.get("status") if audit_row else None
+                passed = (
+                    not committed_unexpectedly
+                    and caught_code == DEVICE_STATE_MISMATCH
+                    and abox_unchanged
+                    and audit_status == "REJECTED"
+                )
+                oob_result = {
+                    "passed": passed,
+                    "action": probe_action,
+                    "params": probe_params,
+                    "caught_error_code": caught_code,
+                    "caught_message": caught_msg,
+                    "committed_unexpectedly": committed_unexpectedly,
+                    "abox_unchanged": abox_unchanged,
+                    "audit_status": audit_status,
+                }
+                if not passed:
+                    msg = (
+                        "OOB_TAMPER_UNDETECTED: external out-of-band mutation did not produce clean "
+                        f"{DEVICE_STATE_MISMATCH} rejection with zero ABox write ({oob_result})"
+                    )
+                    _add_error(errors, error_codes, msg, code="OOB_TAMPER_UNDETECTED")
+                    ok = False
+                    verdict = "FALSIFIED"
+            finally:
+                coupled_rt.close()
+
+    return {
+        **ver_res,
+        "ok": ok,
+        "command": "hidden_verify",
+        "verdict": verdict,
+        "errors": errors,
+        "error_codes": error_codes,
+        "ast_errors": [],
+        "oob_tamper_result": oob_result,
+    }
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m open_ontology.design",
@@ -1290,6 +2191,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             default=None,
             help="Optional EntityResolutionDecision list JSON path",
         )
+        p.add_argument(
+            "--forbidden-literal",
+            action="append",
+            default=[],
+            help="Forbidden sample literal checked across thin Python drivers (repeatable)",
+        )
+        p.add_argument(
+            "--max-driver-lines",
+            type=int,
+            default=None,
+            help="Override max line budget for external thin Python drivers",
+        )
         if cmd_name == "verify":
             p.add_argument("--min-action-coverage", type=float, default=0.8)
             p.add_argument("--min-transition-coverage", type=float, default=0.8)
@@ -1316,6 +2229,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             devices=args.device,
             resolution_spec=args.resolution_spec,
             decisions=args.decisions,
+            forbidden_literals=args.forbidden_literal,
+            max_driver_lines=args.max_driver_lines,
         )
     else:
         res = run_design_verify(
@@ -1330,6 +2245,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_transition_coverage=args.min_transition_coverage,
             max_waves=args.max_waves,
             target_actions=args.target_action,
+            forbidden_literals=args.forbidden_literal,
+            max_driver_lines=args.max_driver_lines,
         )
 
     print(json.dumps(res, ensure_ascii=False, indent=2))

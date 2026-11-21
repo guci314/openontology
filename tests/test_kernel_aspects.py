@@ -626,7 +626,7 @@ def test_drivers_do_not_reimplement_governance():
 
 
 def test_architecture_doc_declares_four_categories():
-    """架构文档必须写清四类模块与行数预算，避免口径漂移。"""
+    """架构文档必须写清四类模块与微内核行数规模，避免口径漂移。"""
     text = (ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
     for token in (
         "用户程序",
@@ -635,9 +635,11 @@ def test_architecture_doc_declares_four_categories():
         "微内核",
         "ingestion.py",
         "aspects.py",
-        "1350",
     ):
         assert token in text, f"架构文档缺少 {token!r}"
+    assert any(budget in text for budget in ("1,331", "1331", "1350")), (
+        "架构文档缺少微内核行数预算/规模说明"
+    )
 
 
 def test_architecture_doc_api_references_are_real():

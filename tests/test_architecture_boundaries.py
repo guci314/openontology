@@ -1,6 +1,6 @@
-"""架构红线统一门禁测试（Track A · 5 道结构性自动门禁）。
+"""架构红线统一门禁测试（Track A · 7 道结构性自动门禁）。
 
-覆盖两类架构反污染与纯同步架构红线，彻底替代碎片化手工黑名单：
+覆盖两类架构反污染、Pure Runtime 依赖收敛与标准域零互耦红线：
 1. 门禁 1（技术不污染业务 · 动态发现 + AST 导入白名单 + 禁动态导入）：动态发现仓库内全部
    纯 M1 本体声明模块，禁止直接/间接/动态 import ``OntologyRuntime``、执行传输、IO、OS 或外部系统库；
 2. 门禁 2（M1 不污染 M2 · 递归边界 + 禁动态导入 + 运行时子类白名单）：递归扫描 ``open_ontology/**/*.py``，
@@ -12,7 +12,11 @@
 4. 门禁 4（M2 跨领域盲测）：使用完全虚构领域（``Starship / WarpCore / Sector``）
    端到端跑通 ``OntologyRuntime`` / ``OntologyMCTSPlanner`` / ``describe_tbox`` / ``SymbolicCrucible``；
 5. 门禁 5（纯同步无挂起 M2 铁笼）：校验 ``open_ontology/schema.sql`` 六表结构及动作账本状态约束仅允许
-   ``('COMMITTED', 'REVERTED', 'REJECTED')``，并校验 ``open_ontology/**`` 对退役 M2 挂起/两相审批符号零命中。
+   ``('COMMITTED', 'REVERTED', 'REJECTED')``，并校验 ``open_ontology/**`` 对退役 M2 挂起/两相审批符号零命中；
+6. 门禁 6（Pure Runtime 零例外铁笼）：锁定 ``open_ontology`` 10 模块纯同步闭环，严禁延迟加载/引用 Design-Time、
+   Workshop、MCTS/MPC 或 ModelViews；
+7. 门禁 7（常识细腰零耦合域间隔离）：动态发现全部 ``examples/std_*_ontology.py``，强制非 ``std_core_ontology``
+   标准域模块零同级交叉导入、声明式蓝图 ``imports`` 与 ``relations.target_type`` 严格收束于本域对象与常识细腰核心。
 """
 
 from __future__ import annotations
@@ -323,23 +327,37 @@ def test_gate2_m2_zero_reverse_example_imports_no_business_objects_clean_io() ->
                             f"M2 内核 {rel} 禁止夹带具体 ObjectType 子类 {node.name!r}"
                         )
 
-    # 2c (Runtime). 动态导入全部 open_ontology.* 子模块并递归遍历 ObjectType.__subclasses__()（覆盖间接继承）
-    for pkg_info in pkgutil.walk_packages(open_ontology.__path__, open_ontology.__name__ + "."):
-        importlib.import_module(pkg_info.name)
-    seen: set[type[ObjectType]] = set()
-    stack: list[type[ObjectType]] = list(ObjectType.__subclasses__())
-    bad_subclasses: list[tuple[str, str]] = []
-    while stack:
-        cls = stack.pop()
-        if cls in seen:
-            continue
-        seen.add(cls)
-        stack.extend(cls.__subclasses__())
-        if cls.__module__.startswith("open_ontology") and cls.__module__ not in meta_ontology_modules:
-            bad_subclasses.append((cls.__module__, cls.__qualname__))
-    assert bad_subclasses == [], (
-        f"M2 运行时检测到非法 ObjectType 间接/直接子类：{sorted(bad_subclasses)}"
+    # 2c (Runtime). 在全新干净子进程动态导入全部 open_ontology.* 子模块并递归遍历 ObjectType.__subclasses__()（防同进程先前 compile_blueprint 动态模型污染）
+    import subprocess
+    import sys
+
+    sub_probe = (
+        "import importlib, pkgutil, open_ontology\n"
+        "from open_ontology.spec import ObjectType\n"
+        f"meta_mods = set({sorted(meta_ontology_modules)!r})\n"
+        "for pkg_info in pkgutil.walk_packages(open_ontology.__path__, open_ontology.__name__ + '.'):\n"
+        "    importlib.import_module(pkg_info.name)\n"
+        "seen = set()\n"
+        "stack = list(ObjectType.__subclasses__())\n"
+        "bad = []\n"
+        "while stack:\n"
+        "    cls = stack.pop()\n"
+        "    if cls in seen:\n"
+        "        continue\n"
+        "    seen.add(cls)\n"
+        "    stack.extend(cls.__subclasses__())\n"
+        "    if cls.__module__.startswith('open_ontology') and cls.__module__ not in meta_mods:\n"
+        "        bad.append((cls.__module__, cls.__qualname__))\n"
+        "assert bad == [], f'M2 运行时检测到非法 ObjectType 间接/直接子类：{sorted(bad)}'\n"
     )
+    rt_proc = subprocess.run(
+        [sys.executable, "-c", sub_probe],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rt_proc.returncode == 0, rt_proc.stderr or rt_proc.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -924,4 +942,219 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
     )
     assert drv_proc.returncode == 0, (
         f"drivers subprocess sys.modules check failed: {drv_proc.stderr or drv_proc.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate 7: 常识细腰零耦合——标准领域模块间严禁静/动态交叉导入与跨域实体引用
+# ---------------------------------------------------------------------------
+def _audit_std_domain_module_isolation(
+    module_stem: str,
+    source: str,
+    blueprint: DeclarativeBlueprint,
+    *,
+    core_object_types: set[str],
+    sibling_own_types: dict[str, set[str]],
+) -> list[str]:
+    """Audit one non-core ``std_*_ontology`` module for zero cross-domain coupling."""
+    violations: list[str] = []
+    tree = ast.parse(source, filename=f"{module_stem}.py")
+
+    dyn_hits = _find_dynamic_imports(tree)
+    for ln, desc in dyn_hits:
+        violations.append(
+            f"{module_stem}:{ln} 禁止动态导入 {desc} 绕过标准域隔离门禁"
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.name
+                root = name.split(".")[0]
+                if name.startswith("examples."):
+                    sub = name.split(".")[1]
+                    if sub not in ("std_core_ontology", "business_ontology"):
+                        violations.append(
+                            f"{module_stem}:{node.lineno} 禁止同级标准域交叉 import {name!r}"
+                        )
+                elif name.startswith("std_") and name != "std_core_ontology":
+                    violations.append(
+                        f"{module_stem}:{node.lineno} 禁止同级标准域交叉 import {name!r}"
+                    )
+                elif root not in _ALLOWED_M1_STDLIB_AND_SDK:
+                    violations.append(
+                        f"{module_stem}:{node.lineno} 存在标准域白名单外 import {name!r}"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if node.level > 0:
+                if mod == "":
+                    for alias in node.names:
+                        if alias.name not in ("std_core_ontology", "business_ontology"):
+                            violations.append(
+                                f"{module_stem}:{node.lineno} 禁止相对交叉导入 sibling {alias.name!r}"
+                            )
+                else:
+                    seg = mod.split(".")[1] if mod.startswith("examples.") else mod.split(".")[0]
+                    if seg not in ("std_core_ontology", "business_ontology"):
+                        violations.append(
+                            f"{module_stem}:{node.lineno} 禁止相对导入非细腰模块 {mod!r}"
+                        )
+            else:
+                if mod == "examples":
+                    for alias in node.names:
+                        if alias.name not in ("std_core_ontology", "business_ontology"):
+                            violations.append(
+                                f"{module_stem}:{node.lineno} 禁止 from examples 导入同级域 {alias.name!r}"
+                            )
+                elif mod.startswith("examples."):
+                    sub = mod.split(".")[1]
+                    if sub not in ("std_core_ontology", "business_ontology"):
+                        violations.append(
+                            f"{module_stem}:{node.lineno} 禁止跨标准域导入 {mod!r}"
+                        )
+                elif mod.split(".")[0].startswith("std_") and mod != "std_core_ontology":
+                    violations.append(
+                        f"{module_stem}:{node.lineno} 禁止跨标准域导入 {mod!r}"
+                    )
+                else:
+                    root = mod.split(".")[0]
+                    allowed = (
+                        mod in _ALLOWED_M1_STDLIB_AND_SDK
+                        or root in _ALLOWED_M1_STDLIB_AND_SDK
+                    )
+                    if not allowed:
+                        violations.append(
+                            f"{module_stem}:{node.lineno} 存在白名单外导入 {mod!r}"
+                        )
+
+    bad_bp_imports = [imp for imp in blueprint.imports if imp != "std_core_ontology"]
+    if bad_bp_imports:
+        violations.append(
+            f"{module_stem} 声明式蓝图 imports 越界包含非核心模块: {bad_bp_imports}"
+        )
+
+    own_types = {ot.name for ot in blueprint.object_types} - core_object_types
+    allowed_targets = own_types | core_object_types
+
+    for sibling_stem, other_types in sorted(sibling_own_types.items()):
+        if sibling_stem == module_stem:
+            continue
+        overlap = sorted(own_types & other_types)
+        if overlap:
+            violations.append(
+                f"{module_stem} 与同级域 {sibling_stem} 存在对象名重叠: {overlap}"
+            )
+
+    for ot in blueprint.object_types:
+        for rel in ot.relations:
+            if rel.target_type not in allowed_targets:
+                violations.append(
+                    f"{module_stem} 实体 {ot.name}.{rel.field} 越界引用同级域/未知对象 {rel.target_type!r}"
+                )
+
+    return violations
+
+
+def test_gate7_standard_domain_modules_zero_cross_imports() -> None:
+    """Gate 7: 自动发现所有 ``examples/std_*_ontology.py``，强制常识细腰隔离与零域间互耦，并跑负向自测。"""
+    std_paths = sorted((REPO_ROOT / "examples").glob("std_*_ontology.py"))
+    std_stems = [p.stem for p in std_paths]
+    assert {"std_core_ontology", "std_crm_ontology", "std_o2c_ontology"} <= set(std_stems), (
+        f"缺少预期标准域模块: discovered={std_stems}"
+    )
+
+    core_mod = importlib.import_module("examples.std_core_ontology")
+    core_bp: DeclarativeBlueprint = core_mod.build_std_core_blueprint()
+    assert core_bp.imports == [], f"std_core_ontology 不得依赖任何同级域: {core_bp.imports}"
+    core_object_types = {ot.name for ot in core_bp.object_types}
+    assert core_object_types >= {"AccountingEntity", "BusinessParty", "WorkCard"}
+
+    # 先通过反射收集所有非核心标准域模块的蓝图与其专属对象集合
+    loaded_domains: dict[str, tuple[str, DeclarativeBlueprint, set[str]]] = {}
+    for path in std_paths:
+        if path.stem == "std_core_ontology":
+            continue
+        mod = importlib.import_module(f"examples.{path.stem}")
+        expected_builder_name = f"build_{path.stem.removesuffix('_ontology')}_blueprint"
+        builder = getattr(mod, expected_builder_name, None)
+        assert callable(builder), (
+            f"标准域模块 examples/{path.name} 必须暴露 {expected_builder_name}()"
+        )
+        bp = builder()
+        assert isinstance(bp, DeclarativeBlueprint), (
+            f"{expected_builder_name}() 必须返回 DeclarativeBlueprint"
+        )
+        own_types = {ot.name for ot in bp.object_types} - core_object_types
+        loaded_domains[path.stem] = (path.read_text(encoding="utf-8"), bp, own_types)
+
+    sibling_own_types = {stem: own for stem, (_, _, own) in loaded_domains.items()}
+
+    all_violations: list[str] = []
+    for stem, (source, bp, _) in loaded_domains.items():
+        all_violations.extend(
+            _audit_std_domain_module_isolation(
+                stem,
+                source,
+                bp,
+                core_object_types=core_object_types,
+                sibling_own_types=sibling_own_types,
+            )
+        )
+    assert all_violations == [], f"Gate 7 标准域细腰隔离失败: {all_violations}"
+
+    # 负向自测：伪造 std_fake_a 导入 std_crm_ontology 或跨引用 CrmAccount 必须被 Gate 7 准确拦截
+    _, o2c_bp, _ = loaded_domains["std_o2c_ontology"]
+    fake_source_rel = (
+        "from __future__ import annotations\n"
+        "from .std_crm_ontology import CrmAccount\n"
+    )
+    rel_hits = _audit_std_domain_module_isolation(
+        "std_fake_a_ontology",
+        fake_source_rel,
+        o2c_bp,
+        core_object_types=core_object_types,
+        sibling_own_types=sibling_own_types,
+    )
+    assert any("std_crm_ontology" in msg for msg in rel_hits), (
+        f"Gate 7 负向自测未拦截相对导入 std_crm_ontology: {rel_hits}"
+    )
+
+    fake_source_abs = (
+        "from __future__ import annotations\n"
+        "import examples.std_crm_ontology\n"
+    )
+    abs_hits = _audit_std_domain_module_isolation(
+        "std_fake_a_ontology",
+        fake_source_abs,
+        o2c_bp,
+        core_object_types=core_object_types,
+        sibling_own_types=sibling_own_types,
+    )
+    assert any("examples.std_crm_ontology" in msg for msg in abs_hits), (
+        f"Gate 7 负向自测未拦截绝对导入 examples.std_crm_ontology: {abs_hits}"
+    )
+
+    fake_bp_payload = o2c_bp.model_dump(mode="python")
+    fake_bp_payload["imports"] = ["std_core_ontology", "std_crm_ontology"]
+    fake_bp_payload["object_types"][0]["relations"].append(
+        {"field": "leaked_crm_account", "target_type": "CrmAccount", "required": False}
+    )
+    fake_bp = DeclarativeBlueprint.model_validate(fake_bp_payload)
+    clean_fake_source = (
+        "from __future__ import annotations\n"
+        "from .std_core_ontology import BusinessParty\n"
+    )
+    bp_hits = _audit_std_domain_module_isolation(
+        "std_fake_a_ontology",
+        clean_fake_source,
+        fake_bp,
+        core_object_types=core_object_types,
+        sibling_own_types=sibling_own_types,
+    )
+    assert any("imports" in msg and "std_crm_ontology" in msg for msg in bp_hits), (
+        f"Gate 7 负向自测未拦截蓝图 imports 越界: {bp_hits}"
+    )
+    assert any("CrmAccount" in msg for msg in bp_hits), (
+        f"Gate 7 负向自测未拦截关系越界指向 CrmAccount: {bp_hits}"
     )

@@ -7,6 +7,7 @@ If Odoo is unreachable, the suite fails instead of skipping.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -410,8 +411,26 @@ def test_pim_psm_separation():
             "workshop.py",
             "meta_admin.py",
         ):
-            for forbidden in ("urllib", "http://", "https://", "http.server"):
+            for forbidden in ("http://", "https://", "http.server"):
                 assert forbidden not in text, f"{forbidden!r} leaked into {path.name}"
+            if path.name == "design.py":
+                # design.py holds external thin-driver AST whitelist strings ("urllib.*"),
+                # so verify via AST that design.py itself performs zero transport imports.
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            root_mod = alias.name.split(".")[0]
+                            assert root_mod not in ("urllib", "http"), (
+                                f"{alias.name!r} imported in {path.name}"
+                            )
+                    elif isinstance(node, ast.ImportFrom):
+                        root_mod = (node.module or "").split(".")[0]
+                        assert root_mod not in ("urllib", "http"), (
+                            f"{node.module!r} imported in {path.name}"
+                        )
+            else:
+                assert "urllib" not in text, f"'urllib' leaked into {path.name}"
 
     domain_text = (
         root / "examples" / "odoo_orders_ontology.py"

@@ -99,3 +99,35 @@ Monotonic additive rules layered atop `target_abi.json` (`extra="forbid"`):
      - `ok == true`
      - `verdict == "CORROBORATED"` (exit code `0`)
      - No `CONFLICTING_HARD_KEY` pair was merged, and genuine L4 gray-zone pairs remain visible in `resolution_summary.ambiguous_candidates` for steward adjudication.
+
+---
+
+## 4. Imperative Thin Python Protocol Driver (`out/driver.py`)
+
+When an external system speaks a network RPC / HTTP / stateful wizard protocol (rather than plain single-table SQLite updates), keep semantic rules in declarative JSON (`out/*_mapping.json`) and implement a minimal **Thin Protocol Transport Layer** in `out/driver.py` alongside `out/*_mapping.json`:
+
+1. **Required Entrypoint Signature**:
+   - `out/driver.py` MUST expose:
+     ```python
+     def build_device_bridge(
+         endpoint_config: Mapping[str, Any],
+         mapping: AdapterMappingSpec,
+     ) -> SourceBridge:
+     ```
+   - Read connection URLs, database/tenant names, and credentials **exclusively** from `endpoint_config` at runtime.
+   - Return `SourceBridge(actuate=actuate, observe=observe)`.
+2. **AST Anti-Cheat & Security Cage (Enforced Statically Before Execution)**:
+   - **Line Budget**: Keep `out/driver.py` concise (`<= 350` lines).
+   - **Zero Hardcoding (`FORBIDDEN_HARDCODED_SAMPLE`)**: NEVER hardcode URLs, database names, usernames/passwords, sample record IDs, document numbers, partner names, or sample amounts into string literals. The outer referee injects an unseen randomized environment into `build_device_bridge(...)` after you finish!
+   - **Allowed Imports Only (`FORBIDDEN_DRIVER_IMPORT`)**:
+     - Stdlib transport & utilities: `urllib.request`, `urllib.error`, `urllib.parse`, `http.client`, `xmlrpc.client`, `json`, `sqlite3`, `typing`, `collections`, `dataclasses`, `copy`, `math`, `decimal`, `re`, `datetime`, `time`, `functools`, `itertools`, `uuid`, `hashlib`, `base64`, `__future__`.
+     - OpenOntology SDK: `open_ontology.settlement` (`SourceBridge`), `open_ontology.spec`, `open_ontology.drivers`, and `open_ontology.induction.phenomenon` / `open_ontology.induction.dsl` (or allowed mapping dataclasses).
+     - Forbidden: `subprocess`, `os`, `sys`, `pathlib`, `shutil`, `ctypes`, `socket`, `importlib`, `pytest`, test packages, `open_ontology.design`, `open_ontology.induction.falsifier`, `open_ontology.induction.crucible`.
+   - **No Dynamic Execution or Disk Writes**: NEVER call `eval`, `exec`, `compile`, `__import__`, `open(..., "w"/"a"/"x"/"+")`, `.write_text`, `.unlink`, etc.
+3. **Live Physical Ground-Truth Readback (`observe`)**:
+   - `observe(move_envelope=None)` MUST return `dict[str, list[dict[str, Any]]]` keyed by exact `ObjectType` names from `target_abi.json`, with canonical IDs derived using `mapping` prefixes/rules and values matching ABI field types and FSM transition keys.
+   - NEVER echo expected post-states from `move_envelope["object_diff"]`; always query live external state over RPC.
+   - When real ERP/CRM databases contain unrelated standalone/orphan/cancelled documents (e.g. unlinked stock transfers, standalone accounting entries with missing origin document, or cancelled drafts/orders that have no valid parent), handle/filter non-O2C noise consistently without fabricating missing parent links or emitting invalid schemas.
+4. **Actuation & Out-of-Band Drift Detection (`actuate` -> `DEVICE_STATE_MISMATCH`)**:
+   - `actuate(move_envelope)` reads `move_envelope["action_type"]`, `move_envelope.get("params")`, and `move_envelope.get("object_diff")`, performs the corresponding live external RPC mutations, and refreshes/commits external state cleanly (mapping all downstream side effects such as stock move quantities or payment wizards).
+   - **Critical State-Drift Contract**: If the external server returns an expected business-state conflict / RPC application fault because the target record was modified out-of-band (for example, cancelled or already settled outside OpenOntology), catch that state-conflict RPC fault cleanly in `actuate` rather than crashing mid-Phase-B, so Phase B's immediate `observe()` reports true physical state back to `HomomorphicSettlementAspect`, triggering `DeviceStateMismatchError` (`DEVICE_STATE_MISMATCH`) with zero ABox corruption.
