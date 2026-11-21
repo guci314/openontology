@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .drivers import DeviceDriverRegistry
+from .mcts import OntologyMCTSPlanner
 from .meta_admin import MetaAdminService
 from .model_views import describe_behavior, describe_openapi, describe_tbox
 from .osdk import AIPAgentExecutor, iter_agent_turn, run_agent_turn
@@ -4716,7 +4717,7 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
             msg = str(body.get("message") or "").strip()
             if not msg:
                 raise ValueError("agent message must be a non-empty string")
-            executor = AIPAgentExecutor(runtime, actor)
+            executor = AIPAgentExecutor(runtime, actor, planner_factory=OntologyMCTSPlanner)
             llm_fn = getattr(self.server, "agent_llm_fn", None)
             scope_tag = "platform" if is_platform else entry.instance_id
             ghost_key = f"{scope_tag}:{actor.actor_id}"
@@ -4826,7 +4827,8 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
 
         # 规划与提交都使用实例预设的默认角色（各蓝图角色体系不同）。
         planner_actor = entry.default_actor or actor
-        report = entry.runtime.plan_mcts(planner_actor, **config)
+        with OntologyMCTSPlanner(entry.runtime, planner_actor, **config) as planner:
+            report = planner.search()
         payload = {
             "ok": True,
             "instance": entry.instance_id,

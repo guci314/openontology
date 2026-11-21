@@ -607,5 +607,17 @@ def test_4_python_diamond_extends_aligns_with_compose_blueprints() -> None:
 # Test 5: Line budget & public exports sanity
 # ---------------------------------------------------------------------------
 def test_5_runtime_line_budget_and_exports() -> None:
+    import open_ontology
+
     runtime_lines = (REPO_ROOT / "open_ontology" / "runtime.py").read_text(encoding="utf-8").splitlines()
-    assert len(runtime_lines) <= 1350, f"open_ontology/runtime.py={len(runtime_lines)} exceeds 1350"
+    assert len(runtime_lines) <= 1335, f"open_ontology/runtime.py={len(runtime_lines)} exceeds 1335"
+    for non_runtime in (
+        "OntologyMCTSPlanner",
+        "ClosedLoopMPCController",
+        "WorkshopServer",
+        "CommandCenterRegistry",
+        "DeclarativeBlueprint",
+        "SymbolicCrucible",
+    ):
+        assert non_runtime not in open_ontology.__all__
+        assert not hasattr(open_ontology, non_runtime)

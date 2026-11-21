@@ -1,14 +1,17 @@
-"""OpenOntology -- a first-principles, lightweight Palantir Ontology kernel.
+"""OpenOntology -- pure runtime execution kernel entry point (JVM core surface).
 
-Public surface::
+Public runtime exports::
 
     from open_ontology import (
         Actor, ObjectType, ObjectProperty, AutoID, OntologySpec,
         OntologyRuntime, EditBatch, ObjectDiff,
+        DeviceDriverRegistry, MountedDevice, SourceBridge,
         export_llm_tools, AIPAgentExecutor, run_eval_suite,
-        OntologyMCTSPlanner, CandidateAction, MCTSPlanResult,
-        fork_runtime, state_fingerprint,
     )
+
+Extension subpackages must be imported explicitly from their dedicated modules
+(e.g. ``open_ontology.workshop``, ``open_ontology.mcts``, ``open_ontology.mpc``,
+``open_ontology.design``, ``open_ontology.induction``).
 """
 
 from .drivers import (
@@ -19,43 +22,6 @@ from .drivers import (
     DeviceDriverRegistry,
     DeviceStatus,
     MountedDevice,
-)
-from .induction import (
-    DeclarativeBlueprint,
-    EvolutionPatch,
-    InductionGovernanceService,
-    OntologyBuilderAgent,
-    OntologyEvolverAgent,
-    SymbolicCrucible,
-)
-from .settlement import (
-    DEVICE_STATE_MISMATCH,
-    SOURCE_REVERT_FORBIDDEN,
-    UNBOUND_SOURCE_BRIDGE,
-    DeviceStateMismatchError,
-    HomomorphicSettlementAspect,
-    SourceBridge,
-    WorldMode,
-)
-from .mpc import (
-    MPC_AWAITING_EXTERNAL,
-    MPC_GOAL_REACHED,
-    MPC_MAX_REPLANS_EXCEEDED,
-    MPC_MAX_STEPS_EXCEEDED,
-    MPC_UNREACHABLE,
-    ClosedLoopMPCController,
-    MPCResult,
-    MPCStepRecord,
-)
-from .mcts import (
-    CandidateAction,
-    MCTSNode,
-    MCTSPlanResult,
-    OntologyMCTSPlanner,
-    RootActionStat,
-    commit_plan,
-    fork_runtime,
-    state_fingerprint,
 )
 from .osdk import (
     AIPAgentExecutor,
@@ -74,6 +40,15 @@ from .sandbox import (
     ObjectChange,
     ObjectDiff,
 )
+from .settlement import (
+    DEVICE_STATE_MISMATCH,
+    SOURCE_REVERT_FORBIDDEN,
+    UNBOUND_SOURCE_BRIDGE,
+    DeviceStateMismatchError,
+    HomomorphicSettlementAspect,
+    SourceBridge,
+    WorldMode,
+)
 from .spec import (
     ActionDef,
     ActionNotFoundError,
@@ -88,30 +63,20 @@ from .spec import (
     InterfaceType,
     InvariantDef,
     InvariantError,
-    RoleDef,
-    ScopedViewSpec,
-    TransitionInvariantDef,
     ObjectNotFoundError,
     ObjectProperty,
     ObjectType,
+    OntologyError,
     OntologySpec,
     OpenOntologyError,
-    OntologyError,
     PermissionDeniedError,
     ReindexConflictError,
+    RoleDef,
+    ScopedViewSpec,
+    TransitionInvariantDef,
     UnknownObjectPropertyError,
     UnknownObjectTypeError,
     UnknownRoleError,
-)
-from .workshop import (
-    CommandCenterRegistry,
-    ConnectorMount,
-    OntologyCatalogEntry,
-    OntologyInstanceEntry,
-    WorkshopHandle,
-    WorkshopServer,
-    start_command_center_server,
-    start_workshop_server,
 )
 
 __version__ = "0.3.0"
@@ -122,8 +87,14 @@ __all__ = [
     "ObjectType",
     "ObjectProperty",
     "OntologySpec",
+    "InterfaceType",
+    "RoleDef",
+    "ScopedViewSpec",
     "FunctionDef",
     "ActionDef",
+    "AutomationDef",
+    "InvariantDef",
+    "TransitionInvariantDef",
     "OntologyRuntime",
     "SimulationResult",
     "EditBatch",
@@ -140,13 +111,13 @@ __all__ = [
     "run_eval_suite",
     "EvalReport",
     "EvalCaseResult",
-    "CandidateAction",
-    "MCTSNode",
-    "MCTSPlanResult",
-    "RootActionStat",
-    "OntologyMCTSPlanner",
     "WorldMode",
     "SourceBridge",
+    "HomomorphicSettlementAspect",
+    "DeviceStateMismatchError",
+    "DEVICE_STATE_MISMATCH",
+    "UNBOUND_SOURCE_BRIDGE",
+    "SOURCE_REVERT_FORBIDDEN",
     "DeviceStatus",
     "MountedDevice",
     "DeviceDriverRegistry",
@@ -154,43 +125,6 @@ __all__ = [
     "DUPLICATE_DEVICE_ID",
     "DUPLICATE_ACTION_DRIVER",
     "DUPLICATE_OWNED_OBJECT_DRIVER",
-    "HomomorphicSettlementAspect",
-    "DeviceStateMismatchError",
-    "DEVICE_STATE_MISMATCH",
-    "UNBOUND_SOURCE_BRIDGE",
-    "SOURCE_REVERT_FORBIDDEN",
-    "DeclarativeBlueprint",
-    "EvolutionPatch",
-    "SymbolicCrucible",
-    "InductionGovernanceService",
-    "OntologyBuilderAgent",
-    "OntologyEvolverAgent",
-    "ClosedLoopMPCController",
-    "MPCResult",
-    "MPCStepRecord",
-    "MPC_GOAL_REACHED",
-    "MPC_AWAITING_EXTERNAL",
-    "MPC_MAX_REPLANS_EXCEEDED",
-    "MPC_MAX_STEPS_EXCEEDED",
-    "MPC_UNREACHABLE",
-    "fork_runtime",
-    "state_fingerprint",
-    "commit_plan",
-    "InterfaceType",
-    "RoleDef",
-    "ScopedViewSpec",
-    "AutomationDef",
-    "InvariantDef",
-    "TransitionInvariantDef",
-    "AutomationNotFoundError",
-    "WorkshopServer",
-    "WorkshopHandle",
-    "start_workshop_server",
-    "ConnectorMount",
-    "OntologyCatalogEntry",
-    "OntologyInstanceEntry",
-    "CommandCenterRegistry",
-    "start_command_center_server",
     "OpenOntologyError",
     "OntologyError",
     "PermissionDeniedError",
@@ -200,6 +134,7 @@ __all__ = [
     "UnknownRoleError",
     "ActionNotFoundError",
     "FunctionNotFoundError",
+    "AutomationNotFoundError",
     "InvariantError",
     "ConcurrencyConflictError",
     "GovernanceViolationError",

@@ -330,7 +330,7 @@ def test_3_zero_trust_readback_catches_tampered_device_b_state() -> None:
 # ---------------------------------------------------------------------------
 def test_4_decompiler_purity_runtime_budget_and_bottlecrm_untouched() -> None:
     runtime_lines = (REPO_ROOT / "open_ontology" / "runtime.py").read_text(encoding="utf-8").splitlines()
-    assert len(runtime_lines) == 1338 and len(runtime_lines) <= 1350
+    assert len(runtime_lines) <= 1335
 
     dec_src = (REPO_ROOT / "open_ontology" / "induction" / "decompiler.py").read_text(encoding="utf-8")
     for forbidden in ("BottleCRM", "bottlecrm", "CrmAccount", "CrmDeal", "CrmTicket", "odoo", "erp_north"):

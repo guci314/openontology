@@ -55,11 +55,13 @@ from pydantic import BaseModel, Field
 
 from open_ontology import (
     Actor,
+    OntologyRuntime,
+)
+from open_ontology.mcts import (
     CandidateAction,
     MCTSNode,
     MCTSPlanResult,
     OntologyMCTSPlanner as CoreMCTSPlanner,
-    OntologyRuntime,
     RootActionStat,
     fork_runtime,
     state_fingerprint,

@@ -39,6 +39,7 @@ from open_ontology.induction import (
     ReplayEvent,
     SymbolicCrucible,
 )
+from open_ontology.mcts import OntologyMCTSPlanner
 from open_ontology.model_views import describe_tbox
 from open_ontology.spec import ObjectProperty, ObjectType
 
@@ -498,12 +499,14 @@ def test_gate4_fictional_domain_blind_m2_contract() -> None:
         tbox = describe_tbox(blind_spec)
         assert {ot["name"] for ot in tbox["object_types"]} == {"WarpCore", "Starship"}
 
-        plan = rt.plan_mcts(
+        with OntologyMCTSPlanner(
+            rt,
             nav,
             candidate_table=[[("jump_sector", {"ship_id": "SS-01", "target_sector": "omega", "cost_cells": 2})]],
             value_function="fleet_fuel_total",
             simulations=8,
-        )
+        ) as planner:
+            plan = planner.search()
         assert plan.best_plan
         rt.submit_action("JUMP-1", "jump_sector", {"ship_id": "SS-01", "target_sector": "omega"}, nav)
         assert rt.get_object(Starship, "SS-01", nav).sector == "omega"
@@ -717,7 +720,27 @@ _FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
         "workshop",
         "workshop_ui",
         "meta_admin",
+        "workspaces",
+        "model_views",
+        "http_server",
+        "webhooks",
+        "mcts",
         "mpc",
+    }
+)
+
+_RUNTIME_WHITELIST_MODULES: frozenset[str] = frozenset(
+    {
+        "open_ontology",
+        "open_ontology.spec",
+        "open_ontology.sandbox",
+        "open_ontology.runtime",
+        "open_ontology.aspects",
+        "open_ontology.settlement",
+        "open_ontology.drivers",
+        "open_ontology.ingestion",
+        "open_ontology.query",
+        "open_ontology.osdk",
     }
 )
 
@@ -725,8 +748,6 @@ _FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
 def _internal_import_targets(
     mod_path: Path,
     tree: ast.AST,
-    *,
-    skip_legacy_runtime_plan_mcts: bool = False,
 ) -> tuple[list[tuple[int, str]], list[str]]:
     """Return ``(all_imports, open_ontology_targets)`` respecting relative imports."""
     rel_name = mod_path.relative_to(PKG_ROOT).with_suffix("")
@@ -734,18 +755,12 @@ def _internal_import_targets(
     all_imports: list[tuple[int, str]] = []
     internal_targets: list[str] = []
 
-    def _visit(node: ast.AST, in_legacy_plan_mcts: bool = False) -> None:
-        cur_legacy = in_legacy_plan_mcts or (
-            skip_legacy_runtime_plan_mcts
-            and isinstance(node, ast.FunctionDef)
-            and node.name == "plan_mcts"
-        )
+    def _visit(node: ast.AST) -> None:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 all_imports.append((node.lineno, alias.name))
                 if alias.name == "open_ontology" or alias.name.startswith("open_ontology."):
-                    if not cur_legacy:
-                        internal_targets.append(alias.name)
+                    internal_targets.append(alias.name)
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             if node.level > 0:
@@ -757,9 +772,8 @@ def _internal_import_targets(
                     cand = f"{full_mod}.{alias.name}" if full_mod else alias.name
                     if full_mod == "open_ontology":
                         all_imports.append((node.lineno, cand))
-                        if not cur_legacy:
-                            internal_targets.append(cand)
-                    elif full_mod.startswith("open_ontology.") and not cur_legacy:
+                        internal_targets.append(cand)
+                    elif full_mod.startswith("open_ontology."):
                         internal_targets.append(full_mod)
             else:
                 all_imports.append((node.lineno, mod))
@@ -767,23 +781,22 @@ def _internal_import_targets(
                     for alias in node.names:
                         cand = f"open_ontology.{alias.name}"
                         all_imports.append((node.lineno, cand))
-                        if not cur_legacy:
-                            internal_targets.append(cand)
-                elif mod.startswith("open_ontology.") and not cur_legacy:
+                        internal_targets.append(cand)
+                elif mod.startswith("open_ontology."):
                     internal_targets.append(mod)
         for child in ast.iter_child_nodes(node):
-            _visit(child, cur_legacy)
+            _visit(child)
 
     _visit(tree)
     return all_imports, internal_targets
 
 
 def test_gate6_runtime_oblivious_to_design_time() -> None:
-    """核心 Runtime 对 Design-Time/Induction/Workshop/CLI/Subprocess 一无所知。"""
+    """零例外铁笼版：核心 Runtime 对 Design-Time/Induction/Workshop/MCTS/MPC/ModelViews 一无所知。"""
     import subprocess
     import sys
 
-    # 6a. 静态 AST 导入封杀 + 禁动态导入
+    # 6a. 静态 AST 导入封杀 + 禁动态导入（0 例外）
     for fname in _RUNTIME_CORE_FILES:
         path = PKG_ROOT / fname
         assert path.is_file(), f"缺少 Runtime 核心模块 {fname}"
@@ -791,80 +804,97 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
         dyn_hits = _find_dynamic_imports(tree)
         assert dyn_hits == [], f"Runtime 核心模块 {fname} 禁止动态导入：{dyn_hits}"
 
-        all_imports, _ = _internal_import_targets(
-            path, tree, skip_legacy_runtime_plan_mcts=(fname == "runtime.py")
-        )
+        all_imports, _ = _internal_import_targets(path, tree)
         for lineno, target in all_imports:
             parts = target.split(".")
             assert parts[0] != "subprocess", (
                 f"Runtime 核心模块 {fname}:{lineno} 禁止引入 subprocess ({target!r})"
             )
             if parts[0] == "open_ontology":
-                bad_segs = [p for p in parts[1:] if p in _FORBIDDEN_IN_RUNTIME_MODULES or p == "mcts"]
-                if fname == "runtime.py" and lineno == 262 and parts[1:2] == ["mcts"]:
-                    # runtime.py 于 WO-11 冻结维持 1338 行；plan_mcts 的延迟导入于 WO-12 物理拆出
-                    bad_segs = [p for p in bad_segs if p != "mcts"]
+                bad_segs = [p for p in parts[1:] if p in _FORBIDDEN_IN_RUNTIME_MODULES]
                 assert bad_segs == [], (
                     f"Runtime 核心模块 {fname}:{lineno} 禁止引用非 Runtime 模块 {target!r}"
                 )
-            elif parts[0] in _FORBIDDEN_IN_RUNTIME_MODULES - {"agents"} or parts[0] == "mcts":
+            elif parts[0] in _FORBIDDEN_IN_RUNTIME_MODULES - {"agents"}:
                 raise AssertionError(
                     f"Runtime 核心模块 {fname}:{lineno} 禁止引入 {target!r}"
                 )
 
-    # 6b. 顶层 open_ontology/__init__.py 严禁导入 open_ontology.design
+    # 6b. 顶层 open_ontology/__init__.py 仅允许静态导入纯 Runtime 核心子模块，严禁 __getattr__ 后门
     init_path = PKG_ROOT / "__init__.py"
     init_tree = ast.parse(init_path.read_text(encoding="utf-8"), filename=str(init_path))
     assert _find_dynamic_imports(init_tree) == [], "open_ontology/__init__.py 禁止动态导入"
-    init_imports, _ = _internal_import_targets(init_path, init_tree)
-    for lineno, target in init_imports:
-        assert "design" not in target.split("."), (
-            f"open_ontology/__init__.py:{lineno} 严禁加载 Design-Time 模块 {target!r}"
+    has_getattr = [
+        node.lineno
+        for node in ast.walk(init_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"
+    ]
+    assert has_getattr == [], f"open_ontology/__init__.py 禁止 __getattr__ 延迟后门：{has_getattr}"
+
+    _, init_targets = _internal_import_targets(init_path, init_tree)
+    for target in init_targets:
+        normalized = ".".join(target.split(".")[:2])
+        assert normalized in _RUNTIME_WHITELIST_MODULES, (
+            f"open_ontology/__init__.py 严禁暴露/加载非 Runtime 模块 {target!r}"
         )
 
-    # 6c. 递归解析 runtime.py 与 drivers.py 直接依赖闭包，确保零反向依赖 Design-Time / Induction / Workshop / MCTS
-    allowed_closure = {
-        "open_ontology.spec",
-        "open_ontology.sandbox",
-        "open_ontology.runtime",
-        "open_ontology.aspects",
-        "open_ontology.settlement",
-        "open_ontology.drivers",
-        "open_ontology.ingestion",
-        "open_ontology.query",
-    }
+    # 6c. 递归解析顶层入口与 Runtime 核心模块静态依赖闭包（0 例外）
     visited: set[str] = set()
-    queue = ["open_ontology.runtime", "open_ontology.drivers"]
+    queue = [
+        "open_ontology",
+        "open_ontology.runtime",
+        "open_ontology.drivers",
+        "open_ontology.osdk",
+    ]
     while queue:
         mod_name = queue.pop(0)
         if mod_name in visited:
             continue
         visited.add(mod_name)
-        mod_file = REPO_ROOT / Path(*mod_name.split(".")).with_suffix(".py")
-        if not mod_file.is_file():
-            continue
-        mtree = ast.parse(mod_file.read_text(encoding="utf-8"), filename=str(mod_file))
-        _, internal_deps = _internal_import_targets(
-            mod_file,
-            mtree,
-            skip_legacy_runtime_plan_mcts=(mod_name == "open_ontology.runtime"),
+        mod_file = (
+            PKG_ROOT / "__init__.py"
+            if mod_name == "open_ontology"
+            else REPO_ROOT / Path(*mod_name.split(".")).with_suffix(".py")
         )
+        assert mod_file.is_file(), f"缺少闭包模块文件 {mod_file}"
+        mtree = ast.parse(mod_file.read_text(encoding="utf-8"), filename=str(mod_file))
+        _, internal_deps = _internal_import_targets(mod_file, mtree)
         for dep in internal_deps:
             normalized = ".".join(dep.split(".")[:2])
-            assert normalized in allowed_closure, (
+            assert normalized in _RUNTIME_WHITELIST_MODULES, (
                 f"{mod_name} 的依赖链越界引用了 {dep!r}"
             )
             if normalized not in visited:
                 queue.append(normalized)
 
-    # 6d. 全新干净子进程 sys.modules 实测
+    # 6d. 全新干净子进程 sys.modules 实测：严格落于纯 Runtime 10 模块白名单，零泄漏扩展模块
+    allowed_literal = repr(sorted(_RUNTIME_WHITELIST_MODULES))
+    banned_segs_literal = repr(
+        [
+            "design",
+            "induction",
+            "workshop",
+            "workshop_ui",
+            "meta_admin",
+            "workspaces",
+            "model_views",
+            "http_server",
+            "webhooks",
+            "mcts",
+            "mpc",
+        ]
+    )
     probe_code = (
         "import sys; "
         "import open_ontology; "
-        "from open_ontology import OntologyRuntime, DeviceDriverRegistry; "
-        "import open_ontology.runtime, open_ontology.drivers; "
-        "bad = [m for m in sys.modules if m == 'open_ontology.design' or m.startswith('open_ontology.design.')]; "
-        "assert not bad, f'leaked design modules: {bad}'"
+        "from open_ontology import OntologyRuntime, DeviceDriverRegistry, AIPAgentExecutor; "
+        f"allowed = set({allowed_literal}); "
+        f"banned = {banned_segs_literal}; "
+        "loaded = {m for m in sys.modules if m == 'open_ontology' or m.startswith('open_ontology.')}; "
+        "extra = sorted(loaded - allowed); "
+        "assert not extra, f'unexpected modules loaded by open_ontology: {extra}'; "
+        "leaked = [m for m in loaded if any(m == f'open_ontology.{b}' or m.startswith(f'open_ontology.{b}.') for b in banned)]; "
+        "assert not leaked, f'banned modules loaded: {leaked}'"
     )
     proc = subprocess.run(
         [sys.executable, "-c", probe_code],
@@ -875,13 +905,15 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
     )
     assert proc.returncode == 0, f"subprocess sys.modules check failed: {proc.stderr or proc.stdout}"
 
-    # 6e. 直接导入 Runtime 各核心子模块在干净进程下也绝不加载 open_ontology.design
+    # 6e. 直接导入 Runtime 核心子模块在干净进程下也严格落于纯 Runtime 白名单
     drv_probe = (
         "import sys; "
         "from open_ontology.drivers import DeviceDriverRegistry; "
         "import open_ontology.runtime, open_ontology.settlement, open_ontology.osdk; "
-        "bad = [m for m in sys.modules if m == 'open_ontology.design' or m.startswith('open_ontology.design.')]; "
-        "assert not bad, f'runtime loaded design modules: {bad}'"
+        f"allowed = set({allowed_literal}); "
+        "loaded = {m for m in sys.modules if m == 'open_ontology' or m.startswith('open_ontology.')}; "
+        "extra = sorted(loaded - allowed); "
+        "assert not extra, f'runtime loaded extra modules: {extra}'"
     )
     drv_proc = subprocess.run(
         [sys.executable, "-c", drv_probe],

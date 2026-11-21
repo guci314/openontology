@@ -22,11 +22,13 @@ import pytest
 
 from open_ontology import (
     Actor,
-    CommandCenterRegistry,
     ObjectProperty,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
+)
+from open_ontology.workshop import (
+    CommandCenterRegistry,
     WorkshopServer,
     start_command_center_server,
     start_workshop_server,

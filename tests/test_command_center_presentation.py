@@ -21,11 +21,8 @@ from urllib.parse import quote, urlencode
 
 import pytest
 
-from open_ontology import (
-    OntologyRuntime,
-    OntologySpec,
-    start_command_center_server,
-)
+from open_ontology import OntologyRuntime, OntologySpec
+from open_ontology.workshop import start_command_center_server
 from open_ontology.workshop import CommandCenterRegistry
 from examples.command_center_demo import build_default_command_center
 

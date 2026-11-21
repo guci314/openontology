@@ -20,7 +20,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from open_ontology import DEVICE_STATE_MISMATCH, MPC_GOAL_REACHED, OntologyRuntime
+from open_ontology import DEVICE_STATE_MISMATCH, OntologyRuntime
+from open_ontology.mpc import MPC_GOAL_REACHED
 
 from examples.o2c_hermes_mcp_server import execute_feishu_card_slash_command
 from examples.o2c_three_boards_studio import (

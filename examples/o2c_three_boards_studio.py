@@ -35,16 +35,15 @@ from typing import Any
 
 from open_ontology import (
     Actor,
-    CandidateAction,
-    ClosedLoopMPCController,
     DEVICE_STATE_MISMATCH,
     DeviceStateMismatchError,
     GovernanceViolationError,
     InvariantError,
-    MPC_GOAL_REACHED,
     OntologyRuntime,
     SourceBridge,
 )
+from open_ontology.mcts import CandidateAction
+from open_ontology.mpc import ClosedLoopMPCController, MPC_GOAL_REACHED
 
 from . import o2c_ontology as o2c
 from .feishu_card_bridge import FeishuOpenAPIClient, TransportFn, format_rmb

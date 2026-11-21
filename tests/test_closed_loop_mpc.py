@@ -23,18 +23,20 @@ from examples.business_ontology import (
 )
 from open_ontology import (
     DEVICE_STATE_MISMATCH,
+    Actor,
+    InvariantError,
+    ObjectType,
+    OntologyRuntime,
+    OntologySpec,
+)
+from open_ontology.mcts import CandidateAction
+from open_ontology.mpc import (
     MPC_AWAITING_EXTERNAL,
     MPC_GOAL_REACHED,
     MPC_MAX_REPLANS_EXCEEDED,
     MPC_MAX_STEPS_EXCEEDED,
     MPC_UNREACHABLE,
-    Actor,
-    CandidateAction,
     ClosedLoopMPCController,
-    InvariantError,
-    ObjectType,
-    OntologyRuntime,
-    OntologySpec,
 )
 
 
@@ -547,7 +549,7 @@ def test_mpc_markov_crash_restart_and_approval_pause_resume(tmp_path):
     def _plan_with_director_foresight(
         rt: OntologyRuntime, _actor: Actor
     ) -> list[CandidateAction]:
-        from open_ontology import OntologyMCTSPlanner
+        from open_ontology.mcts import OntologyMCTSPlanner
 
         with OntologyMCTSPlanner(
             rt,

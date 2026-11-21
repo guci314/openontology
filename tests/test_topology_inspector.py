@@ -11,7 +11,7 @@ from urllib.request import urlopen
 import pytest
 
 from examples.command_center_demo import build_default_command_center
-from open_ontology import start_command_center_server
+from open_ontology.workshop import start_command_center_server
 
 
 @pytest.fixture()

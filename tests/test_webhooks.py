@@ -19,13 +19,12 @@ from examples.webhook_codebuddy_listener import (
 )
 from open_ontology import (
     Actor,
-    CommandCenterRegistry,
     InvariantError,
     ObjectType,
     OntologyRuntime,
     OntologySpec,
-    start_command_center_server,
 )
+from open_ontology.workshop import CommandCenterRegistry, start_command_center_server
 from open_ontology.webhooks import (
     OutboundWebhookDispatcher,
     WebhookFilter,

@@ -20,8 +20,8 @@ from open_ontology import (
     ObjectType,
     OntologyRuntime,
     OntologySpec,
-    start_command_center_server,
 )
+from open_ontology.workshop import start_command_center_server
 
 _RUN_SEQ = itertools.count(1)
 

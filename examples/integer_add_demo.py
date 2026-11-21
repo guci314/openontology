@@ -18,8 +18,8 @@ from open_ontology import (
     ObjectType,
     OntologyRuntime,
     OntologySpec,
-    start_workshop_server,
 )
+from open_ontology.workshop import start_workshop_server
 
 
 class IntegerValue(ObjectType):

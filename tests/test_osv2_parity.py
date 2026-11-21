@@ -36,9 +36,8 @@ from open_ontology import (
     ObjectType,
     OntologyRuntime,
     OntologySpec,
-    WorkshopServer,
-    start_workshop_server,
 )
+from open_ontology.workshop import WorkshopServer, start_workshop_server
 
 # ---------------------------------------------------------------------------
 # 领域模型：钢材卷（带列级脱敏 + 本体自有字段）与废钢批（同接口、带 RLS）

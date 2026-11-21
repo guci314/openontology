@@ -24,8 +24,8 @@ from open_ontology import (
     Actor,
     InvariantError,
     OntologyRuntime,
-    start_workshop_server,
 )
+from open_ontology.workshop import start_workshop_server
 from examples.dev_factory_ontology import Deliverable, Engineer, WorkTicket, spec
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -32,8 +32,8 @@ from open_ontology import (
     ObjectType,
     OntologyRuntime,
     OntologySpec,
-    start_command_center_server,
 )
+from open_ontology.workshop import start_command_center_server
 from .dev_factory_ontology import FACTORY_MANAGER
 from .dev_factory_ontology import spec as factory_spec
 from open_ontology.workshop import (

@@ -257,13 +257,6 @@ class OntologyRuntime:
         row = self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
         return int(row["n"])
 
-    def plan_mcts(self, actor: Actor, **kwargs: Any) -> Any:
-        """快捷入口：``OntologyMCTSPlanner(self, actor, **kwargs).search()``。"""
-        from .mcts import OntologyMCTSPlanner
-
-        with OntologyMCTSPlanner(self, actor, **kwargs) as planner:
-            return planner.search()
-
     # -- transactions ------------------------------------------------------
     @contextmanager
     def _write_gate(self) -> Iterator[sqlite3.Connection]:

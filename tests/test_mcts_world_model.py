@@ -395,8 +395,8 @@ def test_main_runs_end_to_end():
 # ---------------------------------------------------------------------------
 # 8. TK-ONTO-014：核心包集成（open_ontology.mcts / runtime / osdk）
 # ---------------------------------------------------------------------------
-from open_ontology import (  # noqa: E402  (分组在文件末尾，便于对照旧测试)
-    AIPAgentExecutor,
+from open_ontology import AIPAgentExecutor  # noqa: E402  (分组在文件末尾，便于对照旧测试)
+from open_ontology.mcts import (  # noqa: E402
     CandidateAction,
     MCTSNode,
     MCTSPlanResult,
@@ -438,10 +438,12 @@ def test_core_package_exports_are_domain_free():
         "fork_runtime",
         "state_fingerprint",
     ):
-        assert name in open_ontology.__all__
-        assert hasattr(open_ontology, name)
+        assert name in core_mcts.__all__
+        assert hasattr(core_mcts, name)
+        assert name not in open_ontology.__all__
+        assert not hasattr(open_ontology, name)
 
-    assert open_ontology.OntologyMCTSPlanner is core_mcts.OntologyMCTSPlanner
+    assert OntologyMCTSPlanner is core_mcts.OntologyMCTSPlanner
     # 核心候选动作只认识 action / params / prior / label，不含任何业务字段
     candidate = CandidateAction(action="dispatch_order", params={"x": 1}, prior=0.5)
     assert set(candidate.to_dict()) == {"action", "params", "prior", "label"}
@@ -484,14 +486,17 @@ def test_state_fingerprint_reports_all_planes(rt):
 
 def test_runtime_plan_mcts_native_method(rt):
     before = rt.state_fingerprint()
-    result = rt.plan_mcts(
+    assert not hasattr(rt, "plan_mcts")
+    with OntologyMCTSPlanner(
+        rt,
         DISPATCHER,
         candidate_generator=dispatch_candidates,
         value_function="evaluate_world_value",
         simulations=80,
         seed=17,
         max_steps=len(ORDERS),
-    )
+    ) as planner:
+        result = planner.search()
     assert isinstance(result, MCTSPlanResult)
     assert isinstance(result.root, MCTSNode)
     assert result.best_plan_labels == demo.optimal_plan_labels()
@@ -516,13 +521,15 @@ def test_static_candidate_table_and_commit_plan(rt):
         ]
         for order in ORDERS
     ]
-    result = rt.plan_mcts(
+    with OntologyMCTSPlanner(
+        rt,
         DISPATCHER,
         candidate_table=table,
         value_function="evaluate_world_value",
         simulations=60,
         seed=17,
-    )
+    ) as planner:
+        result = planner.search()
     assert result.best_plan_labels == demo.optimal_plan_labels()
 
     runs = commit_plan(rt, result, DISPATCHER, run_id_prefix="CORE-PLAN")
@@ -618,7 +625,8 @@ def test_executor_simulate_sequence_sees_previous_step_mutation(rt):
 
 
 def test_executor_plan_mcts_tool(rt):
-    executor = AIPAgentExecutor(rt, DISPATCHER)
+    bare_executor = AIPAgentExecutor(rt, DISPATCHER)
+    executor = AIPAgentExecutor(rt, DISPATCHER, planner_factory=OntologyMCTSPlanner)
     before = rt.state_fingerprint()
     table = [
         [
@@ -632,6 +640,11 @@ def test_executor_plan_mcts_tool(rt):
         ]
         for order in ORDERS
     ]
+    with pytest.raises(ValueError, match="planner_factory"):
+        bare_executor.dispatch(
+            "plan_mcts",
+            {"candidates": table, "value_function": "evaluate_world_value"},
+        )
     payload = executor.dispatch(
         "plan_mcts",
         {
