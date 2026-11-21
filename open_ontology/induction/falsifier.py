@@ -394,11 +394,13 @@ class DifferentialFalsifier:
         min_transition_coverage: float = 0.8,
         adversarial_probes: Sequence[AdversarialProbe] = (),
         max_wave_steps: int = 24,
+        max_waves: int = 3,
     ) -> None:
         self.min_action_coverage = float(min_action_coverage)
         self.min_transition_coverage = float(min_transition_coverage)
         self.adversarial_probes = tuple(adversarial_probes)
         self.max_wave_steps = max(4, int(max_wave_steps))
+        self.max_waves = max(1, int(max_waves))
 
     def evaluate(
         self,
@@ -602,10 +604,11 @@ class DifferentialFalsifier:
         tried_pairs: set[tuple[str, str, str]] = set()
         reachable_edges = _infer_reachable_transitions(blueprint, target_act_defs, list(sandbox.snapshot_m0()))
 
-        for wave_idx in range(2):
+        for wave_idx in range(self.max_waves):
             if len(covered_actions) == len(target_act_defs) and covered_edges >= reachable_edges:
                 break
             wave_failed_sigs: set[tuple[str, str, str]] = set()
+            wave_executed_sigs: set[tuple[str, str, str]] = set()
             sandbox.reset()
             m0_now = list(sandbox.snapshot_m0())
             bridge = sandbox.make_source_bridge(spec, adapter_mapping)
@@ -631,12 +634,12 @@ class DifferentialFalsifier:
                         | None
                     ) = None
 
-                    # Prioritize uncovered actions, then uncovered transitions
-                    for pass_uncovered_only in (True, False):
+                    # Prioritize: (1) uncovered action, (2) uncovered edge, (3) state-advancing stepping stone
+                    for pass_kind in ("uncovered_action", "uncovered_edge", "stepping_stone"):
                         if chosen is not None:
                             break
                         for act in target_act_defs:
-                            if pass_uncovered_only and act.name in covered_actions:
+                            if pass_kind == "uncovered_action" and act.name in covered_actions:
                                 continue
                             subj_type, id_param = _primary_subject_for_action(act, ot_by_name)
                             if subj_type is None:
@@ -645,9 +648,9 @@ class DifferentialFalsifier:
                             subj_rows = m0_by_type.get(subj_type, {})
                             for oid, odata in sorted(subj_rows.items()):
                                 sig = (act.name, oid, str(odata.get(ot_by_name[subj_type].status_field, "")))
-                                if sig in wave_failed_sigs:
+                                if sig in wave_failed_sigs or sig in wave_executed_sigs:
                                     continue
-                                if sig in tried_pairs and wave_idx == 1 and pass_uncovered_only:
+                                if wave_idx >= 1 and pass_kind != "stepping_stone" and sig in tried_pairs:
                                     continue
                                 for params in _candidate_param_dicts(act, oid, id_param, odata):
                                     for actor in actors:
@@ -662,13 +665,9 @@ class DifferentialFalsifier:
                                             act.name not in covered_actions
                                             or any(e not in covered_edges for e in edges)
                                         )
-                                        if not gains_cov and pass_uncovered_only:
+                                        if pass_kind in ("uncovered_action", "uncovered_edge") and not gains_cov:
                                             continue
-                                        if (
-                                            wave_idx == 1
-                                            and act.name in covered_actions
-                                            and all(e in covered_edges for e in edges)
-                                        ):
+                                        if pass_kind == "stepping_stone" and not edges:
                                             continue
                                         chosen = (act, params, actor, sim, edges, sig)
                                         tried_pairs.add(sig)
@@ -684,6 +683,7 @@ class DifferentialFalsifier:
                         break
 
                     act, params, actor, mem_sim, edges, chosen_sig = chosen
+                    wave_executed_sigs.add(chosen_sig)
                     cases_run += 1
                     run_id = f"FALS-W{wave_idx}-S{step_idx}-{act.name}"
                     try:

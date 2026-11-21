@@ -725,6 +725,12 @@ def settle_work_card(
                 target_params,
                 approver,
             )
+            if settled_run.get("status") != "COMMITTED":
+                raise InvariantError(
+                    f"WorkCard:{card_id} target action run {act_rid!r} did not commit "
+                    f"(status={settled_run.get('status')!r}, error_code={settled_run.get('error_code')!r})",
+                    code=str(settled_run.get("error_code") or "WORK_CARD_SETTLEMENT_NOT_COMMITTED"),
+                )
             comp_run = rt_handle.submit_action(
                 comp_rid,
                 "complete_work_card",
@@ -1002,6 +1008,8 @@ def build_work_card_action_blueprints(
             "params": [
                 {"name": "card_id", "field_type": "str", "required": True},
                 {"name": "resolution_note", "field_type": "str", "default": ""},
+                {"name": "external_ref", "field_type": "str", "default": ""},
+                {"name": "settled_run_id", "field_type": "str", "default": ""},
             ],
             "preconditions": [sod_pre, assignee_pre],
             "mutations": [
@@ -1013,6 +1021,12 @@ def build_work_card_action_blueprints(
                         "status": {"lit": "COMPLETED"},
                         "resolved_by_actor_id": {"ref": "actor.actor_id"},
                         "resolution_note": {"ref": "param.resolution_note"},
+                        "external_ref": {
+                            "op": "if_else",
+                            "cond": {"op": "ne", "left": {"ref": "param.external_ref"}, "right": {"lit": ""}},
+                            "then": {"ref": "param.external_ref"},
+                            "else": {"ref": "obj.external_ref"},
+                        },
                     },
                 }
             ],

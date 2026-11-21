@@ -20,7 +20,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from open_ontology import (
     Actor,
@@ -32,6 +32,11 @@ from open_ontology import (
 )
 
 from . import o2c_ontology as o2c
+
+try:
+    from .business_ontology import settle_work_card
+except ImportError:
+    from examples.business_ontology import settle_work_card
 
 __all__ = [
     "FeishuOpenAPIClient",
@@ -179,6 +184,46 @@ def _parse_occ_external_ref(external_ref: str) -> tuple[str, str, int] | None:
         return None
 
 
+def _get_work_card_cls(runtime: OntologyRuntime) -> type[Any]:
+    if "WorkCard" in runtime.spec.object_types:
+        return runtime.spec.get_object_type("WorkCard")
+    return o2c.WorkCard
+
+
+def _infer_target_object(
+    runtime: OntologyRuntime,
+    action_name: str,
+    params: Mapping[str, Any],
+    target_object_type: str | None = None,
+) -> tuple[str, str]:
+    p = dict(params or {})
+    if target_object_type and target_object_type in runtime.spec.object_types:
+        cls = runtime.spec.get_object_type(target_object_type)
+        pk = cls.primary_key_name()
+        for key in (pk, "order", "order_id", "deal_id", "invoice_id", "ticket_id", "delivery_id", "id"):
+            val = p.get(key)
+            if val is not None and str(val).strip() != "":
+                return target_object_type, str(val)
+        return target_object_type, ""
+
+    act_def = runtime.spec.actions.get(action_name)
+    if act_def is not None:
+        for ot_name in act_def.touched_object_types:
+            if ot_name not in runtime.spec.object_types or ot_name == "WorkCard":
+                continue
+            pk = runtime.spec.get_object_type(ot_name).primary_key_name()
+            for key in (pk, "order", "order_id", "deal_id", "invoice_id", "ticket_id", "delivery_id"):
+                val = p.get(key)
+                if val is not None and str(val).strip() != "":
+                    return ot_name, str(val)
+
+    for key in ("order", "order_id", "deal_id", "invoice_id", "ticket_id", "delivery_id"):
+        val = p.get(key)
+        if val is not None and str(val).strip() != "":
+            return str(target_object_type or ""), str(val)
+    return str(target_object_type or ""), ""
+
+
 def submit_with_feishu_approval(
     runtime: OntologyRuntime,
     run_id: str,
@@ -189,15 +234,17 @@ def submit_with_feishu_approval(
     assignee_role: str = "finance_director",
     target_object_type: str = "SalesOrder",
 ) -> dict[str, Any]:
-    """提交 O2C 动作；若触发 ``APPROVAL_REQUIRED_*`` 预条件，同步开立 M1 签批协同卡。"""
+    """提交业务动作；若触发 ``APPROVAL_REQUIRED_*`` 预条件，同步开立 M1 签批协同卡。"""
     try:
         return runtime.submit_action(run_id, action_name, params, actor)
     except InvariantError as exc:
         if not str(exc.code or "").startswith("APPROVAL_REQUIRED_"):
             raise
-        order_id = str(params.get("order") or params.get("order_id") or "")
-        ver = _read_target_version(runtime, target_object_type, order_id)
-        ext_ref = f"occ:{target_object_type}:{order_id}:v{ver}" if ver is not None else ""
+        resolved_type, target_id = _infer_target_object(
+            runtime, action_name, params, target_object_type
+        )
+        ver = _read_target_version(runtime, resolved_type, target_id)
+        ext_ref = f"occ:{resolved_type}:{target_id}:v{ver}" if ver is not None else ""
         target_action = runtime.spec.get_action(action_name)
         params_json = target_action.params.model_validate(params or {}).model_dump_json()
         open_run = runtime.submit_action(
@@ -206,8 +253,8 @@ def submit_with_feishu_approval(
             {
                 "card_id": run_id,
                 "card_kind": "APPROVAL",
-                "target_object_type": target_object_type,
-                "target_object_id": order_id,
+                "target_object_type": resolved_type,
+                "target_object_id": target_id,
                 "requested_action": action_name,
                 "requested_params_json": params_json,
                 "assignee_role": assignee_role,
@@ -313,14 +360,18 @@ def format_run_for_executive(
     actor_id = str(run.get("actor_id") or "")
 
     # 若传入的是 open_work_card / reject_work_card / complete_work_card 或 WorkCard 对象，展开目标业务动作与 live 推演预览
-    work_card: o2c.WorkCard | None = None
+    work_card: Any | None = None
     card_id_hint = str(run.get("card_id") or params.get("card_id") or "")
     if card_id_hint and (raw_action == "open_work_card" or run.get("work_card_status")):
         try:
             sys_actor = Actor(actor_id="__card__", role="system", clearance_tags={"*"})
-            work_card = runtime.get_object(o2c.WorkCard, card_id_hint, sys_actor)
+            work_card = runtime.get_object(_get_work_card_cls(runtime), card_id_hint, sys_actor)
         except Exception:
             work_card = None
+
+    display_actions = dict((runtime.spec.display or {}).get("actions") or {})
+    display_objects = dict((runtime.spec.display or {}).get("objects") or {})
+    display_fields = dict((runtime.spec.display or {}).get("fields") or {})
 
     if work_card is not None:
         run_id = work_card.card_id
@@ -342,10 +393,27 @@ def format_run_for_executive(
         actor_id = work_card.requester_actor_id or actor_id
         if status == "OPEN":
             try:
+                target_act = runtime.spec.actions.get(work_card.requested_action)
+                allowed = tuple(target_act.allowed_roles or ()) if target_act is not None else ()
+                preview_role = work_card.assignee_role or "finance_director"
+                if allowed and preview_role not in allowed:
+                    preview_role = next(
+                        (
+                            r
+                            for r in ("steward", "admin", "finance_director", "sales_manager", *allowed)
+                            if r in allowed
+                        ),
+                        allowed[0],
+                    )
+                preview_actor = Actor(
+                    actor_id="__card_preview__",
+                    role=preview_role,
+                    clearance_tags=frozenset({"*"}),
+                )
                 sim_res = runtime.simulate_action(
                     work_card.requested_action,
                     params,
-                    o2c.FINANCE_DIRECTOR,
+                    preview_actor,
                 )
                 if sim_res.valid:
                     diff = sim_res.diff.to_dict()
@@ -357,7 +425,7 @@ def format_run_for_executive(
 
     is_revert = _is_revert_run({"action_type": action_type, "object_diff": diff})
 
-    action_label = _ACTION_LABELS.get(action_type, action_type)
+    action_label = display_actions.get(action_type) or _ACTION_LABELS.get(action_type, action_type)
     if is_revert:
         action_label = f"紧急冲正撤回：{action_label}"
 
@@ -367,7 +435,15 @@ def format_run_for_executive(
         or actor_id
         or "业务操作员"
     )
-    order_id = str(params.get("order") or params.get("order_id") or "")
+    order_id = str(
+        (work_card.target_object_id if work_card is not None and work_card.target_object_id else "")
+        or params.get("order")
+        or params.get("order_id")
+        or params.get("deal_id")
+        or params.get("invoice_id")
+        or params.get("ticket_id")
+        or ""
+    )
 
     # 提取结构化字段变更（Before -> After）
     changes_summary: list[dict[str, str]] = []
@@ -376,7 +452,7 @@ def format_run_for_executive(
         if obj_type == "WorkCard" and work_card is not None:
             continue
         obj_id = str(ch.get("object_id") or "")
-        obj_label = _OBJECT_LABELS.get(obj_type, obj_type)
+        obj_label = display_objects.get(obj_type) or _OBJECT_LABELS.get(obj_type, obj_type)
         kind = str(ch.get("kind") or "")
         before = ch.get("before") or {}
         after = ch.get("after") or {}
@@ -409,7 +485,7 @@ def format_run_for_executive(
             changes_summary.append(
                 {
                     "object_label": f"{obj_label} ({obj_id})",
-                    "field_label": _FIELD_LABELS.get(key, key),
+                    "field_label": display_fields.get(key) or _FIELD_LABELS.get(key, key),
                     "before_text": _format_field_value(key, before.get(key)),
                     "after_text": _format_field_value(key, after.get(key)),
                 }
@@ -419,33 +495,55 @@ def format_run_for_executive(
     risk_headline = ""
     customer_name = "目标客户"
     if order_id:
+        sys_actor = Actor(actor_id="__card__", role="system", clearance_tags={"*"})
+        target_hint = work_card.target_object_type if work_card is not None else ""
         try:
-            order_obj = runtime.get_object(
-                o2c.SalesOrder,
-                order_id,
-                Actor(actor_id="__card__", role="system", clearance_tags={"*"}),
-            )
-            cust_obj = runtime.get_object(
-                o2c.Customer,
-                order_obj.customer,
-                Actor(actor_id="__card__", role="system", clearance_tags={"*"}),
-            )
-            ar_cents = o2c.get_customer_ar_balance(
-                runtime,
-                cust_obj.customer_id,
-                Actor(actor_id="__card__", role="system", clearance_tags={"*"}),
-            )
-            customer_name = cust_obj.name
-            remaining = max(0, cust_obj.credit_limit_cents - ar_cents)
-            over = max(0, ar_cents + order_obj.total_cents - cust_obj.credit_limit_cents)
-            if status in ("OPEN", "IN_PROGRESS") and action_type == "confirm_sales_order" and over > 0:
-                risk_headline = (
-                    f"订单金额 {format_rmb(order_obj.total_cents)}，"
-                    f"超出客户剩余可用授信 {format_rmb(over)}"
-                    f"（授信总额 {format_rmb(cust_obj.credit_limit_cents)}，"
-                    f"当前可用 {format_rmb(remaining)}），"
-                    "已由数字沙箱安全拦截并开立财务签批单，ERP 原单据保持草稿未变动。"
-                )
+            if "SalesOrder" in runtime.spec.object_types and target_hint in ("", "SalesOrder"):
+                order_obj = runtime.get_object(o2c.SalesOrder, order_id, sys_actor)
+                cust_obj = runtime.get_object(o2c.Customer, order_obj.customer, sys_actor)
+                ar_cents = o2c.get_customer_ar_balance(runtime, cust_obj.customer_id, sys_actor)
+                customer_name = cust_obj.name
+                remaining = max(0, cust_obj.credit_limit_cents - ar_cents)
+                over = max(0, ar_cents + order_obj.total_cents - cust_obj.credit_limit_cents)
+                if status in ("OPEN", "IN_PROGRESS") and action_type == "confirm_sales_order" and over > 0:
+                    risk_headline = (
+                        f"订单金额 {format_rmb(order_obj.total_cents)}，"
+                        f"超出客户剩余可用授信 {format_rmb(over)}"
+                        f"（授信总额 {format_rmb(cust_obj.credit_limit_cents)}，"
+                        f"当前可用 {format_rmb(remaining)}），"
+                        "已由数字沙箱安全拦截并开立财务签批单，ERP 原单据保持草稿未变动。"
+                    )
+            elif "O2cOrder" in runtime.spec.object_types and (
+                target_hint == "O2cOrder" or (target_hint == "" and ("order_id" in params or "order" in params))
+            ):
+                order_cls = runtime.spec.get_object_type("O2cOrder")
+                prof_cls = runtime.spec.get_object_type("O2cCustomerProfile")
+                order_obj = runtime.get_object(order_cls, order_id, sys_actor)
+                prof_obj = runtime.get_object(prof_cls, order_obj.customer, sys_actor)
+                if "BusinessParty" in runtime.spec.object_types:
+                    pty_cls = runtime.spec.get_object_type("BusinessParty")
+                    customer_name = runtime.get_object(pty_cls, prof_obj.party, sys_actor).legal_name
+                else:
+                    customer_name = prof_obj.profile_id
+                if status in ("OPEN", "IN_PROGRESS") and action_type == "confirm_o2c_order":
+                    amt = float(getattr(order_obj, "amount_total", 0.0))
+                    limit = float(getattr(prof_obj, "credit_limit", 0.0))
+                    risk_headline = (
+                        f"O2C 订单金额 ¥{amt:,.2f}（授信上限 ¥{limit:,.2f}），"
+                        "已由组合本体数字沙箱安全拦截并开立签批单，ERP 原单据保持草稿未变动。"
+                    )
+            elif "CrmDeal" in runtime.spec.object_types and (
+                target_hint == "CrmDeal" or (target_hint == "" and "deal_id" in params)
+            ):
+                deal_cls = runtime.spec.get_object_type("CrmDeal")
+                acc_cls = runtime.spec.get_object_type("CrmAccount")
+                deal_obj = runtime.get_object(deal_cls, order_id, sys_actor)
+                acc_obj = runtime.get_object(acc_cls, deal_obj.account, sys_actor)
+                if "BusinessParty" in runtime.spec.object_types and hasattr(acc_obj, "party"):
+                    pty_cls = runtime.spec.get_object_type("BusinessParty")
+                    customer_name = runtime.get_object(pty_cls, acc_obj.party, sys_actor).legal_name
+                else:
+                    customer_name = acc_obj.name
         except Exception:
             pass
 
@@ -467,7 +565,7 @@ def format_run_for_executive(
 
     # 拼装数据锁版本摘要
     version_badges = [
-        f"{_OBJECT_LABELS.get(k.partition(':')[0], k.partition(':')[0])}({k.partition(':')[2]}) v{v}"
+        f"{display_objects.get(k.partition(':')[0], _OBJECT_LABELS.get(k.partition(':')[0], k.partition(':')[0]))}({k.partition(':')[2]}) v{v}"
         for k, v in sorted(read_versions.items())
     ]
     version_lock_text = " / ".join(version_badges) if version_badges else "无前置锁定对象"
@@ -1014,7 +1112,7 @@ class FeishuApprovalGateway:
         baseline: dict[str, int] = {}
         try:
             sys_actor = Actor(actor_id="__card__", role="system", clearance_tags={"*"})
-            wc = self.runtime.get_object(o2c.WorkCard, card_id, sys_actor)
+            wc = self.runtime.get_object(_get_work_card_cls(self.runtime), card_id, sys_actor)
             parsed = _parse_occ_external_ref(wc.external_ref)
             if parsed is not None:
                 baseline[f"{parsed[0]}:{parsed[1]}"] = parsed[2]
@@ -1130,7 +1228,7 @@ class FeishuApprovalGateway:
             if run is None:
                 try:
                     sys_actor = Actor(actor_id="__card__", role="system", clearance_tags={"*"})
-                    wc = self.runtime.get_object(o2c.WorkCard, run_id, sys_actor)
+                    wc = self.runtime.get_object(_get_work_card_cls(self.runtime), run_id, sys_actor)
                     self._capture_card_baseline(run_id)
                     run = {
                         "run_id": wc.card_id,
@@ -1270,6 +1368,21 @@ class FeishuApprovalGateway:
             )
         return self.default_approver
 
+    def _next_settlement_run_ids(self, run_id: str) -> tuple[str, str]:
+        if run_id in self._settled_run_by_card:
+            sid = self._settled_run_by_card[run_id]
+            return sid, f"{run_id}-COMP"
+        act_rid = f"{run_id}-ACT"
+        comp_rid = f"{run_id}-COMP"
+        existing = self.runtime.get_action_run(act_rid)
+        suffix = 2
+        while existing is not None and existing.get("status") != "COMMITTED":
+            act_rid = f"{run_id}-ACT-{suffix}"
+            comp_rid = f"{run_id}-COMP-{suffix}"
+            existing = self.runtime.get_action_run(act_rid)
+            suffix += 1
+        return act_rid, comp_rid
+
     def _check_revert_allowed(self, run: dict[str, Any]) -> None:
         action_type = str(run.get("action_type") or "")
         p = run.get("params") or {}
@@ -1278,7 +1391,7 @@ class FeishuApprovalGateway:
             return
         sys_actor = Actor(actor_id="__guard__", role="system", clearance_tags={"*"})
 
-        if action_type == "confirm_sales_order":
+        if action_type == "confirm_sales_order" and "SalesOrder" in self.runtime.spec.object_types:
             order_obj = self.runtime.get_object(o2c.SalesOrder, order_id, sys_actor)
             if order_obj.status in ("shipped", "invoiced", "paid"):
                 raise InvariantError(
@@ -1293,7 +1406,16 @@ class FeishuApprovalGateway:
                         code="REVERT_BLOCKED_ALREADY_SHIPPED",
                     )
 
-        elif action_type == "issue_and_post_invoice":
+        elif action_type == "confirm_o2c_order" and "O2cOrder" in self.runtime.spec.object_types:
+            o2c_order_cls = self.runtime.spec.get_object_type("O2cOrder")
+            order_obj = self.runtime.get_object(o2c_order_cls, order_id, sys_actor)
+            if order_obj.status in ("delivered", "invoiced"):
+                raise InvariantError(
+                    _ERROR_LABELS["REVERT_BLOCKED_ALREADY_SHIPPED"],
+                    code="REVERT_BLOCKED_ALREADY_SHIPPED",
+                )
+
+        elif action_type == "issue_and_post_invoice" and "SalesOrder" in self.runtime.spec.object_types:
             order_obj = self.runtime.get_object(o2c.SalesOrder, order_id, sys_actor)
             if order_obj.status == "paid":
                 raise InvariantError(
@@ -1368,8 +1490,7 @@ class FeishuApprovalGateway:
         with self._lock:
             actor = self._resolve_actor(open_id)
             if op == "approve":
-                act_rid = f"{run_id}-ACT"
-                comp_rid = f"{run_id}-COMP"
+                act_rid, comp_rid = self._next_settlement_run_ids(run_id)
                 self._suppress_event_run_ids.update({run_id, act_rid, comp_rid})
                 try:
                     baseline = self._capture_card_baseline(run_id)
@@ -1381,7 +1502,7 @@ class FeishuApprovalGateway:
                                 f"stale approval on {obj_key}: card opened at v{expected_ver}, "
                                 f"live version is v{live_ver}"
                             )
-                    settled_res = o2c.settle_work_card(
+                    settled_res = settle_work_card(
                         self.runtime,
                         run_id,
                         actor,
@@ -1395,7 +1516,7 @@ class FeishuApprovalGateway:
                     self._suppress_event_run_ids.add(cancel_rid)
                     try:
                         wc = self.runtime.get_object(
-                            o2c.WorkCard,
+                            _get_work_card_cls(self.runtime),
                             run_id,
                             Actor(actor_id="__occ__", role="system", clearance_tags={"*"}),
                         )

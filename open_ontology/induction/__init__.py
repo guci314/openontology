@@ -124,6 +124,7 @@ from .phenomenon import (
     RowFilterSpec,
     project_external_phenomenon,
     project_single_record,
+    merge_projected_phenomena,
     toposort_entity_mappings,
 )
 from .seed import (
@@ -199,6 +200,7 @@ __all__ = [
     "toposort_entity_mappings",
     "project_external_phenomenon",
     "project_single_record",
+    "merge_projected_phenomena",
     # M0 friction collection
     "FrictionEvidence",
     "FrictionClusterSummary",

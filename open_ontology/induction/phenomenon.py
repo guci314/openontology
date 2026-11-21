@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 from collections import defaultdict, deque
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,6 +27,7 @@ __all__ = [
     "toposort_entity_mappings",
     "project_external_phenomenon",
     "project_single_record",
+    "merge_projected_phenomena",
 ]
 
 
@@ -102,6 +103,7 @@ class FieldTransformSpec(BaseModel):
     fallback_fields: list[str] = Field(default_factory=list)
     lookup_table: str = ""
     lookup_key_field: str = ""
+    lookup_target_type: str = ""
     treat_false_as_null: bool | None = None
 
 
@@ -223,6 +225,8 @@ def _apply_field_transform(
         raw = _extract_raw_value(row, tf.source_field, treat_false_as_null=treat_false_as_null)
         if raw is None:
             return copy.deepcopy(tf.default)
+        if tf.enum_map and str(raw) in tf.enum_map:
+            return tf.enum_map[str(raw)]
         return f"{tf.prefix}{raw}"
     if tf.kind == "foreign_key_id":
         raw = row.get(tf.source_field)
@@ -231,11 +235,17 @@ def _apply_field_transform(
         raw_id = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
         if raw_id is None or (treat_false_as_null and raw_id is False):
             return copy.deepcopy(tf.default)
+        if tf.enum_map and str(raw_id) in tf.enum_map:
+            return tf.enum_map[str(raw_id)]
         return f"{tf.prefix}{raw_id}"
     if tf.kind == "lookup_join":
         raw = _extract_raw_value(row, tf.source_field, treat_false_as_null=treat_false_as_null)
         if raw is None:
             return copy.deepcopy(tf.default)
+        if tf.lookup_target_type:
+            typed_key = (f"{tf.lookup_target_type}@{tf.lookup_table}", tf.lookup_key_field, str(raw))
+            if typed_key in lookup_index:
+                return lookup_index[typed_key]
         return lookup_index.get(
             (tf.lookup_table, tf.lookup_key_field, str(raw)),
             copy.deepcopy(tf.default),
@@ -261,9 +271,11 @@ def toposort_entity_mappings(
 ) -> tuple[list[EntityMappingSpec], list[str]]:
     """Order entity_mappings so lookup_join and foreign_key_id parent tables precede dependent tables."""
     idx_by_table: dict[str, list[int]] = defaultdict(list)
+    idx_by_target_and_table: dict[tuple[str, str], list[int]] = defaultdict(list)
     idx_by_prefix: dict[str, list[int]] = defaultdict(list)
     for idx, em in enumerate(mappings):
         idx_by_table[em.source_table].append(idx)
+        idx_by_target_and_table[(em.target_object_type, em.source_table)].append(idx)
         if em.id_transform.prefix:
             idx_by_prefix[em.id_transform.prefix].append(idx)
 
@@ -273,7 +285,12 @@ def toposort_entity_mappings(
         all_tfs = [em.id_transform, *em.field_transforms]
         for tf in all_tfs:
             if tf.kind == "lookup_join" and tf.lookup_table:
-                for dep_idx in idx_by_table.get(tf.lookup_table, []):
+                dep_candidates = (
+                    idx_by_target_and_table.get((tf.lookup_target_type, tf.lookup_table), [])
+                    if tf.lookup_target_type
+                    else idx_by_table.get(tf.lookup_table, [])
+                )
+                for dep_idx in dep_candidates:
                     if dep_idx != idx:
                         deps[idx].add(dep_idx)
                         rev[dep_idx].add(idx)
@@ -396,7 +413,12 @@ def project_external_phenomenon(
                     and not (em_false_as_null and raw_v is False)
                     and not isinstance(raw_v, (list, dict))
                 ):
-                    lookup_index[(em.source_table, str(raw_k), str(raw_v))] = canonical_id
+                    lookup_index[
+                        (f"{em.target_object_type}@{em.source_table}", str(raw_k), str(raw_v))
+                    ] = canonical_id
+                    lookup_index.setdefault(
+                        (em.source_table, str(raw_k), str(raw_v)), canonical_id
+                    )
 
             dedup_key = (em.target_object_type, canonical_id)
             if dedup_key in seen_keys:
@@ -452,3 +474,34 @@ def project_single_record(
             treat_false_as_null=_resolve_false_as_null(tf, em, treat_false_as_null),
         )
     return data
+
+
+def merge_projected_phenomena(
+    batches: Sequence[Sequence[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Coalesce projected M0 object dicts across multiple sources by ``(object_type, object_id)``."""
+    merged: list[dict[str, Any]] = []
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for batch in batches:
+        for raw_entry in batch:
+            tname = str(raw_entry.get("object_type") or "")
+            oid = str(raw_entry.get("object_id") or "")
+            key = (tname, oid)
+            incoming_data = dict(raw_entry.get("data") or {})
+            if key not in by_key:
+                copied = {
+                    "object_type": tname,
+                    "object_id": oid,
+                    "data": copy.deepcopy(incoming_data),
+                }
+                merged.append(copied)
+                by_key[key] = copied
+                continue
+            cur_data = by_key[key]["data"]
+            for fname, val in incoming_data.items():
+                if val is None or val == "":
+                    continue
+                cur_val = cur_data.get(fname)
+                if cur_val is None or cur_val == "":
+                    cur_data[fname] = copy.deepcopy(val)
+    return merged

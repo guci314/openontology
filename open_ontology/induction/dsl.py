@@ -1104,10 +1104,123 @@ def _validate_fsm_monotonic(
     return merged
 
 
+def _validate_expr_schema_refs(
+    node: Any,
+    *,
+    ot_by_name: Mapping[str, ObjectTypeBlueprint],
+    root_types: Mapping[str, str],
+    param_names: set[str] | None = None,
+) -> None:
+    """Validate that ref paths, quantifier targets, and aggregate fields exist on declared schemas."""
+    if isinstance(node, (str, int, float, bool)) or node is None or isinstance(node, list):
+        return
+    if not isinstance(node, dict):
+        return
+    if set(node.keys()) == {"lit"}:
+        return
+    if set(node.keys()) == {"ref"} and isinstance(node["ref"], str):
+        ref_str = node["ref"]
+        parts = ref_str.split(".")
+        root = parts[0]
+        tail = parts[1:]
+        if root == "actor":
+            return
+        if root == "param":
+            if param_names is not None and tail and tail[0] not in param_names:
+                raise InvariantError(
+                    f"ref {ref_str!r} references undeclared param {tail[0]!r}",
+                    code="UNKNOWN_PARAM_IN_REF",
+                )
+            return
+        if root in root_types:
+            cur_type = root_types[root]
+            for idx, seg in enumerate(tail):
+                ot = ot_by_name.get(cur_type)
+                if ot is None:
+                    raise InvariantError(
+                        f"ref {ref_str!r} targets unknown object type {cur_type!r}",
+                        code="UNKNOWN_OBJECT_TYPE",
+                    )
+                has_more = idx < len(tail) - 1
+                rel_map = {r.field: r.target_type for r in ot.relations}
+                valid_fields = {ot.primary_key} | {f.name for f in ot.fields} | set(rel_map.keys())
+                if has_more:
+                    if seg not in rel_map:
+                        raise InvariantError(
+                            f"ref {ref_str!r} traverses unknown relation {cur_type}.{seg!r}",
+                            code="UNKNOWN_RELATION_IN_REF",
+                        )
+                    cur_type = rel_map[seg]
+                elif seg not in valid_fields:
+                    raise InvariantError(
+                        f"ref {ref_str!r} references unknown field {cur_type}.{seg!r}",
+                        code="UNKNOWN_FIELD_IN_REF",
+                    )
+        return
+
+    op = node.get("op")
+    if op in QUANTIFIER_OPS or op in AGGREGATE_OPS:
+        sub_type = str(node.get("object_type") or "")
+        sub_ot = ot_by_name.get(sub_type)
+        if sub_ot is None:
+            raise InvariantError(
+                f"{op!r} references unknown object_type {sub_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        sub_roots = {**root_types, "target": sub_type}
+        if op in AGGREGATE_OPS:
+            fspec = node.get("field")
+            if isinstance(fspec, str):
+                valid_sub_fields = (
+                    {sub_ot.primary_key}
+                    | {f.name for f in sub_ot.fields}
+                    | {r.field for r in sub_ot.relations}
+                )
+                if fspec not in valid_sub_fields:
+                    raise InvariantError(
+                        f"aggregate {op!r} references unknown field {sub_type}.{fspec!r}",
+                        code="UNKNOWN_FIELD_IN_REF",
+                    )
+            elif isinstance(fspec, dict):
+                _validate_expr_schema_refs(
+                    fspec,
+                    ot_by_name=ot_by_name,
+                    root_types=sub_roots,
+                    param_names=param_names,
+                )
+        if node.get("where"):
+            _validate_expr_schema_refs(
+                node["where"],
+                ot_by_name=ot_by_name,
+                root_types=sub_roots,
+                param_names=param_names,
+            )
+        return
+
+    for k, v in node.items():
+        if k != "lit":
+            if isinstance(v, list):
+                for item in v:
+                    _validate_expr_schema_refs(
+                        item,
+                        ot_by_name=ot_by_name,
+                        root_types=root_types,
+                        param_names=param_names,
+                    )
+            else:
+                _validate_expr_schema_refs(
+                    v,
+                    ot_by_name=ot_by_name,
+                    root_types=root_types,
+                    param_names=param_names,
+                )
+
+
 def _validate_action_preconditions_ast(
     preconditions: Sequence[InvariantRuleSpec],
     *,
-    ot_by_name: dict[str, ObjectTypeBlueprint],
+    ot_by_name: Mapping[str, ObjectTypeBlueprint],
+    param_names: set[str] | None = None,
 ) -> None:
     pre_roots = frozenset({"obj", "param", "actor"})
     for pre in preconditions:
@@ -1117,17 +1230,25 @@ def _validate_action_preconditions_ast(
                 f"precondition {pre.name!r} targets unknown object type {pre.target_type!r}",
                 code="UNKNOWN_OBJECT_TYPE",
             )
+        ref_roots = {"obj": pre.target_type}
         if pre.when is not None:
             validate_predicate_ast(pre.when, allowed_roots=pre_roots, allow_view=True)
+            _validate_expr_schema_refs(
+                pre.when, ot_by_name=ot_by_name, root_types=ref_roots, param_names=param_names
+            )
         validate_predicate_ast(pre.must_hold, allowed_roots=pre_roots, allow_view=True)
+        _validate_expr_schema_refs(
+            pre.must_hold, ot_by_name=ot_by_name, root_types=ref_roots, param_names=param_names
+        )
 
 
 def _validate_action_mutations_ast(
     act: ActionBlueprint,
     *,
-    ot_by_name: dict[str, ObjectTypeBlueprint],
+    ot_by_name: Mapping[str, ObjectTypeBlueprint],
 ) -> None:
     param_names = {p.name for p in act.params}
+    subject_type = _resolve_blueprint_action_subject(act)
     has_subject = any(
         (m.op != "create" and m.target_ref is None and m.id_param in param_names)
         for m in act.mutations
@@ -1148,12 +1269,34 @@ def _validate_action_mutations_ast(
                     f"action {act.name!r} mutation target_ref {mut.target_ref!r} requires a primary subject object",
                     code="UNAVAILABLE_REF_IN_CONTEXT",
                 )
+            ref_roots: dict[str, str] = {"obj": mut.object_type}
+            if subject_type:
+                ref_roots["source_obj"] = subject_type
+            if mut.target_ref.startswith("obj.") and subject_type:
+                _validate_expr_schema_refs(
+                    {"ref": mut.target_ref},
+                    ot_by_name=ot_by_name,
+                    root_types={"obj": subject_type},
+                    param_names=param_names,
+                )
+            elif mut.target_ref.startswith("param."):
+                _validate_expr_schema_refs(
+                    {"ref": mut.target_ref},
+                    ot_by_name=ot_by_name,
+                    root_types={},
+                    param_names=param_names,
+                )
         elif mut.op == "create":
             mut_roots = frozenset({"param", "actor"})
+            ref_roots = {}
         else:
             mut_roots = frozenset({"obj", "param", "actor"})
+            ref_roots = {"obj": mut.object_type}
         for fv in mut.set_fields.values():
             _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
+            _validate_expr_schema_refs(
+                fv, ot_by_name=ot_by_name, root_types=ref_roots, param_names=param_names
+            )
 
 
 def _validate_action_update_monotonic(
@@ -1364,9 +1507,12 @@ def apply_overlay(
                 f"invariant {new_inv.name!r} targets unknown object type {new_inv.target_type!r}",
                 code="UNKNOWN_OBJECT_TYPE",
             )
+        inv_ref_roots = {"obj": new_inv.target_type}
         if new_inv.when is not None:
             validate_predicate_ast(new_inv.when, allowed_roots=inv_roots, allow_view=True)
+            _validate_expr_schema_refs(new_inv.when, ot_by_name=ot_by_name, root_types=inv_ref_roots)
         validate_predicate_ast(new_inv.must_hold, allowed_roots=inv_roots, allow_view=True)
+        _validate_expr_schema_refs(new_inv.must_hold, ot_by_name=ot_by_name, root_types=inv_ref_roots)
         if new_inv.name in base_inv_by_name:
             if new_inv.model_dump(mode="json") != base_inv_by_name[new_inv.name].model_dump(mode="json"):
                 raise InvariantError(
@@ -1391,7 +1537,11 @@ def apply_overlay(
                 f"overlay cannot redefine existing action {new_act.name!r}",
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
-        _validate_action_preconditions_ast(new_act.preconditions, ot_by_name=ot_by_name)
+        _validate_action_preconditions_ast(
+            new_act.preconditions,
+            ot_by_name=ot_by_name,
+            param_names={p.name for p in new_act.params},
+        )
         _validate_action_mutations_ast(new_act, ot_by_name=ot_by_name)
         candidate.actions.append(copy.deepcopy(new_act))
         act_by_name[new_act.name] = candidate.actions[-1]
@@ -1402,7 +1552,11 @@ def apply_overlay(
                 f"overlay updates unknown action {upd_act.name!r}",
                 code="UNKNOWN_ACTION",
             )
-        _validate_action_preconditions_ast(upd_act.preconditions, ot_by_name=ot_by_name)
+        _validate_action_preconditions_ast(
+            upd_act.preconditions,
+            ot_by_name=ot_by_name,
+            param_names={p.name for p in upd_act.params},
+        )
         _validate_action_mutations_ast(upd_act, ot_by_name=ot_by_name)
         if upd_act.name in base_act_by_name:
             _validate_action_update_monotonic(base_act_by_name[upd_act.name], upd_act)
@@ -1416,8 +1570,12 @@ def apply_overlay(
                 f"overlay adds preconditions to unknown action {act_name!r}",
                 code="UNKNOWN_ACTION",
             )
-        _validate_action_preconditions_ast(extra_pres, ot_by_name=ot_by_name)
         target_act = act_by_name[act_name]
+        _validate_action_preconditions_ast(
+            extra_pres,
+            ot_by_name=ot_by_name,
+            param_names={p.name for p in target_act.params},
+        )
         existing_pre_by_name = {p.name: p.model_dump(mode="json") for p in target_act.preconditions}
         for pre in extra_pres:
             if pre.name in existing_pre_by_name:
@@ -2196,6 +2354,7 @@ def compile_blueprint(
                             )
             return True
 
+    ot_by_name = {ot.name: ot for ot in blueprint.object_types}
     for inv in blueprint.invariants:
         _assert_safe_identifier(inv.name, "invariant name")
         if inv.target_type not in created_classes:
@@ -2204,9 +2363,12 @@ def compile_blueprint(
                 code="UNKNOWN_OBJECT_TYPE",
             )
         inv_roots = frozenset({"obj"})
+        inv_ref_roots = {"obj": inv.target_type}
         if inv.when is not None:
             validate_predicate_ast(inv.when, allowed_roots=inv_roots, allow_view=True)
+            _validate_expr_schema_refs(inv.when, ot_by_name=ot_by_name, root_types=inv_ref_roots)
         validate_predicate_ast(inv.must_hold, allowed_roots=inv_roots, allow_view=True)
+        _validate_expr_schema_refs(inv.must_hold, ot_by_name=ot_by_name, root_types=inv_ref_roots)
 
         def _make_invariant(rule: InvariantRuleSpec) -> Callable[[InvariantView], bool]:
             target_cls = created_classes[rule.target_type]
@@ -2261,15 +2423,23 @@ def compile_blueprint(
         subject_cls, subject_id_param = _resolve_subject(act, param_defs)
 
         pre_roots = frozenset({"obj", "param", "actor"})
+        act_param_names = set(param_defs.keys())
         for pre in act.preconditions:
             if pre.target_type not in created_classes:
                 raise InvariantError(
                     f"precondition {pre.name!r} targets unknown object type {pre.target_type!r}",
                     code="UNKNOWN_OBJECT_TYPE",
                 )
+            pre_ref_roots = {"obj": pre.target_type}
             if pre.when is not None:
                 validate_predicate_ast(pre.when, allowed_roots=pre_roots, allow_view=True)
+                _validate_expr_schema_refs(
+                    pre.when, ot_by_name=ot_by_name, root_types=pre_ref_roots, param_names=act_param_names
+                )
             validate_predicate_ast(pre.must_hold, allowed_roots=pre_roots, allow_view=True)
+            _validate_expr_schema_refs(
+                pre.must_hold, ot_by_name=ot_by_name, root_types=pre_ref_roots, param_names=act_param_names
+            )
 
         for mut in act.mutations:
             if mut.object_type not in created_classes:
@@ -2297,12 +2467,34 @@ def compile_blueprint(
                         code="UNAVAILABLE_REF_IN_CONTEXT",
                     )
                 mut_roots = frozenset({"obj", "source_obj", "param", "actor"})
+                mut_ref_roots: dict[str, str] = {"obj": mut.object_type}
+                if subject_cls is not None:
+                    mut_ref_roots["source_obj"] = subject_cls.__name__
+                if tref_parts[0] == "obj" and subject_cls is not None:
+                    _validate_expr_schema_refs(
+                        {"ref": mut.target_ref},
+                        ot_by_name=ot_by_name,
+                        root_types={"obj": subject_cls.__name__},
+                        param_names=act_param_names,
+                    )
+                elif tref_parts[0] == "param":
+                    _validate_expr_schema_refs(
+                        {"ref": mut.target_ref},
+                        ot_by_name=ot_by_name,
+                        root_types={},
+                        param_names=act_param_names,
+                    )
             elif mut.op == "create":
                 mut_roots = frozenset({"param", "actor"})
+                mut_ref_roots = {}
             else:
                 mut_roots = frozenset({"obj", "param", "actor"})
+                mut_ref_roots = {"obj": mut.object_type}
             for fv in mut.set_fields.values():
                 _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
+                _validate_expr_schema_refs(
+                    fv, ot_by_name=ot_by_name, root_types=mut_ref_roots, param_names=act_param_names
+                )
 
         def _make_action_handler(
             action_bp: ActionBlueprint,
