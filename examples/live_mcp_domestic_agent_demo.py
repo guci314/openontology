@@ -12,7 +12,7 @@ Starts a real ``OntologyMCPServer`` over Streamable HTTP hosting:
   2. ``ORD-RISK-102`` (180,000 CNY, blocked by urgent ``CrmTicket`` ``TK-URG-901``)
 
 Connects the local real ``hermes`` CLI inside a temporary isolated ``HERMES_HOME``
-configured with a domestic model channel (OpenRouter ``deepseek/deepseek-chat-v3-0324``
+configured with a domestic model channel (OpenRouter ``deepseek/deepseek-v4.1-flash``
 or DeepSeek direct, strictly avoiding exhausted ``opencode-go`` and Gemini, zero mocks)
 via native ``mcp_servers`` Streamable HTTP transport.
 """
@@ -84,13 +84,13 @@ def _select_live_domestic_channel() -> tuple[dict[str, Any], dict[str, str]]:
     if or_key:
         candidates.append(
             {
-                "name": "openrouter-deepseek-v3",
+                "name": "openrouter-deepseek-v4.1-flash",
                 "provider": "openrouter",
-                "model": "deepseek/deepseek-chat-v3-0324",
+                "model": "deepseek/deepseek-v4.1-flash",
                 "probe_url": "https://openrouter.ai/api/v1/chat/completions",
                 "env_vars": {"OPENROUTER_API_KEY": or_key},
                 "config_model": {
-                    "default": "deepseek/deepseek-chat-v3-0324",
+                    "default": "deepseek/deepseek-v4.1-flash",
                     "provider": "openrouter",
                 },
                 "auth_key": or_key,
