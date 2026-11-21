@@ -496,7 +496,7 @@ def test_2_customer_overlay_extends_without_editing_standard_core() -> None:
         ),
         (
             "expand_standard_action_allowed_roles",
-            {"restrict_allowed_roles": {"win_crm_deal": ["sales_rep", "guest"]}},
+            {"add_roles": ["guest"], "restrict_allowed_roles": {"win_crm_deal": ["sales_rep", "guest"]}},
         ),
         (
             "reopen_terminal_fsm_state",
@@ -565,6 +565,7 @@ def test_4_python_diamond_extends_aligns_with_compose_blueprints() -> None:
     py_unified = OntologySpec(extends=(std_crm_spec, std_o2c_spec))
     bp_unified = compile_blueprint(_composed_enterprise_blueprint(), seed_ontology=BUSINESS_SEED_ONTOLOGY)
 
+    assert set(py_unified.roles.keys()) == set(bp_unified.roles.keys())
     assert set(py_unified.object_types.keys()) == set(bp_unified.object_types.keys())
     assert set(py_unified.actions.keys()) == set(bp_unified.actions.keys())
     assert set(py_unified.invariants.keys()) == set(bp_unified.invariants.keys())

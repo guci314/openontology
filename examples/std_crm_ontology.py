@@ -134,7 +134,7 @@ class ResolveCrmTicketParams(BaseModel):
 @spec.action(
     "win_crm_deal",
     WinCrmDealParams,
-    allowed_roles=("sales_rep", "sales_manager", "steward", "ai_agent", "admin"),
+    allowed_roles=("sales_rep", "sales_manager", "finance_director", "steward", "ai_agent", "admin"),
     touched_object_types=("CrmDeal",),
     description="将处于报价/谈判阶段的 CRM 商机推进为赢单（CLOSED_WON）。",
 )
@@ -286,7 +286,7 @@ def build_std_crm_blueprint() -> DeclarativeBlueprint:
                 "name": "win_crm_deal",
                 "display_label": "商机赢单",
                 "description": "将处于报价/谈判阶段的 CRM 商机推进为赢单（CLOSED_WON）。",
-                "allowed_roles": ["sales_rep", "sales_manager", "steward", "ai_agent", "admin"],
+                "allowed_roles": ["sales_rep", "sales_manager", "finance_director", "steward", "ai_agent", "admin"],
                 "params": [
                     {"name": "deal_id", "field_type": "str", "required": True},
                 ],

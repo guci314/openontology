@@ -235,6 +235,7 @@ class DeclarativeBlueprint(BaseModel):
     version: str = "1.0.0"
     seed_ontology_id: str | None = None
     imports: list[str] = Field(default_factory=list)
+    roles: list[str] = Field(default_factory=list)
     description: str = ""
     object_types: list[ObjectTypeBlueprint] = Field(default_factory=list)
     actions: list[ActionBlueprint] = Field(default_factory=list)
@@ -335,6 +336,7 @@ class CustomerOverlaySpec(BaseModel):
     base_model_id: str | None = None
     target_version: str | None = None
     description: str = ""
+    add_roles: list[str] = Field(default_factory=list)
     add_object_types: list[ObjectTypeBlueprint] = Field(default_factory=list)
     add_fields: dict[str, list[FieldSpec]] = Field(default_factory=dict)
     add_relations: dict[str, list[RelationSpec]] = Field(default_factory=dict)
@@ -920,6 +922,103 @@ def _merge_unique_definitions(
     return merged, {k: v for k, (_, v) in by_key.items()}
 
 
+def _dedup_clean_roles(roles: Sequence[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for role in roles:
+        name = str(role).strip()
+        if not name:
+            raise InvariantError("role name must not be empty", code="UNKNOWN_ROLE")
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    return cleaned
+
+
+def _assert_known_roles(
+    roles: Sequence[str],
+    valid_roles: set[str],
+    *,
+    context: str,
+) -> None:
+    cleaned = _dedup_clean_roles(roles)
+    if not valid_roles:
+        return
+    for role_name in cleaned:
+        if role_name not in valid_roles:
+            raise InvariantError(
+                f"{context}: unknown role {role_name!r} (declared roles: {sorted(valid_roles)})",
+                code="UNKNOWN_ROLE",
+            )
+
+
+def _is_actor_role_ref(node: Any) -> bool:
+    return (
+        isinstance(node, dict)
+        and set(node.keys()) == {"ref"}
+        and node.get("ref") == "actor.role"
+    )
+
+
+def _unwrap_literal(node: Any) -> tuple[bool, Any]:
+    if isinstance(node, dict) and set(node.keys()) == {"lit"}:
+        return True, node["lit"]
+    if isinstance(node, (str, list, tuple)):
+        return True, node
+    return False, None
+
+
+def _iter_ast_actor_role_literals(node: Any) -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        if set(node.keys()) == {"lit"}:
+            return found
+        op = node.get("op")
+        if op in ("eq", "ne"):
+            left = node.get("left")
+            right = node.get("right")
+            if _is_actor_role_ref(left):
+                ok, val = _unwrap_literal(right)
+                if ok and isinstance(val, str):
+                    found.append(val)
+            elif _is_actor_role_ref(right):
+                ok, val = _unwrap_literal(left)
+                if ok and isinstance(val, str):
+                    found.append(val)
+        elif op in ("in", "not_in"):
+            left = node.get("left")
+            right = node.get("right")
+            if _is_actor_role_ref(left):
+                ok, val = _unwrap_literal(right)
+                if ok and isinstance(val, (list, tuple)):
+                    for item in val:
+                        if isinstance(item, str):
+                            found.append(item)
+        for k, v in node.items():
+            if k == "lit":
+                continue
+            if isinstance(v, (dict, list, tuple)):
+                found.extend(_iter_ast_actor_role_literals(v))
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            if isinstance(item, (dict, list, tuple)):
+                found.extend(_iter_ast_actor_role_literals(item))
+    return found
+
+
+def _validate_expr_closed_roles(
+    node: Any,
+    valid_roles: set[str],
+    *,
+    context: str,
+) -> None:
+    if not valid_roles or node is None:
+        return
+    role_literals = _iter_ast_actor_role_literals(node)
+    if role_literals:
+        _assert_known_roles(role_literals, valid_roles, context=context)
+
+
 def compose_blueprints(
     blueprints: Sequence[DeclarativeBlueprint | Mapping[str, Any]],
     *,
@@ -1023,12 +1122,21 @@ def compose_blueprints(
                     code="UNKNOWN_VOUCHER_TYPE",
                 )
 
+    merged_roles: list[str] = []
+    seen_roles: set[str] = set()
+    for bp in coerced:
+        for role_name in _dedup_clean_roles(bp.roles):
+            if role_name not in seen_roles:
+                seen_roles.add(role_name)
+                merged_roles.append(role_name)
+
     resolved_desc = description or " + ".join(bp.model_id for bp in coerced)
     return DeclarativeBlueprint(
         model_id=model_id,
         version=version,
         seed_ontology_id=resolved_seed,
         imports=merged_imports,
+        roles=merged_roles,
         description=resolved_desc,
         object_types=object_types,
         actions=actions,
@@ -1343,6 +1451,51 @@ def _validate_action_update_monotonic(
             )
 
 
+def _validate_action_closed_roles(
+    act: ActionBlueprint,
+    valid_roles: set[str],
+    *,
+    context_prefix: str,
+) -> None:
+    if not valid_roles:
+        return
+    _assert_known_roles(
+        act.allowed_roles,
+        valid_roles,
+        context=f"{context_prefix} {act.name}.allowed_roles",
+    )
+    _assert_known_roles(
+        act.revert_roles,
+        valid_roles,
+        context=f"{context_prefix} {act.name}.revert_roles",
+    )
+    for param in act.params:
+        if param.masked_roles:
+            _assert_known_roles(
+                param.masked_roles,
+                valid_roles,
+                context=f"{context_prefix} {act.name}.params.{param.name}.masked_roles",
+            )
+    for pre in act.preconditions:
+        _validate_expr_closed_roles(
+            pre.when,
+            valid_roles,
+            context=f"{context_prefix} {act.name}.preconditions.{pre.name}.when",
+        )
+        _validate_expr_closed_roles(
+            pre.must_hold,
+            valid_roles,
+            context=f"{context_prefix} {act.name}.preconditions.{pre.name}.must_hold",
+        )
+    for mut in act.mutations:
+        for fv in mut.set_fields.values():
+            _validate_expr_closed_roles(
+                fv,
+                valid_roles,
+                context=f"{context_prefix} {act.name}.mutations.{mut.object_type}",
+            )
+
+
 def apply_overlay(
     base_blueprint: DeclarativeBlueprint | Mapping[str, Any],
     overlay: CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any],
@@ -1374,6 +1527,13 @@ def apply_overlay(
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
 
+    if base.roles:
+        merged_roles = _dedup_clean_roles([*base.roles, *spec_overlay.add_roles])
+        candidate.roles = merged_roles
+        valid_roles: set[str] = set(merged_roles)
+    else:
+        valid_roles = set()
+
     base_ot_by_name = {ot.name: ot for ot in base.object_types}
     ot_by_name = {ot.name: ot for ot in candidate.object_types}
 
@@ -1403,6 +1563,12 @@ def apply_overlay(
                     f"overlay weakens or breaks standard field {ot_name}.{fld.name!r}",
                     code="OVERLAY_BREAKS_STANDARD_CONTRACT",
                 )
+            if fld.masked_roles:
+                _assert_known_roles(
+                    fld.masked_roles,
+                    valid_roles,
+                    context=f"overlay alter_fields {ot_name}.{fld.name}.masked_roles",
+                )
             for idx, cur in enumerate(cand_fields):
                 if cur.name == fld.name:
                     cand_fields[idx] = copy.deepcopy(fld)
@@ -1415,6 +1581,13 @@ def apply_overlay(
                 f"overlay cannot overwrite existing object type {new_ot.name!r}",
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
+        for fld in new_ot.fields:
+            if fld.masked_roles:
+                _assert_known_roles(
+                    fld.masked_roles,
+                    valid_roles,
+                    context=f"overlay add_object_types {new_ot.name}.{fld.name}.masked_roles",
+                )
         candidate.object_types.append(copy.deepcopy(new_ot))
         ot_by_name[new_ot.name] = candidate.object_types[-1]
 
@@ -1432,6 +1605,12 @@ def apply_overlay(
                 raise InvariantError(
                     f"overlay cannot overwrite or redefine field {ot_name}.{nf.name!r}",
                     code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            if nf.masked_roles:
+                _assert_known_roles(
+                    nf.masked_roles,
+                    valid_roles,
+                    context=f"overlay add_fields {ot_name}.{nf.name}.masked_roles",
                 )
             ot.fields.append(copy.deepcopy(nf))
             existing_names.add(nf.name)
@@ -1508,6 +1687,16 @@ def apply_overlay(
                 code="UNKNOWN_OBJECT_TYPE",
             )
         inv_ref_roots = {"obj": new_inv.target_type}
+        _validate_expr_closed_roles(
+            new_inv.when,
+            valid_roles,
+            context=f"overlay add_invariants {new_inv.name}.when",
+        )
+        _validate_expr_closed_roles(
+            new_inv.must_hold,
+            valid_roles,
+            context=f"overlay add_invariants {new_inv.name}.must_hold",
+        )
         if new_inv.when is not None:
             validate_predicate_ast(new_inv.when, allowed_roots=inv_roots, allow_view=True)
             _validate_expr_schema_refs(new_inv.when, ot_by_name=ot_by_name, root_types=inv_ref_roots)
@@ -1537,6 +1726,7 @@ def apply_overlay(
                 f"overlay cannot redefine existing action {new_act.name!r}",
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
+        _validate_action_closed_roles(new_act, valid_roles, context_prefix="overlay add_actions")
         _validate_action_preconditions_ast(
             new_act.preconditions,
             ot_by_name=ot_by_name,
@@ -1552,6 +1742,7 @@ def apply_overlay(
                 f"overlay updates unknown action {upd_act.name!r}",
                 code="UNKNOWN_ACTION",
             )
+        _validate_action_closed_roles(upd_act, valid_roles, context_prefix="overlay update_actions")
         _validate_action_preconditions_ast(
             upd_act.preconditions,
             ot_by_name=ot_by_name,
@@ -1571,6 +1762,17 @@ def apply_overlay(
                 code="UNKNOWN_ACTION",
             )
         target_act = act_by_name[act_name]
+        for pre in extra_pres:
+            _validate_expr_closed_roles(
+                pre.when,
+                valid_roles,
+                context=f"overlay add_action_preconditions {act_name}.{pre.name}.when",
+            )
+            _validate_expr_closed_roles(
+                pre.must_hold,
+                valid_roles,
+                context=f"overlay add_action_preconditions {act_name}.{pre.name}.must_hold",
+            )
         _validate_action_preconditions_ast(
             extra_pres,
             ot_by_name=ot_by_name,
@@ -1594,7 +1796,12 @@ def apply_overlay(
                 f"overlay restricts roles on unknown action {act_name!r}",
                 code="UNKNOWN_ACTION",
             )
-        dedup_roles = list(dict.fromkeys(roles))
+        dedup_roles = _dedup_clean_roles(roles) if roles else []
+        _assert_known_roles(
+            dedup_roles,
+            valid_roles,
+            context=f"overlay restrict_allowed_roles {act_name}",
+        )
         current_roles = act_by_name[act_name].allowed_roles
         if not dedup_roles or not set(dedup_roles).issubset(set(current_roles)):
             raise InvariantError(
@@ -1610,7 +1817,12 @@ def apply_overlay(
                 f"overlay updates revert_roles on unknown action {act_name!r}",
                 code="UNKNOWN_ACTION",
             )
-        dedup_roles = list(dict.fromkeys(roles))
+        dedup_roles = _dedup_clean_roles(roles) if roles else []
+        _assert_known_roles(
+            dedup_roles,
+            valid_roles,
+            context=f"overlay update_revert_roles {act_name}",
+        )
         if (
             act_name in base_act_by_name
             and base_act_by_name[act_name].revert_roles
@@ -1626,6 +1838,11 @@ def apply_overlay(
     valid_act_names = set(act_by_name.keys())
     view_by_name = {v.name: idx for idx, v in enumerate(candidate.views)}
     for new_view in spec_overlay.add_views:
+        _assert_known_roles(
+            new_view.roles,
+            valid_roles,
+            context=f"overlay add_views {new_view.name}.roles",
+        )
         _validate_scoped_view_bp(new_view, valid_ot_names=valid_ot_names, valid_act_names=valid_act_names)
         if new_view.name in view_by_name:
             raise InvariantError(
@@ -1635,6 +1852,11 @@ def apply_overlay(
         candidate.views.append(copy.deepcopy(new_view))
         view_by_name[new_view.name] = len(candidate.views) - 1
     for upd_view in spec_overlay.update_views:
+        _assert_known_roles(
+            upd_view.roles,
+            valid_roles,
+            context=f"overlay update_views {upd_view.name}.roles",
+        )
         _validate_scoped_view_bp(upd_view, valid_ot_names=valid_ot_names, valid_act_names=valid_act_names)
         if upd_view.name not in view_by_name:
             raise InvariantError(
@@ -2046,6 +2268,13 @@ def compile_blueprint(
         )
 
     spec = OntologySpec(extends=(seed_ontology.base_spec,)) if seed_ontology is not None else OntologySpec()
+    seed_roles = set(seed_ontology.base_spec.roles) if seed_ontology is not None else set()
+    if blueprint.roles:
+        for role_name in _dedup_clean_roles(blueprint.roles):
+            if role_name not in seed_roles and role_name not in spec.roles:
+                spec.role(role_name)
+    compiled_valid_roles = set(spec.roles)
+
     created_classes: dict[str, type[ObjectType]] = {}
     type_names = {_assert_safe_identifier(ot.name, "object type") for ot in blueprint.object_types}
 
@@ -2364,6 +2593,17 @@ def compile_blueprint(
             )
         inv_roots = frozenset({"obj"})
         inv_ref_roots = {"obj": inv.target_type}
+        if compiled_valid_roles:
+            _validate_expr_closed_roles(
+                inv.when,
+                compiled_valid_roles,
+                context=f"invariant {inv.name}.when",
+            )
+            _validate_expr_closed_roles(
+                inv.must_hold,
+                compiled_valid_roles,
+                context=f"invariant {inv.name}.must_hold",
+            )
         if inv.when is not None:
             validate_predicate_ast(inv.when, allowed_roots=inv_roots, allow_view=True)
             _validate_expr_schema_refs(inv.when, ot_by_name=ot_by_name, root_types=inv_ref_roots)
@@ -2430,6 +2670,17 @@ def compile_blueprint(
                     f"precondition {pre.name!r} targets unknown object type {pre.target_type!r}",
                     code="UNKNOWN_OBJECT_TYPE",
                 )
+            if compiled_valid_roles:
+                _validate_expr_closed_roles(
+                    pre.when,
+                    compiled_valid_roles,
+                    context=f"action {act.name}.preconditions.{pre.name}.when",
+                )
+                _validate_expr_closed_roles(
+                    pre.must_hold,
+                    compiled_valid_roles,
+                    context=f"action {act.name}.preconditions.{pre.name}.must_hold",
+                )
             pre_ref_roots = {"obj": pre.target_type}
             if pre.when is not None:
                 validate_predicate_ast(pre.when, allowed_roots=pre_roots, allow_view=True)
@@ -2491,6 +2742,12 @@ def compile_blueprint(
                 mut_roots = frozenset({"obj", "param", "actor"})
                 mut_ref_roots = {"obj": mut.object_type}
             for fv in mut.set_fields.values():
+                if compiled_valid_roles:
+                    _validate_expr_closed_roles(
+                        fv,
+                        compiled_valid_roles,
+                        context=f"action {act.name}.mutations.{mut.object_type}",
+                    )
                 _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
                 _validate_expr_schema_refs(
                     fv, ot_by_name=ot_by_name, root_types=mut_ref_roots, param_names=act_param_names

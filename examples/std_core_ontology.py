@@ -152,6 +152,7 @@ def build_std_core_blueprint() -> DeclarativeBlueprint:
         "version": "1.0.0",
         "seed_ontology_id": "business_ontology",
         "imports": [],
+        "roles": [r for r, _ in STD_ROLES],
         "description": "企业标准核心底座蓝图：核算主体、往来业务伙伴与统一协同 WorkCard。",
         "object_types": [
             {

@@ -127,6 +127,21 @@ from .phenomenon import (
     merge_projected_phenomena,
     toposort_entity_mappings,
 )
+from .resolution import (
+    BlockedPairRecord,
+    CrosswalkEntry,
+    CrosswalkTable,
+    EntityMatchCandidate,
+    EntityResolutionDecision,
+    EntityResolutionReport,
+    EntityResolutionSpec,
+    SourceEntityBatch,
+    SourceRef,
+    apply_resolution_decisions,
+    build_resolution_task_intent,
+    inject_crosswalk_into_mapping,
+    resolve_entities,
+)
 from .seed import (
     SeedArchetypeHint,
     SeedOntology,
@@ -201,6 +216,20 @@ __all__ = [
     "project_external_phenomenon",
     "project_single_record",
     "merge_projected_phenomena",
+    # M2 4-tier entity resolution & crosswalk
+    "EntityResolutionSpec",
+    "SourceRef",
+    "SourceEntityBatch",
+    "CrosswalkEntry",
+    "EntityMatchCandidate",
+    "BlockedPairRecord",
+    "EntityResolutionDecision",
+    "CrosswalkTable",
+    "EntityResolutionReport",
+    "resolve_entities",
+    "apply_resolution_decisions",
+    "build_resolution_task_intent",
+    "inject_crosswalk_into_mapping",
     # M0 friction collection
     "FrictionEvidence",
     "FrictionClusterSummary",

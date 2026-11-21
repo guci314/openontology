@@ -162,7 +162,7 @@ class RecordO2cPaymentParams(BaseModel):
 @spec.action(
     "confirm_o2c_order",
     ConfirmO2cOrderParams,
-    allowed_roles=("sales_rep", "sales_manager", "ops", "steward", "ai_agent", "admin"),
+    allowed_roles=("sales_rep", "sales_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
     touched_object_types=("O2cOrder",),
     description="校验草稿状态与正金额后确认标准销售订单。",
 )
@@ -184,7 +184,7 @@ def confirm_o2c_order(ctx: Any, params: ConfirmO2cOrderParams) -> None:
 @spec.action(
     "complete_o2c_delivery",
     CompleteO2cDeliveryParams,
-    allowed_roles=("warehouse", "ops", "steward", "ai_agent", "admin"),
+    allowed_roles=("warehouse", "ops", "finance_director", "steward", "ai_agent", "admin"),
     touched_object_types=("O2cDelivery", "O2cOrder"),
     description="完成待发货履约单并同步推进关联销售订单为已发货（delivered）。",
 )
@@ -383,7 +383,7 @@ def build_std_o2c_blueprint() -> DeclarativeBlueprint:
                 "name": "confirm_o2c_order",
                 "display_label": "确认销售订单",
                 "description": "校验草稿状态与正金额后确认标准销售订单。",
-                "allowed_roles": ["sales_rep", "sales_manager", "ops", "steward", "ai_agent", "admin"],
+                "allowed_roles": ["sales_rep", "sales_manager", "ops", "finance_director", "steward", "ai_agent", "admin"],
                 "params": [
                     {"name": "order_id", "field_type": "str", "required": True},
                 ],
@@ -426,7 +426,7 @@ def build_std_o2c_blueprint() -> DeclarativeBlueprint:
                 "name": "complete_o2c_delivery",
                 "display_label": "完成发货确认",
                 "description": "完成待发货履约单并同步推进关联销售订单为已发货（delivered）。",
-                "allowed_roles": ["warehouse", "ops", "steward", "ai_agent", "admin"],
+                "allowed_roles": ["warehouse", "ops", "finance_director", "steward", "ai_agent", "admin"],
                 "params": [
                     {"name": "delivery_id", "field_type": "str", "required": True},
                 ],
