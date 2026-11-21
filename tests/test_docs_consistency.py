@@ -151,6 +151,23 @@ def test_living_docs_synced_with_runtime_design_split_and_no_retired_symbols():
         corpus_parts.append(text)
 
     combined = "\n".join(corpus_parts)
-    for anchor in ("DeviceDriverRegistry", "open_ontology.design", "WorkCard"):
+    for anchor in (
+        "DeviceDriverRegistry",
+        "open_ontology.design",
+        "WorkCard",
+        "mcp_server",
+        "AutonomyRampController",
+        "SagaReconciler",
+        "schema_pg.sql",
+        "MDMSidecarPlugin",
+        "Gate 7",
+    ):
         assert anchor in combined, f"活文档缺少现行关键架构锚点：{anchor}"
     assert "Gate 6" in combined or "Runtime 对 Design-Time" in combined
+
+    for anchor in ("mcp_server", "AutonomyRampController", "SagaReconciler", "schema_pg.sql", "MDMSidecarPlugin", "Gate 7"):
+        assert anchor in readme_doc, f"README.md 缺少生产运行壳或门禁锚点：{anchor}"
+        assert anchor in arch_doc, f"docs/ARCHITECTURE.md 缺少生产运行壳或门禁锚点：{anchor}"
+
+    for leak in ("jshERP", "Odoo", "BottleCRM", "SteelStorageBin", "螺纹钢"):
+        assert leak not in arch_doc, f"M2 平台宪法 docs/ARCHITECTURE.md 夹带了具体厂商或行业实现词：{leak}"

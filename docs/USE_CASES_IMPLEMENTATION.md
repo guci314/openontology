@@ -281,11 +281,12 @@ flowchart TB
 
 ### 4.3 Runtime 分级：同一份 PIM，多种 PSM
 
-| 级别 | 存储 | 集成 | 部署 | 适用 |
+| 级别 | 存储 | 集成与安全运行壳 | 部署 | 适用 |
 |---|---|---|---|---|
-| **L0 沙盘** | SQLite `:memory:` | 无 / Mock | 单进程 | 建模、推演、单元测试、AI 生成模型的验证 |
-| **L1 部门级**（当前实现） | SQLite 文件 | Python 适配器 + Quarkus/Camel 工程 | 单机 HTTP 服务 | 试点、部门系统、边缘场景 |
-| **L2 生产级**（可选，规划） | RDF 数据库 | Apache Camel 集成总线 | 微服务集群（Spring Cloud 对应的 Python 技术栈） | 集团级、高可用、多系统集成 |
+| **L0 沙盘** | SQLite `:memory:` | 无 / Mock | 单进程 | 建模、推演、`fork()` 反事实测试、AI 生成模型的验证 |
+| **L1 单机/MCP 控制面**（当前已落地） | SQLite 文件 | Python 适配器 + `DeviceDriverRegistry` + `OntologyMCPServer`（stdio / Streamable HTTP）+ `AutonomyRampController` + `SagaReconciler` | 单机 HTTP / MCP 服务 | 试点、部门级审批、Agent 影子爬坡冷启动 |
+| **L1.5 生产多进程持久化**（当前已落地） | **PostgreSQL 16**（`open_postgres_runtime` + `schema_pg.sql` PL/pgSQL 门禁 + 跨连接 OCC） | 同上 + 外挂 `MDMSidecarPlugin` + Quarkus/Camel 工程 | Docker / 独立 PG16 数据库 | 多进程并发交易控制面、双异构企业 B2B 协同（`fork()` 仍零锁降落 `:memory:` 沙盘） |
+| **L2 联邦级**（规划中） | 分布式图/列存储 + SPI 抽象 | Apache Camel / CDC 流式连接器 + 企微/飞书组织树动态行权（`WO-23`） | 容器集群 | 集团级海量数据湖与全组织多层级联动 |
 
 `fork()` 出的平行世界始终可以落在 L0 上，因此**生产环境也能随时开沙盘**。
 
@@ -493,9 +494,10 @@ flowchart LR
 
 前两把锁让旁路**没有意义**（建了也用不了），第三把锁让旁路**没有机会**。
 
-#### 机制 5：跨系统身份 → 关系 + 四级实体解析 `CrosswalkTable`
+#### 机制 5：跨系统身份 → 关系 + 四级实体解析 `CrosswalkTable` + 外挂 `MDMSidecarPlugin`
 - CRM 客户、ERP 客户、财务开票主体通过共享 `BusinessParty` 与关系边对齐，避免人工映射表漂移；
-- 面对跨系统多设备同名异构主数据（如中文全称、缺失税号、子母公司同名异税号冲突），通过纯 M2 四级实体解析漏斗（`open_ontology/induction/resolution.py`）自动化治理：**L1 税号等标准化硬键精确自动合并**、**同名异税号触发 `CONFLICTING_HARD_KEY` 刚性阻断严禁合并**、**L4 缺硬键灰区不盲合而是自动生成 `WorkCard(HUMAN_TASK)` 交由 Steward 确认（L0 `CONFIRM_MERGE` / `REJECT_SEPARATE`）**，最终固化为不可变 `CrosswalkTable` 注入 CRM / ERP 双外设驱动。
+- 面对跨系统多设备同名异构主数据（如中文全称、缺失税号、子母公司同名异税号冲突），通过 `open_ontology/induction/resolution.py` + 零内核污染外挂 **[mdm_plugin.py](file:///Users/guci/work/open-ontology/open_ontology/mdm_plugin.py)**（`MDMSidecarPlugin`）自动化治理：**L1 税号等标准化硬键精确自动合并并热刷新**、**同名异税号触发 `CONFLICTING_HARD_KEY` 刚性阻断**、**L4 缺硬键灰区不盲合而是幂等生成单张 `WorkCard(HUMAN_TASK)` 交由 Steward 确认（L0 `CONFIRM_MERGE` / `REJECT_SEPARATE`）**，最终固化为 `CrosswalkTable` 注入异构 ERP / CRM 双外设驱动。
+- 在河北钢厂深水区插件（[steel_mdm_plugin.py](file:///Users/guci/work/open-ontology/examples/steel_mdm_plugin.py)）中进一步实证了物理料仓 **`SteelStorageBin` 粒度的 `BIN_EXACT` 精确溯源 vs 品牌 FIFO**（同一厂家多炉号直采料仓互不串味），以及旁路散码**前松（地磅称重阶段仅打 `PROVISIONAL` 标签放行不卡车）后紧（关账、开票、付款前凭 Steward 审定工单解除 `PROVISIONAL` 硬拦）**两段式落地解法。
 
 ### 6.3 这种结构在各行业普遍存在
 
@@ -537,8 +539,8 @@ flowchart LR
 | 阶段 | 做什么 | 对业务的影响 | 风险 |
 |---|---|---|---|
 | **0. 本体工作坊** | 业务骨干 + 建模师一起做可执行建模，导入部分真实数据，当场沙盘推演典型业务 | 无 | 极低 |
-| **1. 寄生期** | 读取老系统快照；Ontology 影子运行，对比结果但不写回 | 无，老系统照常 | 极低 |
-| **2. 共生期** | 新字段、新规则只写 overlay；增量数据过 Action 门禁；存量脏数据靠 overlay 归并 | 部分新流程走本体 | 低，可 revert |
+| **1. 寄生期** | 读取老系统快照；`AutonomyRampController` 启动 `SHADOW` 影子模式与 `OntologyMCPServer` 受控接管入口，对比结果但不外写 | 无，老系统照常 | 极低 |
+| **2. 共生期** | 新字段、新规则只写 overlay；增量过 Action 门禁；`AUTO_UNDER_CEILING` 定额内渐进放行（`SagaReconciler` 防写后超时重放）；存量靠 `MDMSidecarPlugin` + overlay 归并 | 部分新流程走本体 | 低，可 revert |
 | **3. 接管期** | 按字段、按对象类型把主权从老系统收回本体（`__owned__`） | 核心流程迁入 | 中，按字段切碎 |
 | **4. 拔除期（可选）** | 老系统降为只读归档或直接下线 | 完成替换 | 前面已验证充分 |
 
@@ -641,11 +643,24 @@ OpenOntology 能降低实施的**技术**风险，但解决不了以下问题：
 - **业务本身没想清楚**：本体能让问题更快暴露，但不能替业务做决定；
 - **适配器工作量**：每接一个外部系统都要写适配器，主流国产 ERP/MES 的适配器生态还需要建设；
 - **建模能力**：需要培养懂业务又懂建模的“本体建模师”，这是新角色；
-- **性能与规模**：当前 Runtime 基于 SQLite，适合沙盘、试点与部门级；集团级需要第四节所述的生产级 Runtime（RDF + Camel + 微服务），这部分尚待建设。即便如此，定位仍是“治理与行动层”，而不是替代数仓或核心交易库。
+- **性能与规模**：除 SQLite 单机与 PostgreSQL 16 多进程交易控制面外，超大规模集团跨区 PB 级分析仍须依托专用数仓与流式引擎；OpenOntology 定位始终是“治理与行动控制面”，而不是替代数仓。
+- **国内组织与岗位动态行权**：国内企业微信 / 飞书组织树增量同步与部门级动态委派/行权将于后续 `WO-23` 补齐。
 
 ---
 
-## 十二、一句话总结
+## 十二、已落地核心示例与全栈基准索引（`WO-13` ~ `WO-21` + `WO-18`）
+
+| 入口文件 | 验证能力与对应场景 |
+|---|---|
+| [std_core_ontology.py](file:///Users/guci/work/open-ontology/examples/std_core_ontology.py) / [std_p2p_ontology.py](file:///Users/guci/work/open-ontology/examples/std_p2p_ontology.py) / [commonsense_exchange.py](file:///Users/guci/work/open-ontology/examples/commonsense_exchange.py) | 标准常识细腰（REA 5 原语 `AccountingEntity` / `BusinessParty` / `TradeResource` / `TradeCommitment` / `FulfillmentEvent`）、标准 P2P/O2C/CRM 模型及严格字段白名单跨企互操作信封 |
+| [live_mcp_domestic_agent_demo.py](file:///Users/guci/work/open-ontology/examples/live_mcp_domestic_agent_demo.py) | 标准 MCP Streamable HTTP（`OntologyMCPServer`）对接隔离 `hermes` CLI + 国产 `deepseek/deepseek-v4.1-flash`（客诉阻断自动开立 `WorkCard`） |
+| [agy_fde_live_odoo19_protocol_benchmark.py](file:///Users/guci/work/open-ontology/examples/agy_fde_live_odoo19_protocol_benchmark.py) / [agy_fde_live_jsherp_protocol_benchmark.py](file:///Users/guci/work/open-ontology/examples/agy_fde_live_jsherp_protocol_benchmark.py) | 国产可用模型 `deepseek-v4.1-flash` 在隔离只读沙盒下零提示盲考反编译真实欧洲 Odoo 19 与中国华夏 ERP（`jshERP`）并通过隐藏世界证伪 |
+| [steel_mdm_plugin.py](file:///Users/guci/work/open-ontology/examples/steel_mdm_plugin.py) + [mdm_plugin.py](file:///Users/guci/work/open-ontology/open_ontology/mdm_plugin.py) | 零内核污染外挂 MDM 插件 + 河北钢厂物理料仓 `SteelStorageBin` `BIN_EXACT` 精确溯源及前松（地磅 `PROVISIONAL`）后紧（关账硬拦）实证 |
+| [live_b2b_steel_trade_lab.py](file:///Users/guci/work/open-ontology/examples/live_b2b_steel_trade_lab.py) | 双企业全栈异构联调实验室：真实华夏 ERP + 真实 Odoo 19 + BottleCRM + PostgreSQL 16 + 双端 `hermes` 代理经 5 原语常识信封完成 `SHADOW` 爬坡、96t/100t 短重争议裁决、URGENT 工单阻断零泄漏、OOB 漂移、Saga 超时对账与 MDM 消歧 |
+
+---
+
+## 十三、一句话总结
 
 > **传统实施是把业务“装进”系统；OpenOntology 是把业务“提出来”，让系统变成可替换的工具。**
 > 业务模型是**可执行 UML**，在沙盘里用真实数据推演验证后直接上生产；实施风险因此从一次性的上线日，变成可切碎、可验证、可回退的连续过程。

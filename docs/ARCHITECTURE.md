@@ -43,7 +43,7 @@ flowchart TB
         ABOX --> ROOT
     end
 
-    subgraph RUNTIME["3. Runtime / 执行引擎（Pure Runtime · 10 模块 / 8,729 行）"]
+    subgraph RUNTIME["3. Runtime / 执行引擎（Pure Runtime · 10 模块 / 8,781 行）"]
         direction TB
         CORE["① Runtime.Core 微内核｜EditBatch 内存沙箱 · ObjectDiff · fork() 平行世界推演 · ontology_write_gate 写门禁"]
         ASPECT["② Runtime.Aspect 六大切面 + 同态结算｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 被拒审计 · 反射 · 忙闲回调 · HomomorphicSettlementAspect"]
@@ -198,21 +198,21 @@ sequenceDiagram
 
 ## 2. 工程模块的物理边界 (Pure Runtime vs Design-Time Decomposition)
 
-代码仓库围绕 **Pure Runtime 核心（JVM 执行面）**、**Design-Time 编译与波普尔证伪工具链（`javac + JUnit`）** 以及 **显式按需导入的可选扩展子包** 三层物理隔离组织；顶层包 `open_ontology/__init__.py`（142 行，严禁 `__getattr__` 隐式延迟后门）仅暴露 Pure Runtime，使 `import open_ontology` 的默认加载面收敛为 **10 个模块 / 8,729 行**：
+代码仓库围绕 **Pure Runtime 核心（JVM 执行面）**、**Design-Time 编译与波普尔证伪工具链（`javac + JUnit`）** 以及 **显式按需导入的可插拔生产运行壳层与扩展子包** 三层物理隔离组织；顶层包 `open_ontology/__init__.py`（142 行，严禁 `__getattr__` 隐式延迟后门）仅暴露 Pure Runtime，使 `import open_ontology` 的默认加载面收敛为 **10 个模块 / 8,781 行**：
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Tier 0 · 用户程序 / Model —— M1 领域模型与只增不破客户覆层            │
 │   examples/*_ontology.py（如 std_*_ontology / kanban · M1 协同 WorkCard）│
-│   严格 AST 白名单：仅依赖 stdlib / pydantic / open_ontology.spec      │
+│   严格 AST 白名单 + Gate 7 标准常识细腰零横向互耦门禁                 │
 ├══════════════════════════════════════════════════════════════════════┤
-│ Tier 1 · Pure Runtime 核心（import open_ontology · 10 模块 / 8,729行）│
+│ Tier 1 · Pure Runtime 核心（import open_ontology · 10 模块 / 8,781行）│
 │                                                                      │
 │ ① 微内核 / Runtime.Core                                              │
 │   __init__.py (142行)  纯运行时符号导出（零 __getattr__ 延迟后门）    │
 │   spec.py              M2 元模型原语（Object/Property/Action/Invariant）│
 │   sandbox.py           EditBatch 内存叠加沙箱与可逆 ObjectDiff         │
-│   runtime.py (1,331行) 系统调用主干：write_gate / OCC / fork / 切面委托│
+│   runtime.py (1,328行) 系统调用主干：write_gate / OCC / fork / 切面委托│
 │   query.py             ObjectSet 集合代数与聚合                        │
 │   schema.sql           5 张纯业务治理表 + 1 张写门禁表（:memory:同构） │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -234,13 +234,19 @@ sequenceDiagram
 │   open_ontology/induction/dsl.py     零 exec 声明式蓝图 / 单调 Overlay  │
 │   open_ontology/induction/resolution.py  L0-L4 实体解析与 CrosswalkTable │
 │   open_ontology/induction/phenomenon.py · crucible.py · falsifier.py   │
-│   skills/openontology-fde/SKILL.md   外部 agy CLI AI-FDE 只读隔离规程 │
+│   skills/openontology-fde/SKILL.md   外部独立 AI-FDE 只读隔离探索规程  │
 ├══════════════════════════════════════════════════════════════════════┤
-│ Tier 3 · 显式按需导入的可选扩展子包（从各自子模块显式导入）          │
-│   open_ontology.mcts        OntologyMCTSPlanner（纯内存 fork() 树搜索）│
-│   open_ontology.mpc         ClosedLoopMPCController（滚动闭环规划）   │
-│   open_ontology.workshop / workshop_ui / workspaces / model_views /    │
-│   http_server / webhooks / meta_admin / execution                    │
+│ Tier 3 · 显式按需导入的可插拔生产运行壳层与扩展子包                   │
+│   生产运行壳层（零内核耦合，按需从各自模块显式导入）：               │
+│     open_ontology.mcp_server        OntologyMCPServer（stdio / POST /mcp）│
+│     open_ontology.autonomy          AutonomyRampController（三级影子爬坡）│
+│     open_ontology.reconciliation    SagaReconciler（写后失联先回读对账）│
+│     open_ontology.postgres_backend + schema_pg.sql（PG16 跨进程持久底座）│
+│     open_ontology.mdm_plugin        MDMSidecarPlugin（L0-L4 外挂协调插件）│
+│   规划、指挥台与目录扩展：                                            │
+│     open_ontology.mcts（OntologyMCTSPlanner）/ mpc（ClosedLoopMPCController）│
+│     open_ontology.workshop / workshop_ui / workspaces / model_views /    │
+│     http_server / webhooks / meta_admin / execution                    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -253,6 +259,7 @@ sequenceDiagram
 | 它是对每次读写/提交无条件生效的权限、脱敏、幂等、审计、回调或同态结算切面吗？ | **系统调用切面与结算**（`aspects.py` / `settlement.py`） |
 | 它是通用多设备挂载路由、单写设备隔离、跨设备共享主数据合并或快照摄入驱动吗？ | **设备驱动总线**（`drivers.py` / `ingestion.py`） |
 | 它是静态蓝图编译、单调 Overlay、L0–L4 Crosswalk 解析、五关熔炉或差分证伪吗？ | **Design-Time 工具链**（`open_ontology.design` / `open_ontology.induction`） |
+| 它是 MCP 运行壳、自治度爬坡、写后 Saga 对账、PG16 存储后端或外挂 MDM 协调插件吗？ | **显式可插拔生产运行壳层**（`mcp_server.py` / `autonomy.py` / `reconciliation.py` / `postgres_backend.py` / `mdm_plugin.py`） |
 | 它是规划搜索（`mcts`/`mpc`）、Web 作战台（`workshop`）、工作空间目录或 HTTP 协议层吗？ | **显式可选扩展子包**（严禁进入 `open_ontology/__init__.py`） |
 
 ### 2.1 `DeviceDriverRegistry`（`open_ontology/drivers.py`）架构契约
@@ -269,8 +276,17 @@ sequenceDiagram
 * **外部 AI-FDE（`agy` CLI）与只读裁判沙盒**：设计期由外部独立编码代理（如 `agy` CLI 依据 `skills/openontology-fde/SKILL.md`）自主探查未知外部数据库并仅在可写目录 `out/` 中产出声明式映射、单调覆层与实体解析配置，绝不修改只读目标 ABI、需求规范与样本源库；随后由零 LLM 的确定性命令行裁判 **`python -m open_ontology.design check | verify`** 在临时沙箱副本上执行编译对齐、五关 `SymbolicCrucible` 与 `DifferentialFalsifier` 波普尔差分证伪（仅当 `verdict == "CORROBORATED"` 且退出码为 `0` 时方允许签发进入 Runtime）。
 
 **微内核行数预算与依赖方向约束**：
-* **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1,335 行**（现行 **1,331 行**，`test_5_runtime_line_budget_and_exports` 与 `test_4_decompiler_purity_runtime_budget_and_bottlecrm_untouched` 硬门禁）。超出预算时必须审视逻辑是否属于 `aspects.py`、驱动层或外围扩展层，严禁放宽预算阈值。
-* **单向依赖铁律**：切面（`aspects.py`）与设备驱动只能通过微内核既定入口（`spec` / `_write_gate()` / `_apply_diff()` / `get_action_run()` / `load_snapshot` / `submit_action`）工作，严禁反向 `import` `runtime.py`（`test_aspects_module_is_self_contained`），也不得绕过治理管线直改底层表。`examples/kanban.py` 与任何具体行业 `ObjectType` 子类（元数据治理本体 `governance.py` / `meta_admin.py` 除外）严禁进入内核导出表。
+* **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1,335 行**（现行 **1,328 行**，`test_5_runtime_line_budget_and_exports` 与 `test_4_decompiler_purity_runtime_budget_and_bottlecrm_untouched` 硬门禁）。超出预算时必须审视逻辑是否属于 `aspects.py`、驱动层、可插拔生产运行壳或外围扩展层，严禁放宽预算阈值。
+* **单向依赖铁律**：切面（`aspects.py`）与设备驱动只能通过微内核既定入口（`spec` / `_write_gate()` / `_apply_diff()` / `get_action_run()` / `load_snapshot` / `submit_action`）工作，严禁反向 `import` `runtime.py`（`test_aspects_module_is_self_contained`），也不得绕过治理管线直改底层表。具体行业 `ObjectType` 子类（元数据治理本体除外）严禁进入内核导出表。
+
+### 2.3 可插拔生产运行壳层契约（MCP · Autonomy · Saga · PostgreSQL · MDM Sidecar）
+
+上述五大生产级能力全部以**独立可插拔运行壳**形态位于 `open_ontology` 外围子模块，经 **Gate 6** 验证与 10 模块 Pure Runtime 核心零耦合：
+1. **标准 MCP 运行壳（`open_ontology/mcp_server.py` · `OntologyMCPServer`）**：基于 Python stdlib 实现 JSON-RPC 2.0 协议，同时提供 stdio 与 Streamable HTTP（`POST /mcp`）传输边界；在服务端硬钉死呼叫方 `Actor` 与 `ScopedView` 身份权限，屏蔽上游代理参数伪造风险，并将工具集合（`describe_tbox`、`query_objects`、`simulate_action`、`submit_action` 等）与受权 M1 领域动作投影为标准 MCP Tool契约。
+2. **三级自治度影子爬坡门禁（`open_ontology/autonomy.py` · `AutonomyRampController`）**：为 Agent 生产切换提供冷启动可控开关，支持按角色与策略分流为 **`SHADOW`**（仅走沙箱预演并写入追加式影子账本 `SHADOW_RECORDED`，物理外设与持久化存储零写入）、**`COPILOT_ESCALATE`**（零隐式直写，生成/校验交由显式协作工单）与 **`AUTO_UNDER_CEILING`**（在指定量化上限内自动提交，超限或缺失指标立即 fail-closed 升级）。
+3. **写后失联 Saga 先回读对账（`open_ontology/reconciliation.py` · `SagaReconciler`）**：封装 `SourceBridge`，应对耦合外设执行期间的网络超时、连接重置或 ACK 丢失。当 `actuate()` 抛出瞬态失联异常时，禁止直接盲目重试，而是**强制先调用 `observe()` 回读真实外部终态并逐项比对**：已落地外部则返回 `RECONCILED_REMOTE_COMMITTED` 无痛提升入主世界，确认未发生外部提交则返回 `RECONCILED_NOT_COMMITTED` 按需安全重放一次，终态仍模糊则转 `AMBIGUOUS_ESCALATED` 并挂载协调工单，保障至多一次精确语义。
+4. **PostgreSQL 16 多进程持久底座（`open_ontology/postgres_backend.py` + `open_ontology/schema_pg.sql` · `open_postgres_runtime`）**：在独立数据库 schema 内复刻同构 6 表与 PL/pgSQL `BEFORE` 物理写门禁触发器及追加式审计防删守卫，支持跨连接/跨进程并发乐观锁（OCC）与幂等校验；同时保持 `runtime.fork()` 对 PostgreSQL 状态按纯内存 SQLite `:memory:`（`world_mode="counterfactual"`）瞬时克隆分叉，兼顾并发事务吞吐与无锁反事实搜索。
+5. **零内核污染外挂 MDM 协调插件（`open_ontology/mdm_plugin.py` · `MDMSidecarPlugin`）**：以外部 Sidecar 身份消费多系统主数据批次并驱动增量 `L0–L4 CrosswalkTable` 对账：自动归并安全高置信匹配并热刷新领域映射，为需要 Steward 确认的 L4 灰区幂等分派单张人工审定工作卡（绝不重复刷单），待审定完成后锁定 `L0_CONFIRMED` 权威身份，全程零污染 M2 内核表结构。
 
 ---
 
@@ -339,15 +355,16 @@ sequenceDiagram
 
 ## 5. M2 自动化架构红线门禁 (Architectural Fitness Functions)
 
-仓库在 [test_architecture_boundaries.py](file:///Users/guci/work/open-ontology/tests/test_architecture_boundaries.py) 与各专项测试中固化了 **6 道 M2 结构性自动化门禁（Gate 1 – Gate 6）** 与配套纯洁性约束，任何修改一旦违反即失败：
+仓库在 [test_architecture_boundaries.py](file:///Users/guci/work/open-ontology/tests/test_architecture_boundaries.py) 与各专项测试中固化了 **7 道 M2 结构性自动化门禁（Gate 1 – Gate 7）** 与配套纯洁性约束，任何修改一旦违反即失败：
 
 1. **Gate 1（M1 本体 AST 导入白名单）**：自动发现仓库全部纯 M1 本体声明模块，严禁直接/间接/动态导入 `OntologyRuntime`、传输库、OS/IO 或外部驱动库，也严禁从 `open_ontology` 顶层混入非规范模块（`test_gate1_m1_ontologies_strict_ast_import_whitelist`）。
 2. **Gate 2（M2 内核零反向引用 `examples` 与干净 IO / `ObjectType` 子类白名单）**：递归扫描 `open_ontology/**/*.py`，严禁静态或动态导入 `examples`（`design.py` 仅允许 `import_module` 加载命令行显式路径且禁止硬编码 `examples`），非传输适配器禁止网络/子进程 IO；运行时遍历 `ObjectType.__subclasses__()` 严禁内核夹带具体业务实体子类（自举元治理与平台元数据模块除外，`test_gate2_m2_zero_reverse_example_imports_no_business_objects_clean_io`）。
-3. **Gate 3（动态 M1 结构词表反向扫描与供应商词禁令）**：动态采集全部 M1 本体注册词表，按词边界正则反向扫描 `open_ontology/**`（含 `drivers.py`、`design.py`、`induction/*`）及 `ui_display.json`，并封杀具体外部产品厂商耦合标识（`test_gate3_dynamic_m1_vocabulary_reverse_scan`）。
+3. **Gate 3（动态 M1 结构词表反向扫描与供应商词禁令）**：动态采集全部 M1 本体注册词表，按词边界正则反向扫描 `open_ontology/**`（含 `drivers.py`、`design.py`、`induction/*` 与可插拔运行壳）及 `ui_display.json`，并封杀具体外部产品厂商耦合标识（`test_gate3_dynamic_m1_vocabulary_reverse_scan`）。
 4. **Gate 4（M2 跨领域虚构盲测）**：使用完全虚构领域模型（`Starship / WarpCore / Sector`）端到端跑通 `OntologyRuntime`、`OntologyMCTSPlanner`、`describe_tbox` 与 `SymbolicCrucible`（`test_gate4_fictional_domain_blind_m2_contract`）。
-5. **Gate 5（纯同步 6 表无 M2 挂起态铁笼）**：校验 `open_ontology/schema.sql` 保持 5 张业务治理表加 1 张 `ontology_write_gate` 写门禁表、`ontology_action_runs.status` 约束仅允许 `('COMMITTED', 'REVERTED', 'REJECTED')`，且全仓 `open_ontology/**` 对任何已退役 M2 挂起/两相审批符号零命中（`test_gate5_pure_synchronous_non_suspending_m2_kernel`）。
-6. **Gate 6（零例外 Runtime 对 Design-Time 与扩展层完全不可知）**：**0 例外** 校验全部核心 Runtime 模块（`spec.py`、`sandbox.py`、`runtime.py`、`aspects.py`、`settlement.py`、`drivers.py`、`ingestion.py`、`query.py`、`osdk.py`）与 `open_ontology/__init__.py`（严禁 `__getattr__`），断言其静态依赖闭包与干净子进程 `import open_ontology` 实测的 `sys.modules` **严格收口于 10 模块 Pure Runtime 白名单**，确保 `design`、`induction`、`workshop`、`workshop_ui`、`meta_admin`、`workspaces`、`model_views`、`http_server`、`webhooks`、`mcts`、`mpc` 与 `subprocess` 完全未加载（`test_gate6_runtime_oblivious_to_design_time`）。
-7. **配套微内核预算与展示/文档门禁**：`open_ontology/runtime.py <= 1,335` 行（现 `1,331` 行）；`aspects.py` 零反向导入 `runtime.py`；`ui_display.json` 零业务词膨胀、`workshop`/`workshop_ui` 零领域字段泄漏；`tests/test_docs_consistency.py` 锁定 Archify 架构图与活文档零退役符号漂移。
+5. **Gate 5（SQLite & PG16 纯同步 6 表无 M2 挂起态铁笼）**：双守卫校验 `open_ontology/schema.sql` 与 `open_ontology/schema_pg.sql` 均保持同构 5 张业务治理表加 1 张 `ontology_write_gate` 写门禁表、`ontology_action_runs.status` 约束仅允许 `('COMMITTED', 'REVERTED', 'REJECTED')`，且全仓 `open_ontology/**` 对任何已退役 M2 挂起/两相审批符号零命中（`test_gate5_pure_synchronous_non_suspending_m2_kernel`）。
+6. **Gate 6（零例外 Runtime 对 Design-Time、可插拔运行壳与扩展层完全不可知）**：**0 例外** 校验全部核心 Runtime 模块（`spec.py`、`sandbox.py`、`runtime.py`、`aspects.py`、`settlement.py`、`drivers.py`、`ingestion.py`、`query.py`、`osdk.py`）与 `open_ontology/__init__.py`（严禁 `__getattr__`），断言其静态依赖闭包与干净子进程 `import open_ontology` 实测的 `sys.modules` **严格收口于 10 模块 Pure Runtime 白名单**，确保 `design`、`induction`、`mcp_server`、`autonomy`、`reconciliation`、`postgres_backend`、`mdm_plugin`、`psycopg`、`workshop`、`workshop_ui`、`meta_admin`、`workspaces`、`model_views`、`http_server`、`webhooks`、`mcts`、`mpc` 与 `subprocess` 完全未加载（`test_gate6_runtime_oblivious_to_design_time`）。
+7. **Gate 7（标准领域模块常识细腰隔离与零横向互耦门禁）**：自动发现全部标准领域模型模块，强制不同行业标准本体只能依赖共性核心常识原语，严禁各标准域之间产生任何静态或动态交叉导入，并通过负向自测验证跨领域泄漏可被静态拦截（`test_gate7_standard_domain_modules_zero_cross_imports`）。
+8. **配套微内核预算与展示/文档门禁**：`open_ontology/runtime.py <= 1,335` 行（现 `1,328` 行）；`aspects.py` 零反向导入 `runtime.py`；`ui_display.json` 零业务词膨胀、`workshop`/`workshop_ui` 零领域字段泄漏；`tests/test_docs_consistency.py` 锁定 Archify 架构图与活文档零退役符号漂移。
 
 ---
 

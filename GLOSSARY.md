@@ -37,24 +37,29 @@
 
 ### 2.1 同一元模型下的运行模式与双空间绝缘（同构 6 表原理）
 
-OpenOntology 的实然主库与反事实分叉复用完全同构的 6 表结构（5 张业务治理表 + `ontology_write_gate` 写门禁表，`ontology_action_runs.status` 仅允许 `COMMITTED / REVERTED / REJECTED`），并通过 `world_mode` 与物理连接器绑定严格区分职责与读写边界：
+OpenOntology 的实然主库与反事实分叉复用完全同构的 6 表结构（5 张业务治理表 + `ontology_write_gate` 写门禁表，`ontology_action_runs.status` 仅允许 `COMMITTED / REVERTED / REJECTED`；除 SQLite `:memory:` / `.sqlite3` 外，亦可运行在 PostgreSQL 16 `open_postgres_runtime` + `schema_pg.sql` 跨 schema 物理写门禁底座上），并通过 `world_mode` 与物理连接器绑定严格区分职责与读写边界：
 
 | 运行模式（`world_mode`） | 标准术语 | 现行代码载体 | 现实承诺与隔离红线 |
 |---|---|---|---|
-| **`standalone`** | **World State / 独立世界状态** | 主 `OntologyRuntime`（`:memory:` 或 `.sqlite3`，`source_bridge=None`） | 仅治理本体自有业务状态，不关联外部源系统 |
-| **`coupled`** | **World State / 耦合同态世界状态** | 主 `OntologyRuntime` + `SourceBridge` / `DeviceDriverRegistry`（`settlement.py` / `drivers.py`） | 凡触碰非自有（source-backed）对象的纯同步提交与授权冲正，必须走无锁三阶段同态核销（*World-to-Mind*），受单动作单写设备红线约束 |
-| **`counterfactual`** | **Counterfactual Space / 反事实空间** | `runtime.fork()`（强制 `db_path=':memory:'` 且 `source_bridge=None`） | 纯内存想象与 MCTS 试错分叉；物理上拒绝挂载 `SourceBridge` 与磁盘持久化 |
+| **`standalone`** | **World State / 独立世界状态** | 主 `OntologyRuntime`（SQLite 或 PostgreSQL 16，`source_bridge=None`） | 仅治理本体自有业务状态，不关联外部源系统 |
+| **`coupled`** | **World State / 耦合同态世界状态** | 主 `OntologyRuntime` + `SourceBridge` / `DeviceDriverRegistry`（`settlement.py` / `drivers.py` / 可选 `SagaReconciler`） | 凡触碰非自有（source-backed）对象的纯同步提交与授权冲正，必须走无锁三阶段同态核销（*World-to-Mind*），受单动作单写设备红线约束 |
+| **`counterfactual`** | **Counterfactual Space / 反事实空间** | `runtime.fork()`（强制 `db_path=':memory:'` 且 `source_bridge=None`） | 纯内存想象与 MCTS 试错分叉（即使主库为 PostgreSQL 16 亦零锁克隆为内存沙盘）；物理上拒绝挂载 `SourceBridge` 与磁盘持久化 |
 
-### 2.2 Pure Runtime、Design-Time、外设总线与归纳 / 解析原语
+### 2.2 Pure Runtime、Design-Time、生产运行壳与归纳 / 解析原语
 
 | 术语 | 含义 | 边界 / 代码载体 |
 |---|---|---|
-| **Pure Runtime vs Design-Time（Gate 6 物理隔离）** | 像 Java JVM 与 `javac`/JUnit 一样拆分：`import open_ontology` 只加载 10 个核心 Runtime 模块（8,729 行），对编译/证伪/AI-FDE/作战台/MCTS/MPC 完全不可知；`python -m open_ontology.design check \| verify` 在设计期负责静态编译、沙箱校验与签发 | `open_ontology/__init__.py` 零 `__getattr__`；`tests/test_architecture_boundaries.py` **Gate 6** 零例外门禁校验静态闭包与子进程 `sys.modules` 白名单 |
+| **Pure Runtime vs Design-Time（Gate 6 物理隔离）** | 像 Java JVM 与 `javac`/JUnit 一样拆分：`import open_ontology` 只加载 10 个核心 Runtime 模块（8,781 行），对编译/证伪/AI-FDE/作战台/MCTS/MPC 及可插拔生产运行壳完全不可知；`python -m open_ontology.design check \| verify` 在设计期负责静态编译、沙箱校验与签发 | `open_ontology/__init__.py` 零 `__getattr__`；`tests/test_architecture_boundaries.py` **Gate 6** 零例外门禁校验静态闭包与子进程 `sys.modules` 白名单 |
 | **`DeviceDriverRegistry`（设备驱动注册表与单动作单写设备红线）** | 纯 M2 多外设驱动总线：统一管理外部 `MountedDevice` 的 `mount` / `unmount` / `set_status` / 原子 `replace` 回滚、防重冲突校验、共享主数据合并观测，并实时投影至 `Workshop` 连接器视图 | `open_ontology/drivers.py`；单动作触及 $\ge 2$ 台外设或跨路由写即在任何外写发生前以 `CROSS_DEVICE_WRITE_FORBIDDEN` fail-closed 拒收，严禁伪造 2PC |
-| **`WorkCard`（M1 统一广义协同工单）** | 替代已退役 M2 挂起审批的 M1 显式协同领域实体（覆盖 `APPROVAL` / `HUMAN_TASK` / `DEPT_TICKET` / `ENTITY_DISAMBIGUATION` 等工作卡），配合 `APPROVAL_REQUIRED_*` 前置不变量实现“$t_0$ 阻塞开卡 → 责任人认领处理 → $t_1$ 现场防幻读重算执行” | `examples/std_core_ontology.py`、`examples/business_ontology.py`、`tests/test_work_card_m1_architecture.py`；强制 SoD 职责分离与完成防静默写 |
-| **Standard Domain Ontology + Monotonic `CustomerOverlay`（标准领域本体与只增不破覆层 / 闭集角色）** | 行业标准薄骨架（`std_core` / `std_crm` / `std_o2c`）仅固化领域公共不变量与闭合标准角色表（`STD_ROLES`），企业个性化规则、字段、前置拦截与窄视图通过零 `eval/exec` 的单调 Overlay 叠加编译 | `open_ontology/induction/dsl.py`（`compose_blueprints` / `apply_overlay`）；破坏标准契约或拼错角色即在编译期抛 `OVERLAY_BREAKS_STANDARD_CONTRACT` / `UNKNOWN_ROLE` |
+| **`WorkCard`（M1 统一广义协同工单）** | 替代已退役 M2 挂起机制的 M1 显式协同领域实体（覆盖 `APPROVAL` / `HUMAN_TASK` / `DEPT_TICKET` / `ENTITY_DISAMBIGUATION` 等工作卡），配合 `APPROVAL_REQUIRED_*` 前置不变量实现“$t_0$ 阻塞开卡 → 责任人认领处理 → $t_1$ 现场防幻读重算执行” | `examples/std_core_ontology.py`、`examples/business_ontology.py`、`tests/test_work_card_m1_architecture.py`；强制 SoD 职责分离与完成防静默写 |
+| **Standard Domain Ontology + Monotonic `CustomerOverlay`（标准领域本体与只增不破覆层 / 闭集角色）** | 行业标准薄骨架（`std_core` / `std_crm` / `std_o2c` / `std_p2p`）仅固化领域公共不变量与闭合标准角色表（`STD_ROLES`），企业个性化规则、字段、前置拦截与窄视图通过零 `eval/exec` 的单调 Overlay 叠加编译 | `open_ontology/induction/dsl.py`（`compose_blueprints` / `apply_overlay`）；破坏标准契约或拼错角色即在编译期抛 `OVERLAY_BREAKS_STANDARD_CONTRACT` / `UNKNOWN_ROLE` |
 | **4-Tier Entity Resolution & `CrosswalkTable`（L0–L4 实体解析漏斗与主数据别名映射）** | 面向跨设备同名异构主数据的纯 M2 四级归并漏斗：L0 人工已拍板确认、L1 标准化硬键（如税号）精确合并并刚性阻断 `CONFLICTING_HARD_KEY`、L2–L3 归一化准键与邻域加权自动合并、L4 灰区生成 `WorkCard(HUMAN_TASK)` 供 Steward 确认或分拆；产出不可变 `CrosswalkTable` 注入适配器 | `open_ontology/induction/resolution.py`（`resolve_entities` / `apply_resolution_decisions` / `inject_crosswalk_into_mapping`）；严禁无硬键灰区强行合并 |
 | **Popperian `DifferentialFalsifier`（覆盖率驱动的波普尔差分证伪）** | 设计期零 LLM 确定性裁判：从真实源库与 `Target ABI` 自动生成多波次覆盖探针与红队越权对抗用例，要求真实沙箱与参考本体在动作与状态跃迁高覆盖率（`action_coverage` / `transition_coverage`）下双边状态差分完全一致且零逃逸、零脏写，通过后方签发 `CORROBORATED` | `open_ontology/induction/falsifier.py` 与 `open_ontology/design.py`（`verify`） |
+| **Commonsense Thin Waist（常识细腰 / REA 5 原语）** | 跨企业、跨标准域互操作的最小公开常识协议面（`AccountingEntity` / `BusinessParty` / `TradeResource` / `TradeCommitment` / `FulfillmentEvent`），配合字段白名单信封严格屏蔽各自内部 CRM/ERP 私有概念，受 **Gate 7** 零交叉导入门禁保护 | `examples/std_core_ontology.py`、`examples/commonsense_exchange.py`、`tests/test_architecture_boundaries.py`（Gate 7） |
+| **Autonomy Ramp（三级自治度影子爬坡）** | 智能体上线的可控权限开关，支持按动作与角色配置 **`SHADOW`**（零外写记录影子账本 `SHADOW_RECORDED`）、**`COPILOT_ESCALATE`**（只出建议转人工工单）与 **`AUTO_UNDER_CEILING`**（定量上限内自动执行、超限或指标缺失 fail-closed 升级） | `open_ontology/autonomy.py`（`AutonomyRampController` / `AutonomyPolicy`）；独立于 M2 Pure Runtime |
+| **Observe-Before-Retry Saga Reconciliation（写后失联先回读对账）** | 封装耦合外设执行期间的网络超时、连接断开或 ACK 丢失保护：异常发生时不盲目重试，先只读 `observe()` 外部物理终态后再分流为 `RECONCILED_REMOTE_COMMITTED`、`RECONCILED_NOT_COMMITTED` 或 `AMBIGUOUS_ESCALATED` | `open_ontology/reconciliation.py`（`SagaReconciler`）；保证耦合外写至多一次语义 |
+| **MDM Sidecar Plugin（外挂主数据协调插件）** | 零侵入 M2 内核的外挂主数据协调插件：消费多 ERP/CRM 批次并驱动增量 `L0–L4 CrosswalkTable` 对账、安全映射热刷新、L4 灰区幂等派发 `WorkCard` 及 Steward 核准后锁定 `L0_CONFIRMED` | `open_ontology/mdm_plugin.py`（`MDMSidecarPlugin`）；支持 SQLite 与 PostgreSQL 16 |
+| **MCP Runtime Shell（标准 MCP 生产运行壳）** | 纯 Python stdlib 实现的 JSON-RPC 2.0 MCP 运行壳，同时支持 **stdio** 与 **Streamable HTTP (`POST /mcp`)**，服务端硬绑定调用方 `Actor` 与 `ScopedView` 防止提示词/参数篡改身份 | `open_ontology/mcp_server.py`（`OntologyMCPServer` / `start_mcp_http_server`） |
 
 ## 3. 身份与寻址
 

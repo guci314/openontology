@@ -13,10 +13,13 @@
 
 > 交互式架构图（浏览器可交互查看视图、图例与源码行号定位）：[docs/assets/openontology-architecture.html](docs/assets/openontology-architecture.html) ｜ 源 JSON：[docs/assets/openontology-architecture.json](docs/assets/openontology-architecture.json)
 
-> **实施状态（`main` 基线 `027fb58` · WO-01 ~ WO-12 已收官）**：系统已按 **“Java 式极薄 Pure Runtime + 极简 `javac` 式 Design-Time CLI + 外部 `agy` CLI AI-FDE”** 分层定型并推送：
-> * **Pure Runtime 瘦身定型**：`import open_ontology` 严格仅加载 **10 个纯运行时模块 / 8,729 行**（较重构前 33 模块 / 30,326 行缩减 **-71.2%**）；`open_ontology/runtime.py` **1,331 行**（硬预算 `<= 1,335`）；`open_ontology/__init__.py`（142 行）零 `__getattr__` 隐式延迟后门；规划器（`open_ontology.mcts` / `open_ontology.mpc`）、Web 作战台（`open_ontology.workshop`）及工作空间目录（`open_ontology.workspaces`）均按显式子包按需导入。
-> * **纯同步 6 表核销 + M1 `WorkCard`**：`schema.sql` 维持 5 张业务治理表 + 1 张 `ontology_write_gate` 写门禁表，`ontology_action_runs` 仅允许 `COMMITTED / REVERTED / REJECTED`，M2 内核无任何挂起审批态；协同审批、人工任务、跨部门工单与 L4 实体消歧统一在 M1 以 **`WorkCard`** 对象状态机 + `APPROVAL_REQUIRED_*` 前置守卫建模（`$t_1$` 现场防幻读重算 + SoD 职责分离）。
-> * **多外设总线与 Design-Time 反编译**：新增 **`DeviceDriverRegistry`**（`open_ontology/drivers.py` · 单动作单写设备红线 `CROSS_DEVICE_WRITE_FORBIDDEN`）与 **`python -m open_ontology.design check | verify`**（`open_ontology/design.py` · 零 LLM 确定性编译 + 五关熔炉 + 覆盖率驱动 `DifferentialFalsifier`）；标准薄领域本体（`std_core` / `std_crm` / `std_o2c`）+ 只增不破 `CustomerOverlay`（闭集角色白名单）+ 四级实体解析 `CrosswalkTable` 支撑外部 `agy` CLI 依据 [SKILL.md](skills/openontology-fde/SKILL.md) 在隔离只读沙盒下自主完成跨异构库反编译；**Model · 领域模型** / **World · 世界状态（Workspace）** 术语与 `tests/test_architecture_boundaries.py` **Gate 1–6** 零例外门禁全部生效。本文档对应代码与历史检查点见 `_state.md`。
+> **实施状态（`main` 基线 `ec29958` · `WO-01 ~ WO-21` + `WO-18` 全栈收官）**：系统已定型为 **“10 模块 Java 式 Pure Runtime 微内核 + 5 大零耦合适配/安全/持久化生产运行壳 + `javac` 式 Design-Time CLI + 外部 CLI AI-FDE”**，并已完成双异构开源 ERP 与国产模型全栈联调实证：
+> * **Pure Runtime 10 模块 JVM 核**：`import open_ontology` 严格仅加载 **10 个纯运行时模块 / 8,781 行**（较重构前缩减超 70%）；`open_ontology/runtime.py` **1,328 行**（硬预算 `<= 1,335`）；`open_ontology/__init__.py`（142 行）零 `__getattr__` 后门；`tests/test_architecture_boundaries.py` **Gate 1–7** 铁笼锁死（其中 **Gate 5** 双守卫 `schema.sql` + `schema_pg.sql` 6 表纯同步无 M2 挂起态，**Gate 6** 禁加载 `design/induction/workshop/mcts/mpc` 及外围扩展壳/`psycopg`，**Gate 7** 锁死 `std_*` 标准域常识细腰零横向交叉导入）。
+> * **标准 MCP Server 生产运行壳（`open_ontology/mcp_server.py`）**：纯 Python stdlib 实现 JSON-RPC 2.0，同时支持 **stdio** 与 **Streamable HTTP (`POST /mcp`)**，服务端钉死 `Actor` 与 `ScopedView` 身份权限契约，安全接入 Hermes / 各类 MCP 客户端。
+> * **生产安全双壳（`autonomy.py` & `reconciliation.py`）**：`AutonomyRampController` 提供 **`SHADOW` / `COPILOT_ESCALATE` / `AUTO_UNDER_CEILING`** 三级自治度影子爬坡与追加式账本；`SagaReconciler` 落地网络写后超时失联 **Observe-Before-Retry**（先只读回读物理终态再裁决提交/回滚/人工兜底），彻底杜绝盲重试重复下账。
+> * **真实 PostgreSQL 16 生产底座（`open_ontology/postgres_backend.py` + `open_ontology/schema_pg.sql` + `docker/postgres/`）**：PL/pgSQL 跨 schema 物理写门禁触发器、追加式审计防删、跨连接/跨进程并发 OCC，且保留 `fork()` 零锁纯 `:memory:` 反事实推演沙盘。
+> * **零内核污染外挂 MDM 插件（`open_ontology/mdm_plugin.py` + `examples/steel_mdm_plugin.py`）**：`MDMSidecarPlugin` 通过 MCP / HTTP 与 L0–L4 `CrosswalkTable` 热刷新及幂等 `WorkCard` 协调跨系统主数据；河北钢厂两死结插件落地物理料仓 `SteelStorageBin` **`BIN_EXACT` 精确溯源 vs 品牌 FIFO** 及旁路散码**前松 `PROVISIONAL` 不卡地磅、关账/付款前硬拦**。
+> * **双异构真实开源 ERP × 国产模型全栈实证**：欧洲 **Odoo 19** 与中国 **华夏 ERP（`jshERP`, `docker/jsherp/`）**均已由中国可用国产模型 **`deepseek-v4.1-flash`** 零提示盲考反编译薄驱动并通过隐藏世界差分证伪（`agy_fde_live_odoo19_protocol_benchmark.py` / `agy_fde_live_jsherp_protocol_benchmark.py`）；全栈双企钢贸实验室 `examples/live_b2b_steel_trade_lab.py` 实测真实华夏 ERP `:19999` + 真实 Odoo 19 `:8069` + 克隆 BottleCRM + 真实 PG16 `:15432` + 双端隔离 `hermes`（`deepseek/deepseek-v4.1-flash`）仅经 **5 原语 REA 常识信封**（`commonsense_exchange.py`）跨企互操作，4/4 场景 `235.85s` 零报错通过。**Model · 领域模型** / **World · 世界状态（Workspace）** 术语、M1 `WorkCard`（`$t_1$` 防幻读重算 + SoD 分离）及版本档案详见 `_state.md`。
 
 ## 快速开始
 
@@ -24,24 +27,33 @@
 cd /Users/guci/work/open-ontology
 pip install -r requirements.txt
 
-# 1. 全量离线回归（排除 live_llm 与视频产物用例）
-/Users/guci/miniforge3/bin/pytest -m "not live_llm" --ignore=tests/test_video_artifacts.py --ignore=tests/test_agent_value_mcts.py -k "not video" -q
+# 1. 全量离线回归（排除需外部容器与视频构建的用例）
+/Users/guci/miniforge3/bin/pytest --ignore=tests/test_agent_value_mcts.py -k "not odoo and not camel and not jsherp and not video_artifact_quality" -q
 
-# 2. 架构边界 Gate 1–6、多外设驱动总线与 Design CLI 门禁
-/Users/guci/miniforge3/bin/pytest tests/test_architecture_boundaries.py tests/test_device_registry_and_design_cli.py tests/test_work_card_m1_architecture.py tests/test_entity_resolution_and_closed_roles.py -v
+# 2. 架构边界 Gate 1–7、生产安全双壳、PG16、MDM 插件、标准域 MCP 与双企实验室核心套件
+/Users/guci/miniforge3/bin/pytest \
+  tests/test_architecture_boundaries.py \
+  tests/test_docs_consistency.py \
+  tests/test_postgres_backend.py \
+  tests/test_autonomy_and_reconciliation.py \
+  tests/test_commonsense_interop_and_mcp.py \
+  tests/test_mdm_sidecar_and_steel_plugin.py \
+  tests/test_b2b_steel_trade_lab.py -v
 
-# 3. javac 式 Design-Time 静态检查与 Popperian 差分证伪 CLI
+# 3. 启动真实 PostgreSQL 16 容器底座（docker/postgres）与华夏 ERP（docker/jsherp）
+docker compose -f docker/postgres/docker-compose.yml up -d
+docker compose -f docker/jsherp/docker-compose.yml up -d
+
+# 4. javac 式 Design-Time 静态检查与 Popperian 差分证伪 CLI
 /Users/guci/miniforge3/bin/python3 -m open_ontology.design check --blueprint ... --device ... --seed ...
 /Users/guci/miniforge3/bin/python3 -m open_ontology.design verify --blueprint ... --device ... --resolution-spec ...
 
-# 4. 典型领域与实操示例
-python3 -m examples.cold_chain                          # 冷链示例
-python3 -m examples.odoo_dual_erp_demo                 # 真实双 Odoo 19 ERP 并购订单全链路
-python3 -m examples.steel_mdm_demo                     # 钢厂主数据两大死结破局演示
-python3 -m examples.odoo_o2c_adapter                   # 真实 Odoo 19 标准 O2C 全流程
-python3 -m examples.dual_device_driver_swap_benchmark  # 同态双异构 CRM 驱动热插拔
-python3 -m examples.mudpit_crm_o2c_feishu_stress       # CRM + Odoo + 飞书三外设泥潭压测
-python3 -m examples.agy_fde_mudpit_decompile_benchmark # 隔离只读沙盒下真实 agy CLI AI-FDE 基准
+# 5. 典型领域、国产 AI-FDE 与全栈异构 B2B 实验室
+python3 -m examples.live_mcp_domestic_agent_demo            # Streamable HTTP MCP + 隔离 Hermes (deepseek-v4.1-flash)
+python3 -m examples.agy_fde_live_odoo19_protocol_benchmark # 真实 Odoo 19 盲考反编译基准
+python3 -m examples.agy_fde_live_jsherp_protocol_benchmark # 真实华夏 ERP (jshERP) 盲考反编译基准
+python3 -m examples.steel_mdm_plugin                       # 河北钢厂 BIN_EXACT 溯源 + 前松 PROVISIONAL MDM 插件
+python3 -m examples.live_b2b_steel_trade_lab               # 全栈异构双企 B2B 钢贸实验室（jshERP + Odoo 19 + BottleCRM + PG16 + Hermes）
 
 # 5. 真实 Quarkus/Camel 工程（离线编译）
 cd camel-sync
@@ -60,25 +72,29 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 
 | 层次 | 文件 | 职责 |
 |---|---|---|
-| Pure Runtime 入口 | `open_ontology/__init__.py` | 142 行纯运行时导出（零 `__getattr__`，默认仅加载 10 模块 / 8,729 行） |
+| Pure Runtime 入口 | `open_ontology/__init__.py` | 142 行纯运行时导出（零 `__getattr__`，默认仅加载 10 模块 / 8,781 行） |
 | Pure Runtime 存储 | `open_ontology/schema.sql` | 5 张纯业务核心表 + 1 张 `ontology_write_gate` 写门禁触发器（仅 `COMMITTED/REVERTED/REJECTED`） |
 | Pure Runtime 声明 | `open_ontology/spec.py` | `Actor` / `ObjectType` / `ObjectProperty` / `AutoID` / 函数 / 动作 / 不变量注册器 |
 | Pure Runtime 沙箱 | `open_ontology/sandbox.py` | `EditBatch` 内存推演、`ObjectDiff` 与逆向补丁 |
-| Pure Runtime 微内核 | `open_ontology/runtime.py` | 1,331 行（`<= 1,335`）：`put_object` / `simulate` / `submit` / `fork` 管线；与 MCTS/Design 零耦合 |
+| Pure Runtime 微内核 | `open_ontology/runtime.py` | **1,328 行**（`<= 1,335`）：`put_object` / `simulate` / `submit` / `fork` 管线；与 MCTS/Design/外围运行壳零耦合 |
 | Pure Runtime 切面 | `open_ontology/aspects.py` | 6 大系统调用切面：列脱敏 / 角色与主权门禁 / 幂等与 OCC / 被拒审计 / 自动化反射 / 忙闲回调 |
 | Pure Runtime 同态结算 | `open_ontology/settlement.py` | `SourceBridge` 与 `HomomorphicSettlementAspect`：无锁三阶段「预测 → 外部驱动 → 独立回读核验 → 原子提交或零污染拒收」 |
 | Pure Runtime 设备总线 | `open_ontology/drivers.py` | `DeviceDriverRegistry` / `MountedDevice`：多外设路由、热插拔、`CROSS_DEVICE_WRITE_FORBIDDEN` 单写红线与共享主数据合并 |
 | Pure Runtime 摄入与查询 | `open_ontology/ingestion.py`、`query.py` | `SnapshotIngestionDriver` 快照摄入与多源列拼接（MDO）；`ObjectSet` 集合代数、`pivot`、`aggregate` |
 | Pure Runtime OSDK | `open_ontology/osdk.py` | 只读 `describe_tbox` / `resolve_scoped_names`、LLM Tool Schema 导出、`AIPAgentExecutor` 与确定性 Diff 评测 |
+| 生产壳：标准 MCP Server | `open_ontology/mcp_server.py` | 1,020 行纯 stdlib MCP 运行壳（stdio + Streamable HTTP `POST /mcp`，服务端钉死 `Actor` / `ScopedView`） |
+| 生产壳：自治爬坡与 Saga 对账 | `open_ontology/autonomy.py`、`reconciliation.py` | `AutonomyRampController`（`SHADOW` / `COPILOT_ESCALATE` / `AUTO_UNDER_CEILING`）+ `SagaReconciler` 写后失联先回读恢复 |
+| 生产壳：PostgreSQL 16 底座 | `open_ontology/postgres_backend.py`、`schema_pg.sql` | 跨 schema 同构 6 表、PL/pgSQL 物理写门禁触发器与跨进程 OCC（`open_postgres_runtime`），容器配置见 `docker/postgres/` |
+| 生产壳：外挂 MDM Sidecar | `open_ontology/mdm_plugin.py` | `MDMSidecarPlugin`：零内核污染 L0–L4 `CrosswalkTable` 增量对账、热刷新与幂等 `WorkCard` 分派 |
 | Design-Time 裁判 CLI | `open_ontology/design.py` | `python -m open_ontology.design check \| verify`：`javac` 式静态编译对齐 + 只读 `?mode=ro` 探测 + `JUnit` 沙箱证伪 |
 | Design-Time 归纳与解析 | `open_ontology/induction/` | 零 `exec` 声明式 DSL 与单调 Overlay（`dsl.py`）、L0–L4 四级实体解析 `CrosswalkTable`（`resolution.py`）、五关熔炉（`crucible.py`）、覆盖率差分证伪（`falsifier.py`） |
 | 显式扩展：规划器 | `open_ontology/mcts.py`、`mpc.py` | 按需导入 `OntologyMCTSPlanner`（纯内存 `fork()` 树搜索）与无状态 `ClosedLoopMPCController` |
 | 显式扩展：目录与视图 | `open_ontology/workspaces.py`、`model_views.py` | `WorkspaceDescriptor` + `workspaces.json` 清单、`takeover_workspace`、`describe_behavior` / `describe_openapi` |
 | 显式扩展：指挥台与传输 | `open_ontology/workshop.py`、`workshop_ui.py`、`http_server.py` | 四视角指挥台（实时投影 `DeviceDriverRegistry` 状态）、拓扑大图与 HTTP 传输边界 |
-| 外部 AI-FDE 工作流 | `skills/openontology-fde/SKILL.md` | 领域无关 AI-FDE 隔离探库、产物撰写与自愈证伪规程（搭配 `agy` CLI） |
-| 标准薄本体与协同模型 | `examples/std_core_ontology.py`、`std_crm_ontology.py`、`std_o2c_ontology.py` | 行业标准骨架 + 闭集角色 + M1 `WorkCard` 协同工单；`kanban.py` 为纯业务 6 态看板 |
+| 外部 AI-FDE 工作流 | `skills/openontology-fde/SKILL.md` | 领域无关 AI-FDE 隔离探库、产物撰写与自愈证伪规程（搭配 `agy` / `opencode` CLI） |
+| 标准薄本体与跨企常识细腰 | `examples/std_core_ontology.py`、`std_crm_ontology.py`、`std_o2c_ontology.py`、`std_p2p_ontology.py`、`commonsense_exchange.py` | 行业标准骨架、REA 5 原语（`AccountingEntity` / `BusinessParty` / `TradeResource` / `TradeCommitment` / `FulfillmentEvent`）+ M1 `WorkCard` + 跨企信封白名单；受 Gate 7 零交叉隔离保护 |
 | 内部执行边界 | `open_ontology/execution/` | 实例级能力绑定与透明可选观察 |
-| 多外设集成与示例 | `examples/`、`camel-sync/` | `dual_device_driver_swap_benchmark.py`、`mudpit_crm_o2c_feishu_stress.py`、`agy_fde_mudpit_decompile_benchmark.py`、`steel_mdm_demo.py`、`odoo_o2c_adapter.py`、`camel-sync/`（Quarkus + Camel） |
+| 全栈集成、MDM 插件与示例 | `examples/`、`camel-sync/` | `live_b2b_steel_trade_lab.py`、`steel_mdm_plugin.py`、`agy_fde_live_jsherp_protocol_benchmark.py`、`agy_fde_live_odoo19_protocol_benchmark.py`、`live_mcp_domestic_agent_demo.py`、`camel-sync/`（Quarkus + Camel） |
 
 ## 五张纯业务表
 
@@ -230,22 +246,28 @@ GET /camel/stats      -> ingest_count / north_writebacks / south_writebacks
 
 ## 测试覆盖
 
-下列分项为核心与特色回归套件说明；当前已提交基线 `027fb58` 下全量离线回归实测 **`663 passed, 4 deselected`**（`/Users/guci/miniforge3/bin/pytest -m "not live_llm" --ignore=tests/test_video_artifacts.py --ignore=tests/test_agent_value_mcts.py -k "not video" -q`），详见 `_state.md`：
+下列分项为核心与特色回归套件说明；当前已提交基线 `ec29958` 下全量离线回归实测 **`650 passed, 6 skipped, 63 deselected`**（`/Users/guci/miniforge3/bin/python3 -m pytest --ignore=tests/test_agent_value_mcts.py -k "not odoo and not camel and not jsherp and not video_artifact_quality" -q`），且 Python 3.11.15 与 Python 3.13.12 双版本 7 文件核心/生产壳套件 **38/38 全绿**，详见 `_state.md`：
 
-- `tests/test_architecture_boundaries.py`：**Gate 1 – Gate 6** 零例外架构门禁（M1 AST 白名单、M2 零反向引用、动态词表/供应商词封杀、虚构 `Starship` 领域盲测、纯同步 6 表无退役符号门禁、Runtime 严格收口 10 模块白名单及 `import open_ontology` 防扩展模块泄漏）。
+- `tests/test_architecture_boundaries.py`：**Gate 1 – Gate 7** 零例外架构门禁（M1 AST 白名单、M2 零反向引用、动态词表/供应商词封杀、虚构 `Starship` 领域盲测、SQLite & PG16 纯同步 6 表无退役符号门禁、Runtime 严格收口 10 模块白名单且不加载任何外围扩展/生产壳及 `psycopg`，以及 `std_*` 标准域常识细腰零交叉导入门禁 **Gate 7**）。
+- `tests/test_postgres_backend.py`：PostgreSQL 16 跨 schema 同构 6 表、PL/pgSQL `BEFORE` 物理写门禁触发器、追加式防删审计、双连接并发 OCC 与 `fork()` 沙盘孤立测试。
+- `tests/test_autonomy_and_reconciliation.py`：`AutonomyRampController` 三级自治度爬坡（`SHADOW` / `COPILOT_ESCALATE` / `AUTO_UNDER_CEILING`）与 `SagaReconciler` 写后失联三分支注入实测。
+- `tests/test_commonsense_interop_and_mcp.py`：`OntologyMCPServer` stdio / Streamable HTTP 协议、身份防覆盖安全、5 原语 REA 常识信封跨企白名单防泄漏及钢铁贸易争议三幕回归。
+- `tests/test_mdm_sidecar_and_steel_plugin.py`：`MDMSidecarPlugin`（SQLite + Live PG16）增量 L1/L4 幂等消歧与河北钢厂 `SteelStorageBin` 料仓级 `BIN_EXACT` 精确溯源 / `PROVISIONAL` 散码前后松紧联防。
+- `tests/test_b2b_steel_trade_lab.py`：`live_b2b_steel_trade_lab.py` 全栈 4 场景确定性离线镜像测试与跨企信封不泄漏校验（真实多容器运行 4/4 全绿，`235.85s`）。
 - `tests/test_device_registry_and_design_cli.py`：`DeviceDriverRegistry` 互斥/原子热替换/单写设备红线、`Workshop` 连接器实时状态投影、`open_ontology.design check | verify` 编译失败码与双外设隔离泥潭端到端独立仲裁。
 - `tests/test_work_card_m1_architecture.py`：M1 统一 `WorkCard`（`$t_1$` 防幻读重算、SoD 职责分离、`HUMAN_TASK` 与耦合 `SourceBridge` 零脏写）。
 - `tests/test_entity_resolution_and_closed_roles.py` & `tests/test_standard_ontology_and_overlay.py`：闭集角色防错、单调 `CustomerOverlay` 不破坏标准契约、L0–L4 四级 `CrosswalkTable` 实体解析与硬键冲突阻断。
-- `tests/test_docs_consistency.py`：Archify 架构图资产存在与引用校验、活文档零退役符号漂移门禁。
+- `tests/test_docs_consistency.py`：Archify 架构图资产存在与引用校验、活文档与 `Gate 7` / 生产壳锚点及零退役符号漂移门禁。
 - `tests/test_open_ontology.py`：纯内核基础测试（写门禁、append-only、内容指纹幂等、RBAC、RLS、沙箱 RYOW、diff 逆转、零写入模拟、原子提交、幂等提交、并发冲突、时光机回滚、业务不变量、Tool Schema、AIP 分派、评测器、注册表持久化、字段级主权/overlay/快照防孤儿/主权边界/被拒审计/`ObjectSet` 代数、`ObjectProperty` 自动三元组同步与 `TARGET_NOT_FOUND` 参照完整性/`AutoID` 元模型投影，以及零 IT 概念污染断言）。
 - `tests/test_odoo_dual_erp.py` & `tests/test_odoo_o2c.py` & `tests/test_camel_odoo_e2e.py` & `tests/test_steel_mdm.py`：真实双 Odoo 19 集成、标准 O2C、Quarkus/Camel E2E 与钢厂 MDM 全链路回归。
 
 ## 运行环境
 
-- Python 3.13、`pydantic`、`pytest`
-- Java 17：`/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home`
-- Maven：`/opt/homebrew/opt/maven`
-- 真实 Odoo 19：`http://localhost:8069`，数据库 `erp_north` / `erp_south`
-- PostgreSQL 容器：`odoo-demo-db`（宿主机 5433）
+- Python 3.11 & 3.13、`pydantic`、`pytest`、`psycopg[binary]`
+- Java 17：`/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home`（Maven `/opt/homebrew/opt/maven`）
+- 真实 PostgreSQL 16：`127.0.0.1:15432`（`docker/postgres/docker-compose.yml`）
+- 真实华夏 ERP（`jshERP`）：`http://127.0.0.1:19999/jshERP-boot`（`docker/jsherp/docker-compose.yml`）
+- 真实 Odoo 19：`http://localhost:8069`（数据库 `erp_north` / `erp_south` / `odoo_demo`，PG 容器 `odoo-demo-db` 5433）
+- 真实本地 `hermes` CLI + BottleCRM（`vendor_crm/bottlecrm.sqlite3` 只读基准镜像）
 
 Odoo 主密码优先读取 `ODOO_MASTER_PASSWORD`，其次 `odoo-demo-master-2026`，最后兼容实际容器默认的 `admin`。
