@@ -1,0 +1,568 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "OpenOntology 系统架构（Pure Runtime 与 Design-Time 物理隔离）",
+    "locale": "zh-CN",
+    "output": "docs/assets/openontology-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/guci314/openontology.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "027fb58646c7cc0a717240f3286d0c6fb389cdbd"
+    },
+    "views": [
+      {
+        "id": "design-time-loop",
+        "label": "Design-Time 反编译与证伪",
+        "focus": [
+          "fde_agent",
+          "design_cli",
+          "compiler_er",
+          "referee"
+        ],
+        "note": "外部 AI-FDE 代理（agy CLI）在隔离目录产出声明式工件，经 check / verify 编译与波普尔差分证伪后签发。"
+      },
+      {
+        "id": "runtime-exec-path",
+        "label": "Runtime 受治理执行主路径",
+        "focus": [
+          "biz_agents",
+          "osdk",
+          "runtime_core",
+          "aspects_settle",
+          "sqlite_store"
+        ],
+        "note": "一线 Agent 经 OSDK 作用域视图提交动作，在纯同步微内核内完成 RBAC、不变量、OCC 与 write_gate 原子落盘。"
+      },
+      {
+        "id": "coupled-device-bus",
+        "label": "外设总线与同态回读闭环",
+        "focus": [
+          "aspects_settle",
+          "driver_bus",
+          "ext_crm",
+          "ext_erp"
+        ],
+        "note": "单动作最多路由至 1 台外部写设备，actuate 后丢弃返回值，以独立 observe 回读核验并经 Crosswalk 融合共享主数据。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "fde_agent",
+      "type": "external",
+      "label": "AI-FDE 编码代理",
+      "sublabel": "agy CLI + FDE Skill",
+      "tag": "仅写隔离 out/",
+      "pos": [
+        40,
+        50
+      ],
+      "size": [
+        175,
+        68
+      ],
+      "sources": [
+        {
+          "path": "skills/openontology-fde/SKILL.md",
+          "line": 1,
+          "end_line": 101,
+          "label": "FDE 工作规程"
+        },
+        {
+          "path": "examples/agy_fde_mudpit_decompile_benchmark.py",
+          "line": 673,
+          "end_line": 813,
+          "label": "隔离沙盒与防篡改"
+        }
+      ]
+    },
+    {
+      "id": "design_cli",
+      "type": "backend",
+      "label": "Design-Time CLI",
+      "sublabel": "design.py check/verify",
+      "tag": "类比 javac + JUnit",
+      "pos": [
+        350,
+        50
+      ],
+      "size": [
+        185,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/design.py",
+          "line": 1069,
+          "end_line": 1160,
+          "label": "check 与 verify 编排"
+        },
+        {
+          "path": "open_ontology/design.py",
+          "line": 1306,
+          "end_line": 1340,
+          "label": "CLI 入口"
+        }
+      ]
+    },
+    {
+      "id": "compiler_er",
+      "type": "backend",
+      "label": "编译与四级实体解析",
+      "sublabel": "dsl + L0-L4 Crosswalk",
+      "tag": "只增不破 · 闭集角色",
+      "pos": [
+        655,
+        50
+      ],
+      "size": [
+        195,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/induction/dsl.py",
+          "line": 1022,
+          "end_line": 1060,
+          "label": "compose_blueprints"
+        },
+        {
+          "path": "open_ontology/induction/dsl.py",
+          "line": 1499,
+          "end_line": 1560,
+          "label": "单调 apply_overlay"
+        },
+        {
+          "path": "open_ontology/induction/resolution.py",
+          "line": 383,
+          "end_line": 445,
+          "label": "L0-L4 实体解析漏斗"
+        }
+      ]
+    },
+    {
+      "id": "referee",
+      "type": "security",
+      "label": "五关熔炉与波普尔证伪",
+      "sublabel": "Crucible + Falsifier",
+      "tag": "覆盖率 + 红队差分",
+      "pos": [
+        970,
+        50
+      ],
+      "size": [
+        195,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/induction/crucible.py",
+          "line": 572,
+          "end_line": 620,
+          "label": "五关 SymbolicCrucible"
+        },
+        {
+          "path": "open_ontology/induction/falsifier.py",
+          "line": 387,
+          "end_line": 445,
+          "label": "DifferentialFalsifier"
+        },
+        {
+          "path": "tests/test_architecture_boundaries.py",
+          "line": 794,
+          "end_line": 868,
+          "label": "Gate 6 零例外隔离"
+        }
+      ]
+    },
+    {
+      "id": "biz_agents",
+      "type": "external",
+      "label": "业务 Agent 与人类",
+      "sublabel": "角色调用 / 飞书 WorkCard",
+      "tag": "M1 广义 Tool 协同",
+      "pos": [
+        40,
+        240
+      ],
+      "size": [
+        175,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/spec.py",
+          "line": 137,
+          "end_line": 165,
+          "label": "Actor 角色契约"
+        },
+        {
+          "path": "examples/std_core_ontology.py",
+          "line": 52,
+          "end_line": 84,
+          "label": "STD_ROLES 角色表"
+        }
+      ]
+    },
+    {
+      "id": "osdk",
+      "type": "backend",
+      "label": "OSDK 作用域视图",
+      "sublabel": "AIPAgentExecutor / Tools",
+      "tag": "最小权限视图",
+      "pos": [
+        350,
+        240
+      ],
+      "size": [
+        185,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/osdk.py",
+          "line": 441,
+          "end_line": 540,
+          "label": "工具导出与执行器"
+        }
+      ]
+    },
+    {
+      "id": "runtime_core",
+      "type": "backend",
+      "label": "纯同步微内核",
+      "sublabel": "runtime.py (1331行) / fork",
+      "tag": "反事实内存分叉",
+      "pos": [
+        655,
+        240
+      ],
+      "size": [
+        195,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/runtime.py",
+          "line": 122,
+          "end_line": 210,
+          "label": "OntologyRuntime 与 fork"
+        },
+        {
+          "path": "open_ontology/spec.py",
+          "line": 707,
+          "end_line": 760,
+          "label": "OntologySpec 元模型"
+        },
+        {
+          "path": "open_ontology/sandbox.py",
+          "line": 192,
+          "end_line": 240,
+          "label": "EditBatch 沙盒"
+        }
+      ]
+    },
+    {
+      "id": "aspects_settle",
+      "type": "security",
+      "label": "切面与同态结算",
+      "sublabel": "RBAC / OCC / 独立回读",
+      "tag": "三元世界隔离",
+      "pos": [
+        970,
+        240
+      ],
+      "size": [
+        195,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/aspects.py",
+          "line": 106,
+          "end_line": 146,
+          "label": "脱敏与权限主权切面"
+        },
+        {
+          "path": "open_ontology/settlement.py",
+          "line": 103,
+          "end_line": 109,
+          "label": "SourceBridge 契约"
+        },
+        {
+          "path": "open_ontology/settlement.py",
+          "line": 714,
+          "end_line": 760,
+          "label": "HomomorphicSettlementAspect"
+        }
+      ]
+    },
+    {
+      "id": "sqlite_store",
+      "type": "database",
+      "label": "6 表物理账本",
+      "sublabel": "SQLite WAL + write_gate",
+      "tag": "触发器禁直写",
+      "pos": [
+        655,
+        390
+      ],
+      "size": [
+        195,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/schema.sql",
+          "line": 18,
+          "end_line": 115,
+          "label": "6 表结构与物理门禁触发器"
+        },
+        {
+          "path": "open_ontology/ingestion.py",
+          "line": 117,
+          "end_line": 160,
+          "label": "SnapshotIngestionDriver"
+        }
+      ]
+    },
+    {
+      "id": "driver_bus",
+      "type": "messagebus",
+      "label": "设备驱动注册表总线",
+      "sublabel": "DeviceDriverRegistry",
+      "tag": "单动作单写设备",
+      "pos": [
+        970,
+        390
+      ],
+      "size": [
+        195,
+        68
+      ],
+      "sources": [
+        {
+          "path": "open_ontology/drivers.py",
+          "line": 82,
+          "end_line": 125,
+          "label": "MountedDevice 与总线"
+        },
+        {
+          "path": "open_ontology/drivers.py",
+          "line": 167,
+          "end_line": 236,
+          "label": "mount / unmount / replace"
+        },
+        {
+          "path": "open_ontology/drivers.py",
+          "line": 383,
+          "end_line": 448,
+          "label": "单写红线与回读融合"
+        }
+      ]
+    },
+    {
+      "id": "ext_crm",
+      "type": "external",
+      "label": "CRM 外设",
+      "sublabel": "BottleCRM 等 (UUID)",
+      "pos": [
+        815,
+        555
+      ],
+      "size": [
+        165,
+        64
+      ],
+      "sources": [
+        {
+          "path": "examples/std_crm_ontology.py",
+          "line": 216,
+          "end_line": 240,
+          "label": "标准 CRM 蓝图"
+        },
+        {
+          "path": "examples/dual_device_driver_swap_benchmark.py",
+          "line": 1,
+          "end_line": 30,
+          "label": "双异构 CRM 热插拔"
+        }
+      ]
+    },
+    {
+      "id": "ext_erp",
+      "type": "external",
+      "label": "ERP 外设",
+      "sublabel": "Odoo 19 / 异构 ERP",
+      "pos": [
+        1010,
+        555
+      ],
+      "size": [
+        165,
+        64
+      ],
+      "sources": [
+        {
+          "path": "examples/std_o2c_ontology.py",
+          "line": 294,
+          "end_line": 325,
+          "label": "标准 O2C 蓝图"
+        },
+        {
+          "path": "examples/mudpit_crm_o2c_feishu_stress.py",
+          "line": 1,
+          "end_line": 35,
+          "label": "三外设泥潭压测"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Design-Time 工具链（对 Runtime 物理不可见 · Gate 6 隔离）",
+      "wraps": [
+        "design_cli",
+        "compiler_er",
+        "referee"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Pure Runtime 核心（import open_ontology · 10 模块 / 8,729 行）",
+      "wraps": [
+        "osdk",
+        "runtime_core",
+        "aspects_settle",
+        "sqlite_store",
+        "driver_bus"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "物理写门禁与纯同步账本",
+      "wraps": [
+        "runtime_core",
+        "sqlite_store"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "fde-to-design",
+      "from": "fde_agent",
+      "to": "design_cli",
+      "label": "check / verify",
+      "variant": "emphasis"
+    },
+    {
+      "id": "design-to-compiler",
+      "from": "design_cli",
+      "to": "compiler_er",
+      "label": "编译与解析"
+    },
+    {
+      "id": "compiler-to-referee",
+      "from": "compiler_er",
+      "to": "referee",
+      "label": "五关与证伪",
+      "variant": "security"
+    },
+    {
+      "id": "referee-to-runtime",
+      "from": "referee",
+      "to": "runtime_core",
+      "label": "签发已证伪工件",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "biz-to-osdk",
+      "from": "biz_agents",
+      "to": "osdk",
+      "label": "工具调用 / 预演",
+      "variant": "emphasis"
+    },
+    {
+      "id": "osdk-to-runtime",
+      "from": "osdk",
+      "to": "runtime_core",
+      "label": "试演 / 提交",
+      "variant": "emphasis"
+    },
+    {
+      "id": "runtime-to-aspects",
+      "from": "runtime_core",
+      "to": "aspects_settle",
+      "label": "切面与核验",
+      "variant": "security"
+    },
+    {
+      "id": "runtime-to-sqlite",
+      "from": "runtime_core",
+      "to": "sqlite_store",
+      "label": "write_gate 写",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "aspects-to-bus",
+      "from": "aspects_settle",
+      "to": "driver_bus",
+      "label": "actuate / observe",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "bus-to-crm",
+      "from": "driver_bus",
+      "to": "ext_crm",
+      "label": "CRM 驱动",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "bus-to-erp",
+      "from": "driver_bus",
+      "to": "ext_erp",
+      "label": "ERP 驱动",
+      "fromSide": "bottom",
+      "toSide": "top"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "极薄 Pure Runtime（JVM）",
+      "items": [
+        "import open_ontology 严格只加载 10 模块 / 8,729 行（runtime.py 仅 1,331 行）",
+        "纯同步原子账本：仅允许 COMMITTED / REVERTED / REJECTED，无 M2 挂起态",
+        "审批、人工任务与 L4 实体消歧统一在 M1 以 WorkCard 对象编排，t1 现场防幻读重算"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Design-Time（javac）与外部 AI-FDE",
+      "items": [
+        "open_ontology.design check / verify 是零 LLM 确定性裁判，选手与裁判物理隔离",
+        "外部 agy CLI 自主探库生成声明式映射、只增不破 Overlay 与 L0-L4 Crosswalk 配置",
+        "经五关 Crucible + 覆盖率与红队波普尔差分证伪通过（CORROBORATED）方可签发上线"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "六道铁笼门禁与可选扩展剥离",
+      "items": [
+        "单动作最多写入 1 台外部权威设备（CROSS_DEVICE_WRITE_FORBIDDEN），严禁伪造 2PC",
+        "Gate 6 零例外验证：Runtime 对 design / induction / workshop / mcts / mpc 完全不可见",
+        "Web 作战台（open_ontology.workshop）与规划器（mcts / mpc）均作为显式按需扩展独立导入"
+      ]
+    }
+  ]
+}

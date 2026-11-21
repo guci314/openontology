@@ -89,9 +89,10 @@ OpenOntology 的建模原语只有两类，**但表达能力已经足够**：
 |---|---|
 | 实体 / 值对象 | `ObjectType` 及其属性 |
 | 聚合根 | 聚合根对象（`workspace_id / object_type / object_id` 寻址） |
-| 关联 | `ObjectProperty` / `LinkType` |
-| 领域服务 / 应用服务 | `Action` |
-| 不变量 | `InvariantError`，在 `simulate` 与 `submit` 两条路径强制执行 |
+| 关联 | `ObjectProperty` |
+| 领域服务 / 应用服务 | `ActionDef` |
+| 不变量 | `InvariantError`（含 `APPROVAL_REQUIRED_*` 前置守卫），在 `simulate` 与 `submit` 两条路径强制执行 |
+| 协同与人工裁决 | M1 统一 `WorkCard`（`$t_1$` 重算 + SoD 分离），M2 内核不设异步挂起态 |
 | 仓储（Repository） | Runtime + `ObjectSet` 查询 |
 | 领域事件 | 动作审计记录 + `Automation` |
 | 限界上下文 | Model / World（多模型、多世界隔离） |
@@ -118,19 +119,20 @@ class SalesOrder(ObjectType):
     amount: int
     status: str = "draft"
 
-# 示意：Service（Action）
+# 示意：Service（Action：纯同步确定性门控 + M1 WorkCard 协同审批）
 @spec.action(
     name="confirm_order",
     params=ConfirmParams,
-    allowed_roles=["sales", "ai_agent"],                      # 权限
-    approval_rule=lambda p, actor: p.amount > 1_000_000,      # 大额需审批
+    allowed_roles=["sales_rep", "sales_manager", "finance_director", "steward", "ai_agent"],
+    revert_roles=["finance_director", "admin"],
 )
 def confirm_order(ctx, p: ConfirmParams):
-    order = ctx.get(SalesOrder, p.order_id)
-    if order.status != "draft":                               # 状态机即普通 Python
+    order = ctx.require(SalesOrder, p.order_id)
+    if order.status != "draft":                               # 状态机即普通 Python（或声明式 DSL）
         raise InvariantError("只能确认草稿订单", code="BAD_STATE")
     if exposure(ctx, order.customer) + order.amount > credit_limit(ctx, order.customer):
-        raise InvariantError("超出信用额度", code="CREDIT_EXCEEDED")
+        if ctx.actor.role != "finance_director":              # 越额即阻断，建 M1 WorkCard 协同特批
+            raise InvariantError("超出信用额度，须发起 WorkCard 特批", code="APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED")
     ctx.modify(order, status="confirmed")
 ```
 
@@ -154,7 +156,7 @@ def confirm_order(ctx, p: ConfirmParams):
 | 可执行 UML 概念 | OpenOntology 对应 |
 |---|---|
 | 类图（Class） | `ObjectType` + 属性（TBox） |
-| 关联（Association） | `ObjectProperty` / `LinkType`，自动同步关系三元组并校验引用完整性 |
+| 关联（Association） | `ObjectProperty`，自动同步关系三元组并校验引用完整性 |
 | 接口 / 泛化 | `Interface` |
 | 状态机（State Machine） | 对象状态字段 + Action 中的状态前置判断；无需专门构件，Python 可表达任意状态机 |
 | 动作语言（Action Language） | **Python 本身**（图灵完备）；`Action` 函数在 `EditBatch` 上操作，读得到自己的暂存修改 |
@@ -478,22 +480,22 @@ flowchart LR
   - **三方总量、总金额恒等**。
 - 各部门不需要统一口径，也就不需要打架。
 
-#### 机制 3：增量 → Action 硬护栏
+#### 机制 3：增量 → Action 硬护栏 + M1 `WorkCard` 特批
 - 新建编码必须走 Action：不绑定标准实体的野码、属性与规格不符的错配，**当场拦截**，并以 `REJECTED` 记入审计账本。
-- 真正的新品种（全厂首次采购的新规格、新客户主体）自动挂起 `PENDING_APPROVAL`，由主数据管理员签批后生效。
+- 真正的新品种（全厂首次采购的新规格、新客户主体）前置触发 `APPROVAL_REQUIRED_NEW_MATERIAL_SPEC` 并生成 M1 协同对象 `WorkCard`；由 `mdm_steward` 认领核准（禁止申请人自批 SoD），并在 `$t_1$` 时刻基于实时最新世界状态重新校验后再原子创建标准规格并入库（零 M2 挂起态或脏写）。
 
 #### 机制 4：防旁路 → 三把锁
 | 锁 | 作用 |
 |---|---|
 | **写门禁锁** | SQLite 触发器物理拦截一切绕过运行时的写入，包括 AI 与脚本 |
 | **下游卡位锁** | 源系统里偷偷新建、未经治理的码，在进入下游流程（入库、领料、开票）时被识别为“黑户”并卡住 |
-| **源头收权锁** | 逐步收回源系统中人工建码的权限，统一走本体 Action |
+| **源头收权锁** | 逐步收回源系统中人工建码的权限，统一走本体 Action 与 `DeviceDriverRegistry`（单动作单写设备） |
 
 前两把锁让旁路**没有意义**（建了也用不了），第三把锁让旁路**没有机会**。
 
-#### 机制 5：跨系统身份 → 关系而非映射表
-- CRM 客户、ERP 客户、财务开票主体都是对象，“是同一主体”是一条有版本、有审计的关系；
-- 通过 `pivot` 在关系上跳转，跨系统流程不再依赖人工维护的映射表。
+#### 机制 5：跨系统身份 → 关系 + 四级实体解析 `CrosswalkTable`
+- CRM 客户、ERP 客户、财务开票主体通过共享 `BusinessParty` 与关系边对齐，避免人工映射表漂移；
+- 面对跨系统多设备同名异构主数据（如中文全称、缺失税号、子母公司同名异税号冲突），通过纯 M2 四级实体解析漏斗（`open_ontology/induction/resolution.py`）自动化治理：**L1 税号等标准化硬键精确自动合并**、**同名异税号触发 `CONFLICTING_HARD_KEY` 刚性阻断严禁合并**、**L4 缺硬键灰区不盲合而是自动生成 `WorkCard(HUMAN_TASK)` 交由 Steward 确认（L0 `CONFIRM_MERGE` / `REJECT_SEPARATE`）**，最终固化为不可变 `CrosswalkTable` 注入 CRM / ERP 双外设驱动。
 
 ### 6.3 这种结构在各行业普遍存在
 
@@ -604,12 +606,12 @@ flowchart LR
 
 | 实施环节 | AI 可以做什么 |
 |---|---|
-| 需求调研 | 从访谈纪要、单据、现有表结构中**抽取本体草案** |
-| 系统映射 | 根据本体和 ERP 元数据**生成适配器**与字段映射 |
-| 数据迁移 | 识别重复/脏主数据，**提出 overlay 归并建议**，人工审批后生效 |
-| 测试验收 | 根据规则**自动生成场景用例**，用 `ObjectDiff` 确定性判定 |
-| 培训推行 | 自动导出 Agent 工具，员工直接对话操作 |
-| 运维支持 | 基于审计账本回答“这张单为什么被拒、谁改的” |
+| 需求调研与规则加装 | 从访谈纪要、单据中抽取零 `exec` 的单调 `CustomerOverlay`（闭集角色与标准契约由 `open_ontology.design check` 静态校验） |
+| 系统映射与驱动生成 | 外部编码代理（`agy` CLI 依据 `skills/openontology-fde/SKILL.md`）在只读沙盒探测异构多库 Schema，产出声明式 `AdapterMappingSpec` 并接入 `DeviceDriverRegistry` |
+| 主数据跨库实体消歧 | 自动执行 L0–L4 四级实体解析（L1 精准归并 + 硬键冲突刚性阻断 + L4 灰区推入 Steward `WorkCard(HUMAN_TASK)` 拍板）并注入 `CrosswalkTable` |
+| 波普尔差分证伪与验收 | 使用 `python -m open_ontology.design verify` 在独立沙箱副本执行五关 Crucible + 覆盖率驱动与红队差分证伪，达到 `CORROBORATED` 方可签发上线 |
+| 一线自然语言操作 | 通过 `osdk.py` 导出作用域收窄后的工具契约，一线用自然语言 / 飞书卡片发起动作与 `WorkCard` 协同 |
+| 运维支持与审计追溯 | 基于 `COMMITTED / REJECTED / REVERTED` 审计账本回答“哪条规则阻断、哪个外设回读失配、谁改的” |
 
 > 有了治理底座，AI 生成的东西出错也能被拦截、被回滚，这是 AI 参与实施的前提。
 

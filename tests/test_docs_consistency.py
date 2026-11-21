@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -98,3 +100,57 @@ def test_canonical_docs_reflect_owl_object_property_and_autoid():
         assert "AutoID" in text, f"{relpath} 缺少 AutoID 说明"
         assert "LinkType" not in text, f"{relpath} 仍残留已移除的 LinkType"
         assert "card_waits_for" not in text, f"{relpath} 仍残留旧连边 card_waits_for"
+
+
+def test_living_docs_synced_with_runtime_design_split_and_no_retired_symbols():
+    """Archify 总体架构图三件套存在且嵌入文档，核心活文档对已退役 M2 符号零残留。"""
+    assets_dir = REPO_ROOT / "docs" / "assets"
+    arch_json = assets_dir / "openontology-architecture.json"
+    arch_html = assets_dir / "openontology-architecture.html"
+    arch_png = assets_dir / "openontology-architecture.png"
+
+    for artifact in (arch_json, arch_html, arch_png):
+        assert artifact.is_file(), f"缺少系统总体架构图资产：{artifact.relative_to(REPO_ROOT)}"
+        assert artifact.stat().st_size > 0, f"系统总体架构图资产为空：{artifact.relative_to(REPO_ROOT)}"
+
+    parsed_json = json.loads(arch_json.read_text(encoding="utf-8"))
+    assert parsed_json.get("diagram_type") == "architecture"
+    assert parsed_json.get("meta", {}).get("output") == "docs/assets/openontology-architecture.html"
+    html_head = arch_html.read_text(encoding="utf-8")[:512].lower()
+    assert "<!doctype html" in html_head or "<html" in html_head
+    assert arch_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+    arch_doc = _doc("docs/ARCHITECTURE.md")
+    assert "assets/openontology-architecture.png" in arch_doc
+    assert "assets/openontology-architecture.html" in arch_doc
+    assert "assets/openontology-architecture.json" in arch_doc
+
+    readme_doc = _doc("README.md")
+    assert "docs/assets/openontology-architecture.png" in readme_doc
+    assert "docs/assets/openontology-architecture.html" in readme_doc
+    assert "docs/assets/openontology-architecture.json" in readme_doc
+
+    retired_re = re.compile(
+        r"(?<![A-Za-z0-9_])("
+        r"PENDING_APPROVAL|ApprovalGateAspect|post_approval|settle_approval|"
+        r"approve_action|reject_action|approval_rule|approver_roles|plan_mcts"
+        r")(?![A-Za-z0-9_])"
+    )
+    living_paths = (
+        "README.md",
+        "docs/ARCHITECTURE.md",
+        "GLOSSARY.md",
+        "docs/PALANTIR_AND_OPEN_ONTOLOGY.md",
+        "docs/USE_CASES_IMPLEMENTATION.md",
+    )
+    corpus_parts: list[str] = []
+    for relpath in living_paths:
+        text = _doc(relpath)
+        hits = sorted(set(retired_re.findall(text)))
+        assert hits == [], f"活文档 {relpath} 仍残留已退役架构符号：{hits}"
+        corpus_parts.append(text)
+
+    combined = "\n".join(corpus_parts)
+    for anchor in ("DeviceDriverRegistry", "open_ontology.design", "WorkCard"):
+        assert anchor in combined, f"活文档缺少现行关键架构锚点：{anchor}"
+    assert "Gate 6" in combined or "Runtime 对 Design-Time" in combined

@@ -19,6 +19,12 @@
 
 四种职责不意味着四个完全正交、必须各自独立管理生命周期的业务资源。指挥台界面可以按这四种视角组织展示，但不能由四个标签页反推出四套割裂的资源账本。
 
+### 系统总体架构图（Archify 代码证据版）
+
+![OpenOntology 系统总体架构](assets/openontology-architecture.png)
+
+> 交互式架构图（支持视图切换、暗/亮主题与源码行号溯源）：[openontology-architecture.html](assets/openontology-architecture.html) ｜ 声明式源定义：[openontology-architecture.json](assets/openontology-architecture.json)
+
 ```mermaid
 flowchart TB
     subgraph MODEL["1. Model / 领域模型（M1 世界法则与结构定义）"]
@@ -33,28 +39,28 @@ flowchart TB
         MODEL_REF["模型引用：model_id"]
         ABOX["ABox 事实状态｜ontology_objects / ontology_links / ontology_overlay · 三级寻址 workspace_id / object_type / object_id"]
         ROOT["聚合根入口｜RootObjectType / object_id"]
-        HISTORY["演化与审计历史｜ontology_action_runs（追加式因果账本）"]
+        HISTORY["演化与审计历史｜ontology_action_runs（追加式因果账本：仅 COMMITTED / REVERTED / REJECTED）"]
         ABOX --> ROOT
     end
 
-    subgraph RUNTIME["3. Runtime / 执行引擎（世界模拟器与治理宿体）"]
+    subgraph RUNTIME["3. Runtime / 执行引擎（Pure Runtime · 10 模块 / 8,729 行）"]
         direction TB
         CORE["① Runtime.Core 微内核｜EditBatch 内存沙箱 · ObjectDiff · fork() 平行世界推演 · ontology_write_gate 写门禁"]
-        ASPECT["② Runtime.Aspect 七大系统调用切面｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 被拒审计 · 反射 · 忙闲回调 · 同态结算"]
-        ADAPTER["③ Runtime.DeviceAdapter 设备驱动｜SnapshotIngestionDriver"]
+        ASPECT["② Runtime.Aspect 六大切面 + 同态结算｜列级脱敏 · RBAC / __owned__ 主权 · 幂等 / MVCC · 被拒审计 · 反射 · 忙闲回调 · HomomorphicSettlementAspect"]
+        ADAPTER["③ Runtime.DeviceAdapter 驱动与设备总线｜DeviceDriverRegistry（单写设备红线）· SourceBridge · SnapshotIngestionDriver"]
         CORE <--> ASPECT
         CORE <--> ADAPTER
     end
 
-    subgraph DEVICE["4. Device / 外部设备（外部系统登记与适配）"]
+    subgraph DEVICE["4. Device / 外部设备（外部系统登记与多设备总线）"]
         direction LR
-        SYMBOLIC["外部工具与系统｜OpenAPI Schema（ERP / CRM / 外部确定性系统）"]
+        SYMBOLIC["外部工具与系统｜SQLite / RPC / ERP / CRM / SaaS 异构设备"]
     end
 
     MODEL ==>|"1 对 N 复用装载（定义结构与转移法则）"| WORLD
     MODEL -.->|"注入 TBox 与 Behavior 规则"| CORE
     RUNTIME ==>|"绑定并驱动受控读写（沙箱先行 · 禁止裸 CRUD）"| WORLD
-    SYMBOLIC ==>|"快照同步刷新（Source-Backed 字段）"| ADAPTER
+    SYMBOLIC ==>|"单写设备 actuate + 独立 observe / 快照融合"| ADAPTER
 ```
 
 ### 1.1 定义、事实与行为（TBox · Behavior · ABox）
@@ -190,47 +196,51 @@ sequenceDiagram
 
 ---
 
-## 2. 工程模块的物理边界 (Microkernel Decomposition)
+## 2. 工程模块的物理边界 (Pure Runtime vs Design-Time Decomposition)
 
-代码仓库围绕**四类核心工程模块**及**内核外围通用支撑层**组织，现阶段不引入 Kafka 等重型中间件，长耗时协同由 M1 状态机与设备适配层承接：
+代码仓库围绕 **Pure Runtime 核心（JVM 执行面）**、**Design-Time 编译与波普尔证伪工具链（`javac + JUnit`）** 以及 **显式按需导入的可选扩展子包** 三层物理隔离组织；顶层包 `open_ontology/__init__.py`（142 行，严禁 `__getattr__` 隐式延迟后门）仅暴露 Pure Runtime，使 `import open_ontology` 的默认加载面收敛为 **10 个模块 / 8,729 行**：
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
-│ 用户程序 / Model (User Programs) —— M1 可复用领域定义与纯沙箱行为    │
-│   examples/*_ontology.py · examples/kanban.py（历史包内 M1：dev_factory.py）│
-│   每个业务 Model 自带对象/关系/动作/不变量 + spec.display 中文词条   │
+│ Tier 0 · 用户程序 / Model —— M1 领域模型与只增不破客户覆层            │
+│   examples/*_ontology.py（如 std_*_ontology / kanban · M1 协同 WorkCard）│
+│   严格 AST 白名单：仅依赖 stdlib / pydantic / open_ontology.spec      │
 ├══════════════════════════════════════════════════════════════════════┤
-│ Runtime 核心三层（支撑工作空间确定性执行与外部互联）：               │
+│ Tier 1 · Pure Runtime 核心（import open_ontology · 10 模块 / 8,729行）│
 │                                                                      │
-│ ① 微内核 / Runtime.Core (Microkernel) —— 状态页表与虚拟现实沙箱      │
-│   spec.py     M2 元模型原语（对象/关系/接口/动作/函数/自动化声明）   │
-│   sandbox.py  内存编辑沙箱 EditBatch 与可逆 ObjectDiff               │
-│   runtime.py  系统调用主干：写门禁 / 版本 / 模拟 / 提交 / 切面委托   │
-│   query.py    ObjectSet 集合代数与聚合                               │
-│   schema.sql  5 张业务治理表 + 1 张写门禁表（:memory: 与文件同构）   │
+│ ① 微内核 / Runtime.Core                                              │
+│   __init__.py (142行)  纯运行时符号导出（零 __getattr__ 延迟后门）    │
+│   spec.py              M2 元模型原语（Object/Property/Action/Invariant）│
+│   sandbox.py           EditBatch 内存叠加沙箱与可逆 ObjectDiff         │
+│   runtime.py (1,331行) 系统调用主干：write_gate / OCC / fork / 切面委托│
+│   query.py             ObjectSet 集合代数与聚合                        │
+│   schema.sql           5 张纯业务治理表 + 1 张写门禁表（:memory:同构） │
 ├──────────────────────────────────────────────────────────────────────┤
-│ ② 系统调用切面 / Runtime.Aspect (Syscall Aspects) —— 确定性治理铁笼  │
-│   aspects.py / settlement.py                                         │
-│   ColumnMaskingAspect          读出口列级脱敏投影                    │
-│   SecurityAndAuthorityAspect   RBAC / 字段主权门禁（__owned__）      │
-│   IdempotencyAndOCCAspect      幂等短路 / MVCC 乐观锁                │
-│   RejectionAuditAspect         不变量被拒企图入账                    │
-│   AutomationReflexAspect       提交后条件反射与版本去重              │
-│   IdleAwareCallbackAspect      忙闲感知回调（忙时入队、闲时 FIFO）   │
-│   HomomorphicSettlementAspect  三阶段无锁同态回读核销与时光机冲正      │
+│ ② 系统调用切面与同态结算 / Runtime.Aspect                             │
+│   aspects.py（六大切面）：                                            │
+│     ColumnMaskingAspect · SecurityAndAuthorityAspect                 │
+│     IdempotencyAndOCCAspect · RejectionAuditAspect                   │
+│     AutomationReflexAspect · IdleAwareCallbackAspect                 │
+│   settlement.py：SourceBridge + HomomorphicSettlementAspect          │
 ├──────────────────────────────────────────────────────────────────────┤
-│ ③ 设备驱动 / Runtime.DeviceAdapter (Device Drivers)                  │
-│   ingestion.py        SnapshotIngestionDriver 快照摄入与多源列拼接   │
-│   examples/*adapter.py  Odoo · CRM · SaaS 外部协议桥接               │
+│ ③ 设备驱动总线与 OSDK / Runtime.DeviceAdapter & OSDK                 │
+│   drivers.py   DeviceDriverRegistry / MountedDevice（单写设备红线）    │
+│   ingestion.py SnapshotIngestionDriver 快照摄入与多源列拼接            │
+│   osdk.py      受控 LLM 工具导出 · 只读 TBox 投影 · AIPAgentExecutor    │
 ├══════════════════════════════════════════════════════════════════════┤
-│ 内核外围 M2 通用支撑与传输边界（领域无关，零具体行业语义）：         │
-│   mcts.py              规划器：基于纯内存 fork() 的前瞻树搜索        │
-│   mpc.py               无状态滚动时域闭环控制器                      │
-│   osdk.py              受控 LLM 工具 Schema 导出、执行器与评测套件   │
-│   execution/fabric.py  JSON 调用边界与非干涉观察织入 ExecutionFabric │
-│   workspaces.py / model_views.py  工作空间目录与 TBox/Behavior 投影  │
-│   workshop.py / workshop_ui.py / http_server.py                      │
-│                        指挥台 HTTP 传输边界与双标准设备目录承载      │
+│ Tier 2 · Design-Time 编译与波普尔证伪工具链（对 Runtime 物理不可见） │
+│   open_ontology/design.py            python -m open_ontology.design   │
+│                                      check（静态编译） / verify（证伪） │
+│   open_ontology/induction/dsl.py     零 exec 声明式蓝图 / 单调 Overlay  │
+│   open_ontology/induction/resolution.py  L0-L4 实体解析与 CrosswalkTable │
+│   open_ontology/induction/phenomenon.py · crucible.py · falsifier.py   │
+│   skills/openontology-fde/SKILL.md   外部 agy CLI AI-FDE 只读隔离规程 │
+├══════════════════════════════════════════════════════════════════════┤
+│ Tier 3 · 显式按需导入的可选扩展子包（从各自子模块显式导入）          │
+│   open_ontology.mcts        OntologyMCTSPlanner（纯内存 fork() 树搜索）│
+│   open_ontology.mpc         ClosedLoopMPCController（滚动闭环规划）   │
+│   open_ontology.workshop / workshop_ui / workspaces / model_views /    │
+│   http_server / webhooks / meta_admin / execution                    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -238,15 +248,29 @@ sequenceDiagram
 
 | 问题 | 归属模块 |
 |---|---|
-| 它描述某个具体业务领域的类型、关系或沙箱内状态转移规则吗？ | **用户程序**（独立 M1 Model 模块） |
+| 它描述某个具体业务领域的类型、关系或沙箱内状态转移规则吗？ | **用户程序**（独立 M1 Model 模块，严禁逆向依赖 Runtime） |
 | 它是所有工作空间共享的对象页表、沙箱 `EditBatch`/`ObjectDiff` 或 `fork()` 骨架吗？ | **微内核**（`Runtime.Core`） |
-| 它是对每次读写/提交无条件生效的权限、脱敏、幂等、审计或同态结算切面吗？ | **系统调用切面**（`Runtime.Aspect`） |
-| 它适配外部 OpenAPI 系统快照或外部协议通信吗？ | **设备驱动**（`Runtime.DeviceAdapter`） |
-| 它是领域无关的树搜索规划、工具导出、工作空间目录或 HTTP/UI 通用展示协议吗？ | **内核外围 M2 支撑与传输边界** |
+| 它是对每次读写/提交无条件生效的权限、脱敏、幂等、审计、回调或同态结算切面吗？ | **系统调用切面与结算**（`aspects.py` / `settlement.py`） |
+| 它是通用多设备挂载路由、单写设备隔离、跨设备共享主数据合并或快照摄入驱动吗？ | **设备驱动总线**（`drivers.py` / `ingestion.py`） |
+| 它是静态蓝图编译、单调 Overlay、L0–L4 Crosswalk 解析、五关熔炉或差分证伪吗？ | **Design-Time 工具链**（`open_ontology.design` / `open_ontology.induction`） |
+| 它是规划搜索（`mcts`/`mpc`）、Web 作战台（`workshop`）、工作空间目录或 HTTP 协议层吗？ | **显式可选扩展子包**（严禁进入 `open_ontology/__init__.py`） |
+
+### 2.1 `DeviceDriverRegistry`（`open_ontology/drivers.py`）架构契约
+
+`DeviceDriverRegistry` 作为纯 M2 多外设驱动总线，将多套异构外设 `SourceBridge` 聚合投影为单一契约给 `OntologyRuntime(world_mode="coupled")`，并强制执行四项不变量：
+1. **声明互斥与防重**：同一活跃设备不得同时声明同对象类型既是专属（`owned_object_types`）又是共享（`shared_object_types`）；跨活跃（非 `UNPLUGGED`）设备的 `device_id`、`handled_actions` 与 `owned_object_types` 各自唯一（冲突即抛 `DUPLICATE_DEVICE_ID` / `DUPLICATE_ACTION_DRIVER` / `DUPLICATE_OWNED_OBJECT_DRIVER`）。
+2. **原子热替换与 Fail-Closed 卸载**：`unmount()` 或 `set_status(..., "DEGRADED" / "UNPLUGGED")` 后该设备动作立即 fail-closed（抛 `GovernanceViolationError(code=UNBOUND_SOURCE_BRIDGE)`），不影响同总线上的其余 `MOUNTED` 设备；`replace()` 在任何冲突发生前快照回滚，保证切换原子性。
+3. **单动作单写设备硬红线（`CROSS_DEVICE_WRITE_FORBIDDEN`，严禁伪造 2PC）**：单次 `ActionDef` 在 `actuate` 前扫描 `ObjectDiff` 触及的 `owned_object_types` 归属设备集合；只要触及 `>= 2` 台活跃外设或与当前路由 `handled_actions` 目标设备不一致，**在任何物理外写发生之前**即以 `CROSS_DEVICE_WRITE_FORBIDDEN` fail-closed 拒收，零部分写入（跨系统协同须拆分为单设备动作与 M1 状态机显式编排，不伪造跨库两阶段提交）。
+4. **共享主数据融合与 `Workshop` 实时投影**：`observe()` / `observe_all()` 按主键合并跨设备 `shared_object_types`（默认确定性非空字段补全，支持 `shared_mergers` 注入）；`open_ontology.workshop` 可选绑定 `driver_registry` 并通过 `effective_connectors()` 实时投影 `MOUNTED -> CONNECTED`、`DEGRADED -> STANDBY`、`UNPLUGGED -> UNPLUGGED`，彻底消除运行时连接器清单与总线实际状态的“两张皮”。
+
+### 2.2 Pure Runtime 与 Design-Time 物理隔离原则
+
+* **单向不可见（Obliviousness）**：Runtime 核心对 `open_ontology.design`、`open_ontology.induction.*`、`workshop`、`mcts`、`mpc`、`workspaces` 与 `model_views` 完全不可见；即使 `AIPAgentExecutor`（`osdk.py`）内置了只读 `describe_tbox` / `resolve_scoped_names`（与 `model_views.py` 同源导出）以及可选 `planner_factory` 回调槽位，其在静态与运行态亦对 `model_views` 与 `mcts` 保持零导入。
+* **外部 AI-FDE（`agy` CLI）与只读裁判沙盒**：设计期由外部独立编码代理（如 `agy` CLI 依据 `skills/openontology-fde/SKILL.md`）自主探查未知外部数据库并仅在可写目录 `out/` 中产出声明式映射、单调覆层与实体解析配置，绝不修改只读目标 ABI、需求规范与样本源库；随后由零 LLM 的确定性命令行裁判 **`python -m open_ontology.design check | verify`** 在临时沙箱副本上执行编译对齐、五关 `SymbolicCrucible` 与 `DifferentialFalsifier` 波普尔差分证伪（仅当 `verdict == "CORROBORATED"` 且退出码为 `0` 时方允许签发进入 Runtime）。
 
 **微内核行数预算与依赖方向约束**：
-* **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1350 行**（`test_runtime_line_budget` 硬门禁）。超出预算时必须审视逻辑是否属于 `aspects.py`、驱动层或外围支撑层，严禁放宽预算阈值。
-* **单向依赖铁律**：切面（`aspects.py`）与设备驱动只能通过微内核既定入口（`spec` / `_write_gate()` / `_apply_diff()` / `get_action_run()` / `load_snapshot` / `submit_action`）工作，严禁反向 `import` `runtime.py`（`test_aspects_module_is_self_contained`），也不得绕过治理管线直改底层表。微内核除保留 `SnapshotIngestionDriver` 快照门面委托外，不得新增对外部协议驱动或 HTTP 传输层的静态依赖；`examples/kanban.py` 与历史包内的 `dev_factory.py` 严禁进入 `open_ontology/__init__.py` 导出表。
+* **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1,335 行**（现行 **1,331 行**，`test_5_runtime_line_budget_and_exports` 与 `test_4_decompiler_purity_runtime_budget_and_bottlecrm_untouched` 硬门禁）。超出预算时必须审视逻辑是否属于 `aspects.py`、驱动层或外围扩展层，严禁放宽预算阈值。
+* **单向依赖铁律**：切面（`aspects.py`）与设备驱动只能通过微内核既定入口（`spec` / `_write_gate()` / `_apply_diff()` / `get_action_run()` / `load_snapshot` / `submit_action`）工作，严禁反向 `import` `runtime.py`（`test_aspects_module_is_self_contained`），也不得绕过治理管线直改底层表。`examples/kanban.py` 与任何具体行业 `ObjectType` 子类（元数据治理本体 `governance.py` / `meta_admin.py` 除外）严禁进入内核导出表。
 
 ---
 
@@ -285,18 +309,18 @@ sequenceDiagram
   * **`world_mode="coupled"`**：耦合实然世界状态，绑定 `SourceBridge`，凡触碰非自有（source-backed）对象的提交/冲正统一走 `HomomorphicSettlementAspect` 闭环；
   * **`world_mode="counterfactual"`**：反事实想象空间，严格强制 `db_path=":memory:"` 且 `source_bridge=None`，物理绝缘外部设备与磁盘状态。
 * **反事实空间隔离分叉（`runtime.fork()`）**：复用同一 `OntologySpec`，通过 SQLite backup 将当前世界状态与历史克隆至独立 `:memory:` 且 `world_mode="counterfactual"` 的推演沙盘（与实然世界状态及外部设备物理隔离、零写入承诺）。
-* **前瞻树搜索与价值函数评估（`OntologyMCTSPlanner`）**：**规划器（Planner）** 在 `fork()` 反事实空间上枚举候选动作序列，自动剪除违反 `InvariantError` 的非法分支与死局状态（`dead_end`），依据**价值函数（Value Function，`@spec.function` 显式效用算分与树节点 `Q(s, a)` 动作价值估计）**择优决策。
-* **默认无锁三阶段同态结算（`HomomorphicSettlementAspect` 与 `SourceBridge`，实现在 `open_ontology/settlement.py`）**：彻底淘汰独立持久队列文件与 M2 异步挂起态，将“反事实预测 → 外部驱动 → 独立只读回读核验 → 原子提交或零污染拒收”内化为 `OntologyRuntime.submit_action` 与 `revert_action` 的唯一同步通道——Phase A 在纯内存沙箱推演预期差集 $\hat{\Delta}$ 并通过权责与不变量门控（不越权不触外写）；Phase B 完全释放 SQLite 写门禁后调用 `SourceBridge.actuate` 并**丢弃写响应文本**，仅采信独立 `SourceBridge.observe` 回读到的物理终态；Phase C 逐项比对非自有字段与连边，一致则原子提升入主世界并记 `COMMITTED`（支持并发快照抢跑收敛至同一终态时的无损合并），失配则主库事实零改动记 `REJECTED`（`DEVICE_STATE_MISMATCH`）并抛出 `DeviceStateMismatchError`；`coupled` 下的 `revert_action` 默认禁止自动反冲外部源（`SOURCE_REVERT_FORBIDDEN`），仅当 `SourceBridge(allow_source_revert=True)` 时走同态冲正闭环。
-* **无状态滚动时域闭环规划器（`ClosedLoopMPCController`，实现在 `open_ontology/mpc.py`）**：直接驱动主 `OntologyRuntime` 执行“多步想象、单步承诺、独立核销、滚动重算”，不依赖本地待执行队列；若 `observe_fn` 揭示外部偏离预期，先执行 `load_snapshot` 刷新实然信念态再在线重规划（支持 `refresh_on_start=True` 马尔可夫冷重启恢复），并受 `max_replans` 与 `max_steps` 护栏封顶。
+* **前瞻树搜索与价值函数评估（`OntologyMCTSPlanner`，位于显式扩展 `open_ontology.mcts`）**：**规划器（Planner）** 在 `fork()` 反事实空间上枚举候选动作序列，自动剪除违反 `InvariantError` 的非法分支与死局状态（`dead_end`），依据**价值函数（Value Function，`@spec.function` 显式效用算分与树节点 `Q(s, a)` 动作价值估计）**择优决策；核心运行时 `runtime.py` 与 `osdk.py` 零反向引用 `mcts`。
+* **默认无锁三阶段同态结算（`HomomorphicSettlementAspect` 与 `SourceBridge` / `DeviceDriverRegistry`）**：彻底淘汰独立持久队列文件与 M2 异步挂起态，将“反事实预测 → 外部驱动 → 独立只读回读核验 → 原子提交或零污染拒收”内化为 `OntologyRuntime.submit_action` 与 `revert_action` 的唯一同步通道——Phase A 在纯内存沙箱推演预期差集 $\hat{\Delta}$ 并门控权限/业务前置守卫；Phase B 脱离写门禁调用单写设备 `SourceBridge.actuate` 并**丢弃写响应文本**，仅采信独立 `SourceBridge.observe` 回读到的物理终态；Phase C 逐项比对非自有字段与连边，一致则原子提升入主世界并记 `COMMITTED`，失配则主库事实零改动记 `REJECTED`（`DEVICE_STATE_MISMATCH`）并抛出 `DeviceStateMismatchError`；`coupled` 下的 `revert_action` 默认禁止自动反冲外部源（`SOURCE_REVERT_FORBIDDEN`），仅当 `SourceBridge(allow_source_revert=True)` 时走同态冲正闭环。
+* **无状态滚动时域闭环规划器（`ClosedLoopMPCController`，位于显式扩展 `open_ontology.mpc`）**：直接驱动主 `OntologyRuntime` 执行“多步想象、单步承诺、独立核销、滚动重算”，不依赖本地待执行队列；若 `observe_fn` 揭示外部偏离预期，先执行 `load_snapshot` 刷新实然信念态再在线重规划（支持 `refresh_on_start=True` 马尔可夫冷重启恢复），并受 `max_replans` 与 `max_steps` 护栏封顶。
 * **因果账本与逆向冲正（`runtime.revert_action`，委托 `HomomorphicSettlementAspect.settle_revert`）**：基于持久化 `ObjectDiff` 与版本号执行带 `revert_roles` 校验与冲突检测的精确逆向回滚，并支持提交后 `evaluate_automations` 条件反射与版本级去重。
-* **指挥台运行视角**：`Runtime · 算力与治理宿体` 展示宿体配置与已挂载的七大 `Aspect` 链路（含 `HomomorphicSettlementAspect`）。
+* **指挥台运行视角**：`Runtime · 算力与治理宿体` 展示宿体配置与已挂载的六大 `aspects.py` 切面及 `HomomorphicSettlementAspect` 同态结算链路。
 
 ### 3.4 指挥台四展示视角与领域无关图形协议（4-View Command Center）
 * **指挥台展示视角**（一级标签升级为 `Model / Runtime / World / Device`，代码与 HTTP 兼容映射见第 6 节）：
   1. **Model / 领域模型视角**（`Model · 领域模型`）：查看结构 TBox、Behavior 操作契约及 `/topology` 全景矢量图（对象、关系、动作、函数及可选自动化规则）；
-  2. **Runtime / 执行引擎视角**（`Runtime · 算力与治理宿体`）：查看运行宿体配置（`:memory:` / `.sqlite3`、已挂载的七大 `Aspect` 与适配器）；
+  2. **Runtime / 执行引擎视角**（`Runtime · 算力与治理宿体`）：查看运行宿体配置（`:memory:` / `.sqlite3`、已挂载的治理切面与同态结算链路）；
   3. **World / 世界状态视角**（`World · 世界状态`，代码兼容别名 `Workspace`）：选择业务世界及聚合根入口，查看 ABox 事实，执行干跑、同步提交、`fork()` / MCTS 推演与时光机回滚；
-  4. **Device / 外部设备视角**（`Device · 外部工具与设备`）：检视外部系统与工具契约（OpenAPI Schema）。
+  4. **Device / 外部设备视角**（`Device · 外部工具与设备`）：检视外部系统与工具契约（含绑定 `DeviceDriverRegistry` 后的实时设备状态）。
 * **展示词条自治（`OntologySpec.display`）**：内核 `ui_display.json` 仅保留跨领域通用界面词汇；各 M1 模型必须在自身 `spec.display` 中自带中文词条。TBox/ABox 为逻辑投影，不拆成两个一级标签页。
 
 ---
@@ -308,21 +332,22 @@ sequenceDiagram
 | 层次 | 载体 / 模块 | 回答的 M2 核心问题 |
 | :--- | :--- | :--- |
 | **1. 业务世界的事实与历史** | `ontology_objects`、`ontology_links`、`ontology_overlay`、`ontology_action_runs` | 当前业务世界内哪些对象与关系事实成立？哪一次受控动作在何时由谁改变了它们？事实与审计逻辑分离，不复制两套业务库。 |
-| **2. 外部设备契约与调用边界** | • **外部工具与设备**：`OpenAPI Schema`（当前目录项 `SymbolicDeviceEntry`）<br>• **上游 Agent 接入**：`Actor -> OSDK (AIPAgentExecutor) -> ActionDef` | 外部确定性系统暴露什么 RPC/快照契约？上游智能体以什么 `Actor` 身份调用世界模型工具？ |
-| **3. M1 领域动作验收门禁** | 各 M1 Model 在 `ActionDef` 中声明的强类型契约与 `InvariantError` 不变量 | 外部输入（尤其是概率性 Agent 传入的参数）是否满足该业务模型要求的确定性准入条件？（未通过门禁一律拒绝写入事实表并记入被拒审计。） |
+| **2. 外部设备总线与上游调用边界** | • **多外设总线**：`DeviceDriverRegistry` + `SourceBridge` / `SnapshotIngestionDriver`<br>• **上游 Agent 接入**：`Actor -> OSDK (AIPAgentExecutor) -> ActionDef` | 哪些外设权威接管各自 `owned_object_types` 与 `handled_actions`？上游智能体以什么 `Actor` 身份经作用域视图调用世界模型工具？ |
+| **3. M1 领域动作验收门禁** | 各 M1 Model 在 `ActionDef` 与单调 Overlay 中声明的强类型契约与 `InvariantError` 不变量 | 外部输入（尤其是概率性 Agent 传入的参数）是否满足该业务模型要求的确定性准入条件？（未通过门禁一律拒绝写入事实表并记入被拒审计；复杂跨人协同以 M1 协同对象状态机显式承载。） |
 
 ---
 
 ## 5. M2 自动化架构红线门禁 (Architectural Fitness Functions)
 
-以下 6 条 M2 平台不变量固化为自动化测试门禁，任何修改一旦违反即判定失败（特定 M1 业务模型的领域门禁归入各自模型文档与单测，如看板量化证据门禁见 `docs/TASK_BOARD.md`）：
+仓库在 [test_architecture_boundaries.py](file:///Users/guci/work/open-ontology/tests/test_architecture_boundaries.py) 与各专项测试中固化了 **6 道 M2 结构性自动化门禁（Gate 1 – Gate 6）** 与配套纯洁性约束，任何修改一旦违反即失败：
 
-1. **内核顶层导出纯洁性**：`open_ontology/__init__.py` 只允许导出 M2 内核、规划/工具与通用指挥台原语，严禁导出任何 M1 具体业务模型（如看板、研发工厂、冷链、钢厂）或具体外部业务适配器。
-2. **内核词典零业务膨胀**：新增或修改 M1 业务模型必须在自身 `spec.display` 中携带中文标签，严禁修改 `open_ontology/ui_display.json`（`test_business_display_terms_live_in_their_own_spec`）。
-3. **通用 UI 引擎零领域泄漏**：`open_ontology/workshop.py` 与 `open_ontology/workshop_ui.py` 严禁出现任何特定 M1 业务领域的私有字段名或专属流程图路由（`test_ui_kernel_has_no_board_domain_fields`、`test_m2_workshop_has_no_process_flow_pollution`）。
-4. **数据库六表纯洁性与无损预检**：`open_ontology/schema.sql` 严格保持 5 张业务治理表加 1 张写门禁表，不混入行业私有列或外部消息队列表（`test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts`）；无损重开已有 SQLite 文件前必须完整校验六表齐全，禁止静默修补半成品库。
-5. **微内核行数预算**：`open_ontology/runtime.py` 不得超过 **1350** 行（`test_runtime_line_budget`）。
-6. **切面零反向依赖**：`open_ontology/aspects.py` 不得 `import` 内核运行时，微内核不得重写已委托给切面的治理逻辑（`test_aspects_module_is_self_contained`、`test_kernel_delegates_to_aspects_not_reimplements`）。
+1. **Gate 1（M1 本体 AST 导入白名单）**：自动发现仓库全部纯 M1 本体声明模块，严禁直接/间接/动态导入 `OntologyRuntime`、传输库、OS/IO 或外部驱动库，也严禁从 `open_ontology` 顶层混入非规范模块（`test_gate1_m1_ontologies_strict_ast_import_whitelist`）。
+2. **Gate 2（M2 内核零反向引用 `examples` 与干净 IO / `ObjectType` 子类白名单）**：递归扫描 `open_ontology/**/*.py`，严禁静态或动态导入 `examples`（`design.py` 仅允许 `import_module` 加载命令行显式路径且禁止硬编码 `examples`），非传输适配器禁止网络/子进程 IO；运行时遍历 `ObjectType.__subclasses__()` 严禁内核夹带具体业务实体子类（自举元治理与平台元数据模块除外，`test_gate2_m2_zero_reverse_example_imports_no_business_objects_clean_io`）。
+3. **Gate 3（动态 M1 结构词表反向扫描与供应商词禁令）**：动态采集全部 M1 本体注册词表，按词边界正则反向扫描 `open_ontology/**`（含 `drivers.py`、`design.py`、`induction/*`）及 `ui_display.json`，并封杀具体外部产品厂商耦合标识（`test_gate3_dynamic_m1_vocabulary_reverse_scan`）。
+4. **Gate 4（M2 跨领域虚构盲测）**：使用完全虚构领域模型（`Starship / WarpCore / Sector`）端到端跑通 `OntologyRuntime`、`OntologyMCTSPlanner`、`describe_tbox` 与 `SymbolicCrucible`（`test_gate4_fictional_domain_blind_m2_contract`）。
+5. **Gate 5（纯同步 6 表无 M2 挂起态铁笼）**：校验 `open_ontology/schema.sql` 保持 5 张业务治理表加 1 张 `ontology_write_gate` 写门禁表、`ontology_action_runs.status` 约束仅允许 `('COMMITTED', 'REVERTED', 'REJECTED')`，且全仓 `open_ontology/**` 对任何已退役 M2 挂起/两相审批符号零命中（`test_gate5_pure_synchronous_non_suspending_m2_kernel`）。
+6. **Gate 6（零例外 Runtime 对 Design-Time 与扩展层完全不可知）**：**0 例外** 校验全部核心 Runtime 模块（`spec.py`、`sandbox.py`、`runtime.py`、`aspects.py`、`settlement.py`、`drivers.py`、`ingestion.py`、`query.py`、`osdk.py`）与 `open_ontology/__init__.py`（严禁 `__getattr__`），断言其静态依赖闭包与干净子进程 `import open_ontology` 实测的 `sys.modules` **严格收口于 10 模块 Pure Runtime 白名单**，确保 `design`、`induction`、`workshop`、`workshop_ui`、`meta_admin`、`workspaces`、`model_views`、`http_server`、`webhooks`、`mcts`、`mpc` 与 `subprocess` 完全未加载（`test_gate6_runtime_oblivious_to_design_time`）。
+7. **配套微内核预算与展示/文档门禁**：`open_ontology/runtime.py <= 1,335` 行（现 `1,331` 行）；`aspects.py` 零反向导入 `runtime.py`；`ui_display.json` 零业务词膨胀、`workshop`/`workshop_ui` 零领域字段泄漏；`tests/test_docs_consistency.py` 锁定 Archify 架构图与活文档零退役符号漂移。
 
 ---
 

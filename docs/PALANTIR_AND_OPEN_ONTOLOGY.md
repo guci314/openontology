@@ -88,10 +88,12 @@ OpenOntology 完整继承了 Palantir Foundry/AIP 的核心原理，并将其精
 | **集合代数与遍历** | ObjectSet / SearchAround / Aggregate | `ObjectSet`（去重保序集合代数）、`pivot`、`aggregate` | [query.py](file:///Users/guci/work/open-ontology/open_ontology/query.py) |
 | **OSv2 双平面与摄入** | Backing Dataset + Action / Ontology Edits（原称 User Edits）+ Reindex | `SnapshotIngestionDriver`（`load_snapshot` / `load_mdo_snapshots`）+ `ontology_objects` + `ontology_overlay` | [ingestion.py](file:///Users/guci/work/open-ontology/open_ontology/ingestion.py)、[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql) |
 | **沙盘先行与变更集** | Scenarios / Edits | `EditBatch` 内存沙箱 + 可逆 `ObjectDiff`（`simulate_action` 与 `submit_action` 同路径） | [sandbox.py](file:///Users/guci/work/open-ontology/open_ontology/sandbox.py) |
-| **安全、并发与审批铁笼** | Markings / RBAC / Column Masking / OCC / Approvals | 七大系统调用切面：`ColumnMaskingAspect`、`SecurityAndAuthorityAspect`、`IdempotencyAndOCCAspect`、`ApprovalGateAspect`、`RejectionAuditAspect`、`AutomationReflexAspect`、`IdleAwareCallbackAspect` | [aspects.py](file:///Users/guci/work/open-ontology/open_ontology/aspects.py) |
-| **写防线与因果账本** | No-CRUD Guardrail + Action Log | `ontology_write_gate` 触发器（5 张业务表 + 1 张门禁表）+ `ontology_action_runs` 追加式账本 | [schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql) |
-| **AI 工具与评测** | OSDK + AIP Agent + AIP Evals | `export_llm_tools` + `AIPAgentExecutor` + 基于 `ObjectDiff` 的确定性评测 `run_eval_suite` | [osdk.py](file:///Users/guci/work/open-ontology/open_ontology/osdk.py) |
-| **动态世界模型推演** | 多步 Scenario 推演 | `runtime.fork()` 平行沙盘 + `OntologyMCTSPlanner` 蒙特卡洛树搜索规划器 | [runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py)、[mcts.py](file:///Users/guci/work/open-ontology/open_ontology/mcts.py) |
+| **安全、并发、核销与协同铁笼** | Markings / RBAC / Column Masking / OCC / 同态结算 | 六大 `aspects.py` 切面（`ColumnMaskingAspect`、`SecurityAndAuthorityAspect`、`IdempotencyAndOCCAspect`、`RejectionAuditAspect`、`AutomationReflexAspect`、`IdleAwareCallbackAspect`）+ `HomomorphicSettlementAspect`（纯同步核销）+ M1 `WorkCard`（`$t_1$` 重算审批/分工） | [aspects.py](file:///Users/guci/work/open-ontology/open_ontology/aspects.py)、[settlement.py](file:///Users/guci/work/open-ontology/open_ontology/settlement.py) |
+| **多外设总线与驱动路由** | Data Connection / Virtual Tables | `DeviceDriverRegistry`（`mount` / `unmount` / `replace`、`CROSS_DEVICE_WRITE_FORBIDDEN` 单写设备红线、共享主数据回读融合）+ `SnapshotIngestionDriver` | [drivers.py](file:///Users/guci/work/open-ontology/open_ontology/drivers.py)、[ingestion.py](file:///Users/guci/work/open-ontology/open_ontology/ingestion.py) |
+| **写防线与因果账本** | No-CRUD Guardrail + Action Log | `ontology_write_gate` 触发器（5 张业务表 + 1 张门禁表）+ `ontology_action_runs` 追加式账本（仅 `COMMITTED / REVERTED / REJECTED`） | [schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql) |
+| **AI 工具与评测** | OSDK + AIP Agent + AIP Evals | `export_llm_tools` + 只读 `describe_tbox` + `AIPAgentExecutor` + 基于 `ObjectDiff` 的确定性评测 `run_eval_suite` | [osdk.py](file:///Users/guci/work/open-ontology/open_ontology/osdk.py) |
+| **Design-Time 编译与实体解析** | Schema Compiler / Ontology Evolving / Entity Resolution | 零 `exec` 声明式蓝图/单调 Overlay（`dsl.py`）+ L0–L4 `CrosswalkTable`（`resolution.py`）+ `open_ontology.design check \| verify`（五关 `SymbolicCrucible` + `DifferentialFalsifier`）+ 外部 `agy` CLI AI-FDE | [design.py](file:///Users/guci/work/open-ontology/open_ontology/design.py)、[dsl.py](file:///Users/guci/work/open-ontology/open_ontology/induction/dsl.py)、[resolution.py](file:///Users/guci/work/open-ontology/open_ontology/induction/resolution.py) |
+| **动态世界模型推演（按需扩展）** | 多步 Scenario 推演 | `runtime.fork()` 平行沙盘 + 显式扩展 `open_ontology.mcts`（`OntologyMCTSPlanner`）与 `open_ontology.mpc`（`ClosedLoopMPCController`） | [runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py)、[mcts.py](file:///Users/guci/work/open-ontology/open_ontology/mcts.py)、[mpc.py](file:///Users/guci/work/open-ontology/open_ontology/mpc.py) |
 
 ---
 
@@ -99,59 +101,59 @@ OpenOntology 完整继承了 Palantir Foundry/AIP 的核心原理，并将其精
 
 相比重型商业套件或普通 Agent 框架，OpenOntology 在保留 Palantir 灵魂的同时形成了 6 项独特优势：
 
-### 3.1 极致轻量的“操作系统式微内核”与零重型依赖
-* Palantir Foundry 依赖庞大的分布式集群（Spark、Flink、Cassandra、Phonograph 与重型控制面）；而 OpenOntology 将整个内核收束在不足 **1400 行**的微内核（[runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py) 当前 1343 行）与同构的 **6 张 SQLite 表**（[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql)）中。
-* 支持 `:memory:` 与本地 `.sqlite3` 无缝同构，模型即 Python 代码模块（Pydantic + 装饰器），无需 Kafka 或外部 RDF/OWL 图数据库即可单进程秒级拉起完整治理环境，非常适合嵌入式控制面、边缘业务与敏捷团队落地。
+### 3.1 极致轻量的“Pure Runtime（Java 式微内核）”与物理隔离
+* Palantir Foundry 依赖庞大的分布式集群（Spark、Flink、Cassandra、Phonograph 与重型控制面）；而 OpenOntology 将 Pure Runtime（`import open_ontology`）严苛收口为 **10 个模块 / 8,729 行**，其中核心执行引擎 [runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py) 仅 **1,331 行**（硬预算 `<= 1,335` 行），底层固定为同构的 **6 张 SQLite 表**（[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql)），通过 **Gate 6 零例外** 与 `Design-Time`（`open_ontology.design` / `induction`）、Web 作战台（`workshop`）及规划器（`mcts` / `mpc`）物理隔绝。
+* 支持 `:memory:` 与本地 `.sqlite3` 无缝同构，模型即 Python 代码模块（或零 `exec` 声明式蓝图/单调 Overlay），无需 Kafka 或外部 RDF/OWL 图数据库即可单进程毫秒级拉起完整治理环境，非常适合嵌入式控制面、边缘业务与敏捷团队落地。
 
-### 3.2 原生支持 `runtime.fork()` 平行宇宙与 MCTS 世界模型树搜索
-* OpenOntology 将确定性本体直接作为 **Symbolic World Model（符号世界模型）**：借助 SQLite 原生 `Connection.backup()` 实现的 `runtime.fork()`（[runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py#L164-L175)），可以在毫秒内克隆出与主库 100% 物理隔离的内存平行宇宙。
-* 结合 [mcts.py](file:///Users/guci/work/open-ontology/open_ontology/mcts.py) 的 `OntologyMCTSPlanner`，Agent 可以像 AlphaGo 一样执行 `Selection (PUCT) → Expansion（InvariantError 自动剪枝）→ Rollout → Backpropagation` 多步前瞻搜索，选出全局最优动作序列后再原子提交回主空间。这是传统 ERP 与大多数 Agent 工具框架完全不具备的能力。
+### 3.2 原生支持 `runtime.fork()` 平行宇宙与 MCTS / MPC 闭环规划
+* OpenOntology 将确定性本体直接作为 **Symbolic World Model（符号世界模型）**：借助 SQLite 原生 `Connection.backup()` 实现的 `runtime.fork()`，可以在毫秒内克隆出与主库 100% 物理隔离的内存平行宇宙（`world_mode="counterfactual"`、`source_bridge=None`）。
+* 上层业务与控制面可按需显式导入 [mcts.py](file:///Users/guci/work/open-ontology/open_ontology/mcts.py) 的 `OntologyMCTSPlanner` 与 [mpc.py](file:///Users/guci/work/open-ontology/open_ontology/mpc.py) 的 `ClosedLoopMPCController` 执行多步前瞻树搜索与滚动时域闭环重算，而 Pure Runtime 自身保持零反向依赖。
 
 ### 3.3 清晰的“寄居吸纳 → 平滑接管 → 一键拔插头（SaaS Unplug）”主权演进路径
-* 针对企业“不愿一次性推翻旧 CRM/ERP”的现实痛点，OpenOntology 通过类级 `__owned__` 声明与 `SecurityAndAuthorityAspect` 强制校验 `source`（外部同步）与 `ontology`（本体自有）两个主权平面，配合 `post_approval` 两段式审批追加机制。
-* 企业可先作为“外挂增强层”吸纳外部软件快照（支持多源按列 MDO 拼接与时间戳/自有优先冲突裁决）并叠加 AI 治理属性；待业务闭环成熟后，只需将 `__owned__` 晋升为 `True`，即可物理断开外部 SaaS（参考 [real_crm_unplug_demo.py](file:///Users/guci/work/open-ontology/examples/real_crm_unplug_demo.py)），上层 `ActionDef` 与 Agent 代码一行不改独立运行。
+* 针对企业“不愿一次性推翻旧 CRM/ERP”的现实痛点，OpenOntology 通过类级 `__owned__` 声明与 `SecurityAndAuthorityAspect` 强制校验 `source`（外部同步）与 `ontology`（本体自有）两个主权平面，配合 `DeviceDriverRegistry` 单写设备红线、L0–L4 `CrosswalkTable` 跨系统主数据对齐，以及纯同步 `APPROVAL_REQUIRED_*` 前置守卫 + M1 `WorkCard`（`$t_1$` 重算落库）。
+* 企业可先作为“外挂增强层”挂载多台外部设备驱动，逐步叠加坡道自有规则与字段；待业务闭环成熟后，只需将 `__owned__` 晋升为 `True`，即可物理断开外部 SaaS（参考 [real_crm_unplug_demo.py](file:///Users/guci/work/open-ontology/examples/real_crm_unplug_demo.py)），上层 `ActionDef` 与 Agent 代码一行不改独立运行。
 
-### 3.4 外部设备（OpenAPI）治理与 Agent 零信任接入
-* OpenOntology 在 M2 架构中将外部确定性工具与数据源统一抽象为外围 `Device`（OpenAPI Schema），经 `SnapshotIngestionDriver` 同步进 World；外部智能体（如 CodeBuddy 等）统一作为上游 `Agent（Actor）` 通过 OSDK / `ActionDef` 与世界模型交互。
-* 外部智能体提交的任何参数均属不可信输入，必须经确定性 `ActionDef` 的 RBAC/RLS、`InvariantError` 不变量与主权门禁验收后才允许进入 ABox。
+### 3.4 多外设同态总线治理（`DeviceDriverRegistry`）与外部 `agy` CLI AI-FDE
+* 运行期通过 [drivers.py](file:///Users/guci/work/open-ontology/open_ontology/drivers.py) 的 `DeviceDriverRegistry` 统一管理多个异构外部设备驱动（原子热替换 `replace`、fail-closed `unmount`、`CROSS_DEVICE_WRITE_FORBIDDEN` 单写红线与共享主数据回读融合）；所有写动作一律走 `HomomorphicSettlementAspect` 独立回读核验（丢弃写响应文本，以独立 `observe` 终态为准）。
+* 设计期通过 `python -m open_ontology.design check | verify` 扮演离线 `javac` + `JUnit` 裁判：支持外部编码代理（`agy` CLI 遵循 [SKILL.md](file:///Users/guci/work/open-ontology/skills/openontology-fde/SKILL.md)）在隔离只读沙盒中自主探测未知多库 Schema、生成声明式映射/单调 Overlay/实体解析配置，并经五关 `SymbolicCrucible` + 覆盖率驱动 `DifferentialFalsifier` 波普尔证伪通过后才签发上线。
 
 ### 3.5 被拒审计、精确逆向冲正与无 LLM 裁判的确定性评测
-* **被拒企图完整入账**：Agent 因违反不变量被拒的尝试，不会悄无声息消失，而是由 `RejectionAuditAspect` 记入 `ontology_action_runs (status='REJECTED')`，为安全审计和模型调优留下完整证据。
-* **可逆因果冲正**：每次落库记录精确的 `ObjectDiff` 与版本前后值，通过 `runtime.revert_action` 可带冲突检测地逆向冲正历史动作。
+* **被拒企图完整入账**：Agent 因违反不变量（或触发 `APPROVAL_REQUIRED_*` 前置拦截）被拒的尝试，不会悄无声息消失，而是由 `RejectionAuditAspect` 记入 `ontology_action_runs (status='REJECTED')`，为安全审计和模型调优留下完整证据。
+* **可逆因果冲正**：每次落库记录精确的 `ObjectDiff` 与版本前后值，通过 `runtime.revert_action` 可带 `revert_roles` 与冲突检测地逆向冲正历史动作。
 * **确定性 AIP Eval**：[osdk.py](file:///Users/guci/work/open-ontology/open_ontology/osdk.py) 的 `run_eval_suite` 直接对比 Agent 产出的 `ObjectDiff` 与预期终局差集，无需引入不稳定的 “LLM-as-a-Judge”。
 
-### 3.6 工程纪律固化为自动化架构门禁（Architectural Fitness Functions）
-* 仓库将微内核行数预算（`runtime.py <= 1400`）、切面零反向依赖、通用 UI 零领域字段泄漏、核心词典零业务膨胀、六表纯洁性与无损预检全部固化在 `pytest` 门禁测试中，防止系统在快速迭代中退化为泥球架构。
+### 3.6 工程纪律固化为 6 道零例外自动化架构门禁
+* 仓库在 [test_architecture_boundaries.py](file:///Users/guci/work/open-ontology/tests/test_architecture_boundaries.py) 与 [test_docs_consistency.py](file:///Users/guci/work/open-ontology/tests/test_docs_consistency.py) 固化 **Gate 1 – Gate 6** 及文档防漂移门禁：Pure Runtime 严守 `10` 模块白名单与 `runtime.py <= 1,335` 行预算，对 Design-Time/Workshop/MCTS/MPC 零耦合；M1/M2/厂商词双向零污染；6 表纯同步无 M2 挂起态。
 
 ---
 
-## 四、 OpenOntology 当前的不足与局限
+## 四、 OpenOntology 当前的不足与边界
 
-从生产级工程视角审视，OpenOntology 面向“轻量、确定性、强治理的业务控制面”做了极致权衡，也因此存在以下 6 项客观不足与边界：
+从生产级工程视角审视，OpenOntology 面向“极薄确定性微内核 + 强治理控制面”做了刻意权衡；历史上的“缺少零 `exec` 声明式 DSL、外部实体映射自动化及跨系统实体消歧”局限已被 `dsl.py` / `resolution.py` / `design.py` 与 `agy` CLI AI-FDE 工作流补齐，但以下 6 项物理边界与工程局限依然客观存在：
 
 ### 4.1 单机 SQLite 的写吞吐与水平扩展局限
 * **现状**：当前 `OntologyRuntime(spec, db_path)` 绑定单个 SQLite 存储（WAL 模式），全部核心事实与审计账本落在一份单机库中。
 * **不足**：虽然非常契合中小规模核心状态机与控制面决策（数千至数万级核心业务对象），但无法像 Palantir Foundry 那样横向扩展到 **PB 级海量数据湖、高并发高吞吐 OLTP 写流（每秒上万并发修改）或多地域分布式集群**。
 
 ### 4.2 `runtime.fork()` 基于全库备份拷贝，超大规模状态图下分叉成本上升
-* **现状**：`runtime.fork()` 通过 SQLite 原生 `Connection.backup()` 将整库复制到 `:memory:` 实例中（[runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py#L164-L175)），并非操作系统内存页级 Copy-on-Write（CoW）。
+* **现状**：`runtime.fork()` 通过 SQLite 原生 `Connection.backup()` 将整库复制到 `:memory:` 实例中，并非操作系统内存页级 Copy-on-Write（CoW）。
 * **不足**：当工作空间中累计了大量历史 `ontology_action_runs` 或十万级以上对象时，MCTS 搜索中高频调用 `fork()` 会带来线性增长的内存占用与拷贝延迟，需要定期归档或控制分叉频率。
 
 ### 4.3 查询层在 Python 内存侧过滤与聚合，缺少索引下推与分布式图查询
-* **现状**：从 [runtime.py](file:///Users/guci/work/open-ontology/open_ontology/runtime.py#L574-L595) 可见，`query_objects` 先通过 `load_all(object_type)` 将该类型所有行加载并反序列化，再在 Python 侧逐行校验 `actor.has_access`、应用 `filters` 谓词和列脱敏。
+* **现状**：`query_objects` 先将目标类型行加载反序列化，再在 Python 侧逐行校验 `actor.has_access`、应用 `filters` 谓词和列脱敏。
 * **不足**：当单个 `ObjectType` 实例规模达到数十万行时，缺乏 SQL 谓词下推（JSON 索引 / 生成列索引）、分页游标与多跳原生图查询优化，全量加载会成为读性能瓶颈。
 
-### 4.4 单 Runtime 绑定单模型，且缺少在线 Schema 演进（Migration）工具链
-* **现状**：规范明确当前 `OntologyRuntime` 只绑定单个 `OntologySpec`，模型随 Python 代码发布；`ontology_objects` 以 JSON 序列化属性存盘（[schema.sql](file:///Users/guci/work/open-ontology/open_ontology/schema.sql#L39-L49)）。
-* **不足**：当业务模型发生字段重命名、必填字段新增或类型变更时，目前缺乏声明式的历史存量对象自动迁移（Schema Migration / Backfill）与版本共存框架，需要应用层自行编写数据清洗脚本；同时尚不支持单个引擎内动态热插拔/多模型联邦查询。
+### 4.4 单 Runtime 绑定单模型，历史实例数据在线 Schema 迁移工具链仍薄
+* **现状**：规范明确当前 `OntologyRuntime` 只绑定单个 `OntologySpec`；尽管设计期已具备声明式蓝图组合（`compose_blueprints`）、单调 `CustomerOverlay` 与快照字段重命名/默认值 `migrations`，线上大库存量实例的分布式零停机 Schema Backfill 编排器仍待加强。
+* **不足**：暂不支持单引擎内联邦挂载多个隔离 `OntologySpec`，复杂跨模型工作流仍需多 Runtime/工作空间协同。
 
-### 4.5 写门禁属于“同进程工程护栏”，且 Python 闭包逻辑难以跨语言静态校验
-* **现状**：`ontology_write_gate` 触发器防范的是同一连接内的误写（Accidental-CRUD Guardrail），而非隔离同进程恶意特权代码的操作系统级沙箱；同时 `ActionDef` 的 `handler`、`approval_rule`、`AutomationDef.condition` 均为 Python 函数/闭包。
-* **不足**：业务逻辑无法像纯声明式 DSL/OWL 那样直接跨语言序列化给前端/外部网关做静态推理或可视规则编排，仍依赖 Python 运行时执行；多租户运行不可信第三方插件代码时，仍需配合进程/容器级隔离。
+### 4.5 写门禁属于“同进程工程护栏”，复杂定制 Action 仍需 Python 宿主进程隔离
+* **现状**：`ontology_write_gate` 触发器防范的是同一连接内的误写（Accidental-CRUD Guardrail），而非隔离同进程恶意特权代码的操作系统级沙箱；虽然单调 Overlay 与标准规则已采用零 `exec` 安全谓词 AST（`dsl.py`），但复杂图灵完备 `ActionDef` 处理器与 `AutomationDef.condition` 仍为 Python 函数。
+* **不足**：高安全多租户运行不可信第三方定制动作代码时，仍需配合容器或独立子进程级隔离（例如类似 `WO-11` 对 AI-FDE 选手采用的只读目录权限 + 外部裁判模式）。
 
-### 4.6 外部系统双向同步仍依赖编写适配器（PSM），缺少海量标准化连接器生态
-* **现状**：虽然 `ingestion.py` 提供了 MDO 多源拼接与冲突裁决驱动，但对接具体外部系统（如 Odoo、BottleCRM 或企业自研 WMS）的 API 拉取与已提交运行写回，仍需按领域编写 Python 适配器（如 [odoo_o2c_adapter.py](file:///Users/guci/work/open-ontology/examples/odoo_o2c_adapter.py)）。
-* **不足**：相比 Palantir Foundry 开箱即用的数百种商业 SaaS / CDC 流式连接器、可视化 Data Lineage 血缘与低代码 Pipeline Builder，OpenOntology 目前面向开发者代码集成，无代码可视化接数能力较弱。
+### 4.6 大规模商业 SaaS / CDC 流式连接器开箱即用生态仍有限
+* **现状**：虽然现行架构已补齐通用多外设总线 `DeviceDriverRegistry`、`DeclarativeSQLiteDriverBridge`、`design.py` 自动化探库验证以及 AI-FDE 自主反编译 SQLite/Odoo 外部系统的闭环，另有 `camel-sync/` 示范对接。
+* **不足**：相比 Palantir Foundry 开箱即用的数百种商业 SaaS / Kafka CDC 流式实时连接器与 PB 级血缘编排面板，面向企业级海量异构 SaaS（如 SAP RFC、Oracle、Salesforce Streaming API）的生产级声明式连接器市场仍需持续积累。
 
 ---
 

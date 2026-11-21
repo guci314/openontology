@@ -25,25 +25,36 @@
 | **TBox** | 类型侧结构投影：`ObjectType`、字段（含 `AutoID` 与 `DatatypeProperty`）、`InterfaceType`、`ObjectProperty`、声明式约束、类型元数据（含 `aggregate_root`） | 不是知识流转阶段，也不是运行时实例值 |
 | **`ObjectProperty` / 对象属性** | OWL 跨对象关系原语：以 `ObjectProperty[Target]` / `ObjectProperty[tuple[Target, ...]]` 或 `spec.object_property(...)` 声明 `domain`、`range`、`cardinality` 与连边主权；写入时自动同步 `ontology_links` 三元组并强制引用完整性（`TARGET_NOT_FOUND`） | 替代关系表外键命名与旧版独立连边原语；不是可任意手填的标量文本字段 |
 | **`AutoID` / 系统自动编号** | 主键/动作编号注解：在 TBox 与 Behavior 契约投影 `auto_generated: True`，用于生成只读系统编号表单控件并由动作自动分配序号 | 不是手填外键，也不跳过唯一性与不变量校验 |
-| **Behavior** | 受控因果变化契约：`ActionDef`、`FunctionDef`、`AutomationDef`、`InvariantDef`、角色授权、审批与参数 Schema | 不能全部塞进静态结构 TBox，也不是第二套执行引擎 |
+| **Behavior** | 受控因果变化契约：`ActionDef`、`FunctionDef`、`AutomationDef`、`InvariantDef`、`TransitionInvariantDef`、角色授权与参数 Schema | 不能全部塞进静态结构 TBox，也不是第二套执行引擎；不设 M2 异步审批挂起态 |
 | **ABox** | 事实侧投影：具体对象属性值、关系断言、执行与审计历史 | 不是知识流转阶段，也不是模型声明 |
 | **World / 世界状态（信念态 Belief State）**（界面 `World · 世界状态`；曾用名 `业务世界`；代码兼容别名 `Workspace / 工作空间`） | 现象经世界模型降维接地后，以 `workspace_id`（`world_id`）标识的当下**实然状态**实例：`model_id` 引用 + ABox + Runtime 绑定 + 演化历史（契合方向为 *Mind-to-World* 心智顺应世界） | **不是外部客观世界本身**，**不是单个业务对象**，也不是源代码工作目录 |
 | **Counterfactual Space / 反事实空间（想象空间 Imagination）** | 由**同一个世界模型**生成的可能世界空间（Possible Worlds）：通过 `runtime.fork()` 克隆至严格纯 `:memory:` 沙盘（`world_mode="counterfactual"`、`source_bridge=None`）推演假想未来（*What-if*） | 与世界状态共享同一元模型，但与外部物理设备彻底绝缘，对实然世界状态及外部系统零写入 |
-| **Homomorphic Settlement / 同态核销闭环（`SourceBridge`）** | `OntologyRuntime` 在 `world_mode="coupled"` 下的默认三阶段无锁结算路径（实现在 `open_ontology/settlement.py`）：Phase A 沙箱推演预期差集 $\hat{\Delta}$ 并门控权限/审批；Phase B 脱离写门禁调用 `SourceBridge.actuate` 并只采信独立 `SourceBridge.observe`；Phase C 逐项核对回读终态，一致原子入库（`COMMITTED`），失配抛 `DeviceStateMismatchError` 且主库零改动（`REJECTED`） | 不落独立持久化动作队列表（不增加新表，不使用独立暂存库） |
+| **Homomorphic Settlement / 同态核销闭环（`SourceBridge`）** | `OntologyRuntime` 在 `world_mode="coupled"` 下的默认三阶段无锁纯同步结算路径（实现在 `open_ontology/settlement.py`）：Phase A 沙箱推演预期差集 $\hat{\Delta}$ 并门控权限与前置不变量；Phase B 脱离写门禁调用单写设备 `SourceBridge.actuate` 并只采信独立 `SourceBridge.observe`；Phase C 逐项核对回读终态，一致原子入库（`COMMITTED`），失配抛 `DeviceStateMismatchError` 且主库零改动（`REJECTED`） | 同步事务闭环；不落独立持久化动作队列表，不引入 M2 挂起态 |
 | **Value Function / 价值函数（评价体系 Valuation）** | 对世界状态好坏与目的性的标量度量 `V(s)`（联结主义中为连续直觉价值网络，符号主义中为 `@spec.function` 显式规则效用函数与搜索树节点动作价值估计 `Q(s, a)`） | 世界模型管“事实判断（将会怎样）”，价值函数管“价值判断（想要怎样）” |
-| **Planner / 规划器** | 连接“世界模型”与“价值函数”的实践理性中枢：由前瞻树搜索（`OntologyMCTSPlanner`）与滚动时域闭环控制器（`ClosedLoopMPCController`）构成，在反事实空间中剪除违反不变量的死局并滚动重算 | 搜索阶段永不直写实然世界状态或外部设备 |
-| **Runtime / 执行引擎** | 执行模型查询、受控动作、治理切面、持久化与反事实沙盘推演的引擎实例，以 `runtime_id` 标识 | 不是额外一份业务事实 |
-| **Device / 外部设备** | 登记并适配外部确定性系统与现象观测源（OpenAPI）的边界；外部智能体直接作为 `Actor` 通过 OSDK / `ActionDef` 与世界模型交互 | 不是未经校验即可写入事实图的可信数据 |
+| **Planner / 规划器** | 连接“世界模型”与“价值函数”的实践理性中枢：由前瞻树搜索（`open_ontology.mcts.OntologyMCTSPlanner`）与滚动时域闭环控制器（`open_ontology.mpc.ClosedLoopMPCController`）构成，在反事实空间中剪除违反不变量的死局并滚动重算 | 位于显式按需导入的扩展子包，搜索阶段永不直写实然世界状态或外部设备 |
+| **Runtime / 执行引擎** | 执行模型查询、受控动作、治理切面、持久化与反事实沙盘推演的纯同步微内核实例（`open_ontology/runtime.py`），以 `runtime_id` 标识 | 不是额外一份业务事实，也不依赖 Design-Time / Induction / Workshop / MCTS |
+| **Device / 外部设备** | 通过 `DeviceDriverRegistry` 与 `SourceBridge`（或 `SnapshotIngestionDriver`）挂载的外部确定性系统与观测连接器；外部智能体直接作为 `Actor` 通过 OSDK / `ActionDef` 与世界模型交互 | 不是未经校验即可写入事实图的可信数据 |
 
 ### 2.1 同一元模型下的运行模式与双空间绝缘（同构 6 表原理）
 
-OpenOntology 的实然主库与反事实分叉复用完全同构的 6 表结构，但通过 `world_mode` 与物理连接器绑定严格区分职责与读写边界：
+OpenOntology 的实然主库与反事实分叉复用完全同构的 6 表结构（5 张业务治理表 + `ontology_write_gate` 写门禁表，`ontology_action_runs.status` 仅允许 `COMMITTED / REVERTED / REJECTED`），并通过 `world_mode` 与物理连接器绑定严格区分职责与读写边界：
 
 | 运行模式（`world_mode`） | 标准术语 | 现行代码载体 | 现实承诺与隔离红线 |
 |---|---|---|---|
 | **`standalone`** | **World State / 独立世界状态** | 主 `OntologyRuntime`（`:memory:` 或 `.sqlite3`，`source_bridge=None`） | 仅治理本体自有业务状态，不关联外部源系统 |
-| **`coupled`** | **World State / 耦合同态世界状态** | 主 `OntologyRuntime` + `SourceBridge`（`open_ontology/settlement.py`） | 凡触碰非自有（source-backed）对象的提交/审批/冲正，必须走无锁三阶段同态核销（*World-to-Mind*），禁止先落信念库再后补对账 |
+| **`coupled`** | **World State / 耦合同态世界状态** | 主 `OntologyRuntime` + `SourceBridge` / `DeviceDriverRegistry`（`settlement.py` / `drivers.py`） | 凡触碰非自有（source-backed）对象的纯同步提交与授权冲正，必须走无锁三阶段同态核销（*World-to-Mind*），受单动作单写设备红线约束 |
 | **`counterfactual`** | **Counterfactual Space / 反事实空间** | `runtime.fork()`（强制 `db_path=':memory:'` 且 `source_bridge=None`） | 纯内存想象与 MCTS 试错分叉；物理上拒绝挂载 `SourceBridge` 与磁盘持久化 |
+
+### 2.2 Pure Runtime、Design-Time、外设总线与归纳 / 解析原语
+
+| 术语 | 含义 | 边界 / 代码载体 |
+|---|---|---|
+| **Pure Runtime vs Design-Time（Gate 6 物理隔离）** | 像 Java JVM 与 `javac`/JUnit 一样拆分：`import open_ontology` 只加载 10 个核心 Runtime 模块（8,729 行），对编译/证伪/AI-FDE/作战台/MCTS/MPC 完全不可知；`python -m open_ontology.design check \| verify` 在设计期负责静态编译、沙箱校验与签发 | `open_ontology/__init__.py` 零 `__getattr__`；`tests/test_architecture_boundaries.py` **Gate 6** 零例外门禁校验静态闭包与子进程 `sys.modules` 白名单 |
+| **`DeviceDriverRegistry`（设备驱动注册表与单动作单写设备红线）** | 纯 M2 多外设驱动总线：统一管理外部 `MountedDevice` 的 `mount` / `unmount` / `set_status` / 原子 `replace` 回滚、防重冲突校验、共享主数据合并观测，并实时投影至 `Workshop` 连接器视图 | `open_ontology/drivers.py`；单动作触及 $\ge 2$ 台外设或跨路由写即在任何外写发生前以 `CROSS_DEVICE_WRITE_FORBIDDEN` fail-closed 拒收，严禁伪造 2PC |
+| **`WorkCard`（M1 统一广义协同工单）** | 替代已退役 M2 挂起审批的 M1 显式协同领域实体（覆盖 `APPROVAL` / `HUMAN_TASK` / `DEPT_TICKET` / `ENTITY_DISAMBIGUATION` 等工作卡），配合 `APPROVAL_REQUIRED_*` 前置不变量实现“$t_0$ 阻塞开卡 → 责任人认领处理 → $t_1$ 现场防幻读重算执行” | `examples/std_core_ontology.py`、`examples/business_ontology.py`、`tests/test_work_card_m1_architecture.py`；强制 SoD 职责分离与完成防静默写 |
+| **Standard Domain Ontology + Monotonic `CustomerOverlay`（标准领域本体与只增不破覆层 / 闭集角色）** | 行业标准薄骨架（`std_core` / `std_crm` / `std_o2c`）仅固化领域公共不变量与闭合标准角色表（`STD_ROLES`），企业个性化规则、字段、前置拦截与窄视图通过零 `eval/exec` 的单调 Overlay 叠加编译 | `open_ontology/induction/dsl.py`（`compose_blueprints` / `apply_overlay`）；破坏标准契约或拼错角色即在编译期抛 `OVERLAY_BREAKS_STANDARD_CONTRACT` / `UNKNOWN_ROLE` |
+| **4-Tier Entity Resolution & `CrosswalkTable`（L0–L4 实体解析漏斗与主数据别名映射）** | 面向跨设备同名异构主数据的纯 M2 四级归并漏斗：L0 人工已拍板确认、L1 标准化硬键（如税号）精确合并并刚性阻断 `CONFLICTING_HARD_KEY`、L2–L3 归一化准键与邻域加权自动合并、L4 灰区生成 `WorkCard(HUMAN_TASK)` 供 Steward 确认或分拆；产出不可变 `CrosswalkTable` 注入适配器 | `open_ontology/induction/resolution.py`（`resolve_entities` / `apply_resolution_decisions` / `inject_crosswalk_into_mapping`）；严禁无硬键灰区强行合并 |
+| **Popperian `DifferentialFalsifier`（覆盖率驱动的波普尔差分证伪）** | 设计期零 LLM 确定性裁判：从真实源库与 `Target ABI` 自动生成多波次覆盖探针与红队越权对抗用例，要求真实沙箱与参考本体在动作与状态跃迁高覆盖率（`action_coverage` / `transition_coverage`）下双边状态差分完全一致且零逃逸、零脏写，通过后方签发 `CORROBORATED` | `open_ontology/induction/falsifier.py` 与 `open_ontology/design.py`（`verify`） |
 
 ## 3. 身份与寻址
 

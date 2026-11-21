@@ -7,9 +7,16 @@
 >
 > **透明 Aspect 目标架构**：工具调用连线上可织入审计、溯源和执行保障；业务无需主动上报事件或携带技术字段。溯源能力保留并分层，不能为了纯洁性全部删除。
 
-**架构入口：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（M2 平台宪法）。** 看板领域与自举规程见 [docs/TASK_BOARD.md](docs/TASK_BOARD.md)，跨文档词汇见 **[GLOSSARY.md](GLOSSARY.md)**。[完整目标设计](docs/plans/2026-11-12-transparent-aspect-architecture.md)与[第一阶段计划](docs/plans/2026-11-12-aspect-execution-foundation.md)分别说明约束和实施边界。
+**架构入口：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（M2 平台宪法）。** 看板领域与自举规程见 [docs/TASK_BOARD.md](docs/TASK_BOARD.md)，跨文档词汇见 **[GLOSSARY.md](GLOSSARY.md)**，核心概念与 Palantir 对照见 [docs/PALANTIR_AND_OPEN_ONTOLOGY.md](docs/PALANTIR_AND_OPEN_ONTOLOGY.md)，实施指南见 [docs/USE_CASES_IMPLEMENTATION.md](docs/USE_CASES_IMPLEMENTATION.md)。历史设计档案保存于 [docs/plans/](docs/plans/)。
 
-> **实施状态**：Model / Workspace 术语迁移（C-WS-01 ～ C-WS-06）已在隔离工作树完成并通过全量回归：无损重开、工作空间目录、TBox/Behavior 只读投影、通用 `takeover_workspace`、指挥台 `Model · 领域模型` / `Workspace · 工作空间` 双栈路由均已落地。随后的微内核门禁补强（C-KERNEL-SEC-01）亦在工作树完成：`post_approval` 增量主权复核、审计账本与注册表的写门禁触发器闭环、外部入口显式 `Actor` 与只读函数读出口脱敏。本文档描述的是**工作树实现**；生产服务是否升级以 `_state.md` 的部署说明为准。透明切面（`aspects.py` 七大切面）是现行运行时治理实现；执行织入（`execution/fabric.py`）已落盘并有测试覆盖，但未宣称已接入全部外部工具路径。
+![OpenOntology 系统总体架构](docs/assets/openontology-architecture.png)
+
+> 交互式架构图（浏览器可交互查看视图、图例与源码行号定位）：[docs/assets/openontology-architecture.html](docs/assets/openontology-architecture.html) ｜ 源 JSON：[docs/assets/openontology-architecture.json](docs/assets/openontology-architecture.json)
+
+> **实施状态（`main` 基线 `027fb58` · WO-01 ~ WO-12 已收官）**：系统已按 **“Java 式极薄 Pure Runtime + 极简 `javac` 式 Design-Time CLI + 外部 `agy` CLI AI-FDE”** 分层定型并推送：
+> * **Pure Runtime 瘦身定型**：`import open_ontology` 严格仅加载 **10 个纯运行时模块 / 8,729 行**（较重构前 33 模块 / 30,326 行缩减 **-71.2%**）；`open_ontology/runtime.py` **1,331 行**（硬预算 `<= 1,335`）；`open_ontology/__init__.py`（142 行）零 `__getattr__` 隐式延迟后门；规划器（`open_ontology.mcts` / `open_ontology.mpc`）、Web 作战台（`open_ontology.workshop`）及工作空间目录（`open_ontology.workspaces`）均按显式子包按需导入。
+> * **纯同步 6 表核销 + M1 `WorkCard`**：`schema.sql` 维持 5 张业务治理表 + 1 张 `ontology_write_gate` 写门禁表，`ontology_action_runs` 仅允许 `COMMITTED / REVERTED / REJECTED`，M2 内核无任何挂起审批态；协同审批、人工任务、跨部门工单与 L4 实体消歧统一在 M1 以 **`WorkCard`** 对象状态机 + `APPROVAL_REQUIRED_*` 前置守卫建模（`$t_1$` 现场防幻读重算 + SoD 职责分离）。
+> * **多外设总线与 Design-Time 反编译**：新增 **`DeviceDriverRegistry`**（`open_ontology/drivers.py` · 单动作单写设备红线 `CROSS_DEVICE_WRITE_FORBIDDEN`）与 **`python -m open_ontology.design check | verify`**（`open_ontology/design.py` · 零 LLM 确定性编译 + 五关熔炉 + 覆盖率驱动 `DifferentialFalsifier`）；标准薄领域本体（`std_core` / `std_crm` / `std_o2c`）+ 只增不破 `CustomerOverlay`（闭集角色白名单）+ 四级实体解析 `CrosswalkTable` 支撑外部 `agy` CLI 依据 [SKILL.md](skills/openontology-fde/SKILL.md) 在隔离只读沙盒下自主完成跨异构库反编译；**Model · 领域模型** / **World · 世界状态（Workspace）** 术语与 `tests/test_architecture_boundaries.py` **Gate 1–6** 零例外门禁全部生效。本文档对应代码与历史检查点见 `_state.md`。
 
 ## 快速开始
 
@@ -17,13 +24,26 @@
 cd /Users/guci/work/open-ontology
 pip install -r requirements.txt
 
-pytest -v                              # 包含内核、治理、集成与界面验收，条数以本轮实际运行输出为准
-python3 -m examples.cold_chain         # 冷链示例
-python3 -m examples.odoo_dual_erp_demo # 真实双 Odoo 19 ERP 并购订单全链路
-python3 -m examples.steel_mdm_demo     # 钢厂主数据两大死结破局演示
-python3 -m examples.odoo_o2c_adapter   # 真实 Odoo 19 标准 O2C 全流程
+# 1. 全量离线回归（排除 live_llm 与视频产物用例）
+/Users/guci/miniforge3/bin/pytest -m "not live_llm" --ignore=tests/test_video_artifacts.py --ignore=tests/test_agent_value_mcts.py -k "not video" -q
 
-# 真实 Quarkus/Camel 工程（离线编译）
+# 2. 架构边界 Gate 1–6、多外设驱动总线与 Design CLI 门禁
+/Users/guci/miniforge3/bin/pytest tests/test_architecture_boundaries.py tests/test_device_registry_and_design_cli.py tests/test_work_card_m1_architecture.py tests/test_entity_resolution_and_closed_roles.py -v
+
+# 3. javac 式 Design-Time 静态检查与 Popperian 差分证伪 CLI
+/Users/guci/miniforge3/bin/python3 -m open_ontology.design check --blueprint ... --device ... --seed ...
+/Users/guci/miniforge3/bin/python3 -m open_ontology.design verify --blueprint ... --device ... --resolution-spec ...
+
+# 4. 典型领域与实操示例
+python3 -m examples.cold_chain                          # 冷链示例
+python3 -m examples.odoo_dual_erp_demo                 # 真实双 Odoo 19 ERP 并购订单全链路
+python3 -m examples.steel_mdm_demo                     # 钢厂主数据两大死结破局演示
+python3 -m examples.odoo_o2c_adapter                   # 真实 Odoo 19 标准 O2C 全流程
+python3 -m examples.dual_device_driver_swap_benchmark  # 同态双异构 CRM 驱动热插拔
+python3 -m examples.mudpit_crm_o2c_feishu_stress       # CRM + Odoo + 飞书三外设泥潭压测
+python3 -m examples.agy_fde_mudpit_decompile_benchmark # 隔离只读沙盒下真实 agy CLI AI-FDE 基准
+
+# 5. 真实 Quarkus/Camel 工程（离线编译）
 cd camel-sync
 PATH="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home/bin:/opt/homebrew/opt/maven/bin:$PATH" \
   mvn -o package -DskipTests
@@ -36,32 +56,29 @@ Camel E2E 测试会自动离线构建 `quarkus-run.jar`，然后每条测试真�
 Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 ```
 
-## 结构
+## 结构（Pure Runtime · Design-Time · 显式扩展）
 
-| 层 | 文件 | 职责 |
+| 层次 | 文件 | 职责 |
 |---|---|---|
-| L2 存储 | `open_ontology/schema.sql` | 5 张纯业务核心表 + 物理写门禁触发器 |
-| L3 声明 | `open_ontology/spec.py` | `Actor` / `ObjectType` / `ObjectProperty` / `AutoID` / 函数 / 动作注册器 |
-| L4 沙箱 | `open_ontology/sandbox.py` | `EditBatch` 内存推演、`ObjectDiff` 与逆向补丁 |
-| L4 运行时（微内核） | `open_ontology/runtime.py` | put_object / simulate / submit 的治理管线；摄入与切面均为薄委托，≤1400 行 |
-| L4 系统调用切面 | `open_ontology/aspects.py` | 脱敏 / 角色与主权门禁 / 幂等与乐观锁 / 审批与回滚 / 被拒入账 / 自动化反射 |
-| L4 同态结算闭环 | `open_ontology/settlement.py` | `SourceBridge` 与 `HomomorphicSettlementAspect`：无锁三阶段「预测 → 外部驱动 → 独立回读核验 → 原子提交或零污染拒收」 |
-| L4 查询 | `open_ontology/query.py` | `ObjectSet` 集合代数、`pivot`、`aggregate` |
-| L4.5 闭环 MPC | `open_ontology/mpc.py` | 无状态闭环滚动时域控制器 `ClosedLoopMPCController`：看多步走一步、感知刷新重规划与防死循环停机 |
-| L5 OSDK | `open_ontology/osdk.py` | LLM Tool JSON Schema 导出 + AIP 确定性评测器 |
-| 设备驱动 · 摄入 | `open_ontology/ingestion.py` | 外部快照解析、多源列拼接（MDO）、时间戳冲突裁决、overlay 重放 |
-| HTTP 传输边界 | `open_ontology/http_server.py` | 标准库 `ThreadingHTTPServer` 暴露 health / snapshot / action-runs / objects；不是业务蓝图 |
-| 工作空间目录 | `open_ontology/workspaces.py` | `WorkspaceDescriptor` + `workspaces.json` 清单、可信模型解析、`takeover_workspace`；不建业务表 |
-| 模型只读投影 | `open_ontology/model_views.py` | `describe_tbox(spec)` / `describe_behavior(spec)`：结构 TBox 与行为契约的纯 JSON 视图 |
-| 指挥台展示 | `open_ontology/workshop.py`、`workshop_ui.py` | `Model · 领域模型` / `World · 世界状态`（`Workspace`） / Runtime / Device 四视角、中文展示与拓扑大图 |
-| 纯业务任务看板 | `examples/kanban.py` | 固定 6 态流（`todo`/`ready`/`doing`/`done`/`blocked`/`triage`）/ 认领 / 裁决 / 带数字的证据 |
-| 内部执行边界 | `open_ontology/execution/` | 实例级能力绑定与透明可选观察；已落盘并有测试，未宣称接入全部外部工具路径 |
-| 纯业务模型 | `examples/odoo_orders_ontology.py` | 双源订单并购场景的 PIM |
-| Odoo PSM | `examples/odoo_dual_erp_demo.py` | 真实 Odoo JSON-RPC 建库、同步、回写桥接 |
-| 钢厂 MDM | `examples/steel_mdm_demo.py` | 散码寄生归并、源头建码护栏、高维批次桶、三视角对账 |
-| O2C PIM | `examples/o2c_ontology.py` | Customer / SalesOrder / Delivery / Invoice + 2 诊断函数 + 5 治理动作 |
-| O2C PSM | `examples/odoo_o2c_adapter.py` | 真实 Odoo 19 确认/出库/开票过账/收款核销适配器 |
-| Camel 总线 | `camel-sync/` | Quarkus 3.15.1 + Camel 4.8.0：REST + Split + Choice CBR + Timer + DeadLetter |
+| Pure Runtime 入口 | `open_ontology/__init__.py` | 142 行纯运行时导出（零 `__getattr__`，默认仅加载 10 模块 / 8,729 行） |
+| Pure Runtime 存储 | `open_ontology/schema.sql` | 5 张纯业务核心表 + 1 张 `ontology_write_gate` 写门禁触发器（仅 `COMMITTED/REVERTED/REJECTED`） |
+| Pure Runtime 声明 | `open_ontology/spec.py` | `Actor` / `ObjectType` / `ObjectProperty` / `AutoID` / 函数 / 动作 / 不变量注册器 |
+| Pure Runtime 沙箱 | `open_ontology/sandbox.py` | `EditBatch` 内存推演、`ObjectDiff` 与逆向补丁 |
+| Pure Runtime 微内核 | `open_ontology/runtime.py` | 1,331 行（`<= 1,335`）：`put_object` / `simulate` / `submit` / `fork` 管线；与 MCTS/Design 零耦合 |
+| Pure Runtime 切面 | `open_ontology/aspects.py` | 6 大系统调用切面：列脱敏 / 角色与主权门禁 / 幂等与 OCC / 被拒审计 / 自动化反射 / 忙闲回调 |
+| Pure Runtime 同态结算 | `open_ontology/settlement.py` | `SourceBridge` 与 `HomomorphicSettlementAspect`：无锁三阶段「预测 → 外部驱动 → 独立回读核验 → 原子提交或零污染拒收」 |
+| Pure Runtime 设备总线 | `open_ontology/drivers.py` | `DeviceDriverRegistry` / `MountedDevice`：多外设路由、热插拔、`CROSS_DEVICE_WRITE_FORBIDDEN` 单写红线与共享主数据合并 |
+| Pure Runtime 摄入与查询 | `open_ontology/ingestion.py`、`query.py` | `SnapshotIngestionDriver` 快照摄入与多源列拼接（MDO）；`ObjectSet` 集合代数、`pivot`、`aggregate` |
+| Pure Runtime OSDK | `open_ontology/osdk.py` | 只读 `describe_tbox` / `resolve_scoped_names`、LLM Tool Schema 导出、`AIPAgentExecutor` 与确定性 Diff 评测 |
+| Design-Time 裁判 CLI | `open_ontology/design.py` | `python -m open_ontology.design check \| verify`：`javac` 式静态编译对齐 + 只读 `?mode=ro` 探测 + `JUnit` 沙箱证伪 |
+| Design-Time 归纳与解析 | `open_ontology/induction/` | 零 `exec` 声明式 DSL 与单调 Overlay（`dsl.py`）、L0–L4 四级实体解析 `CrosswalkTable`（`resolution.py`）、五关熔炉（`crucible.py`）、覆盖率差分证伪（`falsifier.py`） |
+| 显式扩展：规划器 | `open_ontology/mcts.py`、`mpc.py` | 按需导入 `OntologyMCTSPlanner`（纯内存 `fork()` 树搜索）与无状态 `ClosedLoopMPCController` |
+| 显式扩展：目录与视图 | `open_ontology/workspaces.py`、`model_views.py` | `WorkspaceDescriptor` + `workspaces.json` 清单、`takeover_workspace`、`describe_behavior` / `describe_openapi` |
+| 显式扩展：指挥台与传输 | `open_ontology/workshop.py`、`workshop_ui.py`、`http_server.py` | 四视角指挥台（实时投影 `DeviceDriverRegistry` 状态）、拓扑大图与 HTTP 传输边界 |
+| 外部 AI-FDE 工作流 | `skills/openontology-fde/SKILL.md` | 领域无关 AI-FDE 隔离探库、产物撰写与自愈证伪规程（搭配 `agy` CLI） |
+| 标准薄本体与协同模型 | `examples/std_core_ontology.py`、`std_crm_ontology.py`、`std_o2c_ontology.py` | 行业标准骨架 + 闭集角色 + M1 `WorkCard` 协同工单；`kanban.py` 为纯业务 6 态看板 |
+| 内部执行边界 | `open_ontology/execution/` | 实例级能力绑定与透明可选观察 |
+| 多外设集成与示例 | `examples/`、`camel-sync/` | `dual_device_driver_swap_benchmark.py`、`mudpit_crm_o2c_feishu_stress.py`、`agy_fde_mudpit_decompile_benchmark.py`、`steel_mdm_demo.py`、`odoo_o2c_adapter.py`、`camel-sync/`（Quarkus + Camel） |
 
 ## 五张纯业务表
 
@@ -91,14 +108,15 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 6. **主权边界强校验**：每个 Action 声明 `affects_source`。编辑计划同时触碰 source 与 ontology 两侧 → `MIXED_AUTHORITY`；触碰 source 却声明 `False` → `UNDECLARED_SOURCE_WRITE`；只碰 ontology 却声明 `True` → `MISDECLARED_SOURCE_WRITE`。
 7. **RLS 行级安全**：`Actor.can_access(tags)` 强制 `region:north` 等安全标签；查询按可见性过滤，直接读取越权对象抛 `PermissionDeniedError`。
 8. **Action 永不直接写库**：Action 只操作 `EditBatch`，读得到自己刚暂存的修改（read-your-own-writes），结束后编译成可序列化、可逆转的 `ObjectDiff`。
-9. **模拟零写入**：`simulate_action` 返回 `valid / diff / requires_approval / read_versions / error`，数据库版本与行数完全不变。
+9. **模拟零写入**：`simulate_action` 返回 `valid / diff / read_versions / error`，数据库版本与行数完全不变。
 10. **原子提交 + 乐观锁**：`submit_action` 幂等（同一 `run_id` 只执行一次），校验 `read_versions` 后在单事务内改对象、改关系、写业务审计记录。
 11. **被拒企图审计**：业务不变量或主权边界失败时，对象/关系零改动，但必须持久化一条 `status='REJECTED'` 的审计记录（含 `error_code` / `error_message`），随后抛出 `InvariantError`。
-12. **治理审批 + 审批后置钩子**：`approval_rule` 命中时只落 `PENDING_APPROVAL` + diff，对象不动；`approve_action` 校验审批角色，并再次比对 `read_versions`，等待期间任何被读对象版本变化都会抛 `ConcurrencyConflictError`。可选的 `post_approval` 钩子用于审批通过后原子创建关联的 Ontology 自有对象（如新物理规格），其 diff 与主动作 diff 合并存储，可被时光机整体撤回。
-13. **时光机回滚**：`revert_action` 取原 diff 的 `inverted()` 逆向恢复对象与关系，原运行标记 `REVERTED`，新增一条回滚运行记录。
+12. **纯同步审批门控 + M1 统一 `WorkCard` 协同（零 M2 挂起态）**：M2 内核不设审批挂起态或队列。需要复核或人工决策的场景在前置校验直接抛出 `APPROVAL_REQUIRED_*`（记 `REJECTED` 审计并零写库），在 M1 通过 **`WorkCard`**（`open_work_card` / `claim_work_card` / `complete_work_card`）显式建卡协调：强制职责分离（SoD，禁止自审）、完成防静默写，并在 `$t_1$` 核批后基于实时最新世界状态防幻读重算再提交（若已有关联工单未完成同样阻断）。
+13. **时光机回滚**：`revert_action` 取原 diff 的 `inverted()` 逆向恢复对象与关系（受 `revert_roles` 控制），原运行标记 `REVERTED`，新增一条回滚运行记录。
 14. **ObjectSet 集合代数**：`search_set` / `union` / `intersect` / `subtract` / `pivot`（正向或反向群跳转，两端 RLS 过滤）/ `aggregate`（分组计数与求和）/ `filter_aggregation`。
-15. **OSDK / AIP**：`export_llm_tools` 导出 OpenAI Tool JSON Schema；`AIPAgentExecutor` 统一分派 `query_objects / call_function / simulate_action / submit_action / pivot / aggregate`；`run_eval_suite` 对模型决策产生的 `ObjectDiff` 做确定性评分。
-16. **纯内存反事实分叉、默认同态结算与闭环滚动时域（`fork()` / `HomomorphicSettlementAspect` / `ClosedLoopMPCController`）**：`runtime.fork()` 强制返回 `world_mode="counterfactual"`、`source_bridge=None` 的纯 `:memory:` 沙盘支撑 MCTS 高频无污染推演；主 `OntologyRuntime` 在 `world_mode="coupled"` 下通过 `SourceBridge` 与 `HomomorphicSettlementAspect` 默认走三阶段无锁同态回读核销（`COMMITTED` / `DEVICE_STATE_MISMATCH`）；无状态 `ClosedLoopMPCController` 将多步 MCTS 想象与单步实然结算合龙，严守传感器/执行器分离，遇到回读偏差先刷新感知再重新规划并受 `max_replans` / `max_steps` 护栏约束。
+15. **OSDK / AIP**：`export_llm_tools` 导出 OpenAI Tool JSON Schema；`AIPAgentExecutor` 统一分派 `query_objects / call_function / simulate_action / submit_action / pivot / aggregate`（需要规划工具时显式注入 `planner_factory=OntologyMCTSPlanner`）；`run_eval_suite` 对模型决策产生的 `ObjectDiff` 做确定性评分。
+16. **纯内存反事实分叉、多外设驱动总线与闭环滚动时域**：`runtime.fork()` 强制返回 `world_mode="counterfactual"`、`source_bridge=None` 的纯 `:memory:` 沙盘；主 `OntologyRuntime` 在 `world_mode="coupled"` 下通过 `DeviceDriverRegistry` + `SourceBridge` + `HomomorphicSettlementAspect` 走三阶段无锁同态回读核销，且受**单动作单写设备红线（`CROSS_DEVICE_WRITE_FORBIDDEN`）**保护；无状态 `ClosedLoopMPCController`（`open_ontology.mpc`）与 `OntologyMCTSPlanner`（`open_ontology.mcts`）作为显式扩展按需协同。
+17. **标准薄本体 + 单调 Overlay + 四级实体解析 Crosswalk + `agy` CLI AI-FDE**：`std_core` / `std_crm` / `std_o2c` 提供行业共享骨架与闭集角色，只增不破 `CustomerOverlay` 拦截任何弱化标准契约或角色拼写错误（`UNKNOWN_ROLE` / `OVERLAY_BREAKS_STANDARD_CONTRACT`）；`resolution.py` 以 L0–L4 四级漏斗生成 `CrosswalkTable`（硬键精确合并、`CONFLICTING_HARD_KEY` 刚性阻断、L4 灰区交由 Steward `WorkCard` 拍板）；外部 `agy` CLI 在只读隔离工作区结合 `python -m open_ontology.design check | verify` 自主探库并经五关 Crucible + 覆盖率差分 `DifferentialFalsifier` 证伪签发。
 
 ## 任务看板本体
 
@@ -131,7 +149,7 @@ GET  /api/objects/{object_type}     -> [objects...]
 - 老 ERP 的 4 个 `ContractSKU` 不合并、不改码。
 - `map_legacy_sku_to_spec` 只写 `canonical_spec_id` / `mapped_by` 到 `ontology_overlay` 并建立 `sku_maps_to_spec` 边。
 - `load_snapshot` 重刷 `ContractSKU` / `Manufacturer` 底表后，归并关系 100% 存活；`MaterialSpec` / `MaterialLot` 完全自有，不受影响。
-- 增量建码 `register_contract_sku` 硬护栏：不绑现有规格、也不申请新规格 → `UNMAPPED_PHYSICAL_SPEC` + REJECTED 审计；灰分/硫分超阈值挂高档规格 → `SPEC_QUALITY_MISMATCH`；新物理品种 → `PENDING_APPROVAL`，`mdm_steward` 批准后才创建新 `MaterialSpec` 和新散码。
+- 增量建码 `register_contract_sku` 硬护栏：不绑现有规格、也不申请新规格 → `UNMAPPED_PHYSICAL_SPEC` + REJECTED 审计；灰分/硫分超阈值挂高档规格 → `SPEC_QUALITY_MISMATCH`；新物理品种 → `APPROVAL_REQUIRED_NEW_MATERIAL_SPEC` 阻断并创建 M1 `WorkCard`，由 `mdm_steward` 审批 `$t_1$` 重算后创建新 `MaterialSpec` 与散码。
 
 **死结二：采购按规格、生产按厂家**
 
@@ -156,7 +174,7 @@ GET  /api/objects/{object_type}     -> [objects...]
 - 对象属性（`ObjectProperty`）：`ReceivableBalance.customer`、`SalesOrder.customer`、`Delivery.order`、`Invoice.order`、`Invoice.customer`、`ReceivableVoucher.ledger`、`ReceivableVoucher.customer`、`ReceivableVoucher.order`。
 - 只读函数：`diagnose_o2c_bottlenecks`（信用超限草稿 / 未发货确认单 / 漏开票 / 未收款发票）与 `evaluate_credit_exposure`。
 - 治理动作：`confirm_sales_order`、`ship_order_delivery`、`issue_and_post_invoice`、`record_customer_payment`、`annotate_o2c_governance`。
-- 硬规则：未发货严禁开票（`CANNOT_INVOICE_UNSHIPPED_ORDER` + REJECTED 审计）；超信用额度且非 `finance_director` 自动 `PENDING_APPROVAL`；付款金额必须与发票精确一致。
+- 硬规则：未发货严禁开票（`CANNOT_INVOICE_UNSHIPPED_ORDER` + REJECTED 审计）；超信用额度且非 `finance_director` 抛 `APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED` 并通过 `WorkCard` 协办特批重算；付款金额必须与发票精确一致。
 
 `examples/odoo_o2c_adapter.py`（PSM）把业务动作翻译成真实 Odoo 19：
 
@@ -212,19 +230,15 @@ GET /camel/stats      -> ingest_count / north_writebacks / south_writebacks
 
 ## 测试覆盖
 
-下列分项为核心与集成用例说明，不构成当前测试总数。当前工作树全量基线以 `_state.md` 记录的实际运行结果为准（`/Users/guci/miniforge3/bin/python -m pytest -q`）；历史条数不当作现行证据。
+下列分项为核心与特色回归套件说明；当前已提交基线 `027fb58` 下全量离线回归实测 **`663 passed, 4 deselected`**（`/Users/guci/miniforge3/bin/pytest -m "not live_llm" --ignore=tests/test_video_artifacts.py --ignore=tests/test_agent_value_mcts.py -k "not video" -q`），详见 `_state.md`：
 
-- `tests/test_open_ontology.py`：44 条纯内核测试（写门禁、append-only、内容指纹幂等、RBAC、RLS、沙箱 RYOW、diff 逆转、零写入模拟、原子提交、幂等提交、审批挂起、并发冲突、时光机回滚、业务不变量、Tool Schema、AIP 分派、评测器、注册表持久化、字段级主权/overlay/快照防孤儿/主权边界/被拒审计/ObjectSet 代数、`ObjectProperty` 自动三元组同步与 `TARGET_NOT_FOUND` 参照完整性/`AutoID` 元模型投影，以及零 IT 概念污染断言）。
-- `tests/test_odoo_dual_erp.py`：10 条真实双 Odoo 集成测试（跨 ERP 查询与集合代数、RLS、已发货取消被拒、待发货取消真实回写、撤回真实恢复、AI 大额审批真实回写、全量重索引 overlay/OrderNote 存活、空原因拒绝、重复取消拒绝、回写幂等、PIM/PSM 分离）。
-- `tests/test_camel_odoo_e2e.py`：6 条真实 Camel E2E 测试。每条测试都会离线构建并启动 `quarkus-run.jar`、启动 `OpenOntology` HTTP Server，并连接真实 `erp_north` / `erp_south`：
-  1. 上行聚合抽取
-  2. 北区取消 + 时光机撤回真实回写
-  3. 南区大额 AI 审批后 CBR 回写
-  4. 全量重刷保留 overlay 与 `OrderNote`
-  5. 同一 `run_id` 幂等回写保护
-  6. 已发货订单拒绝后无回写
-- `tests/test_steel_mdm.py`：14 条钢厂 MDM 测试（存量寄生归并重刷存活、无归属野码拦截、以次充好拦截、新物理品种审批、新规格撤回、已有规格秒级建码、未治理散码禁止入库、高维批次三边挂载、按厂家 FIFO 跨规格消耗、库存不足拒绝、三视角金额恒等、投料撤回、规格推荐、ObjectSet/pivot/aggregate 多对多还原）。
-- `tests/test_odoo_o2c.py`：14 条真实 Odoo 19 O2C 测试（PIM/PSM 分离、真实草稿报价单、订单确认、出库校验、未发货开票拒绝、全链路 paid + residual=0、信用敞口、AI 大额审批、overlay 重刷存活、付款金额不一致、重复收款、黑名单客户、分阶段经营体检、重复确认）。
+- `tests/test_architecture_boundaries.py`：**Gate 1 – Gate 6** 零例外架构门禁（M1 AST 白名单、M2 零反向引用、动态词表/供应商词封杀、虚构 `Starship` 领域盲测、纯同步 6 表无退役符号门禁、Runtime 严格收口 10 模块白名单及 `import open_ontology` 防扩展模块泄漏）。
+- `tests/test_device_registry_and_design_cli.py`：`DeviceDriverRegistry` 互斥/原子热替换/单写设备红线、`Workshop` 连接器实时状态投影、`open_ontology.design check | verify` 编译失败码与双外设隔离泥潭端到端独立仲裁。
+- `tests/test_work_card_m1_architecture.py`：M1 统一 `WorkCard`（`$t_1$` 防幻读重算、SoD 职责分离、`HUMAN_TASK` 与耦合 `SourceBridge` 零脏写）。
+- `tests/test_entity_resolution_and_closed_roles.py` & `tests/test_standard_ontology_and_overlay.py`：闭集角色防错、单调 `CustomerOverlay` 不破坏标准契约、L0–L4 四级 `CrosswalkTable` 实体解析与硬键冲突阻断。
+- `tests/test_docs_consistency.py`：Archify 架构图资产存在与引用校验、活文档零退役符号漂移门禁。
+- `tests/test_open_ontology.py`：纯内核基础测试（写门禁、append-only、内容指纹幂等、RBAC、RLS、沙箱 RYOW、diff 逆转、零写入模拟、原子提交、幂等提交、并发冲突、时光机回滚、业务不变量、Tool Schema、AIP 分派、评测器、注册表持久化、字段级主权/overlay/快照防孤儿/主权边界/被拒审计/`ObjectSet` 代数、`ObjectProperty` 自动三元组同步与 `TARGET_NOT_FOUND` 参照完整性/`AutoID` 元模型投影，以及零 IT 概念污染断言）。
+- `tests/test_odoo_dual_erp.py` & `tests/test_odoo_o2c.py` & `tests/test_camel_odoo_e2e.py` & `tests/test_steel_mdm.py`：真实双 Odoo 19 集成、标准 O2C、Quarkus/Camel E2E 与钢厂 MDM 全链路回归。
 
 ## 运行环境
 
