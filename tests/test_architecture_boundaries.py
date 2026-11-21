@@ -65,6 +65,7 @@ M1_ONTOLOGY_MODULES: tuple[tuple[str, str], ...] = (
     ("examples.std_core_ontology", "spec"),
     ("examples.std_crm_ontology", "spec"),
     ("examples.std_o2c_ontology", "spec"),
+    ("examples.std_p2p_ontology", "spec"),
 )
 
 _ALLOWED_M1_STDLIB_AND_SDK = frozenset(
@@ -113,6 +114,7 @@ _FORBIDDEN_TECH_ROOTS = frozenset(
 _TRANSPORT_EXEMPT_FILES = frozenset(
     {
         PKG_ROOT / "http_server.py",
+        PKG_ROOT / "mcp_server.py",
         PKG_ROOT / "workshop.py",
         PKG_ROOT / "meta_admin.py",
         PKG_ROOT / "webhooks.py",
@@ -741,6 +743,7 @@ _FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
         "workspaces",
         "model_views",
         "http_server",
+        "mcp_server",
         "webhooks",
         "mcts",
         "mpc",
@@ -897,6 +900,7 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
             "workspaces",
             "model_views",
             "http_server",
+            "mcp_server",
             "webhooks",
             "mcts",
             "mpc",

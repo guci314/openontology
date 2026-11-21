@@ -292,6 +292,17 @@ def _load_seed_arg(arg: str | None) -> SeedOntology | None:
     return loaded
 
 
+def load_symbol_arg(arg: str) -> Any:
+    """Load an arbitrary Python symbol from ``'module.path:symbol'``."""
+    if ":" not in arg:
+        raise ValueError(f"symbol argument {arg!r} must be 'module.path:symbol'")
+    mod_name, attr_name = arg.split(":", 1)
+    if not mod_name or not attr_name:
+        raise ValueError(f"symbol argument {arg!r} must be 'module.path:symbol'")
+    mod = importlib.import_module(mod_name)
+    return getattr(mod, attr_name)
+
+
 def _load_device_arg(arg: str) -> tuple[DesignDeviceSpec, Path | None]:
     stripped = arg.strip()
     if stripped.startswith("{"):

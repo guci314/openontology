@@ -147,10 +147,13 @@ def test_1_compose_blueprints_deduplicates_shared_core_and_rejects_conflicts() -
     assert composed.seed_ontology_id == "business_ontology"
 
     ot_names = [ot.name for ot in composed.object_types]
-    assert len(ot_names) == len(set(ot_names)) == 10
+    assert len(ot_names) == len(set(ot_names)) == 13
     assert set(ot_names) == {
         "AccountingEntity",
         "BusinessParty",
+        "TradeResource",
+        "TradeCommitment",
+        "FulfillmentEvent",
         "WorkCard",
         "CrmAccount",
         "CrmDeal",

@@ -396,18 +396,20 @@ def test_pim_psm_separation():
     ]
     for path in kernel_sources:
         text = path.read_text(encoding="utf-8").lower()
-        # No ERP / RPC vendor concepts anywhere in the kernel.
-        for forbidden in ("odoo", "jsonrpc"):
+        # No ERP / vendor concepts anywhere in the kernel; MCP server may speak standard JSON-RPC 2.0.
+        forbidden_rpc = ("odoo",) if path.name == "mcp_server.py" else ("odoo", "jsonrpc")
+        for forbidden in forbidden_rpc:
             assert forbidden not in text, f"{forbidden!r} leaked into {path.name}"
         # ``erp`` 按词边界判定：内核合法 API ``state_fingerprint`` 含有
         # "erp" 子串，但它显然不是 ERP 概念。
         assert not re.search(r"(?<![a-z])erp(?![a-z])", text), (
             f"'erp' leaked into {path.name}"
         )
-        # The pure HTTP boundaries are allowed to use the stdlib transport;
+        # The pure HTTP/MCP boundaries are allowed to use the stdlib transport;
         # every other kernel module must stay fully transport-agnostic.
         if path.name not in (
             "http_server.py",
+            "mcp_server.py",
             "workshop.py",
             "meta_admin.py",
         ):
