@@ -703,7 +703,7 @@ def test_overfit_driver_passes_world_a_but_falsified_on_hidden_world_b(
         'if True',
     ).replace(
         'o[\'partner_id\']',
-        '(110 if o["partner_id"] == 110 else int(o["partner_id"]) - 1)',
+        "(110 if o['partner_id'] == 110 else int(o['partner_id']) - 1)",
     )
     driver_path = tmp_path / "overfit_driver.py"
     driver_path.write_text(overfit_code, encoding="utf-8")
@@ -915,3 +915,125 @@ def test_lying_driver_that_echoes_diff_caught_by_oob_tamper_check(
     assert not hid_res["ok"]
     assert hid_res["verdict"] == "FALSIFIED"
     assert "OOB_TAMPER_UNDETECTED" in hid_res["error_codes"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Pluggable External FDE Runner (agy | opencode) Command & Parser Tests
+# ---------------------------------------------------------------------------
+def test_pluggable_fde_runner_command_builder_agy_and_opencode() -> None:
+    from examples.agy_fde_live_odoo_protocol_benchmark import build_fde_runner_command
+
+    agy_cmd = build_fde_runner_command(
+        fde_runner="agy",
+        cli_path="/usr/local/bin/agy",
+        model_name="gemini-4-neon-medium",
+        prompt="hello fde",
+        timeout_sec=360,
+    )
+    assert agy_cmd == [
+        "/usr/local/bin/agy",
+        "--model",
+        "gemini-4-neon-medium",
+        "--dangerously-skip-permissions",
+        "--disable-slash-commands",
+        "--output-format",
+        "json",
+        "--print-timeout",
+        "360s",
+        "--print",
+        "hello fde",
+    ]
+    agy_repair = build_fde_runner_command(
+        fde_runner="agy",
+        cli_path="/usr/local/bin/agy",
+        model_name="gemini-4-neon-medium",
+        prompt="fix driver",
+        timeout_sec=360,
+        session_id="conv-123",
+    )
+    assert "--conversation" in agy_repair and "conv-123" in agy_repair
+
+    oc_cmd = build_fde_runner_command(
+        fde_runner="opencode",
+        cli_path="/opt/homebrew/bin/opencode",
+        model_name="opencode-go/deepseek-v4.1-flash",
+        prompt="hello opencode",
+        timeout_sec=480,
+    )
+    assert oc_cmd == [
+        "/opt/homebrew/bin/opencode",
+        "run",
+        "--auto",
+        "--format",
+        "json",
+        "-m",
+        "opencode-go/deepseek-v4.1-flash",
+        "hello opencode",
+    ]
+    oc_repair = build_fde_runner_command(
+        fde_runner="opencode",
+        cli_path="/opt/homebrew/bin/opencode",
+        model_name="opencode-go/deepseek-v4.1-flash",
+        prompt="repair now",
+        timeout_sec=480,
+        session_id="ses_abc123",
+    )
+    assert oc_repair == [
+        "/opt/homebrew/bin/opencode",
+        "run",
+        "--auto",
+        "--format",
+        "json",
+        "-m",
+        "opencode-go/deepseek-v4.1-flash",
+        "--session",
+        "ses_abc123",
+        "repair now",
+    ]
+
+    with pytest.raises(ValueError):
+        build_fde_runner_command(
+            fde_runner="unknown_cli",
+            cli_path="/bin/true",
+            model_name="x",
+            prompt="p",
+            timeout_sec=10,
+        )
+
+
+def test_pluggable_fde_runner_output_parser_opencode_jsonl_and_agy_json() -> None:
+    from examples.agy_fde_live_odoo_protocol_benchmark import parse_fde_runner_output
+
+    jsonl = "\n".join(
+        [
+            '{"type":"step_start","timestamp":1000,"sessionID":"ses_test1","part":{"type":"step-start"}}',
+            '{"type":"tool_use","timestamp":1500,"sessionID":"ses_test1","part":{"tool":"write","state":{"status":"completed"}}}',
+            '{"type":"step_finish","timestamp":2000,"sessionID":"ses_test1","part":{"reason":"tool-calls","cost":0.005,"tokens":{"input":100,"output":20,"reasoning":10,"cache":{"read":50,"write":0}}}}',
+            '{"type":"tool_use","timestamp":2500,"sessionID":"ses_test1","part":{"tool":"shell","state":{"status":"completed"}}}',
+            '{"type":"text","timestamp":2900,"sessionID":"ses_test1","part":{"text":"CORROBORATED done"}}',
+            '{"type":"step_finish","timestamp":3500,"sessionID":"ses_test1","part":{"reason":"stop","cost":0.002,"tokens":{"input":40,"output":15,"reasoning":0,"cache":{"read":120,"write":0}}}}',
+        ]
+    )
+    parsed_oc = parse_fde_runner_output(fde_runner="opencode", stdout=jsonl)
+    assert parsed_oc is not None
+    assert parsed_oc["runner"] == "opencode"
+    assert parsed_oc["conversation_id"] == "ses_test1"
+    assert parsed_oc["status"] == "SUCCESS"
+    assert parsed_oc["num_turns"] == 2
+    assert parsed_oc["tool_calls_count"] == 2
+    assert parsed_oc["tools_used"] == ["write", "shell"]
+    assert parsed_oc["duration_seconds"] == 2.5
+    assert parsed_oc["total_cost_usd"] == 0.007
+    assert parsed_oc["usage"] == {
+        "input_tokens": 140,
+        "output_tokens": 35,
+        "reasoning_tokens": 10,
+        "cache_read_tokens": 170,
+        "cache_write_tokens": 0,
+        "total_tokens": 185,
+    }
+    assert parsed_oc["response"] == "CORROBORATED done"
+
+    agy_raw = 'log banner\n{"conversation_id":"conv-1","status":"SUCCESS","num_turns":1}\n'
+    parsed_agy = parse_fde_runner_output(fde_runner="agy", stdout=agy_raw)
+    assert parsed_agy == {"conversation_id": "conv-1", "status": "SUCCESS", "num_turns": 1}

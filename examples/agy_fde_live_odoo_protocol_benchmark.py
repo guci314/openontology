@@ -46,6 +46,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -76,6 +77,18 @@ MASTER_CANDIDATES = tuple(
 SKILL_MD_PATH = ROOT / "skills" / "openontology-fde" / "SKILL.md"
 STD_O2C_BP_ARG = "examples.std_o2c_ontology:build_std_o2c_blueprint"
 BUSINESS_SEED_ARG = "examples.business_ontology:BUSINESS_SEED_ONTOLOGY"
+DEFAULT_AGY_MODELS: tuple[str, ...] = (
+    "gemini-4-neon-medium",
+    "gemini-4-argon-medium",
+    "gemini-3.8-flash-medium",
+)
+DEFAULT_OPENCODE_DEEPSEEK_MODELS: tuple[str, ...] = (
+    "opencode-go/deepseek-v4.1-flash",
+    "opencode/deepseek-v4.1-flash",
+    "opencode/deepseek-v4.1-flash-free",
+    "openrouter/deepseek/deepseek-v4.1-flash",
+    "codebuddy/deepseek-v4.1-flash",
+)
 O2C_OWNED_TYPES = [
     "AccountingEntity",
     "BusinessParty",
@@ -721,16 +734,194 @@ def _verify_readonly_integrity(ws_root: Path, expected_hashes: Mapping[str, str]
     assert not tampered, f"Read-only workspace files modified: {tampered}"
 
 
+def resolve_fde_cli_binary(fde_runner: str) -> str:
+    """Locate the external coding-agent CLI binary for ``agy`` or ``opencode``."""
+    runner = str(fde_runner).strip().lower()
+    if runner == "agy":
+        found = shutil.which("agy")
+        if not found:
+            raise RuntimeError("agy CLI binary not found on PATH")
+        return found
+    if runner == "opencode":
+        found = shutil.which("opencode")
+        if not found and Path("/opt/homebrew/bin/opencode").is_file():
+            found = "/opt/homebrew/bin/opencode"
+        if not found:
+            raise RuntimeError("opencode CLI binary not found on PATH or /opt/homebrew/bin/opencode")
+        return found
+    raise ValueError(f"Unsupported fde_runner {fde_runner!r}; expected 'agy' or 'opencode'")
+
+
+def build_fde_runner_command(
+    *,
+    fde_runner: str,
+    cli_path: str,
+    model_name: str,
+    prompt: str,
+    timeout_sec: int,
+    session_id: str | None = None,
+) -> list[str]:
+    """Build non-interactive headless subprocess argv for ``agy`` or ``opencode``."""
+    runner = str(fde_runner).strip().lower()
+    if runner == "agy":
+        cmd = [cli_path, "--model", model_name]
+        if session_id:
+            cmd.extend(["--conversation", session_id])
+        cmd.extend(
+            [
+                "--dangerously-skip-permissions",
+                "--disable-slash-commands",
+                "--output-format",
+                "json",
+                "--print-timeout",
+                f"{timeout_sec}s",
+                "--print",
+                prompt,
+            ]
+        )
+        return cmd
+    if runner == "opencode":
+        cmd = [cli_path, "run", "--auto", "--format", "json", "-m", model_name]
+        if session_id:
+            cmd.extend(["--session", session_id])
+        cmd.append(prompt)
+        return cmd
+    raise ValueError(f"Unsupported fde_runner {fde_runner!r}; expected 'agy' or 'opencode'")
+
+
+def parse_fde_runner_output(
+    *,
+    fde_runner: str,
+    stdout: str,
+    wall_elapsed_sec: float | None = None,
+) -> dict[str, Any] | None:
+    """Parse structured JSON (``agy``) or JSONL event stream (``opencode``) output."""
+    runner = str(fde_runner).strip().lower()
+    raw = (stdout or "").strip()
+    if not raw:
+        return None
+    if runner == "agy":
+        if "{" not in raw or "}" not in raw:
+            return None
+        try:
+            obj = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    if runner != "opencode":
+        raise ValueError(f"Unsupported fde_runner {fde_runner!r}; expected 'agy' or 'opencode'")
+
+    events: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or not s.startswith("{"):
+            continue
+        try:
+            ev = json.loads(s)
+        except Exception:
+            continue
+        if isinstance(ev, dict):
+            events.append(ev)
+    if not events:
+        return None
+
+    session_id: str | None = None
+    step_finishes = 0
+    tool_calls_count = 0
+    tools_used: list[str] = []
+    text_parts: list[str] = []
+    errors: list[Any] = []
+    input_tokens = 0
+    output_tokens = 0
+    reasoning_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
+    total_cost = 0.0
+    timestamps: list[float] = []
+
+    for ev in events:
+        if ev.get("sessionID") and not session_id:
+            session_id = str(ev["sessionID"])
+        ts = ev.get("timestamp")
+        if isinstance(ts, (int, float)):
+            timestamps.append(float(ts))
+        ev_type = str(ev.get("type") or "")
+        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        if ev_type == "tool_use":
+            tool_calls_count += 1
+            tname = str(part.get("tool") or "")
+            if tname and tname not in tools_used:
+                tools_used.append(tname)
+        elif ev_type == "text":
+            txt = str(part.get("text") or "").strip()
+            if txt:
+                text_parts.append(txt)
+        elif ev_type == "step_finish":
+            step_finishes += 1
+            cost_val = part.get("cost")
+            if isinstance(cost_val, (int, float)):
+                total_cost += float(cost_val)
+            toks = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+            input_tokens += int(toks.get("input") or 0)
+            output_tokens += int(toks.get("output") or 0)
+            reasoning_tokens += int(toks.get("reasoning") or 0)
+            cache = toks.get("cache") if isinstance(toks.get("cache"), dict) else {}
+            cache_read_tokens += int(cache.get("read") or 0)
+            cache_write_tokens += int(cache.get("write") or 0)
+        elif ev_type == "error":
+            errors.append(ev.get("error") or ev)
+
+    duration_sec = (
+        round(float(wall_elapsed_sec), 3)
+        if wall_elapsed_sec is not None
+        else (
+            round((max(timestamps) - min(timestamps)) / 1000.0, 3)
+            if len(timestamps) >= 2
+            else 0.0
+        )
+    )
+    status = "ERROR" if (errors and step_finishes == 0) else "SUCCESS"
+    return {
+        "runner": "opencode",
+        "conversation_id": session_id,
+        "session_id": session_id,
+        "status": status,
+        "num_turns": step_finishes,
+        "tool_calls_count": tool_calls_count,
+        "tools_used": tools_used,
+        "duration_seconds": duration_sec,
+        "total_cost_usd": round(total_cost, 6),
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "total_tokens": input_tokens + output_tokens + reasoning_tokens,
+        },
+        "response": "\n".join(text_parts),
+        "errors": errors,
+        "event_count": len(events),
+    }
+
+
 def run_live_odoo_agy_fde_benchmark(
     *,
-    models: tuple[str, ...] = ("gemini-4-neon-medium", "gemini-4-argon-medium", "gemini-3.8-flash-medium"),
+    fde_runner: str = "agy",
+    models: tuple[str, ...] | None = None,
     timeout_sec: int = 480,
     output_json_path: Path = Path("/tmp/wo14_live_odoo_agy_fde.json"),
 ) -> dict[str, Any]:
-    """Run real isolated ``agy`` CLI protocol benchmark on live Odoo 19 + blind Hidden World B."""
-    cli_path = shutil.which("agy")
-    if not cli_path:
-        raise RuntimeError("agy CLI binary not found on PATH")
+    """Run isolated live coding-agent benchmark (``agy`` or ``opencode``) on Odoo 19 + blind Hidden World B."""
+    runner_name = str(fde_runner).strip().lower()
+    cli_path = resolve_fde_cli_binary(runner_name)
+    resolved_models: tuple[str, ...] = (
+        models
+        if models is not None
+        else (DEFAULT_OPENCODE_DEEPSEEK_MODELS if runner_name == "opencode" else DEFAULT_AGY_MODELS)
+    )
+    agent_env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"}
 
     admin = _OdooAdminClient(ODOO_URL)
     rand_id = uuid.uuid4().hex[:6]
@@ -792,39 +983,46 @@ def run_live_odoo_agy_fde_benchmark(
             "because an unseen randomized tenant will be tested after you finish."
         )
 
-        # 2. Run live agy CLI inside the physically isolated workspace
+        # 2. Run live external coding agent (agy or opencode) inside isolated workspace
         attempts: list[dict[str, Any]] = []
         chosen_model: str | None = None
         agy_envelope: dict[str, Any] | None = None
+        last_verify_probe: dict[str, Any] | None = None
 
-        for model_name in models:
-            cmd = [
-                cli_path,
-                "--model",
-                model_name,
-                "--dangerously-skip-permissions",
-                "--disable-slash-commands",
-                "--output-format",
-                "json",
-                "--print-timeout",
-                f"{timeout_sec}s",
-                "--print",
-                prompt,
-            ]
-            proc = subprocess.run(
-                cmd,
-                cwd=str(ws_root),
-                text=True,
-                capture_output=True,
-                timeout=timeout_sec + 60,
+        for model_name in resolved_models:
+            cmd = build_fde_runner_command(
+                fde_runner=runner_name,
+                cli_path=cli_path,
+                model_name=model_name,
+                prompt=prompt,
+                timeout_sec=timeout_sec,
             )
-            stdout = (proc.stdout or "").strip()
-            parsed_env: dict[str, Any] | None = None
-            if stdout and "{" in stdout and "}" in stdout:
-                try:
-                    parsed_env = json.loads(stdout[stdout.find("{") : stdout.rfind("}") + 1])
-                except Exception:
-                    parsed_env = None
+            t0 = time.monotonic()
+            timed_out = False
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(ws_root),
+                    env=agent_env,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_sec + 60,
+                )
+                rc = proc.returncode
+                stdout = (proc.stdout or "").strip()
+                stderr = (proc.stderr or "").strip()
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                rc = 124
+                stdout = (exc.stdout or "").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+                stderr = (exc.stderr or "").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+            wall_sec = round(time.monotonic() - t0, 3)
+
+            parsed_env = parse_fde_runner_output(
+                fde_runner=runner_name,
+                stdout=stdout,
+                wall_elapsed_sec=wall_sec,
+            )
 
             out_ready = (ws_root / "out" / "odoo_o2c_mapping.json").is_file() and (
                 ws_root / "out" / "driver.py"
@@ -836,21 +1034,26 @@ def run_live_odoo_agy_fde_benchmark(
                 try:
                     probe_ver = json.loads(pv.stdout)
                 except Exception:
-                    probe_ver = {"ok": False, "raw": pv.stdout[:400]}
+                    probe_ver = {"ok": False, "raw": pv.stdout[:500], "stderr": pv.stderr[:400]}
+                last_verify_probe = probe_ver
 
             attempts.append(
                 {
+                    "fde_runner": runner_name,
                     "model": model_name,
-                    "returncode": proc.returncode,
-                    "agy_status": parsed_env.get("status") if parsed_env else None,
+                    "returncode": rc,
+                    "timed_out": timed_out,
+                    "agent_status": parsed_env.get("status") if parsed_env else None,
                     "num_turns": parsed_env.get("num_turns") if parsed_env else None,
-                    "duration_seconds": parsed_env.get("duration_seconds") if parsed_env else None,
+                    "duration_seconds": (parsed_env.get("duration_seconds") if parsed_env else None) or wall_sec,
+                    "tool_calls_count": parsed_env.get("tool_calls_count") if parsed_env else None,
+                    "total_cost_usd": parsed_env.get("total_cost_usd") if parsed_env else None,
                     "usage": parsed_env.get("usage") if parsed_env else None,
                     "conversation_id": parsed_env.get("conversation_id") if parsed_env else None,
                     "out_ready": out_ready,
                     "verify_ok": bool(probe_ver and probe_ver.get("ok") is True),
                     "verify_errors": (probe_ver or {}).get("errors", [])[:5],
-                    "stderr_tail": (proc.stderr or "")[-400:],
+                    "stderr_tail": stderr[-400:],
                 }
             )
 
@@ -859,86 +1062,127 @@ def run_live_odoo_agy_fde_benchmark(
                 agy_envelope = parsed_env
                 break
 
-            # Allow 1 continuation repair turn on existing conversation_id if needed
-            if parsed_env and parsed_env.get("conversation_id") and proc.returncode == 0:
-                conv_id = str(parsed_env["conversation_id"])
-                repair_prompt = (
-                    "Run ./verify_driver.sh verify right now, read every diagnostic error or counterexample, "
-                    "and fix out/odoo_o2c_mapping.json and/or out/driver.py until ./verify_driver.sh verify "
-                    "exits 0 with ok=true and verdict=CORROBORATED."
-                )
-                proc2 = subprocess.run(
-                    [
-                        cli_path,
-                        "--model",
-                        model_name,
-                        "--conversation",
-                        conv_id,
-                        "--dangerously-skip-permissions",
-                        "--disable-slash-commands",
-                        "--output-format",
-                        "json",
-                        "--print-timeout",
-                        f"{timeout_sec}s",
-                        "--print",
-                        repair_prompt,
-                    ],
-                    cwd=str(ws_root),
-                    text=True,
-                    capture_output=True,
-                    timeout=timeout_sec + 60,
-                )
-                stdout2 = (proc2.stdout or "").strip()
-                parsed2: dict[str, Any] | None = None
-                if stdout2 and "{" in stdout2 and "}" in stdout2:
-                    try:
-                        parsed2 = json.loads(stdout2[stdout2.find("{") : stdout2.rfind("}") + 1])
-                    except Exception:
-                        parsed2 = None
-
-                out_ready2 = (ws_root / "out" / "odoo_o2c_mapping.json").is_file() and (
-                    ws_root / "out" / "driver.py"
-                ).is_file()
-                probe2 = None
-                if out_ready2:
-                    pv2 = subprocess.run(
-                        ["./verify_driver.sh", "verify"], cwd=str(ws_root), text=True, capture_output=True
+            # Allow up to 2 continuation repair turns on existing session/conversation if not yet verified
+            conv_id = str((parsed_env or {}).get("conversation_id") or "")
+            if conv_id and not timed_out and rc == 0:
+                for repair_idx in range(1, 3):
+                    repair_prompt = (
+                        "Run ./verify_driver.sh check and ./verify_driver.sh verify right now, "
+                        "read every diagnostic error or counterexample, and fix "
+                        "out/odoo_o2c_mapping.json and/or out/driver.py until ./verify_driver.sh verify "
+                        "exits 0 with ok=true and verdict=CORROBORATED."
                     )
+                    cmd_rep = build_fde_runner_command(
+                        fde_runner=runner_name,
+                        cli_path=cli_path,
+                        model_name=model_name,
+                        prompt=repair_prompt,
+                        timeout_sec=timeout_sec,
+                        session_id=conv_id,
+                    )
+                    t_rep0 = time.monotonic()
+                    rep_to = False
                     try:
-                        probe2 = json.loads(pv2.stdout)
-                    except Exception:
-                        probe2 = {"ok": False, "raw": pv2.stdout[:400]}
+                        proc_rep = subprocess.run(
+                            cmd_rep,
+                            cwd=str(ws_root),
+                            env=agent_env,
+                            text=True,
+                            capture_output=True,
+                            timeout=timeout_sec + 60,
+                        )
+                        rc_rep = proc_rep.returncode
+                        stdout_rep = (proc_rep.stdout or "").strip()
+                        stderr_rep = (proc_rep.stderr or "").strip()
+                    except subprocess.TimeoutExpired as exc:
+                        rep_to = True
+                        rc_rep = 124
+                        stdout_rep = (exc.stdout or "").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+                        stderr_rep = (exc.stderr or "").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+                    rep_wall = round(time.monotonic() - t_rep0, 3)
 
-                attempts.append(
-                    {
-                        "model": model_name,
-                        "repair_turn": True,
-                        "returncode": proc2.returncode,
-                        "agy_status": parsed2.get("status") if parsed2 else None,
-                        "num_turns": parsed2.get("num_turns") if parsed2 else None,
-                        "duration_seconds": parsed2.get("duration_seconds") if parsed2 else None,
-                        "usage": parsed2.get("usage") if parsed2 else None,
-                        "conversation_id": conv_id,
-                        "out_ready": out_ready2,
-                        "verify_ok": bool(probe2 and probe2.get("ok") is True),
-                        "verify_errors": (probe2 or {}).get("errors", [])[:5],
-                    }
-                )
-                if out_ready2 and probe2 and probe2.get("ok") is True:
-                    chosen_model = model_name
-                    agy_envelope = parsed2
+                    parsed_rep = parse_fde_runner_output(
+                        fde_runner=runner_name,
+                        stdout=stdout_rep,
+                        wall_elapsed_sec=rep_wall,
+                    )
+                    out_ready_rep = (ws_root / "out" / "odoo_o2c_mapping.json").is_file() and (
+                        ws_root / "out" / "driver.py"
+                    ).is_file()
+                    probe_rep = None
+                    if out_ready_rep:
+                        pv_rep = subprocess.run(
+                            ["./verify_driver.sh", "verify"], cwd=str(ws_root), text=True, capture_output=True
+                        )
+                        try:
+                            probe_rep = json.loads(pv_rep.stdout)
+                        except Exception:
+                            probe_rep = {"ok": False, "raw": pv_rep.stdout[:500], "stderr": pv_rep.stderr[:400]}
+                        last_verify_probe = probe_rep
+
+                    attempts.append(
+                        {
+                            "fde_runner": runner_name,
+                            "model": model_name,
+                            "repair_turn": repair_idx,
+                            "returncode": rc_rep,
+                            "timed_out": rep_to,
+                            "agent_status": parsed_rep.get("status") if parsed_rep else None,
+                            "num_turns": parsed_rep.get("num_turns") if parsed_rep else None,
+                            "duration_seconds": (parsed_rep.get("duration_seconds") if parsed_rep else None) or rep_wall,
+                            "tool_calls_count": parsed_rep.get("tool_calls_count") if parsed_rep else None,
+                            "total_cost_usd": parsed_rep.get("total_cost_usd") if parsed_rep else None,
+                            "usage": parsed_rep.get("usage") if parsed_rep else None,
+                            "conversation_id": conv_id,
+                            "out_ready": out_ready_rep,
+                            "verify_ok": bool(probe_rep and probe_rep.get("ok") is True),
+                            "verify_errors": (probe_rep or {}).get("errors", [])[:5],
+                            "stderr_tail": stderr_rep[-400:],
+                        }
+                    )
+                    if out_ready_rep and probe_rep and probe_rep.get("ok") is True:
+                        chosen_model = model_name
+                        agy_envelope = parsed_rep
+                        break
+                    if rep_to or rc_rep != 0:
+                        break
+                if chosen_model is not None:
                     break
 
         if chosen_model is None:
+            partial_driver = (
+                (ws_root / "out" / "driver.py").read_text("utf-8")
+                if (ws_root / "out" / "driver.py").is_file()
+                else None
+            )
+            partial_mapping = (
+                (ws_root / "out" / "odoo_o2c_mapping.json").read_text("utf-8")
+                if (ws_root / "out" / "odoo_o2c_mapping.json").is_file()
+                else None
+            )
+            partial_ast = (
+                audit_thin_driver_ast(
+                    ws_root / "out" / "driver.py",
+                    forbidden_literals=world_a_info["fingerprints"],
+                    max_lines=350,
+                )
+                if partial_driver is not None
+                else None
+            )
             fail_report = {
                 "ok": False,
+                "fde_runner": runner_name,
                 "workspace": str(ws_root),
                 "world_a": world_a_info,
                 "attempts": attempts,
-                "error": "agy CLI did not achieve CORROBORATED on Public World A",
+                "last_verify_probe": last_verify_probe,
+                "partial_ast_audit": partial_ast,
+                "partial_driver_source": partial_driver,
+                "partial_mapping_raw": partial_mapping,
+                "error": f"{runner_name} CLI did not achieve CORROBORATED on Public World A",
             }
             output_json_path.write_text(json.dumps(fail_report, ensure_ascii=False, indent=2), "utf-8")
-            raise RuntimeError(f"Live agy benchmark failed on Public World A: see {output_json_path}")
+            raise RuntimeError(f"Live {runner_name} benchmark failed on Public World A: see {output_json_path}")
 
         # 3. Outer Referee Audit: workspace tamper + AST forbidden_literals
         _verify_readonly_integrity(ws_root, prep["readonly_hashes"])
@@ -1066,12 +1310,14 @@ def run_live_odoo_agy_fde_benchmark(
 
         report: dict[str, Any] = {
             "ok": overall_ok,
+            "fde_runner": runner_name,
             "chosen_model": chosen_model,
             "driver_line_count": driver_lines,
             "ast_audit_errors": ast_issues,
             "readonly_tamper_check_passed": True,
             "attempts": attempts,
             "agy_envelope": agy_envelope,
+            "agent_envelope": agy_envelope,
             "world_a": world_a_info,
             "world_a_verify": world_a_verify,
             "world_b_hidden": {
@@ -1098,18 +1344,26 @@ def run_live_odoo_agy_fde_benchmark(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run live Odoo 19 agy CLI AI-FDE protocol benchmark")
-    parser.add_argument("--model", default=None, help="Primary agy CLI model to try first")
+    parser = argparse.ArgumentParser(description="Run live Odoo 19 pluggable AI-FDE protocol benchmark")
+    parser.add_argument(
+        "--fde-runner",
+        choices=("agy", "opencode"),
+        default="agy",
+        help="Headless coding agent CLI runner to benchmark",
+    )
+    parser.add_argument("--model", default=None, help="Primary model to try first")
     parser.add_argument("--timeout-sec", type=int, default=480)
     parser.add_argument("--output", default="/tmp/wo14_live_odoo_agy_fde.json")
     args = parser.parse_args()
 
-    models = (
-        (args.model, "gemini-4-argon-medium", "gemini-3.8-flash-medium")
-        if args.model
-        else ("gemini-4-neon-medium", "gemini-4-argon-medium", "gemini-3.8-flash-medium")
-    )
+    defaults = DEFAULT_OPENCODE_DEEPSEEK_MODELS if args.fde_runner == "opencode" else DEFAULT_AGY_MODELS
+    if args.model:
+        models = tuple(dict.fromkeys((args.model, *defaults)))
+    else:
+        models = defaults
+
     res = run_live_odoo_agy_fde_benchmark(
+        fde_runner=args.fde_runner,
         models=models,
         timeout_sec=args.timeout_sec,
         output_json_path=Path(args.output),
@@ -1118,6 +1372,7 @@ def main() -> int:
         json.dumps(
             {
                 "ok": res["ok"],
+                "fde_runner": res["fde_runner"],
                 "chosen_model": res["chosen_model"],
                 "driver_line_count": res["driver_line_count"],
                 "world_a_verdict": res["world_a_verify"]["verdict"],
