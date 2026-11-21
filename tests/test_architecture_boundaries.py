@@ -134,6 +134,13 @@ _RETIRED_M2_STAGING_SYMBOLS: tuple[str, ...] = (
 )
 
 
+_DYNAMIC_IMPORT_EXEMPT_FILES = frozenset(
+    {
+        (PKG_ROOT / "design.py").resolve(),
+    }
+)
+
+
 def _iter_kernel_py_files() -> list[Path]:
     return sorted(
         p for p in PKG_ROOT.rglob("*.py") if "__pycache__" not in p.parts
@@ -256,8 +263,18 @@ def test_gate2_m2_zero_reverse_example_imports_no_business_objects_clean_io() ->
         rel = path.relative_to(REPO_ROOT)
 
         # 2a. 禁止任何层次的静态与动态反向 import（含 import_module / __import__）
-        dyn_hits = _find_dynamic_imports(tree)
-        assert dyn_hits == [], f"M2 内核 {rel} 禁止动态导入逃逸：{dyn_hits}"
+        if path.resolve() not in _DYNAMIC_IMPORT_EXEMPT_FILES:
+            dyn_hits = _find_dynamic_imports(tree)
+            assert dyn_hits == [], f"M2 内核 {rel} 禁止动态导入逃逸：{dyn_hits}"
+        else:
+            # design.py 仅允许使用 importlib.import_module 解析命令行显式传入路径，仍禁 __import__ 与硬编码 examples 字符串
+            for ln, call_desc in _find_dynamic_imports(tree):
+                assert "__import__" not in call_desc, f"{rel}:{ln} 禁止 __import__"
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    assert "examples" not in node.value.split("."), (
+                        f"{rel} 不得硬编码 examples 引用 {node.value!r}"
+                    )
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -667,3 +684,212 @@ def test_gate5_pure_synchronous_non_suspending_m2_kernel() -> None:
 
     assert raw_hits == [], f"open_ontology/** 原文残留退役 M2 挂起符号：{raw_hits}"
     assert ast_hits == [], f"open_ontology/** AST 残留退役 M2 挂起符号：{ast_hits}"
+
+
+# ---------------------------------------------------------------------------
+# Gate 6: Runtime 对 Design-Time 一无所知（AST + 依赖闭包 + 干净子进程 sys.modules）
+# ---------------------------------------------------------------------------
+_RUNTIME_CORE_FILES: tuple[str, ...] = (
+    "spec.py",
+    "sandbox.py",
+    "runtime.py",
+    "aspects.py",
+    "settlement.py",
+    "drivers.py",
+    "ingestion.py",
+    "query.py",
+    "osdk.py",
+)
+
+_FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
+    {
+        "design",
+        "induction",
+        "crucible",
+        "falsifier",
+        "decompiler",
+        "agents",
+        "backends",
+        "dsl",
+        "phenomenon",
+        "resolution",
+        "governance",
+        "workshop",
+        "workshop_ui",
+        "meta_admin",
+        "mpc",
+    }
+)
+
+
+def _internal_import_targets(
+    mod_path: Path,
+    tree: ast.AST,
+    *,
+    skip_legacy_runtime_plan_mcts: bool = False,
+) -> tuple[list[tuple[int, str]], list[str]]:
+    """Return ``(all_imports, open_ontology_targets)`` respecting relative imports."""
+    rel_name = mod_path.relative_to(PKG_ROOT).with_suffix("")
+    pkg_parts = ("open_ontology",) + rel_name.parts[:-1]
+    all_imports: list[tuple[int, str]] = []
+    internal_targets: list[str] = []
+
+    def _visit(node: ast.AST, in_legacy_plan_mcts: bool = False) -> None:
+        cur_legacy = in_legacy_plan_mcts or (
+            skip_legacy_runtime_plan_mcts
+            and isinstance(node, ast.FunctionDef)
+            and node.name == "plan_mcts"
+        )
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                all_imports.append((node.lineno, alias.name))
+                if alias.name == "open_ontology" or alias.name.startswith("open_ontology."):
+                    if not cur_legacy:
+                        internal_targets.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if node.level > 0:
+                up = node.level - 1
+                base_parts = pkg_parts[: len(pkg_parts) - up] if up <= len(pkg_parts) else ()
+                full_mod = ".".join((*base_parts, mod)) if mod else ".".join(base_parts)
+                all_imports.append((node.lineno, full_mod))
+                for alias in node.names:
+                    cand = f"{full_mod}.{alias.name}" if full_mod else alias.name
+                    if full_mod == "open_ontology":
+                        all_imports.append((node.lineno, cand))
+                        if not cur_legacy:
+                            internal_targets.append(cand)
+                    elif full_mod.startswith("open_ontology.") and not cur_legacy:
+                        internal_targets.append(full_mod)
+            else:
+                all_imports.append((node.lineno, mod))
+                if mod == "open_ontology":
+                    for alias in node.names:
+                        cand = f"open_ontology.{alias.name}"
+                        all_imports.append((node.lineno, cand))
+                        if not cur_legacy:
+                            internal_targets.append(cand)
+                elif mod.startswith("open_ontology.") and not cur_legacy:
+                    internal_targets.append(mod)
+        for child in ast.iter_child_nodes(node):
+            _visit(child, cur_legacy)
+
+    _visit(tree)
+    return all_imports, internal_targets
+
+
+def test_gate6_runtime_oblivious_to_design_time() -> None:
+    """核心 Runtime 对 Design-Time/Induction/Workshop/CLI/Subprocess 一无所知。"""
+    import subprocess
+    import sys
+
+    # 6a. 静态 AST 导入封杀 + 禁动态导入
+    for fname in _RUNTIME_CORE_FILES:
+        path = PKG_ROOT / fname
+        assert path.is_file(), f"缺少 Runtime 核心模块 {fname}"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        dyn_hits = _find_dynamic_imports(tree)
+        assert dyn_hits == [], f"Runtime 核心模块 {fname} 禁止动态导入：{dyn_hits}"
+
+        all_imports, _ = _internal_import_targets(
+            path, tree, skip_legacy_runtime_plan_mcts=(fname == "runtime.py")
+        )
+        for lineno, target in all_imports:
+            parts = target.split(".")
+            assert parts[0] != "subprocess", (
+                f"Runtime 核心模块 {fname}:{lineno} 禁止引入 subprocess ({target!r})"
+            )
+            if parts[0] == "open_ontology":
+                bad_segs = [p for p in parts[1:] if p in _FORBIDDEN_IN_RUNTIME_MODULES or p == "mcts"]
+                if fname == "runtime.py" and lineno == 262 and parts[1:2] == ["mcts"]:
+                    # runtime.py 于 WO-11 冻结维持 1338 行；plan_mcts 的延迟导入于 WO-12 物理拆出
+                    bad_segs = [p for p in bad_segs if p != "mcts"]
+                assert bad_segs == [], (
+                    f"Runtime 核心模块 {fname}:{lineno} 禁止引用非 Runtime 模块 {target!r}"
+                )
+            elif parts[0] in _FORBIDDEN_IN_RUNTIME_MODULES - {"agents"} or parts[0] == "mcts":
+                raise AssertionError(
+                    f"Runtime 核心模块 {fname}:{lineno} 禁止引入 {target!r}"
+                )
+
+    # 6b. 顶层 open_ontology/__init__.py 严禁导入 open_ontology.design
+    init_path = PKG_ROOT / "__init__.py"
+    init_tree = ast.parse(init_path.read_text(encoding="utf-8"), filename=str(init_path))
+    assert _find_dynamic_imports(init_tree) == [], "open_ontology/__init__.py 禁止动态导入"
+    init_imports, _ = _internal_import_targets(init_path, init_tree)
+    for lineno, target in init_imports:
+        assert "design" not in target.split("."), (
+            f"open_ontology/__init__.py:{lineno} 严禁加载 Design-Time 模块 {target!r}"
+        )
+
+    # 6c. 递归解析 runtime.py 与 drivers.py 直接依赖闭包，确保零反向依赖 Design-Time / Induction / Workshop / MCTS
+    allowed_closure = {
+        "open_ontology.spec",
+        "open_ontology.sandbox",
+        "open_ontology.runtime",
+        "open_ontology.aspects",
+        "open_ontology.settlement",
+        "open_ontology.drivers",
+        "open_ontology.ingestion",
+        "open_ontology.query",
+    }
+    visited: set[str] = set()
+    queue = ["open_ontology.runtime", "open_ontology.drivers"]
+    while queue:
+        mod_name = queue.pop(0)
+        if mod_name in visited:
+            continue
+        visited.add(mod_name)
+        mod_file = REPO_ROOT / Path(*mod_name.split(".")).with_suffix(".py")
+        if not mod_file.is_file():
+            continue
+        mtree = ast.parse(mod_file.read_text(encoding="utf-8"), filename=str(mod_file))
+        _, internal_deps = _internal_import_targets(
+            mod_file,
+            mtree,
+            skip_legacy_runtime_plan_mcts=(mod_name == "open_ontology.runtime"),
+        )
+        for dep in internal_deps:
+            normalized = ".".join(dep.split(".")[:2])
+            assert normalized in allowed_closure, (
+                f"{mod_name} 的依赖链越界引用了 {dep!r}"
+            )
+            if normalized not in visited:
+                queue.append(normalized)
+
+    # 6d. 全新干净子进程 sys.modules 实测
+    probe_code = (
+        "import sys; "
+        "import open_ontology; "
+        "from open_ontology import OntologyRuntime, DeviceDriverRegistry; "
+        "import open_ontology.runtime, open_ontology.drivers; "
+        "bad = [m for m in sys.modules if m == 'open_ontology.design' or m.startswith('open_ontology.design.')]; "
+        "assert not bad, f'leaked design modules: {bad}'"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe_code],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"subprocess sys.modules check failed: {proc.stderr or proc.stdout}"
+
+    # 6e. 直接导入 Runtime 各核心子模块在干净进程下也绝不加载 open_ontology.design
+    drv_probe = (
+        "import sys; "
+        "from open_ontology.drivers import DeviceDriverRegistry; "
+        "import open_ontology.runtime, open_ontology.settlement, open_ontology.osdk; "
+        "bad = [m for m in sys.modules if m == 'open_ontology.design' or m.startswith('open_ontology.design.')]; "
+        "assert not bad, f'runtime loaded design modules: {bad}'"
+    )
+    drv_proc = subprocess.run(
+        [sys.executable, "-c", drv_probe],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert drv_proc.returncode == 0, (
+        f"drivers subprocess sys.modules check failed: {drv_proc.stderr or drv_proc.stdout}"
+    )

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .drivers import DeviceDriverRegistry
 from .meta_admin import MetaAdminService
 from .model_views import describe_behavior, describe_openapi, describe_tbox
 from .osdk import AIPAgentExecutor, iter_agent_turn, run_agent_turn
@@ -192,10 +193,30 @@ class OntologyInstanceEntry:
     runtime: OntologyRuntime
     runtime_id: str = DEFAULT_RUNTIME_ID
     connectors: list[ConnectorMount] = field(default_factory=list)
+    driver_registry: DeviceDriverRegistry | None = None
     default_actor: Actor | None = None
     sample_action_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     mcts_config: dict[str, Any] | None = None
     unplug_fn: Callable[[], dict[str, Any]] | None = None
+
+    def effective_connectors(self) -> list[ConnectorMount]:
+        """当绑定 ``driver_registry`` 时实时投影设备状态，否则回退静态连接器清单。"""
+        if self.driver_registry is not None:
+            status_map = {
+                "MOUNTED": "CONNECTED",
+                "UNPLUGGED": "UNPLUGGED",
+                "DEGRADED": "STANDBY",
+            }
+            return [
+                ConnectorMount(
+                    name=str(dev["name"]),
+                    kind=str(dev["kind"]),
+                    endpoint=str(dev["endpoint"]),
+                    status=status_map.get(str(dev["status"]), "STANDBY"),
+                )
+                for dev in self.driver_registry.list_devices()
+            ]
+        return list(self.connectors)
 
     @property
     def workspace_id(self) -> str:
@@ -639,7 +660,8 @@ class CommandCenterRegistry:
 
     def _sync_devices(self, entry: OntologyInstanceEntry) -> None:
         """将外部连接器统一登记为 OpenAPI 工具/设备契约。"""
-        for idx, connector in enumerate(entry.connectors, start=1):
+        effective = entry.effective_connectors()
+        for idx, connector in enumerate(effective, start=1):
             self.register_symbolic_device(
                 f"dev-{entry.instance_id}-openapi-{idx}",
                 connector.name,
@@ -653,9 +675,10 @@ class CommandCenterRegistry:
     def _bind_runtime(self, entry: OntologyInstanceEntry) -> str:
         """为实例绑定宿体：零外设内存沙盘共用默认宿体，其余各建一台。"""
         storage_kind = "memory" if ":memory:" in entry.db_uri else "sqlite"
-        adapters = [connector.name for connector in entry.connectors]
+        effective = entry.effective_connectors()
+        adapters = [connector.name for connector in effective]
         runtime_id = _workspace_runtime_id(
-            entry.instance_id, entry.db_uri, entry.connectors
+            entry.instance_id, entry.db_uri, effective
         )
         if runtime_id == DEFAULT_RUNTIME_ID:
             runtime = self.runtimes.get(runtime_id)
@@ -721,6 +744,7 @@ class CommandCenterRegistry:
         db_uri: str = "sqlite://:memory:",
         description: str = "",
         connectors: Iterable[ConnectorMount] | None = None,
+        driver_registry: DeviceDriverRegistry | None = None,
         default_actor: Actor | None = None,
         sample_action_params: dict[str, dict[str, Any]] | None = None,
         mcts_config: dict[str, Any] | None = None,
@@ -737,7 +761,7 @@ class CommandCenterRegistry:
         with self.lock:
             existing = self.instances.get(workspace_id)
             if existing is not None:
-                if self._same_workspace(existing, model_id, runtime, db_uri, connector_list):
+                if self._same_workspace(existing, model_id, runtime, db_uri, connector_list, driver_registry=driver_registry):
                     return existing
                 raise WorkspaceConflictError(
                     f"workspace {workspace_id!r} is already registered "
@@ -752,13 +776,14 @@ class CommandCenterRegistry:
                 db_uri=db_uri,
                 runtime=runtime,
                 connectors=connector_list,
+                driver_registry=driver_registry,
                 default_actor=default_actor,
                 sample_action_params=dict(sample_action_params or {}),
                 mcts_config=dict(mcts_config) if mcts_config else None,
                 unplug_fn=unplug_fn,
             )
             entry.runtime_id = _workspace_runtime_id(
-                workspace_id, db_uri, connector_list
+                workspace_id, db_uri, entry.effective_connectors()
             )
             descriptor = self._workspace_descriptor(entry)
             if descriptor is not None:
@@ -787,6 +812,7 @@ class CommandCenterRegistry:
         db_uri: str = "sqlite://:memory:",
         description: str = "",
         connectors: Iterable[ConnectorMount] | None = None,
+        driver_registry: DeviceDriverRegistry | None = None,
         default_actor: Actor | None = None,
         sample_action_params: dict[str, dict[str, Any]] | None = None,
         mcts_config: dict[str, Any] | None = None,
@@ -801,6 +827,7 @@ class CommandCenterRegistry:
             db_uri=db_uri,
             description=description,
             connectors=connectors,
+            driver_registry=driver_registry,
             default_actor=default_actor,
             sample_action_params=sample_action_params,
             mcts_config=mcts_config,
@@ -830,6 +857,8 @@ class CommandCenterRegistry:
         runtime: OntologyRuntime,
         db_uri: str,
         connectors: Iterable[ConnectorMount],
+        *,
+        driver_registry: DeviceDriverRegistry | None = None,
     ) -> bool:
         if existing.ontology_id != model_id:
             return False
@@ -840,8 +869,11 @@ class CommandCenterRegistry:
                 return False
         elif Path(existing_db).resolve() != Path(incoming_db).resolve():
             return False
+        if driver_registry is not None and existing.driver_registry is not driver_registry:
+            return False
+        expected_conns = existing.effective_connectors() if existing.driver_registry is not None else list(connectors)
         expected_runtime_id = _workspace_runtime_id(
-            existing.instance_id, db_uri, connectors
+            existing.instance_id, db_uri, expected_conns
         )
         return existing.runtime_id == expected_runtime_id
 
@@ -1015,7 +1047,7 @@ class CommandCenterRegistry:
                     endpoint=item.endpoint,
                     status=item.status,
                 )
-                for item in source.connectors
+                for item in source.effective_connectors()
             ],
             default_actor=source.default_actor,
             sample_action_params=copy.deepcopy(source.sample_action_params),
@@ -1135,7 +1167,7 @@ def _instance_summary(entry: OntologyInstanceEntry, registry: CommandCenterRegis
         "label": entry.label,
         "description": entry.description,
         "db_uri": entry.db_uri,
-        "connectors": [asdict(item) for item in entry.connectors],
+        "connectors": [asdict(item) for item in entry.effective_connectors()],
         "counts": {
             "objects": runtime.count_objects(),
             "links": _count_links(runtime),
@@ -4853,17 +4885,21 @@ class _WorkshopHandler(BaseHTTPRequestHandler):
         if entry.unplug_fn is None:
             raise ValueError(f"instance {entry.instance_id!r} does not support unplug")
         result = entry.unplug_fn()
+        if entry.driver_registry is not None:
+            for dev in entry.driver_registry.list_devices():
+                entry.driver_registry.unmount(str(dev["device_id"]))
         if entry.runtime.world_mode == "coupled":
             entry.runtime.bind_source_bridge(None, world_mode="standalone")
         for connector in entry.connectors:
             connector.status = "UNPLUGGED"
+        effective = entry.effective_connectors()
         self._send_json(
             200,
             {
                 "ok": True,
                 "instance": entry.instance_id,
-                "unplugged": [connector.name for connector in entry.connectors],
-                "connectors": [asdict(connector) for connector in entry.connectors],
+                "unplugged": [connector.name for connector in effective],
+                "connectors": [asdict(connector) for connector in effective],
                 "result": result,
             },
         )

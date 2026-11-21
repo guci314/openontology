@@ -11,6 +11,15 @@ Public surface::
     )
 """
 
+from .drivers import (
+    CROSS_DEVICE_WRITE_FORBIDDEN,
+    DUPLICATE_ACTION_DRIVER,
+    DUPLICATE_DEVICE_ID,
+    DUPLICATE_OWNED_OBJECT_DRIVER,
+    DeviceDriverRegistry,
+    DeviceStatus,
+    MountedDevice,
+)
 from .induction import (
     DeclarativeBlueprint,
     EvolutionPatch,
@@ -138,6 +147,13 @@ __all__ = [
     "OntologyMCTSPlanner",
     "WorldMode",
     "SourceBridge",
+    "DeviceStatus",
+    "MountedDevice",
+    "DeviceDriverRegistry",
+    "CROSS_DEVICE_WRITE_FORBIDDEN",
+    "DUPLICATE_DEVICE_ID",
+    "DUPLICATE_ACTION_DRIVER",
+    "DUPLICATE_OWNED_OBJECT_DRIVER",
     "HomomorphicSettlementAspect",
     "DeviceStateMismatchError",
     "DEVICE_STATE_MISMATCH",
