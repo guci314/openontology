@@ -758,6 +758,45 @@ class HomomorphicSettlementAspect:
         return readback_objects, readback_links, mismatches
 
     @classmethod
+    def _phase_b_with_rejection_audit(
+        cls,
+        runtime: Any,
+        bridge: SourceBridge,
+        *,
+        run_id: str,
+        action: ActionDef,
+        actor: Actor,
+        params_json: dict[str, Any],
+        read_versions: dict[str, int],
+        move: dict[str, Any],
+        diff: ObjectDiff,
+    ) -> tuple[
+        dict[str, list[dict[str, Any]]],
+        dict[str, list[tuple[str, str]]] | None,
+        list[str],
+    ]:
+        try:
+            return cls._phase_b_actuate_and_observe(runtime, bridge, move, diff)
+        except InvariantError as exc:
+            with runtime._write_gate() as conn:
+                insert_action_run(
+                    runtime,
+                    conn,
+                    run_id=run_id,
+                    action=action,
+                    actor=actor,
+                    params_json=params_json,
+                    status=AUDIT_STATUS_REJECTED,
+                    read_versions=read_versions,
+                    diff=ObjectDiff(),
+                    approved_by=None,
+                    error_code=exc.code or DEVICE_STATE_MISMATCH,
+                    error_message=str(exc),
+                )
+            _notify_rejected(runtime, actor, run_id)
+            raise
+
+    @classmethod
     def _reject_on_mismatch(
         cls,
         runtime: Any,
@@ -947,8 +986,16 @@ class HomomorphicSettlementAspect:
                 read_versions=read_versions,
                 diff=diff,
             )
-            readback_objects, readback_links, mismatches = cls._phase_b_actuate_and_observe(
-                runtime, bridge, move, diff
+            readback_objects, readback_links, mismatches = cls._phase_b_with_rejection_audit(
+                runtime,
+                bridge,
+                run_id=run_id,
+                action=action,
+                actor=actor,
+                params_json=params_json,
+                read_versions=read_versions,
+                move=move,
+                diff=diff,
             )
 
             # Phase C：回读核验与原子提升（不一致则保留物理观测，内存事实零改动）
@@ -1084,8 +1131,16 @@ class HomomorphicSettlementAspect:
                 is_revert=True,
                 reverts_run_id=run_id,
             )
-            readback_objects, readback_links, mismatches = cls._phase_b_actuate_and_observe(
-                runtime, bridge, move, inverted
+            readback_objects, readback_links, mismatches = cls._phase_b_with_rejection_audit(
+                runtime,
+                bridge,
+                run_id=revert_run_id,
+                action=action,
+                actor=actor,
+                params_json=dict(run["params"]),
+                read_versions=revert_read_versions,
+                move=move,
+                diff=inverted,
             )
             if mismatches:
                 cls._reject_on_mismatch(

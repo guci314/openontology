@@ -30,6 +30,7 @@ import threading
 import uuid
 from typing import Any, Callable, Mapping, Sequence, TextIO
 
+from .autonomy import AutonomyRampController
 from .drivers import DeviceDriverRegistry
 from .osdk import AIPAgentExecutor
 from .runtime import OntologyRuntime
@@ -360,6 +361,7 @@ class OntologyMCPServer:
         include_ui_tools: bool = False,
         planner_factory: Callable[..., Any] | None = None,
         actor_resolver: Callable[[Mapping[str, str]], Actor] | None = None,
+        autonomy_controller: AutonomyRampController | None = None,
     ) -> None:
         self.runtime = runtime
         self.actor = actor
@@ -371,6 +373,7 @@ class OntologyMCPServer:
         self.include_ui_tools = bool(include_ui_tools)
         self.planner_factory = planner_factory
         self.actor_resolver = actor_resolver
+        self.autonomy_controller = autonomy_controller
         self._lock = threading.RLock()
         self.call_history: list[dict[str, Any]] = []
 
@@ -461,6 +464,18 @@ class OntologyMCPServer:
                     raise ValueError(f"tool {tool_name!r} is disabled on this server")
                 if tool_name == "describe_tbox":
                     result = executor.describe_tbox()
+                elif tool_name == "submit_action" and self.autonomy_controller is not None:
+                    executor._require_public_action(args["action"])
+                    decision = self.autonomy_controller.execute(
+                        self.runtime,
+                        actor,
+                        args["run_id"],
+                        args["action"],
+                        args.get("params", {}),
+                    )
+                    result = {"autonomy": decision.to_dict()}
+                    if decision.run is not None:
+                        result["run"] = decision.run
                 else:
                     result = executor.dispatch(tool_name, args)
                 self.call_history.append(
@@ -674,6 +689,11 @@ class OntologyMCPServer:
                 "view": self.view if isinstance(self.view, str) else getattr(self.view, "name", None),
                 "world_mode": self.runtime.world_mode,
                 "tool_count": len(tools),
+                "autonomy_default_mode": (
+                    self.autonomy_controller.policy.default_mode
+                    if self.autonomy_controller is not None
+                    else None
+                ),
             }
 
     def serve_stdio(

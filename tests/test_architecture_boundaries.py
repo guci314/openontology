@@ -747,6 +747,8 @@ _FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
         "webhooks",
         "mcts",
         "mpc",
+        "autonomy",
+        "reconciliation",
     }
 )
 
@@ -904,6 +906,8 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
             "webhooks",
             "mcts",
             "mpc",
+            "autonomy",
+            "reconciliation",
         ]
     )
     probe_code = (
