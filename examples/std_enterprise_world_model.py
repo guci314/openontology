@@ -382,13 +382,34 @@ def project_h2r_to_org_directory(
             )
         )
 
+    unit_dir = OrgDirectory(units=units)
+    unit_dir.validate()
+
+    subtree_tags_by_dept: dict[str, set[str]] = {}
+    for did in active_depts:
+        subtree_tags_by_dept[did] = {
+            unit_dir.get_unit(uid).scope_tag
+            for uid in unit_dir.subtree_ids(did, include_self=True)
+            if unit_dir.get_unit(uid).scope_tag and "*" not in unit_dir.get_unit(uid).scope_tag
+        }
+
     mandate_tags_by_emp: dict[str, list[str]] = {}
     for m in valid_mandates:
-        norm_tag = normalize_org_scope_tag(m.scope_tag)
-        if norm_tag:
-            bucket = mandate_tags_by_emp.setdefault(m.grantee, [])
-            if norm_tag not in bucket:
-                bucket.append(norm_tag)
+        raw_tag = str(m.scope_tag or "").strip()
+        if not raw_tag or "*" in raw_tag:
+            continue
+        norm_tag = normalize_org_scope_tag(raw_tag)
+        if not norm_tag or "*" in norm_tag:
+            continue
+        grantor = all_employees.get(m.grantor)
+        if grantor is None or grantor.department not in subtree_tags_by_dept:
+            continue
+        # P0-1: Only project scope_tag strictly covered by grantor's active org subtree
+        if norm_tag not in subtree_tags_by_dept[grantor.department]:
+            continue
+        bucket = mandate_tags_by_emp.setdefault(m.grantee, [])
+        if norm_tag not in bucket:
+            bucket.append(norm_tag)
 
     members: list[OrgMember] = []
     for emp in all_employees.values():
@@ -430,9 +451,10 @@ def _resolve_employee_record(
     key = str(employee_or_actor_id or "").strip()
     if key in employees:
         return employees[key]
-    for emp in employees.values():
-        if emp.actor_id and emp.actor_id == key:
-            return emp
+    by_actor = [emp for emp in employees.values() if emp.actor_id and emp.actor_id == key]
+    if by_actor:
+        active_matches = [emp for emp in by_actor if emp.status == "active"]
+        return active_matches[0] if active_matches else by_actor[0]
     raise OrgAuthorityError(
         f"unknown H2R employee or actor {employee_or_actor_id!r}",
         code=ORG_MEMBER_NOT_FOUND,
@@ -473,21 +495,32 @@ def _compute_employee_effective_ceilings(
         else 0
     )
 
-    target_scope_tag = directory.get_unit(target_unit_id).scope_tag
+    target_chain_tags = {
+        directory.get_unit(uid).scope_tag
+        for uid in directory.ancestors(target_unit_id, include_self=True)
+        if directory.get_unit(uid).scope_tag and "*" not in directory.get_unit(uid).scope_tag
+    }
     mandate_ceiling = 0
     for m in valid_mandates:
         if m.grantee != emp.employee_id:
             continue
         if required_role is not None and m.role_name != required_role:
             continue
-        m_tag = normalize_org_scope_tag(m.scope_tag)
+        raw_m_tag = str(m.scope_tag or "").strip()
+        if "*" in raw_m_tag:
+            continue
+        m_tag = normalize_org_scope_tag(raw_m_tag)
+        if "*" in m_tag:
+            continue
         grantor = all_employees.get(m.grantor)
-        scope_ok = (
-            (not m_tag)
-            or (bool(target_scope_tag) and m_tag == target_scope_tag)
-            or (grantor is not None and grantor.department in active_depts and directory.covers(grantor.department, target_unit_id))
+        # P0-2: Strict conjunction — grantor subtree must cover target AND explicit scope_tag must match target ancestor chain
+        grantor_covers_target = (
+            grantor is not None
+            and grantor.department in active_depts
+            and directory.covers(grantor.department, target_unit_id)
         )
-        if scope_ok and int(m.ceiling_cents) > mandate_ceiling:
+        tag_matches_target = (not m_tag) or (m_tag in target_chain_tags)
+        if grantor_covers_target and tag_matches_target and int(m.ceiling_cents) > mandate_ceiling:
             mandate_ceiling = int(m.ceiling_cents)
 
     return base_ceiling, mandate_ceiling, str(pos.role_name)
@@ -734,7 +767,7 @@ def project_event_to_draft_journal(
             f"JournalEntry:{entry_id} projected amount_cents={eff_cents} must be > 0",
             code="NON_POSITIVE_JOURNAL_AMOUNT",
         )
-    if event_cents > 0 and eff_cents > event_cents:
+    if eff_cents > event_cents:
         raise InvariantError(
             f"JournalEntry:{entry_id} amount_cents={eff_cents} exceeds event {ev.event_id} amount_cents={event_cents}",
             code="JOURNAL_EXCEEDS_SOURCE_EVENT",

@@ -1271,9 +1271,288 @@ def test_4_customer_overlay_monotonic_extension_design_check_and_execution(
         assert rt.get_object("O2cInvoice", "INV-OV", fin).status == "posted"
 
 
-def test_5_postgres16_zero_leaked_temporary_schemas() -> None:
-    assert len(_CREATED_PG_SCHEMAS) >= 3, (
-        "Expected live PG16 runs for standalone 6-domain loop, org RLS, and overlay E2E"
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_5_h2r_m2_projection_security_and_zero_event_red_team(backend: str) -> None:
+    admin = Actor(actor_id="adm-red", role="admin", clearance_tags={"*"})
+    rls_spec = build_org_rls_enterprise_spec()
+    with _open_enterprise_world(backend, spec=rls_spec) as rt:
+        _seed_common_hr_and_accounting_world(rt, admin)
+
+        ResCls = rls_spec.get_object_type("TradeResource")
+        BomCls = rls_spec.get_object_type("BomSpec")
+        WoCls = rls_spec.get_object_type("WorkOrder")
+        PartyCls = rls_spec.get_object_type("BusinessParty")
+        CommCls = rls_spec.get_object_type("TradeCommitment")
+        EvtCls = rls_spec.get_object_type("FulfillmentEvent")
+        PerCls = rls_spec.get_object_type("FiscalPeriod")
+        AccCls = rls_spec.get_object_type("GlAccount")
+        EmpCls = rls_spec.get_object_type("Employee")
+
+        rt.put_object(ResCls(resource_id="RES-R", name="钢材"), actor=admin)
+        rt.put_object(ResCls(resource_id="RES-P", name="成品"), actor=admin)
+        rt.put_object(
+            BomCls(bom_id="BOM-RED", output_resource="RES-P", input_resource="RES-R", input_per_unit=1.0),
+            actor=admin,
+        )
+        rt.put_object(
+            WoCls(
+                work_order_id="WO-NORTH-1",
+                accounting_entity="ENT-GROUP",
+                bom="BOM-RED",
+                output_resource="RES-P",
+                planned_qty=10.0,
+                org="plant_north",
+            ),
+            actor=admin,
+        )
+        rt.put_object(
+            WoCls(
+                work_order_id="WO-SOUTH-1",
+                accounting_entity="ENT-GROUP",
+                bom="BOM-RED",
+                output_resource="RES-P",
+                planned_qty=10.0,
+                org="plant_south",
+            ),
+            actor=admin,
+        )
+
+        # Red Team 1 (P0-1): North Plant Manager tries to grant forged cross-plant / HQ / wildcard scope_tag to North worker
+        north_pm = Actor(actor_id="act-north-pm", role="plant_manager")
+        for idx, forged_tag in enumerate(("org:plant_south", "*", "org:hq"), start=1):
+            rt.submit_action(
+                f"RED1-GRANT-{idx}",
+                "grant_authority_mandate",
+                {
+                    "mandate_id": f"MND-FORGED-{idx}",
+                    "grantor_id": "EMP-NORTH-PM",
+                    "grantee_id": "EMP-NORTH-SF",
+                    "role_name": "plant_manager",
+                    "ceiling_cents": 10_000,
+                    "scope_tag": forged_tag,
+                },
+                north_pm,
+            )
+
+        dir_red1 = project_h2r_to_org_directory(rt, admin)
+        north_actor = dir_red1.resolve_actor("act-north-sf")
+        assert "org:plant_south" not in north_actor.clearance_tags
+        assert "*" not in north_actor.clearance_tags
+        assert "org:*" not in north_actor.clearance_tags
+        assert "org:hq" not in north_actor.clearance_tags
+        assert north_actor.clearance_tags == {"org:plant_north"}
+
+        with pytest.raises(PermissionDeniedError):
+            rt.get_object("WorkOrder", "WO-SOUTH-1", north_actor)
+        with pytest.raises(OrgAuthorityError) as e_red1_scope:
+            evaluate_h2r_employee_authority(
+                rt,
+                admin,
+                employee_or_actor_id="EMP-NORTH-SF",
+                target_unit_id="DEPT-SOUTH-MFG",
+                amount_cents=10_000,
+                directory=dir_red1,
+            )
+        assert e_red1_scope.value.code == AUTHORITY_ORG_SCOPE_DENIED
+
+        # Red Team 2a (P0-2): HQ CFO grants explicit scope_tag='org:plant_north' mandate to HQ staff EMP-HR-ADMIN
+        cfo = Actor(actor_id="act-cfo", role="finance_director")
+        rt.submit_action(
+            "RED2A-GRANT",
+            "grant_authority_mandate",
+            {
+                "mandate_id": "MND-CFO-NORTH-ONLY",
+                "grantor_id": "EMP-CFO",
+                "grantee_id": "EMP-HR-ADMIN",
+                "role_name": "finance_director",
+                "ceiling_cents": 10_000_000,
+                "scope_tag": "org:plant_north",
+            },
+            cfo,
+        )
+        dir_red2 = project_h2r_to_org_directory(rt, admin)
+        d_north = evaluate_h2r_employee_authority(
+            rt,
+            admin,
+            employee_or_actor_id="EMP-HR-ADMIN",
+            target_unit_id="DEPT-NORTH-MFG",
+            amount_cents=8_000_000,
+            required_role="finance_director",
+            directory=dir_red2,
+        )
+        assert d_north.mandate_ceiling_cents == 10_000_000
+        assert d_north.decision == "AUTO"
+
+        # Explicit org:plant_north mandate MUST NOT leak to DEPT-SOUTH-MFG even though grantor CFO covers HQ
+        d_south = evaluate_h2r_employee_authority(
+            rt,
+            admin,
+            employee_or_actor_id="EMP-HR-ADMIN",
+            target_unit_id="DEPT-SOUTH-MFG",
+            amount_cents=8_000_000,
+            required_role="finance_director",
+            directory=dir_red2,
+        )
+        assert d_south.mandate_ceiling_cents == 0
+        assert d_south.effective_ceiling_cents == 0
+        assert d_south.decision == "ESCALATE"
+
+        # Red Team 2b (P0-2): North PM cannot amplify HQ staff authority inside DEPT-SOUTH-MFG using empty or forged south tag
+        rt.submit_action(
+            "RED2B-EMPTY",
+            "grant_authority_mandate",
+            {
+                "mandate_id": "MND-PM-EMPTY",
+                "grantor_id": "EMP-NORTH-PM",
+                "grantee_id": "EMP-HR-ADMIN",
+                "role_name": "plant_manager",
+                "ceiling_cents": 20_000_000,
+                "scope_tag": "",
+            },
+            north_pm,
+        )
+        rt.submit_action(
+            "RED2B-SPOOF",
+            "grant_authority_mandate",
+            {
+                "mandate_id": "MND-PM-SPOOF-SOUTH",
+                "grantor_id": "EMP-NORTH-PM",
+                "grantee_id": "EMP-HR-ADMIN",
+                "role_name": "plant_manager",
+                "ceiling_cents": 20_000_000,
+                "scope_tag": "org:plant_south",
+            },
+            north_pm,
+        )
+        dir_red2b = project_h2r_to_org_directory(rt, admin)
+        d_south_pm = evaluate_h2r_employee_authority(
+            rt,
+            admin,
+            employee_or_actor_id="EMP-HR-ADMIN",
+            target_unit_id="DEPT-SOUTH-MFG",
+            amount_cents=10_000_000,
+            required_role="plant_manager",
+            directory=dir_red2b,
+        )
+        assert d_south_pm.mandate_ceiling_cents == 0
+        assert d_south_pm.effective_ceiling_cents == 0
+        assert d_south_pm.decision == "ESCALATE"
+
+        # Legitimate North target covered by North PM gets empty-tag North mandate
+        d_north_pm = evaluate_h2r_employee_authority(
+            rt,
+            admin,
+            employee_or_actor_id="EMP-HR-ADMIN",
+            target_unit_id="DEPT-NORTH-MFG",
+            amount_cents=10_000_000,
+            required_role="plant_manager",
+            directory=dir_red2b,
+        )
+        assert d_north_pm.mandate_ceiling_cents == 20_000_000
+        assert d_north_pm.decision == "AUTO"
+
+        # P1-2: Re-hired active Employee sharing actor_id with an older offboarded Employee resolves to active record
+        hr_admin = Actor(actor_id="act-hr-admin", role="hr_admin")
+        rt.put_object(
+            EmpCls(
+                employee_id="EMP-REHIRE-1",
+                department="DEPT-PROC",
+                position="POS-BUYER",
+                full_name="周返聘（旧）",
+                actor_id="act-rehire",
+                status="active",
+            ),
+            actor=admin,
+        )
+        rt.submit_action("OFF-REHIRE-1", "offboard_employee", {"employee_id": "EMP-REHIRE-1"}, hr_admin)
+        rt.put_object(
+            EmpCls(
+                employee_id="EMP-REHIRE-2",
+                department="DEPT-PROC",
+                position="POS-BUYER",
+                full_name="周返聘（新）",
+                actor_id="act-rehire",
+                status="active",
+            ),
+            actor=admin,
+        )
+        d_rehire = evaluate_h2r_employee_authority(
+            rt,
+            admin,
+            employee_or_actor_id="act-rehire",
+            target_unit_id="DEPT-PROC",
+            amount_cents=1_000_000,
+        )
+        assert d_rehire.employee_id == "EMP-REHIRE-2"
+        assert d_rehire.decision == "AUTO"
+        with pytest.raises(OrgAuthorityError) as e_old_emp:
+            evaluate_h2r_employee_authority(
+                rt,
+                admin,
+                employee_or_actor_id="EMP-REHIRE-1",
+                target_unit_id="DEPT-PROC",
+                amount_cents=1_000_000,
+            )
+        assert e_old_emp.value.code == ORG_MEMBER_INACTIVE
+
+        # Red Team 3 (P1-1): 0.0-amount confirmed FulfillmentEvent cannot project positive JournalEntry
+        rt.put_object(PartyCls(party_id="PTY-Z1", legal_name="零元测试买方"), actor=admin)
+        rt.put_object(PartyCls(party_id="PTY-Z2", legal_name="零元测试卖方"), actor=admin)
+        rt.put_object(
+            CommCls(
+                commitment_id="CM-ZERO",
+                buyer_party="PTY-Z1",
+                seller_party="PTY-Z2",
+                resource="RES-P",
+                quantity=1.0,
+                unit_price=0.0,
+                total_amount=0.0,
+                status="agreed",
+            ),
+            actor=admin,
+        )
+        rt.put_object(
+            EvtCls(
+                event_id="EVT-ZERO-0",
+                commitment="CM-ZERO",
+                event_kind="JOURNAL_POST",
+                quantity=1.0,
+                amount=0.0,
+                status="confirmed",
+            ),
+            actor=admin,
+        )
+        rt.put_object(
+            PerCls(period_id="2026-11", accounting_entity="ENT-GROUP", start_date="2026-11-01", end_date="2026-11-30"),
+            actor=admin,
+        )
+        rt.put_object(
+            AccCls(account_code="1001", accounting_entity="ENT-GROUP", name="银行存款", category="ASSET", normal_side="DEBIT"),
+            actor=admin,
+        )
+        rt.put_object(
+            AccCls(account_code="4001", accounting_entity="ENT-GROUP", name="实收资本", category="EQUITY", normal_side="CREDIT"),
+            actor=admin,
+        )
+        with pytest.raises(InvariantError) as e_zero_proj:
+            project_event_to_draft_journal(
+                rt,
+                admin,
+                entry_id="JE-ZERO-BAD",
+                accounting_entity="ENT-GROUP",
+                fiscal_period="2026-11",
+                source_event_id="EVT-ZERO-0",
+                debit_account="1001",
+                credit_account="4001",
+                amount_cents=100_000,
+            )
+        assert e_zero_proj.value.code == "JOURNAL_EXCEEDS_SOURCE_EVENT"
+        assert rt.load_object("JournalEntry", "JE-ZERO-BAD") is None
+
+
+def test_6_postgres16_zero_leaked_temporary_schemas() -> None:
+    assert len(_CREATED_PG_SCHEMAS) >= 4, (
+        "Expected live PG16 runs for standalone 6-domain loop, org RLS, overlay E2E, and security red-team"
     )
     with psycopg.connect(PG_DSN) as conn:
         leaked = conn.execute(
