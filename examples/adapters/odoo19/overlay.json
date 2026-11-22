@@ -1,0 +1,210 @@
+{
+  "overlay_id": "odoo19_customer_overlay",
+  "base_model_id": "std_enterprise_world_model",
+  "target_version": "1.0.0",
+  "description": "Odoo 19 customer monotonic overlay: adds owned ERP-side tag fields, requires completed delivery before O2C invoice posting, and prepends completed receipt check before P2P vendor bill posting.",
+  "add_fields": {
+    "O2cOrder": [
+      {
+        "name": "odoo_sales_channel",
+        "field_type": "str",
+        "default": "direct",
+        "owned": true
+      }
+    ],
+    "P2pPurchaseOrder": [
+      {
+        "name": "odoo_buyer_note",
+        "field_type": "str",
+        "default": "",
+        "owned": true
+      }
+    ],
+    "JournalEntry": [
+      {
+        "name": "odoo_journal_code",
+        "field_type": "str",
+        "default": "MISC",
+        "owned": true
+      }
+    ]
+  },
+  "add_action_preconditions": {
+    "post_o2c_invoice": [
+      {
+        "name": "odoo19_delivery_required_before_invoice",
+        "code": "DELIVERY_REQUIRED_BEFORE_INVOICE",
+        "target_type": "O2cInvoice",
+        "id_param": "invoice_id",
+        "must_hold": {
+          "op": "in",
+          "left": {"ref": "obj.order.status"},
+          "right": {"lit": ["delivered", "invoiced"]}
+        },
+        "description": "Odoo 19 overlay rule: O2C delivery must be completed before posting an O2C customer invoice."
+      }
+    ]
+  },
+  "update_actions": [
+    {
+      "name": "post_p2p_bill",
+      "display_label": "应付账单过账",
+      "description": "正式过账供应商应付账单；若关联采购单处于 disputed 则以 PO_DISPUTED_BLOCKED 硬拦截。",
+      "allowed_roles": [
+        "finance",
+        "finance_director",
+        "procurement_manager",
+        "steward",
+        "ai_agent",
+        "admin"
+      ],
+      "affects_source": true,
+      "params": [
+        {
+          "name": "bill_id",
+          "field_type": "str",
+          "required": true
+        }
+      ],
+      "preconditions": [
+        {
+          "name": "odoo19_receipt_required_before_bill",
+          "code": "RECEIPT_REQUIRED_BEFORE_BILL",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "eq",
+            "left": {"ref": "obj.purchase_order.status"},
+            "right": {"lit": "received"}
+          },
+          "description": "Odoo 19 overlay rule: goods receipt must be completed before posting vendor bill."
+        },
+        {
+          "name": "p2p_bill_po_not_disputed",
+          "code": "PO_DISPUTED_BLOCKED",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "ne",
+            "left": {"ref": "obj.purchase_order.status"},
+            "right": {"lit": "disputed"}
+          },
+          "description": "Blocked while linked P2pPurchaseOrder is disputed."
+        },
+        {
+          "name": "p2p_bill_must_be_draft",
+          "code": "BILL_NOT_DRAFT",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "eq",
+            "left": {"ref": "obj.status"},
+            "right": {"lit": "draft"}
+          },
+          "description": "P2pVendorBill must be draft."
+        },
+        {
+          "name": "p2p_bill_po_must_be_received",
+          "code": "PO_NOT_RECEIVED",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "eq",
+            "left": {"ref": "obj.purchase_order.status"},
+            "right": {"lit": "received"}
+          },
+          "description": "Linked P2pPurchaseOrder must be received."
+        },
+        {
+          "name": "p2p_bill_within_po_amount",
+          "code": "BILL_EXCEEDS_PO_AMOUNT",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "le",
+            "left": {"ref": "obj.amount_total"},
+            "right": {
+              "op": "add",
+              "left": {"ref": "obj.purchase_order.amount_total"},
+              "right": {"lit": 1e-9}
+            }
+          },
+          "description": "Vendor bill amount_total must not exceed PO amount_total."
+        }
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "set_fields": {"status": {"lit": "posted"}}
+        },
+        {
+          "op": "modify",
+          "object_type": "P2pPurchaseOrder",
+          "target_ref": "obj.purchase_order",
+          "set_fields": {"status": {"lit": "billed"}}
+        }
+      ]
+    }
+  ],
+  "add_actions": [
+    {
+      "name": "tag_odoo_order_sales_channel",
+      "display_label": "标注 Odoo 销售渠道",
+      "description": "设置本体自持扩展字段 O2cOrder.odoo_sales_channel，不回写 Odoo。",
+      "allowed_roles": ["sales_rep", "sales_manager", "steward", "ai_agent", "admin"],
+      "affects_source": false,
+      "params": [
+        {"name": "order_id", "field_type": "str", "required": true},
+        {"name": "sales_channel", "field_type": "str", "required": true}
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "O2cOrder",
+          "id_param": "order_id",
+          "set_fields": {"odoo_sales_channel": {"ref": "param.sales_channel"}}
+        }
+      ]
+    },
+    {
+      "name": "set_odoo_po_buyer_note",
+      "display_label": "标注 Odoo 采购备忘",
+      "description": "设置本体自持扩展字段 P2pPurchaseOrder.odoo_buyer_note，不回写 Odoo。",
+      "allowed_roles": ["buyer", "procurement_manager", "steward", "ai_agent", "admin"],
+      "affects_source": false,
+      "params": [
+        {"name": "po_id", "field_type": "str", "required": true},
+        {"name": "buyer_note", "field_type": "str", "required": true}
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "P2pPurchaseOrder",
+          "id_param": "po_id",
+          "set_fields": {"odoo_buyer_note": {"ref": "param.buyer_note"}}
+        }
+      ]
+    },
+    {
+      "name": "tag_odoo_journal_code",
+      "display_label": "标注 Odoo 账簿编码",
+      "description": "设置本体自持扩展字段 JournalEntry.odoo_journal_code，不回写 Odoo。",
+      "allowed_roles": ["chief_accountant", "finance", "finance_director", "steward", "ai_agent", "admin"],
+      "affects_source": false,
+      "params": [
+        {"name": "entry_id", "field_type": "str", "required": true},
+        {"name": "journal_code", "field_type": "str", "required": true}
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "JournalEntry",
+          "id_param": "entry_id",
+          "set_fields": {"odoo_journal_code": {"ref": "param.journal_code"}}
+        }
+      ]
+    }
+  ]
+}

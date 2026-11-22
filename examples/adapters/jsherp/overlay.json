@@ -1,0 +1,242 @@
+{
+  "overlay_id": "jsherp_customer_overlay",
+  "base_model_id": "std_enterprise_world_model",
+  "target_version": "1.0.0",
+  "description": "jshERP customer monotonic overlay: adds owned ontology-side metadata fields, enforces delivery/receipt preconditions before invoicing/billing, and adds additive mandate revocation for clean H2R offboarding.",
+  "add_fields": {
+    "P2pPurchaseOrder": [
+      {
+        "name": "jsh_settlement_account_tag",
+        "field_type": "str",
+        "default": "DEFAULT_ACCT",
+        "owned": true
+      }
+    ],
+    "O2cOrder": [
+      {
+        "name": "jsh_depot_tag",
+        "field_type": "str",
+        "default": "MAIN_DEPOT",
+        "owned": true
+      }
+    ],
+    "Employee": [
+      {
+        "name": "jsh_roster_note",
+        "field_type": "str",
+        "default": "",
+        "owned": true
+      }
+    ]
+  },
+  "add_action_preconditions": {
+    "post_o2c_invoice": [
+      {
+        "name": "jsherp_delivery_required_before_invoice",
+        "code": "DELIVERY_REQUIRED_BEFORE_INVOICE",
+        "target_type": "O2cInvoice",
+        "id_param": "invoice_id",
+        "must_hold": {
+          "op": "in",
+          "left": {"ref": "obj.order.status"},
+          "right": {"lit": ["delivered", "invoiced"]}
+        },
+        "description": "jshERP overlay rule: O2C delivery must be completed before posting an O2C customer invoice."
+      }
+    ]
+  },
+  "update_actions": [
+    {
+      "name": "post_p2p_bill",
+      "display_label": "应付账单过账",
+      "description": "正式过账供应商应付账单；若关联采购单处于 disputed 则以 PO_DISPUTED_BLOCKED 硬拦截。",
+      "allowed_roles": [
+        "finance",
+        "finance_director",
+        "procurement_manager",
+        "steward",
+        "ai_agent",
+        "admin"
+      ],
+      "affects_source": true,
+      "params": [
+        {
+          "name": "bill_id",
+          "field_type": "str",
+          "required": true
+        }
+      ],
+      "preconditions": [
+        {
+          "name": "jsherp_receipt_required_before_bill",
+          "code": "RECEIPT_REQUIRED_BEFORE_BILL",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "eq",
+            "left": {"ref": "obj.purchase_order.status"},
+            "right": {"lit": "received"}
+          },
+          "description": "jshERP overlay rule: goods receipt must be completed before posting vendor bill."
+        },
+        {
+          "name": "p2p_bill_po_not_disputed",
+          "code": "PO_DISPUTED_BLOCKED",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "ne",
+            "left": {"ref": "obj.purchase_order.status"},
+            "right": {"lit": "disputed"}
+          },
+          "description": "Blocked while linked P2pPurchaseOrder is disputed."
+        },
+        {
+          "name": "p2p_bill_must_be_draft",
+          "code": "BILL_NOT_DRAFT",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "eq",
+            "left": {"ref": "obj.status"},
+            "right": {"lit": "draft"}
+          },
+          "description": "P2pVendorBill must be draft."
+        },
+        {
+          "name": "p2p_bill_po_must_be_received",
+          "code": "PO_NOT_RECEIVED",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "eq",
+            "left": {"ref": "obj.purchase_order.status"},
+            "right": {"lit": "received"}
+          },
+          "description": "Linked P2pPurchaseOrder must be received."
+        },
+        {
+          "name": "p2p_bill_within_po_amount",
+          "code": "BILL_EXCEEDS_PO_AMOUNT",
+          "target_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "must_hold": {
+            "op": "le",
+            "left": {"ref": "obj.amount_total"},
+            "right": {
+              "op": "add",
+              "left": {"ref": "obj.purchase_order.amount_total"},
+              "right": {"lit": 1e-9}
+            }
+          },
+          "description": "Vendor bill amount_total must not exceed PO amount_total."
+        }
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "P2pVendorBill",
+          "id_param": "bill_id",
+          "set_fields": {"status": {"lit": "posted"}}
+        },
+        {
+          "op": "modify",
+          "object_type": "P2pPurchaseOrder",
+          "target_ref": "obj.purchase_order",
+          "set_fields": {"status": {"lit": "billed"}}
+        }
+      ]
+    }
+  ],
+  "add_actions": [
+    {
+      "name": "tag_jsh_po_settlement_account",
+      "display_label": "标注华夏 ERP 采购结算账户标签",
+      "description": "设置本体自持扩展字段 P2pPurchaseOrder.jsh_settlement_account_tag，不回写 jshERP。",
+      "allowed_roles": ["buyer", "procurement_manager", "steward", "ai_agent", "admin"],
+      "affects_source": false,
+      "params": [
+        {"name": "po_id", "field_type": "str", "required": true},
+        {"name": "account_tag", "field_type": "str", "required": true}
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "P2pPurchaseOrder",
+          "id_param": "po_id",
+          "set_fields": {"jsh_settlement_account_tag": {"ref": "param.account_tag"}}
+        }
+      ]
+    },
+    {
+      "name": "tag_jsh_order_depot",
+      "display_label": "标注华夏 ERP 销售出库仓标签",
+      "description": "设置本体自持扩展字段 O2cOrder.jsh_depot_tag，不回写 jshERP。",
+      "allowed_roles": ["sales_rep", "sales_manager", "steward", "ai_agent", "admin"],
+      "affects_source": false,
+      "params": [
+        {"name": "order_id", "field_type": "str", "required": true},
+        {"name": "depot_tag", "field_type": "str", "required": true}
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "O2cOrder",
+          "id_param": "order_id",
+          "set_fields": {"jsh_depot_tag": {"ref": "param.depot_tag"}}
+        }
+      ]
+    },
+    {
+      "name": "annotate_jsh_employee_roster",
+      "display_label": "标注华夏 ERP 员工花名册备注",
+      "description": "设置本体自持扩展字段 Employee.jsh_roster_note，不回写 jshERP。",
+      "allowed_roles": ["hr_admin", "hr_director", "steward", "ai_agent", "admin"],
+      "affects_source": false,
+      "params": [
+        {"name": "employee_id", "field_type": "str", "required": true},
+        {"name": "roster_note", "field_type": "str", "required": true}
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "Employee",
+          "id_param": "employee_id",
+          "set_fields": {"jsh_roster_note": {"ref": "param.roster_note"}}
+        }
+      ]
+    },
+    {
+      "name": "revoke_authority_mandate",
+      "display_label": "吊销动态授权委派凭证",
+      "description": "在本体侧将 active 状态的动态授权委派凭证吊销为 revoked，以便员工合规离职。",
+      "allowed_roles": ["hr_admin", "hr_director", "steward", "admin"],
+      "affects_source": false,
+      "params": [
+        {"name": "mandate_id", "field_type": "str", "required": true}
+      ],
+      "preconditions": [
+        {
+          "name": "h2r_revoke_mandate_must_be_active",
+          "code": "MANDATE_NOT_ACTIVE",
+          "target_type": "AuthorityMandate",
+          "id_param": "mandate_id",
+          "must_hold": {
+            "op": "eq",
+            "left": {"ref": "obj.status"},
+            "right": {"lit": "active"}
+          },
+          "description": "AuthorityMandate must be active to revoke."
+        }
+      ],
+      "mutations": [
+        {
+          "op": "modify",
+          "object_type": "AuthorityMandate",
+          "id_param": "mandate_id",
+          "set_fields": {"status": {"lit": "revoked"}}
+        }
+      ]
+    }
+  ]
+}

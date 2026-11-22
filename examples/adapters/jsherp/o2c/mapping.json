@@ -1,0 +1,334 @@
+{
+  "mapping_id": "jsherp_o2c_rest_mapping",
+  "source_kind": "rest_openapi",
+  "treat_false_as_null": false,
+  "entity_mappings": [
+    {
+      "source_table": "jsh_system_config",
+      "target_object_type": "AccountingEntity",
+      "row_filters": [],
+      "id_transform": {
+        "target_field": "entity_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "ENT-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "name",
+          "source_field": "companyName",
+          "kind": "direct"
+        },
+        {
+          "target_field": "base_currency",
+          "source_field": "base_currency",
+          "kind": "const",
+          "default": "CNY"
+        },
+        {
+          "target_field": "status",
+          "source_field": "deleteFlag",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "0": "active",
+            "1": "inactive"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "jsh_supplier",
+      "target_object_type": "BusinessParty",
+      "row_filters": [
+        {
+          "field": "type",
+          "op": "eq",
+          "value": "客户"
+        }
+      ],
+      "id_transform": {
+        "target_field": "party_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "PTY-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "legal_name",
+          "source_field": "supplier",
+          "kind": "direct"
+        },
+        {
+          "target_field": "tax_id",
+          "source_field": "taxNum",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "country_code",
+          "source_field": "country_code",
+          "kind": "const",
+          "default": "CN"
+        },
+        {
+          "target_field": "status",
+          "source_field": "enabled",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "true": "active",
+            "True": "active",
+            "1": "active",
+            "false": "inactive",
+            "False": "inactive",
+            "0": "inactive"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "jsh_supplier",
+      "target_object_type": "O2cCustomerProfile",
+      "row_filters": [
+        {
+          "field": "type",
+          "op": "eq",
+          "value": "客户"
+        }
+      ],
+      "id_transform": {
+        "target_field": "profile_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "CUST-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "credit_limit",
+          "source_field": "advanceIn",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "payment_terms",
+          "source_field": "description",
+          "kind": "direct",
+          "default": "NET30"
+        },
+        {
+          "target_field": "status",
+          "source_field": "enabled",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "true": "active",
+            "True": "active",
+            "1": "active",
+            "false": "inactive",
+            "False": "inactive",
+            "0": "inactive"
+          }
+        },
+        {
+          "target_field": "party",
+          "source_field": "id",
+          "kind": "foreign_key_id",
+          "prefix": "PTY-"
+        },
+        {
+          "target_field": "accounting_entity",
+          "source_field": "company_id",
+          "kind": "foreign_key_id",
+          "prefix": "ENT-"
+        }
+      ]
+    },
+    {
+      "source_table": "jsh_depot_head_order",
+      "target_object_type": "O2cOrder",
+      "row_filters": [],
+      "id_transform": {
+        "target_field": "order_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "ORD-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "order_number",
+          "source_field": "number",
+          "kind": "direct"
+        },
+        {
+          "target_field": "amount_total",
+          "source_field": "totalPrice",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "status",
+          "source_field": "status",
+          "kind": "enum_map",
+          "default": "draft",
+          "enum_map": {
+            "0": "draft",
+            "1": "confirmed",
+            "2": "confirmed",
+            "3": "delivered",
+            "4": "invoiced",
+            "9": "cancelled",
+            "draft": "draft",
+            "confirmed": "confirmed",
+            "delivered": "delivered",
+            "invoiced": "invoiced",
+            "cancelled": "cancelled"
+          }
+        },
+        {
+          "target_field": "customer",
+          "source_field": "organId",
+          "kind": "foreign_key_id",
+          "prefix": "CUST-"
+        },
+        {
+          "target_field": "accounting_entity",
+          "source_field": "company_id",
+          "kind": "foreign_key_id",
+          "prefix": "ENT-"
+        }
+      ]
+    },
+    {
+      "source_table": "jsh_depot_head_delivery",
+      "target_object_type": "O2cDelivery",
+      "row_filters": [],
+      "id_transform": {
+        "target_field": "delivery_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "DEL-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "status",
+          "source_field": "status",
+          "kind": "enum_map",
+          "default": "pending",
+          "enum_map": {
+            "0": "pending",
+            "1": "completed",
+            "9": "cancelled",
+            "pending": "pending",
+            "completed": "completed",
+            "cancelled": "cancelled"
+          }
+        },
+        {
+          "target_field": "order",
+          "source_field": "order_id",
+          "kind": "foreign_key_id",
+          "prefix": "ORD-"
+        }
+      ]
+    },
+    {
+      "source_table": "jsh_account_head_invoice",
+      "target_object_type": "O2cInvoice",
+      "row_filters": [],
+      "id_transform": {
+        "target_field": "invoice_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "INV-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "amount_total",
+          "source_field": "totalPrice",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "amount_residual",
+          "source_field": "amount_residual",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "payment_state",
+          "source_field": "payment_state",
+          "kind": "enum_map",
+          "default": "not_paid",
+          "enum_map": {
+            "not_paid": "not_paid",
+            "partial": "partial",
+            "paid": "paid"
+          }
+        },
+        {
+          "target_field": "status",
+          "source_field": "status",
+          "kind": "enum_map",
+          "default": "draft",
+          "enum_map": {
+            "0": "draft",
+            "1": "posted",
+            "9": "cancelled",
+            "draft": "draft",
+            "posted": "posted",
+            "cancelled": "cancelled"
+          }
+        },
+        {
+          "target_field": "order",
+          "source_field": "order_id",
+          "kind": "foreign_key_id",
+          "prefix": "ORD-"
+        }
+      ]
+    }
+  ],
+  "action_bindings": [
+    {
+      "action_name": "confirm_o2c_order",
+      "external_table": "jsh_depot_head_order",
+      "external_method": "POST /depotHead/batchSetStatus status=1",
+      "target_object_type": "O2cOrder",
+      "id_param": "order_id",
+      "id_prefix": "ORD-",
+      "expected_state_field": "status",
+      "expected_state_after": "confirmed"
+    },
+    {
+      "action_name": "complete_o2c_delivery",
+      "external_table": "jsh_depot_head_delivery",
+      "external_method": "POST /depotHead/batchSetStatus status=1",
+      "target_object_type": "O2cDelivery",
+      "id_param": "delivery_id",
+      "id_prefix": "DEL-",
+      "expected_state_field": "status",
+      "expected_state_after": "completed"
+    },
+    {
+      "action_name": "post_o2c_invoice",
+      "external_table": "jsh_account_head_invoice",
+      "external_method": "POST /accountHead/batchSetStatus status=1",
+      "target_object_type": "O2cInvoice",
+      "id_param": "invoice_id",
+      "id_prefix": "INV-",
+      "expected_state_field": "status",
+      "expected_state_after": "posted"
+    },
+    {
+      "action_name": "record_o2c_payment",
+      "external_table": "jsh_account_head_invoice",
+      "external_method": "PUT /accountHead/updateAccountHeadAndDetail",
+      "target_object_type": "O2cInvoice",
+      "id_param": "invoice_id",
+      "id_prefix": "INV-",
+      "expected_state_field": "status",
+      "expected_state_after": "posted"
+    }
+  ]
+}

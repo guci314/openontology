@@ -1,0 +1,217 @@
+{
+  "mapping_id": "jsherp_h2r_mapping",
+  "source_kind": "http_rest",
+  "treat_false_as_null": false,
+  "entity_mappings": [
+    {
+      "source_table": "jsh_system_config",
+      "target_object_type": "AccountingEntity",
+      "id_transform": {
+        "target_field": "entity_id",
+        "source_field": "tenantId",
+        "kind": "id_prefix",
+        "prefix": "ENT-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "name",
+          "source_field": "companyName",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "base_currency",
+          "source_field": "base_currency",
+          "kind": "direct",
+          "default": "CNY"
+        },
+        {
+          "target_field": "status",
+          "source_field": "deleteFlag",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "0": "active",
+            "active": "active"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "jsh_organization",
+      "target_object_type": "Department",
+      "id_transform": {
+        "target_field": "department_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "DEPT-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "name",
+          "source_field": "orgAbr",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "scope_tag",
+          "source_field": "remark",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "status",
+          "source_field": "deleteFlag",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "0": "active",
+            "active": "active"
+          }
+        },
+        {
+          "target_field": "accounting_entity",
+          "source_field": "tenantId",
+          "kind": "foreign_key_id",
+          "prefix": "ENT-"
+        },
+        {
+          "target_field": "parent_department",
+          "source_field": "parentId",
+          "kind": "foreign_key_id",
+          "prefix": "DEPT-"
+        }
+      ]
+    },
+    {
+      "source_table": "jsh_role",
+      "target_object_type": "JobPosition",
+      "id_transform": {
+        "target_field": "position_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "POS-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "title",
+          "source_field": "name",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "role_name",
+          "source_field": "role_name",
+          "kind": "direct",
+          "default": "ops"
+        },
+        {
+          "target_field": "approval_ceiling_cents",
+          "source_field": "approval_ceiling_cents",
+          "kind": "direct",
+          "default": 0
+        },
+        {
+          "target_field": "status",
+          "source_field": "enabled",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "true": "active",
+            "false": "inactive",
+            "active": "active",
+            "inactive": "inactive"
+          }
+        },
+        {
+          "target_field": "department",
+          "source_field": "department_id",
+          "kind": "foreign_key_id",
+          "prefix": "DEPT-"
+        }
+      ]
+    },
+    {
+      "source_table": "jsh_user",
+      "target_object_type": "Employee",
+      "id_transform": {
+        "target_field": "employee_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "EMP-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "full_name",
+          "source_field": "username",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "actor_id",
+          "source_field": "loginName",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "status",
+          "source_field": "description",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "0": "active",
+            "2": "offboarded",
+            "onboarding": "onboarding",
+            "active": "active",
+            "suspended": "suspended",
+            "offboarded": "offboarded"
+          }
+        },
+        {
+          "target_field": "department",
+          "source_field": "orgaId",
+          "kind": "foreign_key_id",
+          "prefix": "DEPT-"
+        },
+        {
+          "target_field": "position",
+          "source_field": "roleId",
+          "kind": "foreign_key_id",
+          "prefix": "POS-"
+        }
+      ]
+    }
+  ],
+  "action_bindings": [
+    {
+      "action_name": "reparent_department",
+      "external_table": "jsh_organization",
+      "external_method": "PUT /organization/update",
+      "target_object_type": "Department",
+      "id_param": "department_id",
+      "id_prefix": "DEPT-",
+      "expected_state_field": "status",
+      "expected_state_after": "active"
+    },
+    {
+      "action_name": "assign_employee_position",
+      "external_table": "jsh_user",
+      "external_method": "PUT /user/updateUser",
+      "target_object_type": "Employee",
+      "id_param": "employee_id",
+      "id_prefix": "EMP-",
+      "expected_state_field": "status",
+      "expected_state_after": "active"
+    },
+    {
+      "action_name": "offboard_employee",
+      "external_table": "jsh_user",
+      "external_method": "POST /user/batchSetStatus",
+      "target_object_type": "Employee",
+      "id_param": "employee_id",
+      "id_prefix": "EMP-",
+      "expected_state_field": "status",
+      "expected_state_after": "offboarded"
+    }
+  ]
+}

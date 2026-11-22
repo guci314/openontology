@@ -1,0 +1,210 @@
+{
+  "mapping_id": "odoo19_o2c_adapter_mapping",
+  "source_kind": "jsonrpc_erp",
+  "treat_false_as_null": true,
+  "entity_mappings": [
+    {
+      "source_table": "res.company",
+      "target_object_type": "AccountingEntity",
+      "id_transform": {
+        "target_field": "entity_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "ENT-"
+      },
+      "field_transforms": [
+        {"target_field": "name", "source_field": "name", "kind": "direct"},
+        {"target_field": "status", "kind": "const", "default": "active"}
+      ]
+    },
+    {
+      "source_table": "res.partner",
+      "target_object_type": "BusinessParty",
+      "id_transform": {
+        "target_field": "party_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "PTY-"
+      },
+      "field_transforms": [
+        {"target_field": "legal_name", "source_field": "name", "kind": "direct"},
+        {"target_field": "tax_id", "source_field": "vat", "kind": "direct", "default": ""},
+        {"target_field": "status", "kind": "const", "default": "active"}
+      ]
+    },
+    {
+      "source_table": "res.partner",
+      "target_object_type": "O2cCustomerProfile",
+      "id_transform": {
+        "target_field": "profile_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "CUST-"
+      },
+      "field_transforms": [
+        {"target_field": "credit_limit", "source_field": "credit_limit", "kind": "direct", "default": 0.0},
+        {"target_field": "status", "kind": "const", "default": "active"},
+        {"target_field": "party", "source_field": "id", "kind": "foreign_key_id", "prefix": "PTY-"},
+        {"target_field": "accounting_entity", "source_field": "company_id", "kind": "foreign_key_id", "prefix": "ENT-"}
+      ]
+    },
+    {
+      "source_table": "sale.order",
+      "target_object_type": "O2cOrder",
+      "row_filters": [
+        {"field": "partner_id", "op": "truthy"}
+      ],
+      "id_transform": {
+        "target_field": "order_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "SO-"
+      },
+      "field_transforms": [
+        {"target_field": "order_number", "source_field": "name", "kind": "direct"},
+        {"target_field": "amount_total", "source_field": "amount_total", "kind": "direct", "default": 0.0},
+        {
+          "target_field": "status",
+          "source_field": "state",
+          "kind": "enum_map",
+          "default": "draft",
+          "enum_map": {
+            "draft": "draft",
+            "sent": "draft",
+            "sale": "confirmed",
+            "done": "delivered",
+            "cancel": "cancelled",
+            "confirmed": "confirmed",
+            "delivered": "delivered",
+            "invoiced": "invoiced",
+            "cancelled": "cancelled"
+          }
+        },
+        {"target_field": "customer", "source_field": "partner_id", "kind": "foreign_key_id", "prefix": "CUST-"},
+        {"target_field": "accounting_entity", "source_field": "company_id", "kind": "foreign_key_id", "prefix": "ENT-", "default": ""}
+      ]
+    },
+    {
+      "source_table": "stock.picking",
+      "target_object_type": "O2cDelivery",
+      "row_filters": [
+        {"field": "picking_type_code", "op": "eq", "value": "outgoing"}
+      ],
+      "id_transform": {
+        "target_field": "delivery_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "DLV-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "status",
+          "source_field": "state",
+          "kind": "enum_map",
+          "default": "pending",
+          "enum_map": {
+            "draft": "pending",
+            "waiting": "pending",
+            "confirmed": "pending",
+            "assigned": "pending",
+            "done": "completed",
+            "cancel": "cancelled",
+            "pending": "pending",
+            "completed": "completed",
+            "cancelled": "cancelled"
+          }
+        },
+        {"target_field": "order", "source_field": "origin", "kind": "lookup_join", "lookup_table": "sale.order", "lookup_key_field": "name", "lookup_target_type": "O2cOrder"}
+      ]
+    },
+    {
+      "source_table": "account.move",
+      "target_object_type": "O2cInvoice",
+      "row_filters": [
+        {"field": "move_type", "op": "eq", "value": "out_invoice"}
+      ],
+      "id_transform": {
+        "target_field": "invoice_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "INV-"
+      },
+      "field_transforms": [
+        {"target_field": "amount_total", "source_field": "amount_total", "kind": "direct", "default": 0.0},
+        {"target_field": "amount_residual", "source_field": "amount_residual", "kind": "direct", "default": 0.0},
+        {
+          "target_field": "payment_state",
+          "source_field": "payment_state",
+          "kind": "enum_map",
+          "default": "not_paid",
+          "enum_map": {
+            "not_paid": "not_paid",
+            "partial": "partial",
+            "in_payment": "paid",
+            "paid": "paid",
+            "reversed": "not_paid"
+          }
+        },
+        {
+          "target_field": "status",
+          "source_field": "state",
+          "kind": "enum_map",
+          "default": "draft",
+          "enum_map": {
+            "draft": "draft",
+            "posted": "posted",
+            "cancel": "cancelled",
+            "cancelled": "cancelled"
+          }
+        },
+        {"target_field": "order", "source_field": "invoice_origin", "kind": "lookup_join", "lookup_table": "sale.order", "lookup_key_field": "name", "lookup_target_type": "O2cOrder"}
+      ]
+    }
+  ],
+  "action_bindings": [
+    {
+      "action_name": "confirm_o2c_order",
+      "external_table": "sale.order",
+      "external_method": "action_confirm",
+      "target_object_type": "O2cOrder",
+      "id_param": "order_id",
+      "id_prefix": "SO-",
+      "expected_state_field": "status",
+      "expected_state_after": "confirmed",
+      "readback_tables": ["sale.order"]
+    },
+    {
+      "action_name": "complete_o2c_delivery",
+      "external_table": "stock.picking",
+      "external_method": "stock.move.quantity=product_uom_qty;button_validate",
+      "target_object_type": "O2cDelivery",
+      "id_param": "delivery_id",
+      "id_prefix": "DLV-",
+      "expected_state_field": "status",
+      "expected_state_after": "completed",
+      "readback_tables": ["stock.picking", "stock.move"]
+    },
+    {
+      "action_name": "post_o2c_invoice",
+      "external_table": "account.move",
+      "external_method": "action_post",
+      "target_object_type": "O2cInvoice",
+      "id_param": "invoice_id",
+      "id_prefix": "INV-",
+      "expected_state_field": "status",
+      "expected_state_after": "posted",
+      "readback_tables": ["account.move"]
+    },
+    {
+      "action_name": "record_o2c_payment",
+      "external_table": "account.move",
+      "external_method": "account.payment.register.create;action_create_payments",
+      "target_object_type": "O2cInvoice",
+      "id_param": "invoice_id",
+      "id_prefix": "INV-",
+      "expected_state_field": "payment_state",
+      "expected_state_after": "paid",
+      "readback_tables": ["account.move", "account.payment"]
+    }
+  ]
+}

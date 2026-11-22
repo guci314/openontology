@@ -1,0 +1,378 @@
+{
+  "mapping_id": "odoo19_p2p_mapping",
+  "source_kind": "odoo_jsonrpc",
+  "treat_false_as_null": true,
+  "entity_mappings": [
+    {
+      "source_table": "res.company",
+      "target_object_type": "AccountingEntity",
+      "id_transform": {
+        "target_field": "entity_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "ENT-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "name",
+          "source_field": "name",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "base_currency",
+          "source_field": "currency_id",
+          "kind": "direct",
+          "default": "USD"
+        },
+        {
+          "target_field": "status",
+          "source_field": "active",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "true": "active",
+            "false": "inactive",
+            "active": "active",
+            "inactive": "inactive"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "res.partner",
+      "target_object_type": "BusinessParty",
+      "row_filters": [
+        {
+          "field": "supplier_rank",
+          "op": "gt",
+          "value": 0
+        }
+      ],
+      "id_transform": {
+        "target_field": "party_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "PTY-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "legal_name",
+          "source_field": "name",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "tax_id",
+          "source_field": "vat",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "country_code",
+          "source_field": "country_id",
+          "kind": "direct",
+          "default": "CN"
+        },
+        {
+          "target_field": "status",
+          "source_field": "active",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "true": "active",
+            "false": "inactive",
+            "active": "active",
+            "inactive": "inactive"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "res.partner",
+      "target_object_type": "P2pSupplierProfile",
+      "row_filters": [
+        {
+          "field": "supplier_rank",
+          "op": "gt",
+          "value": 0
+        }
+      ],
+      "id_transform": {
+        "target_field": "profile_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "SUP-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "party",
+          "source_field": "id",
+          "kind": "foreign_key_id",
+          "prefix": "PTY-"
+        },
+        {
+          "target_field": "accounting_entity",
+          "source_field": "company_id",
+          "kind": "foreign_key_id",
+          "prefix": "ENT-"
+        },
+        {
+          "target_field": "payment_terms",
+          "source_field": "property_supplier_payment_term_id",
+          "kind": "direct",
+          "default": "NET30"
+        },
+        {
+          "target_field": "status",
+          "source_field": "active",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "true": "active",
+            "false": "inactive",
+            "active": "active",
+            "inactive": "inactive"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "purchase.order",
+      "target_object_type": "P2pPurchaseOrder",
+      "id_transform": {
+        "target_field": "po_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "PO-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "po_number",
+          "source_field": "name",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "supplier",
+          "source_field": "partner_id",
+          "kind": "foreign_key_id",
+          "prefix": "SUP-"
+        },
+        {
+          "target_field": "accounting_entity",
+          "source_field": "company_id",
+          "kind": "foreign_key_id",
+          "prefix": "ENT-"
+        },
+        {
+          "target_field": "ordered_qty",
+          "source_field": "ordered_qty",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "unit_price",
+          "source_field": "unit_price",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "amount_total",
+          "source_field": "amount_total",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "status",
+          "source_field": "state",
+          "kind": "enum_map",
+          "default": "draft",
+          "enum_map": {
+            "draft": "draft",
+            "sent": "draft",
+            "to approve": "draft",
+            "purchase": "confirmed",
+            "done": "received",
+            "cancel": "cancelled",
+            "confirmed": "confirmed",
+            "received": "received",
+            "disputed": "disputed",
+            "billed": "billed",
+            "cancelled": "cancelled"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "stock.picking",
+      "target_object_type": "P2pGoodsReceipt",
+      "row_filters": [
+        {
+          "field": "picking_type_code",
+          "op": "eq",
+          "value": "incoming"
+        }
+      ],
+      "id_transform": {
+        "target_field": "receipt_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "GR-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "purchase_order",
+          "source_field": "purchase_id",
+          "kind": "foreign_key_id",
+          "prefix": "PO-"
+        },
+        {
+          "target_field": "expected_qty",
+          "source_field": "expected_qty",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "received_qty",
+          "source_field": "received_qty",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "inspection_status",
+          "source_field": "inspection_status",
+          "kind": "enum_map",
+          "default": "pending",
+          "enum_map": {
+            "pending": "pending",
+            "passed": "passed",
+            "failed": "failed"
+          }
+        },
+        {
+          "target_field": "status",
+          "source_field": "state",
+          "kind": "enum_map",
+          "default": "pending",
+          "enum_map": {
+            "draft": "pending",
+            "waiting": "pending",
+            "confirmed": "pending",
+            "assigned": "pending",
+            "done": "completed",
+            "cancel": "cancelled",
+            "pending": "pending",
+            "completed": "completed",
+            "disputed": "disputed",
+            "cancelled": "cancelled"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "account.move",
+      "target_object_type": "P2pVendorBill",
+      "row_filters": [
+        {
+          "field": "move_type",
+          "op": "eq",
+          "value": "in_invoice"
+        }
+      ],
+      "id_transform": {
+        "target_field": "bill_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "BILL-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "purchase_order",
+          "source_field": "purchase_order_id",
+          "kind": "foreign_key_id",
+          "prefix": "PO-"
+        },
+        {
+          "target_field": "amount_total",
+          "source_field": "amount_total",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "amount_residual",
+          "source_field": "amount_residual",
+          "kind": "direct",
+          "default": 0.0
+        },
+        {
+          "target_field": "payment_state",
+          "source_field": "payment_state",
+          "kind": "enum_map",
+          "default": "not_paid",
+          "enum_map": {
+            "not_paid": "not_paid",
+            "partial": "partial",
+            "in_payment": "paid",
+            "paid": "paid",
+            "reversed": "not_paid"
+          }
+        },
+        {
+          "target_field": "status",
+          "source_field": "state",
+          "kind": "enum_map",
+          "default": "draft",
+          "enum_map": {
+            "draft": "draft",
+            "posted": "posted",
+            "cancel": "cancelled",
+            "cancelled": "cancelled"
+          }
+        }
+      ]
+    }
+  ],
+  "action_bindings": [
+    {
+      "action_name": "confirm_p2p_order",
+      "external_table": "purchase.order",
+      "external_method": "button_confirm",
+      "target_object_type": "P2pPurchaseOrder",
+      "id_param": "po_id",
+      "id_prefix": "PO-",
+      "expected_state_field": "status",
+      "expected_state_after": "confirmed"
+    },
+    {
+      "action_name": "record_p2p_receipt",
+      "external_table": "stock.picking",
+      "external_method": "button_validate",
+      "target_object_type": "P2pGoodsReceipt",
+      "id_param": "receipt_id",
+      "id_prefix": "GR-",
+      "expected_state_field": "status",
+      "expected_state_after": "completed"
+    },
+    {
+      "action_name": "post_p2p_bill",
+      "external_table": "account.move",
+      "external_method": "action_post",
+      "target_object_type": "P2pVendorBill",
+      "id_param": "bill_id",
+      "id_prefix": "BILL-",
+      "expected_state_field": "status",
+      "expected_state_after": "posted"
+    },
+    {
+      "action_name": "record_p2p_payment",
+      "external_table": "account.move",
+      "external_method": "account.payment.register:action_create_payments",
+      "target_object_type": "P2pVendorBill",
+      "id_param": "bill_id",
+      "id_prefix": "BILL-",
+      "expected_state_field": "status",
+      "expected_state_after": "posted"
+    }
+  ]
+}

@@ -1,0 +1,261 @@
+{
+  "mapping_id": "odoo19_r2r_mapping",
+  "source_kind": "odoo_jsonrpc",
+  "treat_false_as_null": true,
+  "entity_mappings": [
+    {
+      "source_table": "res.company",
+      "target_object_type": "AccountingEntity",
+      "id_transform": {
+        "target_field": "entity_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "ENT-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "name",
+          "source_field": "name",
+          "kind": "direct"
+        },
+        {
+          "target_field": "base_currency",
+          "source_field": "currency_id",
+          "kind": "direct",
+          "default": "USD"
+        },
+        {
+          "target_field": "status",
+          "source_field": "active",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "true": "active",
+            "false": "inactive"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "account.fiscal.period",
+      "target_object_type": "FiscalPeriod",
+      "id_transform": {
+        "target_field": "period_id",
+        "source_field": "period_key",
+        "kind": "id_prefix",
+        "prefix": "FP-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "accounting_entity",
+          "source_field": "company_id",
+          "kind": "foreign_key_id",
+          "prefix": "ENT-"
+        },
+        {
+          "target_field": "start_date",
+          "source_field": "start_date",
+          "kind": "direct"
+        },
+        {
+          "target_field": "end_date",
+          "source_field": "end_date",
+          "kind": "direct"
+        },
+        {
+          "target_field": "status",
+          "source_field": "status",
+          "kind": "enum_map",
+          "default": "open",
+          "enum_map": {
+            "open": "open",
+            "closing": "closing",
+            "closed": "closed"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "account.account",
+      "target_object_type": "GlAccount",
+      "id_transform": {
+        "target_field": "account_code",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "ACC-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "accounting_entity",
+          "source_field": "company_id",
+          "kind": "foreign_key_id",
+          "prefix": "ENT-"
+        },
+        {
+          "target_field": "name",
+          "source_field": "name",
+          "kind": "direct"
+        },
+        {
+          "target_field": "category",
+          "source_field": "account_type",
+          "kind": "enum_map",
+          "default": "ASSET",
+          "enum_map": {
+            "asset_receivable": "ASSET",
+            "asset_cash": "ASSET",
+            "asset_current": "ASSET",
+            "asset_non_current": "ASSET",
+            "asset_prepayments": "ASSET",
+            "asset_fixed": "ASSET",
+            "liability_payable": "LIABILITY",
+            "liability_credit_card": "LIABILITY",
+            "liability_current": "LIABILITY",
+            "liability_non_current": "LIABILITY",
+            "equity": "EQUITY",
+            "equity_unaffected": "EQUITY",
+            "income": "REVENUE",
+            "income_other": "REVENUE",
+            "expense": "EXPENSE",
+            "expense_depreciation": "EXPENSE",
+            "expense_direct_cost": "EXPENSE"
+          }
+        },
+        {
+          "target_field": "normal_side",
+          "source_field": "account_type",
+          "kind": "enum_map",
+          "default": "DEBIT",
+          "enum_map": {
+            "asset_receivable": "DEBIT",
+            "asset_cash": "DEBIT",
+            "asset_current": "DEBIT",
+            "asset_non_current": "DEBIT",
+            "asset_prepayments": "DEBIT",
+            "asset_fixed": "DEBIT",
+            "liability_payable": "CREDIT",
+            "liability_credit_card": "CREDIT",
+            "liability_current": "CREDIT",
+            "liability_non_current": "CREDIT",
+            "equity": "CREDIT",
+            "equity_unaffected": "CREDIT",
+            "income": "CREDIT",
+            "income_other": "CREDIT",
+            "expense": "DEBIT",
+            "expense_depreciation": "DEBIT",
+            "expense_direct_cost": "DEBIT"
+          }
+        },
+        {
+          "target_field": "debit_total_cents",
+          "source_field": "debit_total_cents",
+          "kind": "direct",
+          "default": 0
+        },
+        {
+          "target_field": "credit_total_cents",
+          "source_field": "credit_total_cents",
+          "kind": "direct",
+          "default": 0
+        },
+        {
+          "target_field": "status",
+          "source_field": "active",
+          "kind": "enum_map",
+          "default": "active",
+          "enum_map": {
+            "true": "active",
+            "false": "frozen"
+          }
+        }
+      ]
+    },
+    {
+      "source_table": "account.move",
+      "target_object_type": "JournalEntry",
+      "id_transform": {
+        "target_field": "entry_id",
+        "source_field": "id",
+        "kind": "id_prefix",
+        "prefix": "JE-"
+      },
+      "field_transforms": [
+        {
+          "target_field": "accounting_entity",
+          "source_field": "company_id",
+          "kind": "foreign_key_id",
+          "prefix": "ENT-"
+        },
+        {
+          "target_field": "fiscal_period",
+          "source_field": "period_key",
+          "kind": "foreign_key_id",
+          "prefix": "FP-"
+        },
+        {
+          "target_field": "debit_account",
+          "source_field": "debit_account_id",
+          "kind": "foreign_key_id",
+          "prefix": "ACC-"
+        },
+        {
+          "target_field": "credit_account",
+          "source_field": "credit_account_id",
+          "kind": "foreign_key_id",
+          "prefix": "ACC-"
+        },
+        {
+          "target_field": "amount_cents",
+          "source_field": "amount_cents",
+          "kind": "direct",
+          "default": 0
+        },
+        {
+          "target_field": "memo",
+          "source_field": "ref",
+          "kind": "direct",
+          "default": ""
+        },
+        {
+          "target_field": "reversal_of",
+          "source_field": "reversed_entry_id",
+          "kind": "foreign_key_id",
+          "prefix": "JE-"
+        },
+        {
+          "target_field": "status",
+          "source_field": "state",
+          "kind": "enum_map",
+          "default": "draft",
+          "enum_map": {
+            "draft": "draft",
+            "posted": "posted",
+            "reversed": "reversed"
+          }
+        }
+      ]
+    }
+  ],
+  "action_bindings": [
+    {
+      "action_name": "post_journal_entry",
+      "external_table": "account.move",
+      "external_method": "action_post",
+      "target_object_type": "JournalEntry",
+      "id_param": "entry_id",
+      "id_prefix": "JE-",
+      "expected_state_field": "status",
+      "expected_state_after": "posted"
+    },
+    {
+      "action_name": "reverse_journal_entry",
+      "external_table": "account.move",
+      "external_method": "account.move.reversal.reverse_moves",
+      "target_object_type": "JournalEntry",
+      "id_param": "entry_id",
+      "id_prefix": "JE-",
+      "expected_state_field": "status",
+      "expected_state_after": "reversed"
+    }
+  ]
+}
