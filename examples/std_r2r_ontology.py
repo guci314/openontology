@@ -270,6 +270,8 @@ def _has_completed_manual_journal_work_card(ctx: Any, entry_id: str) -> bool:
     for card in ctx.query(WorkCard):
         if (
             card.status == "COMPLETED"
+            and card.card_kind == "APPROVAL"
+            and card.assignee_role in ("finance_director", "admin")
             and card.target_object_type == "JournalEntry"
             and card.target_object_id == entry_id
             and card.requested_action == "post_journal_entry"
@@ -378,7 +380,22 @@ def post_journal_entry(ctx: Any, params: PostJournalEntryParams) -> None:
             code="PERIOD_CLOSED_POSTING_FORBIDDEN",
         )
 
-    is_manual = not entry.source_event
+    is_manual = True
+    if entry.source_event:
+        ev = ctx.require(FulfillmentEvent, entry.source_event)
+        if ev.status != "confirmed":
+            raise InvariantError(
+                f"JournalEntry:{entry.entry_id} source_event {ev.event_id!r} status is {ev.status!r}, expected 'confirmed'",
+                code="SOURCE_EVENT_NOT_CONFIRMED",
+            )
+        if ev.amount > 0:
+            max_cents = int(round(ev.amount * 100))
+            if entry.amount_cents > max_cents:
+                raise InvariantError(
+                    f"JournalEntry:{entry.entry_id} amount_cents={entry.amount_cents} exceeds source_event amount_cents={max_cents}",
+                    code="JOURNAL_EXCEEDS_SOURCE_EVENT",
+                )
+            is_manual = False
     if (
         is_manual
         and entry.amount_cents >= MANUAL_JOURNAL_APPROVAL_THRESHOLD_CENTS
@@ -404,6 +421,11 @@ def post_journal_entry(ctx: Any, params: PostJournalEntryParams) -> None:
 )
 def reverse_journal_entry(ctx: Any, params: ReverseJournalEntryParams) -> None:
     orig = ctx.require(JournalEntry, params.entry_id)
+    if orig.reversal_of:
+        raise InvariantError(
+            f"JournalEntry:{orig.entry_id} is itself a reversal entry of {orig.reversal_of!r} and cannot be reversed",
+            code="CANNOT_REVERSE_REVERSAL_ENTRY",
+        )
     if orig.status == "reversed" or any(
         e.reversal_of == orig.entry_id for e in ctx.query(JournalEntry)
     ):
@@ -805,6 +827,47 @@ def build_std_r2r_blueprint() -> DeclarativeBlueprint:
                         },
                     },
                     {
+                        "name": "r2r_post_source_event_confirmed",
+                        "code": "SOURCE_EVENT_NOT_CONFIRMED",
+                        "target_type": "JournalEntry",
+                        "id_param": "entry_id",
+                        "when": {
+                            "op": "and",
+                            "args": [
+                                {"op": "ne", "left": {"ref": "obj.source_event"}, "right": {"lit": None}},
+                                {"op": "ne", "left": {"ref": "obj.source_event"}, "right": {"lit": ""}},
+                            ],
+                        },
+                        "must_hold": {
+                            "op": "eq",
+                            "left": {"ref": "obj.source_event.status"},
+                            "right": {"lit": "confirmed"},
+                        },
+                    },
+                    {
+                        "name": "r2r_post_within_source_event_amount",
+                        "code": "JOURNAL_EXCEEDS_SOURCE_EVENT",
+                        "target_type": "JournalEntry",
+                        "id_param": "entry_id",
+                        "when": {
+                            "op": "and",
+                            "args": [
+                                {"op": "ne", "left": {"ref": "obj.source_event"}, "right": {"lit": None}},
+                                {"op": "ne", "left": {"ref": "obj.source_event"}, "right": {"lit": ""}},
+                                {"op": "gt", "left": {"ref": "obj.source_event.amount"}, "right": {"lit": 0}},
+                            ],
+                        },
+                        "must_hold": {
+                            "op": "le",
+                            "left": {"ref": "obj.amount_cents"},
+                            "right": {
+                                "op": "add",
+                                "left": {"op": "mul", "left": {"ref": "obj.source_event.amount"}, "right": {"lit": 100}},
+                                "right": {"lit": 0.5},
+                            },
+                        },
+                    },
+                    {
                         "name": "r2r_post_manual_journal_approval_gate",
                         "code": "APPROVAL_REQUIRED_MANUAL_JOURNAL",
                         "target_type": "JournalEntry",
@@ -817,6 +880,7 @@ def build_std_r2r_blueprint() -> DeclarativeBlueprint:
                                     "args": [
                                         {"op": "eq", "left": {"ref": "obj.source_event"}, "right": {"lit": None}},
                                         {"op": "eq", "left": {"ref": "obj.source_event"}, "right": {"lit": ""}},
+                                        {"op": "le", "left": {"ref": "obj.source_event.amount"}, "right": {"lit": 0}},
                                     ],
                                 },
                                 {
@@ -837,6 +901,8 @@ def build_std_r2r_blueprint() -> DeclarativeBlueprint:
                                         "op": "and",
                                         "args": [
                                             {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "COMPLETED"}},
+                                            {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"lit": "APPROVAL"}},
+                                            {"op": "in", "left": {"ref": "target.assignee_role"}, "right": {"lit": ["finance_director", "admin"]}},
                                             {"op": "eq", "left": {"ref": "target.target_object_type"}, "right": {"lit": "JournalEntry"}},
                                             {"op": "eq", "left": {"ref": "target.target_object_id"}, "right": {"ref": "obj.entry_id"}},
                                             {"op": "eq", "left": {"ref": "target.requested_action"}, "right": {"lit": "post_journal_entry"}},
@@ -892,6 +958,13 @@ def build_std_r2r_blueprint() -> DeclarativeBlueprint:
                     {"name": "memo", "field_type": "str", "default": ""},
                 ],
                 "preconditions": [
+                    {
+                        "name": "r2r_reverse_forbids_reversal_entry",
+                        "code": "CANNOT_REVERSE_REVERSAL_ENTRY",
+                        "target_type": "JournalEntry",
+                        "id_param": "entry_id",
+                        "must_hold": {"op": "eq", "left": {"ref": "obj.reversal_of"}, "right": {"lit": ""}},
+                    },
                     {
                         "name": "r2r_reverse_not_already_reversed",
                         "code": "ENTRY_ALREADY_REVERSED",

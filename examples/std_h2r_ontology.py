@@ -258,7 +258,7 @@ def h2r_mandate_no_self_grant(view: Any) -> bool:
 @spec.invariant(
     "h2r_no_active_mandate_for_offboarded",
     code="OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN",
-    description="已离职员工名下不得保留任何 active 状态的 AuthorityMandate。",
+    description="已离职员工（无论作为被授权人还是原授权人）名下不得保留任何 active 状态的 AuthorityMandate。",
 )
 def h2r_no_active_mandate_for_offboarded(view: Any) -> bool:
     for mandate in view.query(AuthorityMandate):
@@ -267,7 +267,13 @@ def h2r_no_active_mandate_for_offboarded(view: Any) -> bool:
         grantee = view.get(Employee, mandate.grantee)
         if grantee is not None and grantee.status == "offboarded":
             raise InvariantError(
-                f"AuthorityMandate:{mandate.mandate_id} remains active for offboarded Employee:{grantee.employee_id}",
+                f"AuthorityMandate:{mandate.mandate_id} remains active for offboarded grantee Employee:{grantee.employee_id}",
+                code="OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN",
+            )
+        grantor = view.get(Employee, mandate.grantor)
+        if grantor is not None and grantor.status == "offboarded":
+            raise InvariantError(
+                f"AuthorityMandate:{mandate.mandate_id} remains active for offboarded grantor Employee:{grantor.employee_id}",
                 code="OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN",
             )
     return True
@@ -302,15 +308,15 @@ def h2r_employee_fsm(diff: Any, _view: Any) -> bool:
     return True
 
 
-def _has_completed_mandate_escalation_card(
-    ctx: Any, mandate_id: str, grantee_id: str
-) -> bool:
+def _has_completed_mandate_escalation_card(ctx: Any, mandate_id: str) -> bool:
     for card in ctx.query(WorkCard):
-        if card.status != "COMPLETED" or card.requested_action != "grant_authority_mandate":
-            continue
         if (
-            (card.target_object_type == "Employee" and card.target_object_id == grantee_id)
-            or (card.target_object_type == "AuthorityMandate" and card.target_object_id == mandate_id)
+            card.status == "COMPLETED"
+            and card.card_kind == "APPROVAL"
+            and card.assignee_role in ("hr_director", "admin")
+            and card.target_object_type == "AuthorityMandate"
+            and card.target_object_id == mandate_id
+            and card.requested_action == "grant_authority_mandate"
         ):
             return True
     return False
@@ -471,20 +477,34 @@ def grant_authority_mandate(ctx: Any, params: GrantAuthorityMandateParams) -> No
             code="UNKNOWN_ROLE",
         )
 
-    if params.ceiling_cents > grantor_pos.approval_ceiling_cents:
-        is_privileged = ctx.actor.role in ("hr_director", "admin") or _has_completed_mandate_escalation_card(
-            ctx, params.mandate_id, grantee.employee_id
+    is_privileged = ctx.actor.role in ("hr_director", "admin") or _has_completed_mandate_escalation_card(
+        ctx, params.mandate_id
+    )
+    if not is_privileged and (not grantor.actor_id or grantor.actor_id != ctx.actor.actor_id):
+        raise InvariantError(
+            f"Actor {ctx.actor.actor_id!r} ({ctx.actor.role!r}) cannot impersonate grantor Employee:{grantor.employee_id} (actor_id={grantor.actor_id!r})",
+            code="MANDATE_GRANTOR_IMPERSONATION_FORBIDDEN",
         )
-        if not is_privileged:
-            if params.escalate_approval:
-                raise InvariantError(
-                    f"Mandate ceiling_cents={params.ceiling_cents} exceeds grantor ceiling {grantor_pos.approval_ceiling_cents}; requires hr_director approval",
-                    code="APPROVAL_REQUIRED_AUTHORITY_ESCALATION",
-                )
+    if params.role_name == "admin" and ctx.actor.role != "admin":
+        raise InvariantError(
+            "Only 'admin' may grant an 'admin' AuthorityMandate",
+            code="ADMIN_ROLE_DELEGATION_FORBIDDEN",
+        )
+    if params.role_name != grantor_pos.role_name and not is_privileged:
+        raise InvariantError(
+            f"Grantor Employee:{grantor.employee_id} role {grantor_pos.role_name!r} cannot escalate mandate to {params.role_name!r}",
+            code="MANDATE_ROLE_ESCALATION_FORBIDDEN",
+        )
+    if params.ceiling_cents > grantor_pos.approval_ceiling_cents and not is_privileged:
+        if params.escalate_approval:
             raise InvariantError(
-                f"Mandate ceiling_cents={params.ceiling_cents} exceeds grantor approval_ceiling_cents={grantor_pos.approval_ceiling_cents}",
-                code="MANDATE_EXCEEDS_GRANTOR_CEILING",
+                f"Mandate ceiling_cents={params.ceiling_cents} exceeds grantor ceiling {grantor_pos.approval_ceiling_cents}; requires hr_director approval",
+                code="APPROVAL_REQUIRED_AUTHORITY_ESCALATION",
             )
+        raise InvariantError(
+            f"Mandate ceiling_cents={params.ceiling_cents} exceeds grantor approval_ceiling_cents={grantor_pos.approval_ceiling_cents}",
+            code="MANDATE_EXCEEDS_GRANTOR_CEILING",
+        )
 
     ctx.create(
         AuthorityMandate(
@@ -504,7 +524,7 @@ def grant_authority_mandate(ctx: Any, params: GrantAuthorityMandateParams) -> No
     OffboardEmployeeParams,
     allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
     touched_object_types=("Employee", "AuthorityMandate"),
-    description="办理员工离职并在同一原子事务内自动吊销其名下全部 active 的 AuthorityMandate。",
+    description="办理员工离职并在同一原子事务内自动吊销其作为授权人与被授权人的全部 active AuthorityMandate。",
 )
 def offboard_employee(ctx: Any, params: OffboardEmployeeParams) -> None:
     emp = ctx.require(Employee, params.employee_id)
@@ -519,7 +539,9 @@ def offboard_employee(ctx: Any, params: OffboardEmployeeParams) -> None:
             code="INVALID_EMPLOYEE_OFFBOARD_STATUS",
         )
     for mandate in ctx.query(AuthorityMandate):
-        if mandate.grantee == emp.employee_id and mandate.status == "active":
+        if (
+            mandate.grantee == emp.employee_id or mandate.grantor == emp.employee_id
+        ) and mandate.status == "active":
             ctx.modify(mandate, status="revoked")
     ctx.modify(emp, status="offboarded")
 
@@ -766,11 +788,19 @@ def build_std_h2r_blueprint() -> DeclarativeBlueprint:
                 "code": "MANDATE_SELF_GRANT_FORBIDDEN",
                 "target_type": "AuthorityMandate",
                 "must_hold": {
-                    "op": "ne",
-                    "left": {"ref": "obj.grantor"},
-                    "right": {"ref": "obj.grantee"},
+                    "op": "and",
+                    "args": [
+                        {"op": "ne", "left": {"ref": "obj.grantor"}, "right": {"ref": "obj.grantee"}},
+                        {
+                            "op": "or",
+                            "args": [
+                                {"op": "eq", "left": {"ref": "obj.grantor.actor_id"}, "right": {"lit": ""}},
+                                {"op": "ne", "left": {"ref": "obj.grantor.actor_id"}, "right": {"ref": "obj.grantee.actor_id"}},
+                            ],
+                        },
+                    ],
                 },
-                "description": "职责分离（SoD）：AuthorityMandate 授权人与被授权人不得为同一员工。",
+                "description": "职责分离（SoD）：AuthorityMandate 授权人与被授权人不得为同一员工或同一 actor_id。",
             },
             {
                 "name": "h2r_no_active_mandate_for_offboarded",
@@ -778,11 +808,13 @@ def build_std_h2r_blueprint() -> DeclarativeBlueprint:
                 "target_type": "AuthorityMandate",
                 "when": {"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "active"}},
                 "must_hold": {
-                    "op": "ne",
-                    "left": {"ref": "obj.grantee.status"},
-                    "right": {"lit": "offboarded"},
+                    "op": "and",
+                    "args": [
+                        {"op": "ne", "left": {"ref": "obj.grantee.status"}, "right": {"lit": "offboarded"}},
+                        {"op": "ne", "left": {"ref": "obj.grantor.status"}, "right": {"lit": "offboarded"}},
+                    ],
                 },
-                "description": "已离职员工名下不得保留任何 active 状态的 AuthorityMandate。",
+                "description": "已离职员工（无论作为被授权人还是原授权人）名下不得保留任何 active 状态的 AuthorityMandate。",
             },
         ],
         "actions": [
@@ -802,18 +834,6 @@ def build_std_h2r_blueprint() -> DeclarativeBlueprint:
                         "target_type": "Department",
                         "id_param": "department_id",
                         "must_hold": {"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "active"}},
-                    },
-                    {
-                        "name": "h2r_reparent_not_self",
-                        "code": "DEPARTMENT_CYCLE_DETECTED",
-                        "target_type": "Department",
-                        "id_param": "department_id",
-                        "when": {"op": "ne", "left": {"ref": "param.new_parent_id"}, "right": {"lit": ""}},
-                        "must_hold": {
-                            "op": "ne",
-                            "left": {"ref": "param.new_parent_id"},
-                            "right": {"ref": "obj.department_id"},
-                        },
                     },
                     {
                         "name": "h2r_reparent_parent_active",
@@ -847,31 +867,6 @@ def build_std_h2r_blueprint() -> DeclarativeBlueprint:
                                 "args": [
                                     {"op": "eq", "left": {"ref": "target.department_id"}, "right": {"ref": "param.new_parent_id"}},
                                     {"op": "eq", "left": {"ref": "target.accounting_entity"}, "right": {"ref": "obj.accounting_entity"}},
-                                ],
-                            },
-                        },
-                    },
-                    {
-                        "name": "h2r_reparent_no_ancestor_cycle",
-                        "code": "DEPARTMENT_CYCLE_DETECTED",
-                        "target_type": "Department",
-                        "id_param": "department_id",
-                        "when": {"op": "ne", "left": {"ref": "param.new_parent_id"}, "right": {"lit": ""}},
-                        "must_hold": {
-                            "op": "not_exists",
-                            "object_type": "Department",
-                            "where": {
-                                "op": "and",
-                                "args": [
-                                    {"op": "eq", "left": {"ref": "target.department_id"}, "right": {"ref": "param.new_parent_id"}},
-                                    {
-                                        "op": "or",
-                                        "args": [
-                                            {"op": "eq", "left": {"ref": "target.parent_department"}, "right": {"ref": "obj.department_id"}},
-                                            {"op": "eq", "left": {"ref": "target.parent_department.parent_department"}, "right": {"ref": "obj.department_id"}},
-                                            {"op": "eq", "left": {"ref": "target.parent_department.parent_department.parent_department"}, "right": {"ref": "obj.department_id"}},
-                                        ],
-                                    },
                                 ],
                             },
                         },
@@ -1000,30 +995,6 @@ def build_std_h2r_blueprint() -> DeclarativeBlueprint:
                         "must_hold": {"op": "gt", "left": {"ref": "param.ceiling_cents"}, "right": {"lit": 0}},
                     },
                     {
-                        "name": "h2r_grant_no_self_sod",
-                        "code": "MANDATE_SELF_GRANT_FORBIDDEN",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "must_hold": {
-                            "op": "and",
-                            "args": [
-                                {"op": "ne", "left": {"ref": "param.grantor_id"}, "right": {"ref": "param.grantee_id"}},
-                                {
-                                    "op": "not_exists",
-                                    "object_type": "Employee",
-                                    "where": {
-                                        "op": "and",
-                                        "args": [
-                                            {"op": "eq", "left": {"ref": "target.employee_id"}, "right": {"ref": "param.grantee_id"}},
-                                            {"op": "ne", "left": {"ref": "obj.actor_id"}, "right": {"lit": ""}},
-                                            {"op": "eq", "left": {"ref": "target.actor_id"}, "right": {"ref": "obj.actor_id"}},
-                                        ],
-                                    },
-                                },
-                            ],
-                        },
-                    },
-                    {
                         "name": "h2r_grant_grantor_active",
                         "code": "EMPLOYEE_NOT_ACTIVE",
                         "target_type": "Employee",
@@ -1043,6 +1014,36 @@ def build_std_h2r_blueprint() -> DeclarativeBlueprint:
                         "target_type": "Employee",
                         "id_param": "grantor_id",
                         "must_hold": {"op": "eq", "left": {"ref": "obj.position.status"}, "right": {"lit": "active"}},
+                    },
+                    {
+                        "name": "h2r_grant_no_impersonation",
+                        "code": "MANDATE_GRANTOR_IMPERSONATION_FORBIDDEN",
+                        "target_type": "Employee",
+                        "id_param": "grantor_id",
+                        "when": {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": ["hr_director", "admin"]}},
+                        "must_hold": {
+                            "op": "and",
+                            "args": [
+                                {"op": "ne", "left": {"ref": "obj.actor_id"}, "right": {"lit": ""}},
+                                {"op": "eq", "left": {"ref": "obj.actor_id"}, "right": {"ref": "actor.actor_id"}},
+                            ],
+                        },
+                    },
+                    {
+                        "name": "h2r_grant_forbid_admin_delegation",
+                        "code": "ADMIN_ROLE_DELEGATION_FORBIDDEN",
+                        "target_type": "Employee",
+                        "id_param": "grantor_id",
+                        "when": {"op": "eq", "left": {"ref": "param.role_name"}, "right": {"lit": "admin"}},
+                        "must_hold": {"op": "eq", "left": {"ref": "actor.role"}, "right": {"lit": "admin"}},
+                    },
+                    {
+                        "name": "h2r_grant_no_role_escalation",
+                        "code": "MANDATE_ROLE_ESCALATION_FORBIDDEN",
+                        "target_type": "Employee",
+                        "id_param": "grantor_id",
+                        "when": {"op": "ne", "left": {"ref": "param.role_name"}, "right": {"ref": "obj.position.role_name"}},
+                        "must_hold": {"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["hr_director", "admin"]}},
                     },
                     {
                         "name": "h2r_grant_exceeds_ceiling_direct_block",
@@ -1085,8 +1086,10 @@ def build_std_h2r_blueprint() -> DeclarativeBlueprint:
                                         "op": "and",
                                         "args": [
                                             {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "COMPLETED"}},
-                                            {"op": "eq", "left": {"ref": "target.target_object_type"}, "right": {"lit": "Employee"}},
-                                            {"op": "eq", "left": {"ref": "target.target_object_id"}, "right": {"ref": "param.grantee_id"}},
+                                            {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"lit": "APPROVAL"}},
+                                            {"op": "in", "left": {"ref": "target.assignee_role"}, "right": {"lit": ["hr_director", "admin"]}},
+                                            {"op": "eq", "left": {"ref": "target.target_object_type"}, "right": {"lit": "AuthorityMandate"}},
+                                            {"op": "eq", "left": {"ref": "target.target_object_id"}, "right": {"ref": "param.mandate_id"}},
                                             {"op": "eq", "left": {"ref": "target.requested_action"}, "right": {"lit": "grant_authority_mandate"}},
                                         ],
                                     },

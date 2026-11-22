@@ -145,7 +145,15 @@ def test_1_std_core_incremental_event_kinds_and_closed_roles() -> None:
         }
         assert expected_new_roles <= role_names
         assert set(core_bp.roles) == role_names
-        assert {"production_planner", "shopfloor", "chief_accountant", "hr_admin"} <= set(STD_WORK_CARD_OPENERS)
+        assert {
+            "production_planner",
+            "shopfloor",
+            "plant_manager",
+            "sales_manager",
+            "finance_director",
+            "chief_accountant",
+            "hr_admin",
+        } <= set(STD_WORK_CARD_OPENERS)
         assert {"plant_manager", "chief_accountant", "hr_director"} <= set(STD_WORK_CARD_RESOLVERS)
         # Operational front-line roles cannot self-resolve WorkCards
         assert "shopfloor" not in STD_WORK_CARD_RESOLVERS
@@ -569,8 +577,8 @@ def test_3_p2m_red_tests_and_scrap_work_card_t1_settlement() -> None:
                 "absorbed_cost_cents": 20_000,
             },
             actors["shopfloor"],
-            target_object_type="WorkOrder",
-            target_object_id="WO-100",
+            target_object_type="ProductionOutput",
+            target_object_id="OUT-SCRAP-2",
             assignee_role="plant_manager",
             card_id="WC-SCRAP-100",
         )
@@ -636,8 +644,8 @@ def _seed_r2r_world(rt: OntologyRuntime, spec: OntologySpec) -> dict[str, Actor]
             seller_party="PTY-1",
             resource="RES-SVC",
             quantity=1.0,
-            unit_price=8000.0,
-            total_amount=8000.0,
+            unit_price=10_000.0,
+            total_amount=10_000.0,
             status="agreed",
         ),
         actor=admin,
@@ -648,7 +656,7 @@ def _seed_r2r_world(rt: OntologyRuntime, spec: OntologySpec) -> dict[str, Actor]
             commitment="CM-R2R-1",
             event_kind="JOURNAL_POST",
             quantity=1.0,
-            amount=8000.0,
+            amount=10_000.0,
             status="confirmed",
         ),
         actor=admin,
@@ -1029,10 +1037,16 @@ def _seed_h2r_world(rt: OntologyRuntime, spec: OntologySpec) -> dict[str, Actor]
 
     rt.put_object(PosCls(position_id="POS-PM", department="DEPT-OPS", title="厂长", role_name="plant_manager", approval_ceiling_cents=1_000_000), actor=admin)
     rt.put_object(PosCls(position_id="POS-BUYER", department="DEPT-MFG", title="采购专员", role_name="buyer", approval_ceiling_cents=200_000), actor=admin)
+    rt.put_object(PosCls(position_id="POS-PROC-MGR", department="DEPT-MFG", title="采购经理", role_name="procurement_manager", approval_ceiling_cents=200_000), actor=admin)
+    rt.put_object(PosCls(position_id="POS-CFO", department="DEPT-ROOT", title="集团财务总监", role_name="finance_director", approval_ceiling_cents=5_000_000_000), actor=admin)
     rt.put_object(PosCls(position_id="POS-SF", department="DEPT-LINE", title="车间报工", role_name="shopfloor", approval_ceiling_cents=50_000), actor=admin)
 
     rt.put_object(
         EmpCls(employee_id="EMP-MGR", department="DEPT-OPS", position="POS-PM", full_name="张厂长", actor_id="act-mgr", status="active"),
+        actor=admin,
+    )
+    rt.put_object(
+        EmpCls(employee_id="EMP-CFO", department="DEPT-ROOT", position="POS-CFO", full_name="赵总监", actor_id="act-cfo", status="active"),
         actor=admin,
     )
     rt.put_object(
@@ -1053,6 +1067,12 @@ def _seed_h2r_world(rt: OntologyRuntime, spec: OntologySpec) -> dict[str, Actor]
         "hr_admin": Actor(actor_id="hr-1", role="hr_admin"),
         "hr_director": Actor(actor_id="hrd-1", role="hr_director"),
         "same_hr_dir": Actor(actor_id="hr-1", role="hr_director"),
+        "same_li_hr_dir": Actor(actor_id="act-li", role="hr_director"),
+        "mgr_actor": Actor(actor_id="act-mgr", role="plant_manager"),
+        "li_proc_mgr": Actor(actor_id="act-li", role="procurement_manager"),
+        "sales_mgr": Actor(actor_id="act-sm", role="sales_manager"),
+        "ai_agent": Actor(actor_id="agent-1", role="ai_agent"),
+        "ops": Actor(actor_id="ops-1", role="ops"),
     }
 
 
@@ -1087,7 +1107,8 @@ def test_6_h2r_positive_flow_reparent_assign_mandate_and_offboard_auto_revoke() 
         assert emp_li.department == "DEPT-OPS"
         assert emp_li.position == "POS-PM"
 
-        # Grant two mandates within grantor ceiling (EMP-MGR ceiling = 1,000,000) to EMP-WANG
+        # Grant two mandates within grantor ceiling (EMP-MGR ceiling = 1,000,000) to EMP-WANG:
+        # Cross-role delegation is approved by hr_director; same-role delegation is directly granted by EMP-MGR actor.
         rt.submit_action(
             "H2R-GRANT-1",
             "grant_authority_mandate",
@@ -1099,7 +1120,7 @@ def test_6_h2r_positive_flow_reparent_assign_mandate_and_offboard_auto_revoke() 
                 "ceiling_cents": 800_000,
                 "scope_tag": "org:mfg",
             },
-            actors["hr_admin"],
+            actors["hr_director"],
         )
         rt.submit_action(
             "H2R-GRANT-2",
@@ -1112,7 +1133,7 @@ def test_6_h2r_positive_flow_reparent_assign_mandate_and_offboard_auto_revoke() 
                 "ceiling_cents": 500_000,
                 "scope_tag": "org:line",
             },
-            actors["hr_admin"],
+            actors["mgr_actor"],
         )
 
         # Read-only effective mandates resolution
@@ -1206,7 +1227,7 @@ def test_7_h2r_red_tests_dag_cycles_closed_roles_sod_ceilings_and_escalation() -
                     "role_name": "super_hacker",
                     "ceiling_cents": 100_000,
                 },
-                actors["hr_admin"],
+                actors["mgr_actor"],
             )
         assert e_mnd_role.value.code == "UNKNOWN_ROLE"
 
@@ -1222,7 +1243,7 @@ def test_7_h2r_red_tests_dag_cycles_closed_roles_sod_ceilings_and_escalation() -
                     "role_name": "plant_manager",
                     "ceiling_cents": 100_000,
                 },
-                actors["hr_admin"],
+                actors["mgr_actor"],
             )
         assert e_self_mnd.value.code == "MANDATE_SELF_GRANT_FORBIDDEN"
 
@@ -1237,7 +1258,7 @@ def test_7_h2r_red_tests_dag_cycles_closed_roles_sod_ceilings_and_escalation() -
                     "role_name": "plant_manager",
                     "ceiling_cents": 100_000,
                 },
-                actors["hr_admin"],
+                actors["mgr_actor"],
             )
         assert e_self_actor_mnd.value.code == "MANDATE_SELF_GRANT_FORBIDDEN"
 
@@ -1250,18 +1271,18 @@ def test_7_h2r_red_tests_dag_cycles_closed_roles_sod_ceilings_and_escalation() -
                     "mandate_id": "MND-INACT",
                     "grantor_id": "EMP-MGR",
                     "grantee_id": "EMP-LI",  # still onboarding
-                    "role_name": "buyer",
+                    "role_name": "plant_manager",
                     "ceiling_cents": 100_000,
                 },
-                actors["hr_admin"],
+                actors["mgr_actor"],
             )
         assert e_inact.value.code == "EMPLOYEE_NOT_ACTIVE"
 
-        # Activate EMP-LI as buyer (ceiling 200,000), then attempt over-ceiling delegation -> MANDATE_EXCEEDS_GRANTOR_CEILING
+        # Activate EMP-LI as procurement_manager (ceiling 200,000), then attempt over-ceiling delegation -> MANDATE_EXCEEDS_GRANTOR_CEILING
         rt.submit_action(
             "ACT-LI",
             "assign_employee_position",
-            {"employee_id": "EMP-LI", "department_id": "DEPT-MFG", "position_id": "POS-BUYER", "activate": True},
+            {"employee_id": "EMP-LI", "department_id": "DEPT-MFG", "position_id": "POS-PROC-MGR", "activate": True},
             actors["hr_admin"],
         )
         with pytest.raises(InvariantError) as e_ceil:
@@ -1276,7 +1297,7 @@ def test_7_h2r_red_tests_dag_cycles_closed_roles_sod_ceilings_and_escalation() -
                     "ceiling_cents": 500_000,  # > EMP-LI's 200,000
                     "escalate_approval": False,
                 },
-                actors["hr_admin"],
+                actors["li_proc_mgr"],
             )
         assert e_ceil.value.code == "MANDATE_EXCEEDS_GRANTOR_CEILING"
 
@@ -1293,9 +1314,9 @@ def test_7_h2r_red_tests_dag_cycles_closed_roles_sod_ceilings_and_escalation() -
                 "ceiling_cents": 500_000,
                 "escalate_approval": True,
             },
-            actors["hr_admin"],
-            target_object_type="Employee",
-            target_object_id="EMP-WANG",
+            actors["li_proc_mgr"],
+            target_object_type="AuthorityMandate",
+            target_object_id="MND-OVER-ESC",
             assignee_role="hr_director",
             card_id="WC-H2R-ESC",
         )
@@ -1303,7 +1324,7 @@ def test_7_h2r_red_tests_dag_cycles_closed_roles_sod_ceilings_and_escalation() -
         assert esc["error_code"] == "APPROVAL_REQUIRED_AUTHORITY_ESCALATION"
 
         with pytest.raises(InvariantError) as e_sod:
-            settle_work_card(rt, "WC-H2R-ESC", actors["same_hr_dir"])
+            settle_work_card(rt, "WC-H2R-ESC", actors["same_li_hr_dir"])
         assert e_sod.value.code == "SOD_SELF_APPROVAL_FORBIDDEN"
 
         settled = settle_work_card(rt, "WC-H2R-ESC", actors["hr_director"], resolution_note="批准临时扩权委派")
@@ -1477,11 +1498,564 @@ def test_9_all_six_standard_domains_compose_idempotently_and_match_python_specs(
                 "mandate_id": "MND-BP-1",
                 "grantor_id": "EMP-MGR",
                 "grantee_id": "EMP-WANG",
-                "role_name": "buyer",
+                "role_name": "plant_manager",
                 "ceiling_cents": 300_000,
             },
-            actors_h2r["hr_admin"],
+            actors_h2r["mgr_actor"],
         )
-        assert rt_h2r.get_object("AuthorityMandate", "MND-BP-1", actors_h2r["hr_admin"]).status == "active"
+        assert rt_h2r.get_object("AuthorityMandate", "MND-BP-1", actors_h2r["mgr_actor"]).status == "active"
     finally:
         rt_h2r.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. P0 Audit Remediation Red Tests (Python + Compiled DeclarativeBlueprint)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("use_blueprint", [False, True])
+def test_10_p0_1_cross_domain_work_card_human_task_and_lifetime_blank_check_red_tests(
+    use_blueprint: bool,
+) -> None:
+    # 1. P2M: HUMAN_TASK completed by warehouse cannot bypass plant_manager, and 1st approved scrap cannot grant lifetime blank check
+    p2m_spec = (
+        compile_blueprint(build_std_p2m_blueprint(), seed_ontology=BUSINESS_SEED_ONTOLOGY)
+        if use_blueprint
+        else std_p2m_spec
+    )
+    rt_p2m = OntologyRuntime(p2m_spec, ":memory:")
+    try:
+        actors = _seed_p2m_world(rt_p2m, p2m_spec)
+        rt_p2m.submit_action("P2M-REL", "release_work_order", {"work_order_id": "WO-100"}, actors["planner"])
+        rt_p2m.submit_action(
+            "P2M-ISS",
+            "issue_material_to_work_order",
+            {
+                "consumption_id": "CONS-P01",
+                "work_order_id": "WO-100",
+                "input_resource": "RES-RAW-STEEL",
+                "qty": 100.0,
+                "unit_cost_cents": 500,
+            },
+            actors["warehouse"],
+        )
+        rt_p2m.submit_action(
+            "P2M-OUT-GOOD",
+            "record_production_output",
+            {
+                "output_id": "OUT-GOOD-1",
+                "work_order_id": "WO-100",
+                "output_resource": "RES-FG-BEAM",
+                "good_qty": 40.0,
+                "scrap_qty": 0.0,
+                "absorbed_cost_cents": 20_000,
+            },
+            actors["shopfloor"],
+        )
+        # Attacker opens HUMAN_TASK card assigned to warehouse and warehouse completes it
+        rt_p2m.submit_action(
+            "OPEN-HT-P2M",
+            "open_work_card",
+            {
+                "card_id": "WC-HT-P2M",
+                "card_kind": "HUMAN_TASK",
+                "target_object_type": "ProductionOutput",
+                "target_object_id": "OUT-HT-SCRAP",
+                "requested_action": "record_production_output",
+                "requested_params_json": "{}",
+                "assignee_role": "warehouse",
+            },
+            actors["shopfloor"],
+        )
+        rt_p2m.submit_action("COMP-HT-P2M", "complete_work_card", {"card_id": "WC-HT-P2M"}, actors["warehouse"])
+        with pytest.raises(InvariantError) as e_p2m_ht:
+            rt_p2m.submit_action(
+                "BYPASS-P2M-HT",
+                "record_production_output",
+                {
+                    "output_id": "OUT-HT-SCRAP",
+                    "work_order_id": "WO-100",
+                    "output_resource": "RES-FG-BEAM",
+                    "good_qty": 10.0,
+                    "scrap_qty": 10.0,
+                    "absorbed_cost_cents": 10_000,
+                },
+                actors["shopfloor"],
+            )
+        assert e_p2m_ht.value.code == "APPROVAL_REQUIRED_SCRAP_RATIO_EXCEEDED"
+        assert rt_p2m.get_action_run("BYPASS-P2M-HT")["status"] == "REJECTED"
+        assert rt_p2m.load_object("ProductionOutput", "OUT-HT-SCRAP") is None
+
+        # Even if WorkOrder had one approved scrap output OUT-SCRAP-OK, a second scrap output OUT-SCRAP-AGAIN on same WO must still block
+        esc_p2m = submit_or_open_work_card(
+            rt_p2m,
+            "RUN-SCRAP-A",
+            "record_production_output",
+            {
+                "output_id": "OUT-SCRAP-OK",
+                "work_order_id": "WO-100",
+                "output_resource": "RES-FG-BEAM",
+                "good_qty": 10.0,
+                "scrap_qty": 5.0,
+                "absorbed_cost_cents": 10_000,
+            },
+            actors["shopfloor"],
+            target_object_type="ProductionOutput",
+            target_object_id="OUT-SCRAP-OK",
+            assignee_role="plant_manager",
+            card_id="WC-SCRAP-OK",
+        )
+        assert esc_p2m["status"] == "AWAITING_WORK_CARD"
+        settled_p2m = settle_work_card(rt_p2m, "WC-SCRAP-OK", actors["plant_manager"])
+        assert settled_p2m["settled_action_run"]["status"] == "COMMITTED"
+
+        with pytest.raises(InvariantError) as e_p2m_blank:
+            rt_p2m.submit_action(
+                "BLANK-CHECK-P2M",
+                "record_production_output",
+                {
+                    "output_id": "OUT-SCRAP-AGAIN",
+                    "work_order_id": "WO-100",
+                    "output_resource": "RES-FG-BEAM",
+                    "good_qty": 0.0,
+                    "scrap_qty": 20.0,
+                    "absorbed_cost_cents": 10_000,
+                },
+                actors["shopfloor"],
+            )
+        assert e_p2m_blank.value.code == "APPROVAL_REQUIRED_SCRAP_RATIO_EXCEEDED"
+        assert rt_p2m.get_action_run("BLANK-CHECK-P2M")["status"] == "REJECTED"
+        assert rt_p2m.load_object("ProductionOutput", "OUT-SCRAP-AGAIN") is None
+    finally:
+        rt_p2m.close()
+
+    # 2. R2R: HUMAN_TASK completed by warehouse cannot bypass finance_director on high-value manual journal
+    r2r_spec = (
+        compile_blueprint(build_std_r2r_blueprint(), seed_ontology=BUSINESS_SEED_ONTOLOGY)
+        if use_blueprint
+        else std_r2r_spec
+    )
+    rt_r2r = OntologyRuntime(r2r_spec, ":memory:")
+    try:
+        actors_r2r = _seed_r2r_world(rt_r2r, r2r_spec)
+        JeCls = r2r_spec.get_object_type("JournalEntry")
+        rt_r2r.put_object(
+            JeCls(
+                entry_id="JE-HT-1",
+                accounting_entity="ENT-HQ",
+                fiscal_period="2026-11",
+                debit_account="6401",
+                credit_account="2202",
+                amount_cents=1_000_000,
+                memo="试图用 HUMAN_TASK 绕过财务总监",
+            ),
+            actor=actors_r2r["admin"],
+        )
+        warehouse = Actor(actor_id="wh-r2r", role="warehouse")
+        rt_r2r.submit_action(
+            "OPEN-HT-R2R",
+            "open_work_card",
+            {
+                "card_id": "WC-HT-R2R",
+                "card_kind": "HUMAN_TASK",
+                "target_object_type": "JournalEntry",
+                "target_object_id": "JE-HT-1",
+                "requested_action": "post_journal_entry",
+                "requested_params_json": "{}",
+                "assignee_role": "warehouse",
+            },
+            actors_r2r["finance"],
+        )
+        rt_r2r.submit_action("COMP-HT-R2R", "complete_work_card", {"card_id": "WC-HT-R2R"}, warehouse)
+        with pytest.raises(InvariantError) as e_r2r_ht:
+            rt_r2r.submit_action("BYPASS-R2R-HT", "post_journal_entry", {"entry_id": "JE-HT-1"}, actors_r2r["finance"])
+        assert e_r2r_ht.value.code == "APPROVAL_REQUIRED_MANUAL_JOURNAL"
+        assert rt_r2r.get_action_run("BYPASS-R2R-HT")["status"] == "REJECTED"
+        assert rt_r2r.get_object("JournalEntry", "JE-HT-1", actors_r2r["admin"]).status == "draft"
+    finally:
+        rt_r2r.close()
+
+    # 3. H2R: HUMAN_TASK completed by ops cannot bypass hr_director, and approved MND-ESC-1 on EMP-WANG cannot waive approval for MND-ESC-2
+    h2r_spec = (
+        compile_blueprint(build_std_h2r_blueprint(), seed_ontology=BUSINESS_SEED_ONTOLOGY)
+        if use_blueprint
+        else std_h2r_spec
+    )
+    rt_h2r = OntologyRuntime(h2r_spec, ":memory:")
+    try:
+        actors_h2r = _seed_h2r_world(rt_h2r, h2r_spec)
+        rt_h2r.submit_action(
+            "ACT-LI-P01",
+            "assign_employee_position",
+            {"employee_id": "EMP-LI", "department_id": "DEPT-MFG", "position_id": "POS-PROC-MGR", "activate": True},
+            actors_h2r["hr_admin"],
+        )
+        rt_h2r.submit_action(
+            "OPEN-HT-H2R",
+            "open_work_card",
+            {
+                "card_id": "WC-HT-H2R",
+                "card_kind": "HUMAN_TASK",
+                "target_object_type": "AuthorityMandate",
+                "target_object_id": "MND-HT-1",
+                "requested_action": "grant_authority_mandate",
+                "requested_params_json": "{}",
+                "assignee_role": "ops",
+            },
+            actors_h2r["ai_agent"],
+        )
+        rt_h2r.submit_action("COMP-HT-H2R", "complete_work_card", {"card_id": "WC-HT-H2R"}, actors_h2r["ops"])
+        with pytest.raises(InvariantError) as e_h2r_ht:
+            rt_h2r.submit_action(
+                "BYPASS-H2R-HT",
+                "grant_authority_mandate",
+                {
+                    "mandate_id": "MND-HT-1",
+                    "grantor_id": "EMP-LI",
+                    "grantee_id": "EMP-WANG",
+                    "role_name": "procurement_manager",
+                    "ceiling_cents": 500_000,
+                    "escalate_approval": True,
+                },
+                actors_h2r["li_proc_mgr"],
+            )
+        assert e_h2r_ht.value.code == "APPROVAL_REQUIRED_AUTHORITY_ESCALATION"
+        assert rt_h2r.get_action_run("BYPASS-H2R-HT")["status"] == "REJECTED"
+        assert rt_h2r.load_object("AuthorityMandate", "MND-HT-1") is None
+
+        # Legitimate escalation for MND-ESC-1 settled by hr_director
+        esc_h2r = submit_or_open_work_card(
+            rt_h2r,
+            "RUN-ESC-1",
+            "grant_authority_mandate",
+            {
+                "mandate_id": "MND-ESC-1",
+                "grantor_id": "EMP-LI",
+                "grantee_id": "EMP-WANG",
+                "role_name": "procurement_manager",
+                "ceiling_cents": 500_000,
+                "escalate_approval": True,
+            },
+            actors_h2r["li_proc_mgr"],
+            target_object_type="AuthorityMandate",
+            target_object_id="MND-ESC-1",
+            assignee_role="hr_director",
+            card_id="WC-ESC-1",
+        )
+        assert esc_h2r["status"] == "AWAITING_WORK_CARD"
+        settled_h2r = settle_work_card(rt_h2r, "WC-ESC-1", actors_h2r["hr_director"])
+        assert settled_h2r["settled_action_run"]["status"] == "COMMITTED"
+
+        # Lifetime blank check attempt: using new mandate_id MND-ESC-2 for same EMP-WANG must STILL block!
+        with pytest.raises(InvariantError) as e_h2r_blank:
+            rt_h2r.submit_action(
+                "BLANK-CHECK-H2R",
+                "grant_authority_mandate",
+                {
+                    "mandate_id": "MND-ESC-2",
+                    "grantor_id": "EMP-LI",
+                    "grantee_id": "EMP-WANG",
+                    "role_name": "procurement_manager",
+                    "ceiling_cents": 900_000,
+                    "escalate_approval": True,
+                },
+                actors_h2r["li_proc_mgr"],
+            )
+        assert e_h2r_blank.value.code == "APPROVAL_REQUIRED_AUTHORITY_ESCALATION"
+        assert rt_h2r.get_action_run("BLANK-CHECK-H2R")["status"] == "REJECTED"
+        assert rt_h2r.load_object("AuthorityMandate", "MND-ESC-2") is None
+    finally:
+        rt_h2r.close()
+
+
+@pytest.mark.parametrize("use_blueprint", [False, True])
+def test_11_p0_2_h2r_impersonation_role_escalation_admin_ban_and_grantor_offboard_red_tests(
+    use_blueprint: bool,
+) -> None:
+    h2r_spec = (
+        compile_blueprint(build_std_h2r_blueprint(), seed_ontology=BUSINESS_SEED_ONTOLOGY)
+        if use_blueprint
+        else std_h2r_spec
+    )
+    rt = OntologyRuntime(h2r_spec, ":memory:")
+    try:
+        actors = _seed_h2r_world(rt, h2r_spec)
+
+        # 1. Impersonating EMP-CFO by sales_manager / ai_agent / hr_admin -> MANDATE_GRANTOR_IMPERSONATION_FORBIDDEN
+        for tag, actor_key in (("SM", "sales_mgr"), ("AI", "ai_agent"), ("HR", "hr_admin")):
+            with pytest.raises(InvariantError) as e_imp:
+                rt.submit_action(
+                    f"RED-IMP-{tag}",
+                    "grant_authority_mandate",
+                    {
+                        "mandate_id": f"MND-IMP-{tag}",
+                        "grantor_id": "EMP-CFO",
+                        "grantee_id": "EMP-WANG",
+                        "role_name": "finance_director",
+                        "ceiling_cents": 10_000_000,
+                    },
+                    actors[actor_key],
+                )
+            assert e_imp.value.code == "MANDATE_GRANTOR_IMPERSONATION_FORBIDDEN"
+            assert rt.get_action_run(f"RED-IMP-{tag}")["status"] == "REJECTED"
+            assert rt.load_object("AuthorityMandate", f"MND-IMP-{tag}") is None
+
+        # 2. Cross-role escalation using own grantor_id -> MANDATE_ROLE_ESCALATION_FORBIDDEN
+        with pytest.raises(InvariantError) as e_role_esc:
+            rt.submit_action(
+                "RED-CROSS-ROLE",
+                "grant_authority_mandate",
+                {
+                    "mandate_id": "MND-CROSS-ROLE",
+                    "grantor_id": "EMP-MGR",  # plant_manager
+                    "grantee_id": "EMP-WANG",
+                    "role_name": "finance_director",
+                    "ceiling_cents": 100_000,
+                },
+                actors["mgr_actor"],
+            )
+        assert e_role_esc.value.code == "MANDATE_ROLE_ESCALATION_FORBIDDEN"
+        assert rt.get_action_run("RED-CROSS-ROLE")["status"] == "REJECTED"
+        assert rt.load_object("AuthorityMandate", "MND-CROSS-ROLE") is None
+
+        # 3. Delegating 'admin' role forbidden for non-admin (both plant_manager and hr_director) -> ADMIN_ROLE_DELEGATION_FORBIDDEN
+        for tag, actor_key in (("PM", "mgr_actor"), ("HRD", "hr_director")):
+            with pytest.raises(InvariantError) as e_adm:
+                rt.submit_action(
+                    f"RED-ADMIN-{tag}",
+                    "grant_authority_mandate",
+                    {
+                        "mandate_id": f"MND-ADMIN-{tag}",
+                        "grantor_id": "EMP-MGR",
+                        "grantee_id": "EMP-WANG",
+                        "role_name": "admin",
+                        "ceiling_cents": 100_000,
+                    },
+                    actors[actor_key],
+                )
+            assert e_adm.value.code == "ADMIN_ROLE_DELEGATION_FORBIDDEN"
+            assert rt.get_action_run(f"RED-ADMIN-{tag}")["status"] == "REJECTED"
+            assert rt.load_object("AuthorityMandate", f"MND-ADMIN-{tag}") is None
+
+        # 4. Grantor offboarding: EMP-MGR grants MND-BY-MGR -> EMP-WANG; offboarding EMP-MGR
+        rt.submit_action(
+            "GRANT-BY-MGR",
+            "grant_authority_mandate",
+            {
+                "mandate_id": "MND-BY-MGR",
+                "grantor_id": "EMP-MGR",
+                "grantee_id": "EMP-WANG",
+                "role_name": "plant_manager",
+                "ceiling_cents": 200_000,
+            },
+            actors["mgr_actor"],
+        )
+        if use_blueprint:
+            # In declarative Blueprint, offboard_employee fails closed when an active mandate granted BY emp still exists
+            with pytest.raises(InvariantError) as e_bp_off:
+                rt.submit_action(
+                    "RED-OFF-GRANTOR-BP",
+                    "offboard_employee",
+                    {"employee_id": "EMP-MGR"},
+                    actors["hr_admin"],
+                )
+            assert e_bp_off.value.code == "OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN"
+            assert rt.get_action_run("RED-OFF-GRANTOR-BP")["status"] == "REJECTED"
+            assert rt.get_object("Employee", "EMP-MGR", actors["admin"]).status == "active"
+        else:
+            # In Python spec, offboard_employee atomically revokes both grantee and grantor active mandates
+            rt.submit_action(
+                "OFF-GRANTOR-MGR",
+                "offboard_employee",
+                {"employee_id": "EMP-MGR", "reason": "授权人离职"},
+                actors["hr_admin"],
+            )
+            assert rt.get_object("Employee", "EMP-MGR", actors["admin"]).status == "offboarded"
+            assert rt.get_object("AuthorityMandate", "MND-BY-MGR", actors["admin"]).status == "revoked"
+            assert rt.get_object("Employee", "EMP-WANG", actors["admin"]).status == "active"
+    finally:
+        rt.close()
+
+
+@pytest.mark.parametrize("use_blueprint", [False, True])
+def test_12_p0_3_r2r_source_event_spoofing_and_nested_reversal_red_tests(
+    use_blueprint: bool,
+) -> None:
+    r2r_spec = (
+        compile_blueprint(build_std_r2r_blueprint(), seed_ontology=BUSINESS_SEED_ONTOLOGY)
+        if use_blueprint
+        else std_r2r_spec
+    )
+    rt = OntologyRuntime(r2r_spec, ":memory:")
+    try:
+        actors = _seed_r2r_world(rt, r2r_spec)
+        EvtCls = r2r_spec.get_object_type("FulfillmentEvent")
+        JeCls = r2r_spec.get_object_type("JournalEntry")
+
+        rt.put_object(
+            EvtCls(
+                event_id="EVT-DISPUTED",
+                commitment="CM-R2R-1",
+                event_kind="JOURNAL_POST",
+                quantity=1.0,
+                amount=200_000.0,
+                status="disputed",
+            ),
+            actor=actors["admin"],
+        )
+        rt.put_object(
+            EvtCls(
+                event_id="EVT-RECORDED",
+                commitment="CM-R2R-1",
+                event_kind="JOURNAL_POST",
+                quantity=1.0,
+                amount=200_000.0,
+                status="recorded",
+            ),
+            actor=actors["admin"],
+        )
+        rt.put_object(
+            EvtCls(
+                event_id="EVT-TINY-1CNY",
+                commitment="CM-R2R-1",
+                event_kind="JOURNAL_POST",
+                quantity=1.0,
+                amount=1.0,
+                status="confirmed",
+            ),
+            actor=actors["admin"],
+        )
+        rt.put_object(
+            EvtCls(
+                event_id="EVT-ZERO-CNY",
+                commitment="CM-R2R-1",
+                event_kind="JOURNAL_POST",
+                quantity=1.0,
+                amount=0.0,
+                status="confirmed",
+            ),
+            actor=actors["admin"],
+        )
+
+        # 1. Disputed / unconfirmed source_event blocked -> SOURCE_EVENT_NOT_CONFIRMED
+        for tag, ev_id in (("DISP", "EVT-DISPUTED"), ("REC", "EVT-RECORDED")):
+            je_id = f"JE-{tag}"
+            rt.put_object(
+                JeCls(
+                    entry_id=je_id,
+                    accounting_entity="ENT-HQ",
+                    fiscal_period="2026-11",
+                    source_event=ev_id,
+                    debit_account="6401",
+                    credit_account="2202",
+                    amount_cents=10_000_000,
+                ),
+                actor=actors["admin"],
+            )
+            with pytest.raises(InvariantError) as e_src:
+                rt.submit_action(f"POST-{tag}", "post_journal_entry", {"entry_id": je_id}, actors["finance"])
+            assert e_src.value.code == "SOURCE_EVENT_NOT_CONFIRMED"
+            assert rt.get_action_run(f"POST-{tag}")["status"] == "REJECTED"
+            assert rt.get_object("JournalEntry", je_id, actors["admin"]).status == "draft"
+
+        # 2. Small confirmed source_event (1 CNY) for 100,000 CNY journal blocked -> JOURNAL_EXCEEDS_SOURCE_EVENT
+        rt.put_object(
+            JeCls(
+                entry_id="JE-TINY-SPOOF",
+                accounting_entity="ENT-HQ",
+                fiscal_period="2026-11",
+                source_event="EVT-TINY-1CNY",
+                debit_account="6401",
+                credit_account="2202",
+                amount_cents=10_000_000,
+            ),
+            actor=actors["admin"],
+        )
+        with pytest.raises(InvariantError) as e_tiny:
+            rt.submit_action("POST-TINY", "post_journal_entry", {"entry_id": "JE-TINY-SPOOF"}, actors["finance"])
+        assert e_tiny.value.code == "JOURNAL_EXCEEDS_SOURCE_EVENT"
+        assert rt.get_action_run("POST-TINY")["status"] == "REJECTED"
+        assert rt.get_object("JournalEntry", "JE-TINY-SPOOF", actors["admin"]).status == "draft"
+
+        # 3. Zero-amount confirmed source_event cannot waive manual approval gate -> APPROVAL_REQUIRED_MANUAL_JOURNAL
+        rt.put_object(
+            JeCls(
+                entry_id="JE-ZERO-SPOOF",
+                accounting_entity="ENT-HQ",
+                fiscal_period="2026-11",
+                source_event="EVT-ZERO-CNY",
+                debit_account="6401",
+                credit_account="2202",
+                amount_cents=MANUAL_JOURNAL_APPROVAL_THRESHOLD_CENTS,
+            ),
+            actor=actors["admin"],
+        )
+        with pytest.raises(InvariantError) as e_zero:
+            rt.submit_action("POST-ZERO", "post_journal_entry", {"entry_id": "JE-ZERO-SPOOF"}, actors["finance"])
+        assert e_zero.value.code == "APPROVAL_REQUIRED_MANUAL_JOURNAL"
+        assert rt.get_action_run("POST-ZERO")["status"] == "REJECTED"
+        assert rt.get_object("JournalEntry", "JE-ZERO-SPOOF", actors["admin"]).status == "draft"
+
+        # 4. Reversing a reversal entry blocked -> CANNOT_REVERSE_REVERSAL_ENTRY
+        if use_blueprint:
+            # Seed a posted reversal entry directly on Blueprint runtime (Blueprint create cannot set swapped fields automatically)
+            rt.put_object(
+                JeCls(
+                    entry_id="JE-ORIG-P",
+                    accounting_entity="ENT-HQ",
+                    fiscal_period="2026-11",
+                    debit_account="1001",
+                    credit_account="4001",
+                    amount_cents=50_000,
+                    status="reversed",
+                ),
+                actor=actors["admin"],
+            )
+            rt.put_object(
+                JeCls(
+                    entry_id="JE-REV-1",
+                    accounting_entity="ENT-HQ",
+                    fiscal_period="2026-11",
+                    debit_account="4001",
+                    credit_account="1001",
+                    amount_cents=50_000,
+                    reversal_of="JE-ORIG-P",
+                    status="posted",
+                ),
+                actor=actors["admin"],
+            )
+        else:
+            rt.put_object(
+                JeCls(
+                    entry_id="JE-ORIG-P",
+                    accounting_entity="ENT-HQ",
+                    fiscal_period="2026-11",
+                    debit_account="1001",
+                    credit_account="4001",
+                    amount_cents=50_000,
+                    status="draft",
+                ),
+                actor=actors["admin"],
+            )
+            rt.submit_action("POST-ORIG-P", "post_journal_entry", {"entry_id": "JE-ORIG-P"}, actors["finance"])
+            rt.submit_action(
+                "REV-ORIG-P",
+                "reverse_journal_entry",
+                {"entry_id": "JE-ORIG-P", "reversal_entry_id": "JE-REV-1"},
+                actors["chief_acc"],
+            )
+
+        debit_before = rt.get_object("GlAccount", "1001", actors["admin"]).debit_total_cents
+        credit_before = rt.get_object("GlAccount", "4001", actors["admin"]).credit_total_cents
+        with pytest.raises(InvariantError) as e_nested_rev:
+            rt.submit_action(
+                "RED-NESTED-REV",
+                "reverse_journal_entry",
+                {"entry_id": "JE-REV-1", "reversal_entry_id": "JE-REV-2"},
+                actors["chief_acc"],
+            )
+        assert e_nested_rev.value.code == "CANNOT_REVERSE_REVERSAL_ENTRY"
+        assert rt.get_action_run("RED-NESTED-REV")["status"] == "REJECTED"
+        assert rt.get_object("JournalEntry", "JE-REV-1", actors["admin"]).status == "posted"
+        assert rt.get_object("GlAccount", "1001", actors["admin"]).debit_total_cents == debit_before
+        assert rt.get_object("GlAccount", "4001", actors["admin"]).credit_total_cents == credit_before
+    finally:
+        rt.close()

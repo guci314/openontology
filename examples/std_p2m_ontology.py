@@ -252,12 +252,14 @@ def p2m_work_order_cost_conservation(view: Any) -> bool:
     return True
 
 
-def _has_completed_scrap_work_card(ctx: Any, work_order_id: str) -> bool:
+def _has_completed_scrap_work_card(ctx: Any, output_id: str) -> bool:
     for card in ctx.query(WorkCard):
         if (
             card.status == "COMPLETED"
-            and card.target_object_type == "WorkOrder"
-            and card.target_object_id == work_order_id
+            and card.card_kind == "APPROVAL"
+            and card.assignee_role in ("plant_manager", "admin")
+            and card.target_object_type == "ProductionOutput"
+            and card.target_object_id == output_id
             and card.requested_action == "record_production_output"
         ):
             return True
@@ -420,7 +422,7 @@ def record_production_output(ctx: Any, params: RecordProductionOutputParams) -> 
     if (
         cum_scrap > bom.max_scrap_ratio * cum_total + 1e-9
         and ctx.actor.role not in ("plant_manager", "admin")
-        and not _has_completed_scrap_work_card(ctx, wo.work_order_id)
+        and not _has_completed_scrap_work_card(ctx, params.output_id)
     ):
         scrap_ratio = cum_scrap / cum_total
         raise InvariantError(
@@ -1039,13 +1041,6 @@ def build_std_p2m_blueprint() -> DeclarativeBlueprint:
                         },
                     },
                     {
-                        "name": "p2m_output_non_neg_absorbed_cost",
-                        "code": "NEGATIVE_ABSORBED_COST",
-                        "target_type": "WorkOrder",
-                        "id_param": "work_order_id",
-                        "must_hold": {"op": "ge", "left": {"ref": "param.absorbed_cost_cents"}, "right": {"lit": 0}},
-                    },
-                    {
                         "name": "p2m_output_resource_match",
                         "code": "OUTPUT_RESOURCE_MISMATCH",
                         "target_type": "WorkOrder",
@@ -1100,8 +1095,10 @@ def build_std_p2m_blueprint() -> DeclarativeBlueprint:
                                         "op": "and",
                                         "args": [
                                             {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "COMPLETED"}},
-                                            {"op": "eq", "left": {"ref": "target.target_object_type"}, "right": {"lit": "WorkOrder"}},
-                                            {"op": "eq", "left": {"ref": "target.target_object_id"}, "right": {"ref": "obj.work_order_id"}},
+                                            {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"lit": "APPROVAL"}},
+                                            {"op": "in", "left": {"ref": "target.assignee_role"}, "right": {"lit": ["plant_manager", "admin"]}},
+                                            {"op": "eq", "left": {"ref": "target.target_object_type"}, "right": {"lit": "ProductionOutput"}},
+                                            {"op": "eq", "left": {"ref": "target.target_object_id"}, "right": {"ref": "param.output_id"}},
                                             {"op": "eq", "left": {"ref": "target.requested_action"}, "right": {"lit": "record_production_output"}},
                                         ],
                                     },
