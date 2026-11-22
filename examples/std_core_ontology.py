@@ -55,7 +55,16 @@ __all__ = [
     "build_std_core_blueprint",
 ]
 
-FulfillmentEventKind = Literal["SHIPMENT", "RECEIPT", "INSPECTION", "INVOICE", "PAYMENT"]
+FulfillmentEventKind = Literal[
+    "SHIPMENT",
+    "RECEIPT",
+    "INSPECTION",
+    "INVOICE",
+    "PAYMENT",
+    "PRODUCTION_ISSUE",
+    "PRODUCTION_OUTPUT",
+    "JOURNAL_POST",
+]
 
 STD_ROLES: tuple[tuple[str, str], ...] = (
     ("admin", "系统管理员：拥有全量管理与核准权限"),
@@ -70,6 +79,12 @@ STD_ROLES: tuple[tuple[str, str], ...] = (
     ("procurement_manager", "采购经理：负责采购争议裁决、异常审批与放行"),
     ("finance", "财务专员：负责应收/应付发票过账与收付款核销"),
     ("finance_director", "财务总监：负责高风险财务放行与大额核准"),
+    ("production_planner", "生产计划员：负责工单排产下达、BOM 维护与工单关闭"),
+    ("shopfloor", "车间报工专员：负责生产领料投料与完工报工记录"),
+    ("plant_manager", "厂长/生产总监：负责生产异常损耗超标审批与工单放行"),
+    ("chief_accountant", "财务主管/总账会计：负责总账凭证过账复核、红冲与会计期间结账"),
+    ("hr_admin", "组织人事专员：负责部门架构维护、岗位管理与员工入转调离"),
+    ("hr_director", "人力总监：负责越权授权审批、高阶岗位定编与组织权限治理"),
     ("system", "系统只读角色：用于内部诊断与不变量视图"),
 )
 
@@ -82,6 +97,10 @@ STD_WORK_CARD_OPENERS: tuple[str, ...] = (
     "buyer",
     "procurement_manager",
     "finance",
+    "production_planner",
+    "shopfloor",
+    "chief_accountant",
+    "hr_admin",
     "steward",
     "admin",
 )
@@ -91,6 +110,9 @@ STD_WORK_CARD_RESOLVERS: tuple[str, ...] = (
     "sales_manager",
     "procurement_manager",
     "finance_director",
+    "plant_manager",
+    "chief_accountant",
+    "hr_director",
     "warehouse",
     "ops",
     "admin",

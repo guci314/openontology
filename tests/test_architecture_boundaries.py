@@ -66,6 +66,9 @@ M1_ONTOLOGY_MODULES: tuple[tuple[str, str], ...] = (
     ("examples.std_crm_ontology", "spec"),
     ("examples.std_o2c_ontology", "spec"),
     ("examples.std_p2p_ontology", "spec"),
+    ("examples.std_p2m_ontology", "spec"),
+    ("examples.std_r2r_ontology", "spec"),
+    ("examples.std_h2r_ontology", "spec"),
     ("examples.steel_mdm_plugin", "spec"),
 )
 
