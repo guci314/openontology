@@ -161,10 +161,13 @@ class CrucibleReport:
 
 def _collect_m0_identifiers(
     m0_objects: Sequence[dict[str, Any]],
+    *,
+    declared_roles: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[set[str], set[str]]:
     """Collect known IDs and high-cardinality / name / ref instance codes from M0 objects."""
     known_ids: set[str] = set()
     known_codes: set[str] = set()
+    name_col_values: dict[tuple[str, str], list[str]] = {}
     code_col_values: dict[tuple[str, str], list[str]] = {}
 
     for obj in m0_objects:
@@ -180,10 +183,15 @@ def _collect_m0_identifiers(
                     known_ids.add(str(v))
             elif k == "name" or k.endswith(("_ref", "_name")):
                 if isinstance(v, str):
-                    known_codes.add(v)
+                    name_col_values.setdefault((ot_name, k), []).append(v)
             elif k == "code" or k.endswith("_code"):
                 if isinstance(v, str):
                     code_col_values.setdefault((ot_name, k), []).append(v)
+
+    for vals in name_col_values.values():
+        if declared_roles and vals and set(vals) <= declared_roles:
+            continue
+        known_codes.update(vals)
 
     for vals in code_col_values.values():
         if len(vals) >= 3 and len(set(vals)) == len(vals):
@@ -197,6 +205,8 @@ def _collect_m0_identifiers(
 
 def _extract_m0_from_runtime(
     runtime: OntologyRuntime,
+    *,
+    declared_roles: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], set[str], set[str]]:
     """Read-only export of ontology_objects, ontology_links, ontology_overlay, and known identifiers."""
     objects: list[dict[str, Any]] = []
@@ -214,7 +224,7 @@ def _extract_m0_from_runtime(
                 "data": data,
             }
         )
-    known_ids, known_codes = _collect_m0_identifiers(objects)
+    known_ids, known_codes = _collect_m0_identifiers(objects, declared_roles=declared_roles)
 
     links: list[dict[str, Any]] = []
     lrows = runtime._conn.execute(
@@ -373,6 +383,7 @@ def _walk_overfitting_checks(
     rel_fields: set[str] = frozenset(),
     known_ids: set[str],
     known_codes: set[str],
+    declared_roles: set[str] | frozenset[str] = frozenset(),
     rule_label: str,
     findings: list[str],
 ) -> None:
@@ -395,6 +406,14 @@ def _walk_overfitting_checks(
                 lit_values = [val_side]
             elif isinstance(val_side, list):
                 lit_values = list(val_side)
+
+            is_closed_role_whitelist = (
+                bool(declared_roles)
+                and op in ("in", "not_in")
+                and len(lit_values) >= 2
+                and all(isinstance(item, str) and bool(item) for item in lit_values)
+                and set(lit_values) <= declared_roles
+            )
 
             is_id_field = (
                 leaf_field in pk_fields
@@ -430,7 +449,7 @@ def _walk_overfitting_checks(
                         f"OVERFITTING_INSTANCE_ID in {rule_label}: "
                         f"rule references concrete instance ID {lv!r} via {ref_path}"
                     )
-                elif lv in known_codes and op in ("eq", "ne", "in", "not_in"):
+                elif lv in known_codes and op in ("eq", "ne", "in", "not_in") and not is_closed_role_whitelist:
                     findings.append(
                         f"OVERFITTING_INSTANCE_CODE in {rule_label}: "
                         f"rule hardcodes concrete instance code/name {lv!r} via {ref_path}"
@@ -455,6 +474,7 @@ def _walk_overfitting_checks(
                 rel_fields=rel_fields,
                 known_ids=known_ids,
                 known_codes=known_codes,
+                declared_roles=declared_roles,
                 rule_label=rule_label,
                 findings=findings,
             )
@@ -467,6 +487,7 @@ def _walk_overfitting_checks(
                         rel_fields=rel_fields,
                         known_ids=known_ids,
                         known_codes=known_codes,
+                        declared_roles=declared_roles,
                         rule_label=rule_label,
                         findings=findings,
                     )
@@ -697,10 +718,17 @@ class SymbolicCrucible:
         m0_overlays = list(context.m0_overlays)
         known_ids = set(context.known_instance_ids)
         known_codes: set[str] = set()
+        declared_roles: frozenset[str] = frozenset(
+            {
+                *(str(r) for r in candidate.roles),
+                *(str(r) for act in candidate.actions for r in act.allowed_roles),
+            }
+        )
 
         if context.production_runtime is not None and not m0_objects:
             exp_objs, exp_links, exp_ovs, exp_ids, exp_codes = _extract_m0_from_runtime(
-                context.production_runtime
+                context.production_runtime,
+                declared_roles=declared_roles,
             )
             m0_objects = exp_objs
             if not m0_links:
@@ -710,7 +738,7 @@ class SymbolicCrucible:
             known_ids |= exp_ids
             known_codes |= exp_codes
         else:
-            col_ids, col_codes = _collect_m0_identifiers(m0_objects)
+            col_ids, col_codes = _collect_m0_identifiers(m0_objects, declared_roles=declared_roles)
             known_ids |= col_ids
             known_codes |= col_codes
 
@@ -1077,6 +1105,7 @@ class SymbolicCrucible:
                     rel_fields=rel_fields,
                     known_ids=known_ids,
                     known_codes=known_codes,
+                    declared_roles=declared_roles,
                     rule_label=label,
                     findings=g5_errors,
                 )

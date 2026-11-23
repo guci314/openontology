@@ -2730,3 +2730,148 @@ def test_incident_precondition_blocks_unguarded_and_passes_role_conditional_gate
     )
     assert r_appr.passed
 
+
+
+def test_crucible_closed_role_name_column_does_not_false_positive_and_preserves_overfitting_check() -> None:
+    """Pure M2 closed-role *_name columns avoid Gate 5 false positives without weakening instance checks."""
+    base_roles = ["pilot", "commander", "engineer"]
+    object_types = [
+        ObjectTypeBlueprint(
+            name="CrewSlot",
+            primary_key="slot_id",
+            fields=[
+                FieldSpec(name="slot_id", field_type="str", primary_key=True, required=True),
+                FieldSpec(name="slot_role_name", field_type="str", required=True),
+            ],
+        ),
+        ObjectTypeBlueprint(
+            name="Vendor",
+            primary_key="vendor_id",
+            fields=[
+                FieldSpec(name="vendor_id", field_type="str", primary_key=True, required=True),
+                FieldSpec(name="vendor_name", field_type="str", required=True),
+            ],
+        ),
+    ]
+    m0 = [
+        {"object_type": "CrewSlot", "object_id": "CS-1", "data": {"slot_id": "CS-1", "slot_role_name": "pilot"}},
+        {"object_type": "CrewSlot", "object_id": "CS-2", "data": {"slot_id": "CS-2", "slot_role_name": "commander"}},
+        {"object_type": "CrewSlot", "object_id": "CS-3", "data": {"slot_id": "CS-3", "slot_role_name": "engineer"}},
+        {"object_type": "Vendor", "object_id": "V-1", "data": {"vendor_id": "V-1", "vendor_name": "Starlight Corp"}},
+        {"object_type": "Vendor", "object_id": "V-2", "data": {"vendor_id": "V-2", "vendor_name": "pilot"}},
+    ]
+
+    # 1. Closed-role whitelist invariant passes even though "pilot" also appears in Vendor.vendor_name
+    clean_bp = DeclarativeBlueprint(
+        model_id="pure_m2_closed_role_test",
+        version="1.0.0",
+        roles=base_roles,
+        object_types=object_types,
+        invariants=[
+            InvariantRuleSpec(
+                name="crew_slot_closed_role",
+                code="UNKNOWN_ROLE",
+                target_type="CrewSlot",
+                must_hold={
+                    "op": "in",
+                    "left": {"ref": "obj.slot_role_name"},
+                    "right": {"lit": list(base_roles)},
+                },
+            )
+        ],
+    )
+    rep_clean = SymbolicCrucible().evaluate(
+        clean_bp,
+        CrucibleContext(mode="genesis", m0_objects=m0),
+    )
+    assert rep_clean.passed, rep_clean.diagnostic_feedback()
+    g5_clean = next(g for g in rep_clean.gates if g.gate == "gate_5_parsimony_anti_overfitting")
+    assert g5_clean.passed is True
+    assert g5_clean.counterexamples == ()
+
+    # 2. Mixed entity-name / role-name column still blocks both ordinary and role-colliding literals
+    for bad_literal in ("Starlight Corp", "pilot"):
+        overfit_bp = DeclarativeBlueprint(
+            model_id="pure_m2_overfit_vendor_test",
+            version="1.0.0",
+            roles=base_roles,
+            object_types=object_types,
+            invariants=[
+                InvariantRuleSpec(
+                    name="overfit_vendor_literal",
+                    code="OVERFIT_VENDOR",
+                    target_type="Vendor",
+                    must_hold={
+                        "op": "eq",
+                        "left": {"ref": "obj.vendor_name"},
+                        "right": {"lit": bad_literal},
+                    },
+                )
+            ],
+        )
+        rep_bad = SymbolicCrucible().evaluate(
+            overfit_bp,
+            CrucibleContext(mode="genesis", m0_objects=m0),
+        )
+        assert not rep_bad.passed
+        g5_bad = next(g for g in rep_bad.gates if g.gate == "gate_5_parsimony_anti_overfitting")
+        assert g5_bad.passed is False
+        assert any("OVERFITTING_INSTANCE_CODE" in ce and bad_literal in ce for ce in g5_bad.counterexamples), g5_bad.counterexamples
+
+
+def test_crucible_std_h2r_blueprint_with_live_m0_objects_passes_gate_5() -> None:
+    """Real std_h2r blueprint grounded on live H2R M0 rows passes SymbolicCrucible directly."""
+    from examples.std_h2r_ontology import build_std_h2r_blueprint
+
+    bp = build_std_h2r_blueprint()
+    m0 = [
+        {
+            "object_type": "AccountingEntity",
+            "object_id": "ENT-1",
+            "data": {"entity_id": "ENT-1", "name": "Titan Holdings", "base_currency": "CNY", "status": "active"},
+        },
+        {
+            "object_type": "Department",
+            "object_id": "DEPT-1",
+            "data": {"department_id": "DEPT-1", "name": "HQ", "scope_tag": "hq", "status": "active", "accounting_entity": "ENT-1", "parent_department": None},
+        },
+        {
+            "object_type": "Department",
+            "object_id": "DEPT-2",
+            "data": {"department_id": "DEPT-2", "name": "ops", "scope_tag": "ops", "status": "active", "accounting_entity": "ENT-1", "parent_department": "DEPT-1"},
+        },
+        {
+            "object_type": "JobPosition",
+            "object_id": "POS-1",
+            "data": {"position_id": "POS-1", "title": "Finance Director", "role_name": "finance_director", "approval_ceiling_cents": 50000000, "status": "active", "department": "DEPT-1"},
+        },
+        {
+            "object_type": "JobPosition",
+            "object_id": "POS-2",
+            "data": {"position_id": "POS-2", "title": "Sales Manager", "role_name": "sales_manager", "approval_ceiling_cents": 20000000, "status": "active", "department": "DEPT-2"},
+        },
+        {
+            "object_type": "JobPosition",
+            "object_id": "POS-3",
+            "data": {"position_id": "POS-3", "title": "Ops Specialist", "role_name": "ops", "approval_ceiling_cents": 5000000, "status": "active", "department": "DEPT-2"},
+        },
+        {
+            "object_type": "Employee",
+            "object_id": "EMP-1",
+            "data": {"employee_id": "EMP-1", "full_name": "Alice", "actor_id": "emp_a", "status": "active", "department": "DEPT-2", "position": "POS-3"},
+        },
+    ]
+    report = SymbolicCrucible().evaluate(
+        bp,
+        CrucibleContext(
+            mode="genesis",
+            m0_objects=m0,
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
+        ),
+    )
+    assert report.passed, report.diagnostic_feedback()
+    g2 = next(g for g in report.gates if g.gate == "gate_2_m0_grounding")
+    g5 = next(g for g in report.gates if g.gate == "gate_5_parsimony_anti_overfitting")
+    assert g2.passed is True
+    assert g5.passed is True
+    assert g5.counterexamples == ()
