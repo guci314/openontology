@@ -119,6 +119,7 @@ _TRANSPORT_EXEMPT_FILES = frozenset(
     {
         PKG_ROOT / "http_server.py",
         PKG_ROOT / "mcp_server.py",
+        PKG_ROOT / "console_server.py",
         PKG_ROOT / "workshop.py",
         PKG_ROOT / "meta_admin.py",
         PKG_ROOT / "webhooks.py",
@@ -750,6 +751,7 @@ _FORBIDDEN_IN_RUNTIME_MODULES: frozenset[str] = frozenset(
         "model_views",
         "http_server",
         "mcp_server",
+        "console_server",
         "webhooks",
         "mcts",
         "mpc",
@@ -914,6 +916,7 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
             "model_views",
             "http_server",
             "mcp_server",
+            "console_server",
             "webhooks",
             "mcts",
             "mpc",
@@ -937,6 +940,7 @@ def test_gate6_runtime_oblivious_to_design_time() -> None:
         "assert not leaked, f'banned modules loaded: {leaked}'; "
         "assert 'open_ontology.mdm_plugin' not in loaded and 'open_ontology.induction.resolution' not in loaded, 'mdm plugin leaked on root import'; "
         "assert 'open_ontology.org_authority' not in loaded, 'org_authority leaked on root import'; "
+        "assert 'open_ontology.console_server' not in loaded, 'console_server leaked on root import'; "
         "assert 'psycopg' not in sys.modules and 'psycopg2' not in sys.modules, 'import open_ontology must not load psycopg'"
     )
     proc = subprocess.run(

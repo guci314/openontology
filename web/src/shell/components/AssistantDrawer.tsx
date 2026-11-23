@@ -1,0 +1,230 @@
+import React, { useState } from 'react';
+import { Bot, Send, Sparkles, X, ArrowUpRight } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import type { AssistantCard, ConsoleMeta } from '../../api/client';
+import { consoleApi } from '../../api/client';
+
+interface AssistantMessage {
+  id: string;
+  sender: 'user' | 'assistant';
+  text: string;
+  highlights?: Array<{ label: string; value: string }>;
+  cards?: AssistantCard[];
+}
+
+interface AssistantDrawerProps {
+  open: boolean;
+  meta: ConsoleMeta;
+  onClose: () => void;
+  onInspectObject: (entityType: string, recordId: string) => void;
+  onSelectSandboxPreset?: (presetId: string) => void;
+}
+
+const QUICK_PROMPTS = [
+  '现在有哪些待我审批的异常或工单？',
+  '当前在手订单、应收和现金余额情况如何？',
+  '如果突发 ¥20,000 维修费对利润有什么影响？',
+  '我当前能看到哪些厂区的单据？',
+];
+
+export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
+  open,
+  meta,
+  onClose,
+  onInspectObject,
+  onSelectSandboxPreset,
+}) => {
+  const navigate = useNavigate();
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [messages, setMessages] = useState<AssistantMessage[]>([
+    {
+      id: 'welcome',
+      sender: 'assistant',
+      text: `您好 ${meta.actor.display_name}！我是运行在「${meta.actor.title}」权限视图内的 AI 数字管家，可实时为您检索待批异常、现金指标与合规沙盘预演。`,
+    },
+  ]);
+
+  if (!open) return null;
+
+  const sendQuestion = async (textToSend: string) => {
+    const trimmed = textToSend.trim();
+    if (!trimmed || busy) return;
+    const userMsg: AssistantMessage = {
+      id: `u-${Date.now()}`,
+      sender: 'user',
+      text: trimmed,
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    setInput('');
+    setBusy(true);
+    try {
+      const res = await consoleApi.assistantChat(trimmed);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `a-${Date.now()}`,
+          sender: 'assistant',
+          text: res.reply,
+          highlights: res.highlights,
+          cards: res.cards,
+        },
+      ]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `err-${Date.now()}`,
+          sender: 'assistant',
+          text: err instanceof Error ? err.message : '问答服务暂时不可用',
+        },
+      ]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/30 backdrop-blur-[1px]">
+      <div
+        className="flex h-full w-full max-w-md flex-col bg-white shadow-2xl"
+        data-testid="assistant-drawer"
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-50 text-blue-700 ring-1 ring-blue-200">
+              <Bot className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900">AI 数字经营管家</h3>
+              <p className="text-xs text-slate-500">
+                当前视角：{meta.actor.display_name}（{meta.actor.unit_name || meta.actor.title}）
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            data-testid="close-assistant-drawer"
+            className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:bg-slate-50"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Quick prompts */}
+        <div className="border-b border-slate-100 bg-slate-50/70 px-5 py-3">
+          <div className="mb-1.5 flex items-center gap-1 text-[11px] font-medium text-slate-500">
+            <Sparkles className="h-3 w-3 text-blue-600" />
+            <span>一键提问</span>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {QUICK_PROMPTS.map((q) => (
+              <button
+                key={q}
+                type="button"
+                onClick={() => sendQuestion(q)}
+                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] text-slate-700 transition hover:border-blue-300 hover:text-blue-700"
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Message stream */}
+        <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          {messages.map((m) => (
+            <div
+              key={m.id}
+              className={`flex flex-col ${m.sender === 'user' ? 'items-end' : 'items-start'}`}
+            >
+              <div
+                className={`max-w-[92%] rounded-2xl px-4 py-2.5 text-xs leading-relaxed ${
+                  m.sender === 'user'
+                    ? 'bg-[#0F172A] text-white'
+                    : 'border border-slate-200 bg-slate-50 text-slate-800'
+                }`}
+              >
+                <p>{m.text}</p>
+                {m.highlights && m.highlights.length > 0 && (
+                  <div className="mt-2.5 grid grid-cols-2 gap-1.5 border-t border-slate-200/80 pt-2">
+                    {m.highlights.map((h) => (
+                      <div key={h.label} className="rounded-lg bg-white px-2.5 py-1.5 ring-1 ring-slate-200/60">
+                        <div className="text-[10px] text-slate-500">{h.label}</div>
+                        <div className="font-mono text-xs font-semibold tabular-nums text-slate-900">
+                          {h.value}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {m.cards && m.cards.length > 0 && (
+                <div className="mt-2 w-full space-y-1.5">
+                  {m.cards.map((card, i) => (
+                    <button
+                      key={`${m.id}-c-${i}`}
+                      type="button"
+                      onClick={() => {
+                        if (card.kind === 'object' && card.object_type && card.object_id) {
+                          onInspectObject(card.object_type, card.object_id);
+                          onClose();
+                        } else if (card.kind === 'sandbox_preset') {
+                          if (card.preset_id && onSelectSandboxPreset) {
+                            onSelectSandboxPreset(card.preset_id);
+                          }
+                          onClose();
+                          navigate(card.route || '/sandbox');
+                        }
+                      }}
+                      className="flex w-full items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-2 text-left transition hover:border-blue-300 hover:bg-blue-50/40"
+                    >
+                      <div className="min-w-0 pr-2">
+                        <div className="truncate text-xs font-semibold text-slate-900">
+                          {card.title}
+                        </div>
+                        <div className="truncate text-[11px] text-slate-500">{card.subtitle}</div>
+                      </div>
+                      <ArrowUpRight className="h-4 w-4 shrink-0 text-blue-600" />
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Input box */}
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            sendQuestion(input);
+          }}
+          className="border-t border-slate-200 bg-white p-4"
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              data-testid="assistant-input"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="输入业务问题，例如：待我审批的工单..."
+              className="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white focus:outline-none"
+            />
+            <button
+              type="submit"
+              data-testid="assistant-send-btn"
+              disabled={busy || !input.trim()}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[#0F172A] text-white transition hover:bg-slate-800 disabled:opacity-40"
+            >
+              <Send className="h-4 w-4" />
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};

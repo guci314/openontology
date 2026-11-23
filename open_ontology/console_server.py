@@ -1,0 +1,2243 @@
+"""Pure M2 domain-agnostic HTTP/JSON console server over ``OntologyRuntime``.
+
+Provides the L1 control-plane transport surface without binding to any concrete
+domain schema or external vendor protocol:
+- Actor authentication via SHA-256 Bearer tokens (``OrgDirectory`` or token registry)
+  or optional controlled demo persona switching (``demo_actor_switch=True``).
+- Read-only TBox, behavior, invariant, and RLS-filtered object + lineage inspection.
+- Counterfactual parallel sandboxes backed by ``runtime.fork()`` with live
+  primary-vs-sandbox comparison and policy-governed promotion.
+- Runtime action simulation and submission governed by ``AutonomyRampController``
+  (``SHADOW`` / ``COPILOT_ESCALATE`` / ``AUTO_UNDER_CEILING``).
+- Controlled admin diagnostics and autonomy policy tuning (role-gated).
+- RLS-scoped natural-language assistant queries and static SPA hosting.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from http import HTTPStatus
+import json
+import mimetypes
+from pathlib import Path
+import socket
+import threading
+from typing import Any, Callable, Iterable, Mapping, Sequence
+import uuid
+
+from fastapi import Body, FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
+import uvicorn
+
+from .aspects import SecurityAndAuthorityAspect
+from .autonomy import ActionAutonomyRule, AutonomyMode, AutonomyPolicy, AutonomyRampController
+from .drivers import DeviceDriverRegistry
+from .model_views import describe_behavior, describe_tbox
+from .org_authority import ORG_MEMBER_INACTIVE, ORG_MEMBER_NOT_FOUND, OrgAuthorityError, OrgDirectory
+from .runtime import OntologyRuntime, SimulationResult
+from .sandbox import ObjectDiff
+from .spec import (
+    ActionNotFoundError,
+    Actor,
+    FunctionNotFoundError,
+    InvariantError,
+    ObjectNotFoundError,
+    OpenOntologyError,
+    PermissionDeniedError,
+    UnknownObjectTypeError,
+)
+
+__all__ = [
+    "DemoActorProfile",
+    "WorkQueueBinding",
+    "ConsoleService",
+    "ConsoleServerHandle",
+    "create_console_app",
+    "start_console_server",
+]
+
+_DEFAULT_ADMIN_ROLES: frozenset[str] = frozenset(
+    {"admin", "steward", "finance_director", "hr_director"}
+)
+
+_STATUS_ZH: dict[str, str] = {
+    "OPEN": "待处理",
+    "IN_PROGRESS": "处理中",
+    "COMPLETED": "已完成",
+    "REJECTED": "已驳回",
+    "SLA_BREACHED": "已超时",
+    "CANCELLED": "已取消",
+    "COMMITTED": "已执行",
+    "REVERTED": "已撤回",
+    "SHADOW_RECORDED": "影子演练",
+    "SHADOW_WOULD_REJECT": "影子拦截",
+    "ESCALATED_COMMITTED": "转人工签批",
+    "ESCALATION_REQUIRED": "需人工复核",
+    "AUTO_COMMITTED": "自动放行",
+    "AUTO_REJECTED": "红线拦截",
+    "COPILOT_REJECTED": "红线拦截",
+    "VALID": "校验通过",
+    "MOUNTED": "已连接",
+    "CONNECTED": "已连接",
+    "DEGRADED": "降级运行",
+    "UNPLUGGED": "已断开",
+    "draft": "草稿",
+    "confirmed": "已确认",
+    "released": "已下达",
+    "in_progress": "进行中",
+    "completed": "已完成",
+    "cancelled": "已取消",
+    "disputed": "争议挂起",
+    "received": "已收货",
+    "billed": "已开票",
+    "delivered": "已发货",
+    "invoiced": "已开票",
+    "posted": "已过账",
+    "reversed": "已冲正",
+    "paid": "已结清",
+    "partial": "部分结清",
+    "not_paid": "未核销",
+    "open": "开放记账",
+    "closing": "结账中",
+    "closed": "已关账",
+    "active": "启用中",
+    "archived": "已归档",
+    "offboarded": "已离职",
+    "onboarding": "待入职",
+    "verified": "已核验",
+}
+
+_ERROR_ZH: dict[str, str] = {
+    "PERMISSION_DENIED": "当前角色没有权限执行该操作，已安全拦截。",
+    "AUTH_TOKEN_MISSING": "缺少身份认证凭据，请重新登录或选择演示账号。",
+    "AUTH_TOKEN_INVALID": "身份凭据无效或已过期。",
+    "SOD_SELF_APPROVAL_FORBIDDEN": "触发职责分离红线：发起人不得审批自己提交的事项。",
+    "UNBOUND_SOURCE_BRIDGE": "外部系统连接器未挂载或已断开，已阻止对真实系统的写入。",
+    "DEVICE_STATE_MISMATCH": "外部系统回读状态与预期不一致，本事务已安全中止并保持零脏写。",
+    "ILLEGAL_DOCUMENT_TRANSITION": "当前单据状态不允许直接跃迁到目标状态。",
+    "WORK_CARD_ASSIGNEE_MISMATCH": "当前账号角色与该待办事项的指派审批角色不匹配。",
+    "WORK_CARD_NOT_ACTIVE": "该待办事项已结束处理，不能重复操作。",
+    "COST_CONSERVATION_VIOLATION": "违反成本守恒铁律：核销吸收成本不得超过已投入物料总成本。",
+    "SELF_BALANCING_ACCOUNT_FORBIDDEN": "违反复式记账规范：借方与贷方不得为同一科目。",
+    "PERIOD_CLOSED_POSTING_FORBIDDEN": "该会计期间已关账，严禁补记或修改凭证。",
+    "PO_DISPUTED_BLOCKED": "关联采购单处于争议挂起状态，须先完成差异裁决后方可过账。",
+    "ORDER_NOT_BILLABLE": "订单当前阶段尚不满足开票条件，请先完成履约发货。",
+    "DELIVERY_REQUIRED_BEFORE_INVOICE": "红线拦截：未完成发货出库前严禁提前开具客户发票。",
+    "RECEIPT_REQUIRED_BEFORE_BILL": "红线拦截：未完成收货验收前严禁过账应付账单。",
+    "OPEN_HIGH_PRIORITY_TICKET_BLOCKS_WIN": "客户尚有未关闭的高优先级客诉，须先闭环客诉才可赢单。",
+    "APPROVAL_REQUIRED_MANUAL_JOURNAL": "触发大额手工调账红线：需财务总监签批复核后方可过账。",
+    "APPROVAL_REQUIRED_SCRAP_RATIO_EXCEEDED": "损耗率超出标准上限，已转交厂长签批放行。",
+}
+
+_SENSITIVE_FIELDS: frozenset[str] = frozenset({"auth_token_hash", "password", "secret"})
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _load_base_display() -> dict[str, Any]:
+    display_path = Path(__file__).with_name("ui_display.json")
+    if not display_path.is_file():
+        return {}
+    try:
+        raw = json.loads(display_path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _merge_display(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for bucket in (
+        "ontologies",
+        "categories",
+        "objects",
+        "object_properties",
+        "fields",
+        "field_overrides",
+        "actions",
+        "functions",
+        "automations",
+        "interfaces",
+        "roles",
+        "statuses",
+        "cardinalities",
+        "kinds",
+    ):
+        left = base.get(bucket) or {}
+        right = extra.get(bucket) or {}
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            merged[bucket] = {**dict(left), **dict(right)}
+        elif isinstance(right, Mapping):
+            merged[bucket] = dict(right)
+        elif isinstance(left, Mapping):
+            merged[bucket] = dict(left)
+        else:
+            merged[bucket] = {}
+    merged["statuses"] = {**_STATUS_ZH, **merged.get("statuses", {})}
+    for key, val in extra.items():
+        if key not in merged:
+            merged[key] = val
+    return merged
+
+
+def _translate_error_hint(error_code: str | None, error_message: str | None) -> str:
+    code = str(error_code or "").strip()
+    if code in _ERROR_ZH:
+        return _ERROR_ZH[code]
+    if code.startswith("APPROVAL_REQUIRED_"):
+        return "触发治理审批阈值：需高一级负责人签批放行。"
+    if error_message:
+        return f"规则校验未通过（{error_message}），已阻止不合规写入，真实系统保持零改动。"
+    return ""
+
+
+def _default_numeric_extractor(
+    params: Mapping[str, Any],
+    sim: SimulationResult,
+) -> float:
+    for key in (
+        "amount_total",
+        "amount",
+        "payment_amount",
+        "settled_amount",
+        "amount_cents",
+        "total_amount",
+        "cost_cells",
+        "value",
+    ):
+        val = params.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return float(val) / 100.0 if key.endswith("_cents") else float(val)
+    for change in sim.diff.object_changes:
+        for snap in (change.after, change.before):
+            if not isinstance(snap, Mapping):
+                continue
+            for key in (
+                "amount_total",
+                "amount",
+                "amount_cents",
+                "total_amount",
+                "cost_cells",
+            ):
+                val = snap.get(key)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    return float(val) / 100.0 if key.endswith("_cents") else float(val)
+    return 0.0
+
+
+def _diff_summary(diff: Mapping[str, Any]) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    for raw in diff.get("object_changes") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        before = raw.get("before") if isinstance(raw.get("before"), Mapping) else {}
+        after = raw.get("after") if isinstance(raw.get("after"), Mapping) else {}
+        field_deltas: list[dict[str, Any]] = []
+        keys = sorted(set(before.keys()) | set(after.keys()))
+        for key in keys:
+            if before.get(key) != after.get(key):
+                field_deltas.append(
+                    {
+                        "field": key,
+                        "before": before.get(key),
+                        "after": after.get(key),
+                    }
+                )
+        changes.append(
+            {
+                "kind": raw.get("kind"),
+                "object_type": raw.get("object_type"),
+                "object_id": raw.get("object_id"),
+                "before": dict(before) if before else None,
+                "after": dict(after) if after else None,
+                "field_deltas": field_deltas,
+            }
+        )
+    return changes
+
+
+def _extract_device_registry(runtime: OntologyRuntime) -> DeviceDriverRegistry | None:
+    direct = getattr(runtime, "device_registry", None)
+    if isinstance(direct, DeviceDriverRegistry):
+        return direct
+    sb = runtime.source_bridge
+    if sb is None:
+        return None
+    sb_reg = getattr(sb, "device_registry", None)
+    if isinstance(sb_reg, DeviceDriverRegistry):
+        return sb_reg
+    for fn in (sb.actuate, sb.observe):
+        if fn is None:
+            continue
+        for cell in getattr(fn, "__closure__", None) or ():
+            val = cell.cell_contents
+            if isinstance(val, DeviceDriverRegistry):
+                return val
+    return None
+
+
+@dataclass(frozen=True)
+class DemoActorProfile:
+    """Selectable demo identity mapped deterministically onto a scoped ``Actor``."""
+
+    actor_id: str
+    display_name: str
+    role: str
+    unit_id: str = ""
+    unit_name: str = ""
+    title: str = ""
+    badge: str = ""
+    clearance_tags: tuple[str, ...] = ()
+    token: str = ""
+    actor: Actor | None = None
+
+    def to_actor(self, org_directory: OrgDirectory | None = None) -> Actor:
+        if self.actor is not None:
+            return self.actor
+        if org_directory is not None:
+            try:
+                return org_directory.resolve_actor(self.actor_id)
+            except OrgAuthorityError:
+                pass
+        return Actor(
+            actor_id=self.actor_id,
+            role=self.role,
+            clearance_tags=set(self.clearance_tags),
+        )
+
+    def to_public_dict(self, actor: Actor, *, admin_roles: Iterable[str]) -> dict[str, Any]:
+        return {
+            "actor_id": actor.actor_id,
+            "role": actor.role,
+            "display_name": self.display_name,
+            "unit_id": self.unit_id,
+            "unit_name": self.unit_name,
+            "title": self.title or self.display_name,
+            "badge": self.badge,
+            "clearance_tags": sorted(actor.clearance_tags),
+            "is_admin_ops": actor.role in set(admin_roles),
+        }
+
+
+class WorkQueueBinding(BaseModel):
+    """Pure M2 descriptor mapping any domain task/escalation object to inbox actions."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    object_type: str
+    id_field: str = "card_id"
+    kind_field: str = "card_kind"
+    status_field: str = "status"
+    active_statuses: tuple[str, ...] = ("OPEN", "IN_PROGRESS", "SLA_BREACHED")
+    target_type_field: str = "target_object_type"
+    target_id_field: str = "target_object_id"
+    intent_action_field: str = "requested_action"
+    intent_params_field: str = "requested_params_json"
+    requester_field: str = "requester_actor_id"
+    assignee_role_field: str = "assignee_role"
+    accept_op: str = ""
+    decline_op: str = ""
+    claim_op: str | None = None
+    id_param: str = "card_id"
+    note_param: str = "resolution_note"
+    settled_run_param: str = "settled_run_id"
+
+
+@dataclass
+class _SandboxSession:
+    sandbox_id: str
+    fork_runtime: OntologyRuntime
+    base_fingerprint: dict[str, Any]
+    created_at: str
+    created_by: str
+    steps: list[dict[str, Any]] = field(default_factory=list)
+
+
+class _SandboxSubmitStep(BaseModel):
+    action: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    actor_id: str | None = None
+
+
+class _SandboxSubmitRequest(BaseModel):
+    action: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+    actor_id: str | None = None
+    steps: list[_SandboxSubmitStep] | None = None
+
+
+class _ActionPayload(BaseModel):
+    action: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    run_id: str | None = None
+
+
+class _WorkQueueResolvePayload(BaseModel):
+    decision: str
+    note: str = ""
+    item_type: str | None = None
+
+
+class _AutonomyRulePayload(BaseModel):
+    action: str = "*"
+    roles: list[str] = Field(default_factory=list)
+    mode: AutonomyMode = "SHADOW"
+    ceiling_field: str | None = None
+    max_value: float | None = None
+    escalation_action: str | None = None
+    escalation_assignee_role: str | None = None
+
+
+class _AutonomyUpdatePayload(BaseModel):
+    default_mode: AutonomyMode | None = None
+    max_value: float | None = None
+    ceiling_field: str | None = None
+    escalation_action: str | None = None
+    escalation_assignee_role: str | None = None
+    rules: list[_AutonomyRulePayload] | None = None
+
+
+class _AssistantPayload(BaseModel):
+    message: str = ""
+    question: str = ""
+
+
+class ConsoleService:
+    """Thread-safe pure M2 backend service driving the console REST & SPA surface."""
+
+    def __init__(
+        self,
+        runtime: OntologyRuntime,
+        *,
+        default_actor: Actor | None = None,
+        org_directory: OrgDirectory | None = None,
+        autonomy_controller: AutonomyRampController | None = None,
+        actor_tokens: Mapping[str, Actor] | None = None,
+        demo_actors: Sequence[DemoActorProfile] = (),
+        demo_actor_switch: bool = False,
+        app_title: str = "OpenOntology 数字孪生控制台",
+        app_subtitle: str = "受治理本体运营工作台",
+        pack_hint: str = "",
+        work_queue_binding: WorkQueueBinding | None = None,
+        sandbox_presets: Sequence[Mapping[str, Any]] = (),
+        assistant_responder: Callable[
+            [OntologyRuntime, Actor, str, Mapping[str, Any]], dict[str, Any]
+        ]
+        | None = None,
+        admin_roles: Iterable[str] = _DEFAULT_ADMIN_ROLES,
+        escalation_action: str | None = None,
+        escalation_assignee_role: str | None = None,
+        escalation_payload_builder: Callable[..., dict[str, Any]] | None = None,
+        value_extractor: Callable[[Mapping[str, Any], SimulationResult], float | int | None]
+        | None = None,
+    ) -> None:
+        self.runtime = runtime
+        self.org_directory = org_directory
+        self.demo_actor_switch = bool(demo_actor_switch)
+        self.app_title = str(app_title)
+        self.app_subtitle = str(app_subtitle)
+        self.pack_hint = str(pack_hint)
+        self.sandbox_presets = [dict(item) for item in sandbox_presets]
+        self.assistant_responder = assistant_responder
+        self.admin_roles = frozenset(admin_roles or _DEFAULT_ADMIN_ROLES)
+        self._lock = threading.RLock()
+        self._sandboxes: dict[str, _SandboxSession] = {}
+
+        self._demo_profiles: dict[str, DemoActorProfile] = {}
+        self._demo_order: list[str] = []
+        self._token_map: dict[str, Actor] = dict(actor_tokens or {})
+        for prof in demo_actors:
+            resolved = prof.to_actor(org_directory)
+            self._demo_profiles[prof.actor_id] = prof
+            self._demo_order.append(prof.actor_id)
+            if prof.token:
+                self._token_map[prof.token] = resolved
+
+        if default_actor is not None:
+            self.default_actor = default_actor
+        elif self._demo_order:
+            first_prof = self._demo_profiles[self._demo_order[0]]
+            self.default_actor = first_prof.to_actor(org_directory)
+        else:
+            self.default_actor = Actor(actor_id="console-viewer", role="admin", clearance_tags={"*"})
+
+        self.work_queue_binding = work_queue_binding or self._infer_work_queue_binding()
+
+        if autonomy_controller is not None:
+            self.autonomy_controller = autonomy_controller
+            if self.autonomy_controller.value_extractor is None:
+                self.autonomy_controller.value_extractor = (
+                    value_extractor or _default_numeric_extractor
+                )
+        else:
+            policy = AutonomyPolicy(
+                default_mode="AUTO_UNDER_CEILING",
+                default_escalation_action=escalation_action,
+                default_escalation_assignee_role=escalation_assignee_role,
+                rules=(
+                    ActionAutonomyRule(
+                        action="*",
+                        mode="AUTO_UNDER_CEILING",
+                        max_value=500_000.0,
+                        escalation_action=escalation_action,
+                        escalation_assignee_role=escalation_assignee_role,
+                    ),
+                ),
+            )
+            self.autonomy_controller = AutonomyRampController(
+                policy,
+                escalation_payload_builder=escalation_payload_builder,
+                value_extractor=value_extractor or _default_numeric_extractor,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            for sbx in list(self._sandboxes.values()):
+                try:
+                    sbx.fork_runtime.close()
+                except Exception:
+                    pass
+            self._sandboxes.clear()
+
+    def _infer_work_queue_binding(self) -> WorkQueueBinding | None:
+        """Purely structural M2 detection of an active queue object schema."""
+        required_cols = {
+            "target_object_type",
+            "target_object_id",
+            "requested_action",
+            "requested_params_json",
+            "assignee_role",
+            "status",
+        }
+        for ot_name, cls in self.runtime.spec.object_types.items():
+            fnames = set(cls.model_fields.keys())
+            if required_cols <= fnames:
+                pk_name = cls.primary_key_name()
+                accept_op = ""
+                decline_op = ""
+                claim_op = None
+                for act_name, act_def in self.runtime.spec.actions.items():
+                    if ot_name not in act_def.touched_object_types:
+                        continue
+                    param_keys = set(act_def.params.model_fields.keys())
+                    if "settled_run_id" in param_keys and pk_name in param_keys:
+                        accept_op = act_name
+                    elif pk_name in param_keys and "resolution_note" in param_keys and "settled_run_id" not in param_keys:
+                        if "sla" not in act_name and "cancel" not in act_name:
+                            decline_op = act_name
+                    elif "external_ref" in param_keys and "resolution_note" not in param_keys and pk_name in param_keys:
+                        claim_op = act_name
+                if accept_op and decline_op:
+                    return WorkQueueBinding(
+                        object_type=ot_name,
+                        id_field=pk_name,
+                        accept_op=accept_op,
+                        decline_op=decline_op,
+                        claim_op=claim_op,
+                        id_param=pk_name,
+                    )
+        return None
+
+    def _actor_profile(self, actor: Actor) -> dict[str, Any]:
+        prof = self._demo_profiles.get(actor.actor_id)
+        if prof is not None:
+            return prof.to_public_dict(actor, admin_roles=self.admin_roles)
+        unit_id = ""
+        unit_name = ""
+        display_name = actor.actor_id
+        title = ""
+        if self.org_directory is not None:
+            try:
+                member = self.org_directory.get_member(actor.actor_id)
+                display_name = member.display_name
+                unit_id = member.unit_id
+                title = member.title
+                unit = self.org_directory.get_unit(unit_id)
+                unit_name = unit.name
+            except OrgAuthorityError:
+                pass
+        return {
+            "actor_id": actor.actor_id,
+            "role": actor.role,
+            "display_name": display_name,
+            "unit_id": unit_id,
+            "unit_name": unit_name,
+            "title": title,
+            "badge": "",
+            "clearance_tags": sorted(actor.clearance_tags),
+            "is_admin_ops": actor.role in self.admin_roles,
+        }
+
+    def resolve_request_actor(
+        self,
+        headers: Mapping[str, str],
+        *,
+        query_actor_id: str | None = None,
+    ) -> Actor:
+        """Authenticate bearer token or controlled demo persona switch (fail-closed)."""
+        norm_headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        auth_header = norm_headers.get("authorization", "").strip()
+        if auth_header:
+            parts = auth_header.split(None, 1)
+            if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+                raise PermissionDeniedError("authorization header must use 'Bearer <token>' format")
+            raw_token = parts[1].strip()
+            if raw_token in self._token_map:
+                return self._token_map[raw_token]
+            if self.org_directory is not None:
+                return self.org_directory.authenticate_token(raw_token)
+            raise PermissionDeniedError("invalid or expired bearer token")
+
+        requested_id = (
+            (query_actor_id or "").strip()
+            or norm_headers.get("x-actor-id", "").strip()
+        )
+        if requested_id:
+            if not self.demo_actor_switch:
+                raise PermissionDeniedError(
+                    "demo_actor_switch is disabled; provide a valid Bearer token"
+                )
+            prof = self._demo_profiles.get(requested_id)
+            if prof is not None:
+                return prof.to_actor(self.org_directory)
+            if self.org_directory is not None:
+                return self.org_directory.resolve_actor(requested_id)
+            if requested_id == self.default_actor.actor_id:
+                return self.default_actor
+            raise PermissionDeniedError(f"unknown demo actor_id {requested_id!r}")
+
+        if not self.demo_actor_switch and (self._token_map or self.org_directory is not None):
+            if self.default_actor is not None:
+                return self.default_actor
+            raise PermissionDeniedError("authentication required")
+        return self.default_actor
+
+    def _require_admin_ops(self, actor: Actor) -> None:
+        if actor.role not in self.admin_roles:
+            raise PermissionDeniedError(
+                f"role {actor.role!r} is not permitted for admin operations endpoints"
+            )
+
+    def _merged_display(self) -> dict[str, Any]:
+        return _merge_display(_load_base_display(), self.runtime.spec.display or {})
+
+    @staticmethod
+    def _sanitize_properties(props: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            str(k): v
+            for k, v in props.items()
+            if str(k) not in _SENSITIVE_FIELDS
+        }
+
+    def _serialize_instance(
+        self,
+        rt: OntologyRuntime,
+        cls: type[Any],
+        obj: Any,
+    ) -> dict[str, Any]:
+        oid = obj.primary_key_value()
+        loaded = rt.load_object(cls.__name__, oid)
+        props = self._sanitize_properties(obj.model_dump(mode="json"))
+        return {
+            "object_type": cls.__name__,
+            "object_id": oid,
+            "primary_key": cls.primary_key_name(),
+            "title": obj.title_value() or oid,
+            "version": int(loaded.version) if loaded is not None else 1,
+            "security_tags": list(loaded.security_tags) if loaded is not None else [],
+            "owned": bool(cls.owned_spec()),
+            "read_only_source": bool(cls.is_read_only_source()),
+            "properties": props,
+        }
+
+    # -- endpoints ---------------------------------------------------------
+    def get_meta(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            display = self._merged_display()
+            demo_list: list[dict[str, Any]] = []
+            if self.demo_actor_switch:
+                for aid in self._demo_order:
+                    prof = self._demo_profiles[aid]
+                    resolved = prof.to_actor(self.org_directory)
+                    demo_list.append(
+                        prof.to_public_dict(resolved, admin_roles=self.admin_roles)
+                    )
+            reg = _extract_device_registry(self.runtime)
+            device_count = len(reg.list_devices()) if reg is not None else (1 if self.runtime.source_bridge else 0)
+            return {
+                "ok": True,
+                "world_mode": self.runtime.world_mode,
+                "app_title": self.app_title,
+                "app_subtitle": self.app_subtitle,
+                "pack_hint": self.pack_hint,
+                "actor": self._actor_profile(actor),
+                "demo_actor_switch": self.demo_actor_switch,
+                "demo_actors": demo_list,
+                "display": display,
+                "work_queue": (
+                    self.work_queue_binding.model_dump(mode="json")
+                    if self.work_queue_binding is not None
+                    else None
+                ),
+                "sandbox_presets": list(self.sandbox_presets),
+                "autonomy_mode": self.autonomy_controller.policy.default_mode,
+                "state_fingerprint": self.runtime.state_fingerprint(),
+                "capabilities": {
+                    "is_admin_ops": actor.role in self.admin_roles,
+                    "has_org_directory": self.org_directory is not None,
+                    "device_count": device_count,
+                },
+            }
+
+    def get_tbox(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            display = self._merged_display()
+            obj_labels = display.get("objects") or {}
+            field_labels = display.get("fields") or {}
+            field_overrides = display.get("field_overrides") or {}
+            act_labels = display.get("actions") or {}
+            fn_labels = display.get("functions") or {}
+
+            scoped_tbox = describe_tbox(self.runtime.spec, actor=actor)
+            scoped_type_names = {ot["name"] for ot in scoped_tbox["object_types"]}
+            tbox = describe_tbox(self.runtime.spec)
+            behavior = describe_behavior(self.runtime.spec, actor=actor)
+
+            enriched_types: list[dict[str, Any]] = []
+            for ot in tbox["object_types"]:
+                ot_name = ot["name"]
+                cls = self.runtime.spec.get_object_type(ot_name)
+                visible_count = len(self.runtime.query_objects(cls, actor))
+                fields_out = []
+                for fld in ot["fields"]:
+                    fname = fld["name"]
+                    flabel = field_overrides.get(f"{ot_name}.{fname}") or field_labels.get(fname) or fname
+                    fields_out.append({**fld, "display_label": flabel})
+                enriched_types.append(
+                    {
+                        **ot,
+                        "display_label": obj_labels.get(ot_name) or ot_name,
+                        "fields": fields_out,
+                        "status_field": getattr(cls, "__status_field__", None),
+                        "initial_statuses": list(getattr(cls, "__initial_statuses__", ()) or ()),
+                        "transitions": {
+                            str(k): list(v)
+                            for k, v in (getattr(cls, "__transitions__", {}) or {}).items()
+                        },
+                        "in_role_scope": ot_name in scoped_type_names,
+                        "visible_count": visible_count,
+                    }
+                )
+
+            enriched_actions = [
+                {
+                    **act,
+                    "display_label": act_labels.get(act["name"]) or act["name"],
+                }
+                for act in behavior["actions"]
+            ]
+
+            enriched_functions = []
+            for fn_meta in behavior["functions"]:
+                fn_obj = self.runtime.spec.functions.get(fn_meta["name"])
+                enriched_functions.append(
+                    {
+                        **fn_meta,
+                        "display_label": fn_labels.get(fn_meta["name"]) or fn_meta["name"],
+                        "params_schema": (
+                            fn_obj.params.model_json_schema() if fn_obj is not None else {}
+                        ),
+                    }
+                )
+
+            invariants = [
+                {
+                    "kind": "state",
+                    "name": inv.name,
+                    "code": inv.code,
+                    "description": inv.description,
+                }
+                for inv in sorted(self.runtime.spec.invariants.values(), key=lambda i: i.name)
+            ] + [
+                {
+                    "kind": "transition",
+                    "name": tinv.name,
+                    "code": tinv.code,
+                    "description": tinv.description,
+                }
+                for tinv in sorted(
+                    self.runtime.spec.transition_invariants.values(), key=lambda i: i.name
+                )
+            ]
+
+            return {
+                "ok": True,
+                "object_types": enriched_types,
+                "interfaces": tbox["interfaces"],
+                "object_properties": tbox["object_properties"],
+                "actions": enriched_actions,
+                "functions": enriched_functions,
+                "automations": behavior["automations"],
+                "roles": behavior["roles"],
+                "invariants": invariants,
+            }
+
+    def list_objects(
+        self,
+        object_type: str,
+        actor: Actor,
+        *,
+        status: str | None = None,
+        q: str | None = None,
+        runtime_override: OntologyRuntime | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            rt = runtime_override or self.runtime
+            cls = rt.spec.get_object_type(object_type)
+            objs = rt.query_objects(cls, actor)
+            items = [self._serialize_instance(rt, cls, obj) for obj in objs]
+            if status:
+                s_val = status.strip()
+                items = [
+                    it
+                    for it in items
+                    if str(it["properties"].get(getattr(cls, "__status_field__", "status") or "status", ""))
+                    == s_val
+                ]
+            if q:
+                needle = q.strip().lower()
+                items = [
+                    it
+                    for it in items
+                    if needle in it["object_id"].lower()
+                    or needle in str(it["title"]).lower()
+                    or needle in json.dumps(it["properties"], ensure_ascii=False).lower()
+                ]
+            display = self._merged_display()
+            return {
+                "ok": True,
+                "object_type": cls.__name__,
+                "display_label": (display.get("objects") or {}).get(cls.__name__) or cls.__name__,
+                "primary_key": cls.primary_key_name(),
+                "count": len(items),
+                "items": items,
+                "objects": items,
+            }
+
+    def get_single_object(
+        self,
+        object_type: str,
+        object_id: str,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            cls = self.runtime.spec.get_object_type(object_type)
+            obj = self.runtime.get_object(cls, object_id, actor)
+            return {
+                "ok": True,
+                "item": self._serialize_instance(self.runtime, cls, obj),
+            }
+
+    def _neighbor_edges(
+        self,
+        ot: str,
+        oid: str,
+        actor: Actor,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Collect 1-hop upstream sources and downstream targets strictly via RLS."""
+        upstream: list[dict[str, Any]] = []
+        downstream: list[dict[str, Any]] = []
+        out_rows = self.runtime.connection.execute(
+            "SELECT link_type, target_type, target_id FROM ontology_links "
+            "WHERE source_type = ? AND source_id = ? ORDER BY link_type, target_type, target_id",
+            (ot, oid),
+        ).fetchall()
+        for r in out_rows:
+            t_type, t_id, l_type = str(r["target_type"]), str(r["target_id"]), str(r["link_type"])
+            loaded = self.runtime.load_object(t_type, t_id)
+            if loaded is None or not actor.has_access(loaded.security_tags):
+                continue
+            downstream.append(
+                {
+                    "direction": "downstream",
+                    "link_type": l_type,
+                    "source_type": ot,
+                    "source_id": oid,
+                    "target_type": t_type,
+                    "target_id": t_id,
+                    "peer_type": t_type,
+                    "peer_id": t_id,
+                }
+            )
+
+        in_rows = self.runtime.connection.execute(
+            "SELECT link_type, source_type, source_id FROM ontology_links "
+            "WHERE target_type = ? AND target_id = ? ORDER BY link_type, source_type, source_id",
+            (ot, oid),
+        ).fetchall()
+        for r in in_rows:
+            s_type, s_id, l_type = str(r["source_type"]), str(r["source_id"]), str(r["link_type"])
+            loaded = self.runtime.load_object(s_type, s_id)
+            if loaded is None or not actor.has_access(loaded.security_tags):
+                continue
+            upstream.append(
+                {
+                    "direction": "upstream",
+                    "link_type": l_type,
+                    "source_type": s_type,
+                    "source_id": s_id,
+                    "target_type": ot,
+                    "target_id": oid,
+                    "peer_type": s_type,
+                    "peer_id": s_id,
+                }
+            )
+        return upstream, downstream
+
+    def get_object_lineage(
+        self,
+        object_type: str,
+        object_id: str,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            root_cls = self.runtime.spec.get_object_type(object_type)
+            root_obj = self.runtime.get_object(root_cls, object_id, actor)
+            display = self._merged_display()
+            obj_labels = display.get("objects") or {}
+
+            nodes: dict[tuple[str, str], dict[str, Any]] = {}
+            edges: list[dict[str, Any]] = []
+            seen_edges: set[tuple[str, str, str, str, str]] = set()
+
+            def _ensure_node(t_name: str, o_id: str, hop: int, rel_dir: str) -> None:
+                key = (t_name, o_id)
+                if key in nodes:
+                    return
+                cls = self.runtime.spec.get_object_type(t_name)
+                obj = self.runtime.get_object(cls, o_id, actor)
+                serialized = self._serialize_instance(self.runtime, cls, obj)
+                nodes[key] = {
+                    **serialized,
+                    "display_label": obj_labels.get(t_name) or t_name,
+                    "hop": hop,
+                    "relation": rel_dir,
+                }
+
+            def _add_edge(edge: Mapping[str, Any]) -> None:
+                sig = (
+                    str(edge["link_type"]),
+                    str(edge["source_type"]),
+                    str(edge["source_id"]),
+                    str(edge["target_type"]),
+                    str(edge["target_id"]),
+                )
+                if sig in seen_edges:
+                    return
+                seen_edges.add(sig)
+                edges.append(dict(edge))
+
+            _ensure_node(root_cls.__name__, root_obj.primary_key_value(), 0, "root")
+
+            # Expand 2 hops upstream & downstream safely inside RLS visibility
+            frontier: list[tuple[str, str, int, str]] = [
+                (root_cls.__name__, root_obj.primary_key_value(), 0, "root")
+            ]
+            visited_expand: set[tuple[str, str]] = set()
+            while frontier:
+                cur_type, cur_id, cur_hop, _ = frontier.pop(0)
+                if (cur_type, cur_id) in visited_expand or cur_hop >= 2:
+                    continue
+                visited_expand.add((cur_type, cur_id))
+                up_list, down_list = self._neighbor_edges(cur_type, cur_id, actor)
+                for edge in [*up_list, *down_list]:
+                    p_type = str(edge["peer_type"])
+                    p_id = str(edge["peer_id"])
+                    try:
+                        _ensure_node(p_type, p_id, cur_hop + 1, str(edge["direction"]))
+                    except (ObjectNotFoundError, PermissionDeniedError, UnknownObjectTypeError):
+                        continue
+                    _add_edge(edge)
+                    if cur_hop + 1 < 2:
+                        frontier.append((p_type, p_id, cur_hop + 1, str(edge["direction"])))
+
+            # Attach generic target-referencing items (if binding present)
+            if self.work_queue_binding is not None:
+                wb = self.work_queue_binding
+                q_cls = self.runtime.spec.object_types.get(wb.object_type)
+                if q_cls is not None:
+                    for item_obj in self.runtime.query_objects(q_cls, actor):
+                        props = item_obj.model_dump(mode="json")
+                        if (
+                            str(props.get(wb.target_type_field, "")) == root_cls.__name__
+                            and str(props.get(wb.target_id_field, "")) == root_obj.primary_key_value()
+                        ):
+                            iid = item_obj.primary_key_value()
+                            _ensure_node(wb.object_type, iid, 1, "upstream")
+                            _add_edge(
+                                {
+                                    "direction": "upstream",
+                                    "link_type": "governs_target",
+                                    "source_type": wb.object_type,
+                                    "source_id": iid,
+                                    "target_type": root_cls.__name__,
+                                    "target_id": root_obj.primary_key_value(),
+                                    "peer_type": wb.object_type,
+                                    "peer_id": iid,
+                                }
+                            )
+
+            all_nodes = list(nodes.values())
+            return {
+                "ok": True,
+                "root": nodes[(root_cls.__name__, root_obj.primary_key_value())],
+                "nodes": all_nodes,
+                "edges": edges,
+                "hops": {
+                    "upstream": [n for n in all_nodes if n["relation"] == "upstream"],
+                    "downstream": [n for n in all_nodes if n["relation"] == "downstream"],
+                },
+            }
+
+    def simulate_action(
+        self,
+        payload: _ActionPayload,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            try:
+                sim = self.runtime.simulate_action(payload.action, payload.params, actor)
+                diff_dict = sim.diff.to_dict()
+                return {
+                    "ok": bool(sim.valid),
+                    "valid": bool(sim.valid),
+                    "status": "VALID" if sim.valid else "REJECTED",
+                    "action": payload.action,
+                    "read_versions": dict(sim.read_versions),
+                    "diff": diff_dict,
+                    "changes": _diff_summary(diff_dict),
+                    "error_code": sim.error_code,
+                    "error": sim.error,
+                    "hint_zh": _translate_error_hint(sim.error_code, sim.error),
+                    "zero_external_dirty_write": True,
+                }
+            except InvariantError as exc:
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "status": "REJECTED",
+                    "action": payload.action,
+                    "diff": {"object_changes": [], "link_changes": []},
+                    "changes": [],
+                    "error_code": exc.code,
+                    "error": str(exc),
+                    "hint_zh": _translate_error_hint(exc.code, str(exc)),
+                    "zero_external_dirty_write": True,
+                }
+
+    def submit_action(
+        self,
+        payload: _ActionPayload,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            run_id = (payload.run_id or "").strip() or f"RUN-{uuid.uuid4().hex[:12]}"
+            try:
+                decision = self.autonomy_controller.execute(
+                    self.runtime,
+                    actor,
+                    run_id,
+                    payload.action,
+                    payload.params,
+                )
+            except InvariantError as exc:
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "committed": False,
+                    "status": "REJECTED",
+                    "outcome": "REJECTED",
+                    "action": payload.action,
+                    "run_id": run_id,
+                    "diff": {"object_changes": [], "link_changes": []},
+                    "changes": [],
+                    "error_code": exc.code,
+                    "error": str(exc),
+                    "hint_zh": _translate_error_hint(exc.code, str(exc)),
+                    "zero_external_dirty_write": True,
+                    "state_fingerprint": self.runtime.state_fingerprint(),
+                }
+
+            sim_diff = decision.simulated.get("diff") or {"object_changes": [], "link_changes": []}
+            run_obj = decision.run
+            diff_dict = (run_obj.get("object_diff") if run_obj else None) or sim_diff
+            ok = bool(decision.valid)
+            return {
+                "ok": ok,
+                "valid": bool(decision.valid),
+                "committed": bool(decision.committed),
+                "mode": decision.mode,
+                "effective_mode": decision.effective_mode,
+                "status": (
+                    "COMMITTED"
+                    if decision.committed
+                    else (decision.outcome if ok else "REJECTED")
+                ),
+                "outcome": decision.outcome,
+                "action": payload.action,
+                "run_id": decision.run_id,
+                "run": run_obj,
+                "escalation": decision.escalation,
+                "diff": diff_dict,
+                "changes": _diff_summary(diff_dict),
+                "evaluated_value": decision.evaluated_value,
+                "max_value": decision.max_value,
+                "error_code": decision.error_code,
+                "error": decision.error_message,
+                "hint_zh": (
+                    _translate_error_hint(decision.error_code, decision.error_message)
+                    if not ok
+                    else ""
+                ),
+                "zero_external_dirty_write": True,
+                "state_fingerprint": self.runtime.state_fingerprint(),
+            }
+
+    def resolve_work_queue_item(
+        self,
+        item_id: str,
+        payload: _WorkQueueResolvePayload,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        """Human work-queue signoff executing RBAC, SoD, and $t_1$ invariants."""
+        with self._lock:
+            wb = self.work_queue_binding
+            if wb is None:
+                raise ActionNotFoundError("no active work_queue_binding registered on this runtime")
+            type_name = (payload.item_type or wb.object_type).strip()
+            cls = self.runtime.spec.get_object_type(type_name)
+            item_obj = self.runtime.get_object(cls, item_id, actor)
+            props = item_obj.model_dump(mode="json")
+
+            decision_kind = payload.decision.strip().lower()
+            if decision_kind not in ("approve", "accept", "reject", "decline"):
+                raise ValueError("decision must be 'approve' or 'reject'")
+            is_accept = decision_kind in ("approve", "accept")
+            op_name = wb.accept_op if is_accept else wb.decline_op
+
+            base_params: dict[str, Any] = {
+                wb.id_param: item_id,
+                wb.note_param: payload.note or ("核准通过" if is_accept else "审核驳回"),
+            }
+            item_kind = str(props.get(wb.kind_field, "")).strip()
+            intent_action = str(props.get(wb.intent_action_field, "")).strip()
+            raw_intent_json = str(props.get(wb.intent_params_field, "") or "{}").strip()
+            try:
+                intent_params = json.loads(raw_intent_json) if raw_intent_json else {}
+            except json.JSONDecodeError:
+                intent_params = {}
+
+            run_id = f"WQ-{uuid.uuid4().hex[:12]}"
+            target_act = self.runtime.spec.actions.get(intent_action) if intent_action else None
+            needs_followup = False
+            if is_accept and item_kind == "APPROVAL" and target_act is not None and isinstance(intent_params, dict):
+                sim_accept = self.runtime.simulate_action(op_name, base_params, actor)
+                if not sim_accept.valid:
+                    return self._rejected_resolution(op_name, run_id, sim_accept.error_code, sim_accept.error)
+                if target_act.affects_source:
+                    # Source-coupled approvals settle the intent first, then finalize queue item with settled_run_id
+                    act_rid = f"WQ-ACT-{uuid.uuid4().hex[:12]}"
+                    settled_run = self.runtime.submit_action(act_rid, intent_action, intent_params, actor)
+                    comp_params = {
+                        **base_params,
+                        wb.settled_run_param: str(settled_run.get("run_id", act_rid)),
+                    }
+                    comp_run = self.runtime.submit_action(run_id, op_name, comp_params, actor)
+                    return self._committed_resolution(op_name, comp_run, follow_up_run=settled_run)
+
+                touched_non_queue = any(
+                    ch.object_type != wb.object_type for ch in sim_accept.diff.object_changes
+                )
+                if not touched_non_queue and intent_params:
+                    needs_followup = True
+
+            if needs_followup and target_act is not None:
+                # Dry-run both steps in isolated fork so partial failure never leaves half-committed state
+                fork_rt = self.runtime.fork()
+                try:
+                    fork_rt.submit_action(f"{run_id}-CHK-1", op_name, base_params, actor)
+                    fork_rt.submit_action(f"{run_id}-CHK-2", intent_action, intent_params, actor)
+                except InvariantError as exc:
+                    return self._rejected_resolution(intent_action, run_id, exc.code, str(exc))
+                finally:
+                    fork_rt.close()
+
+                comp_run = self.runtime.submit_action(run_id, op_name, base_params, actor)
+                follow_run = self.runtime.submit_action(
+                    f"WQ-INT-{uuid.uuid4().hex[:12]}",
+                    intent_action,
+                    intent_params,
+                    actor,
+                )
+                return self._committed_resolution(op_name, comp_run, follow_up_run=follow_run)
+
+            try:
+                comp_run = self.runtime.submit_action(run_id, op_name, base_params, actor)
+            except InvariantError as exc:
+                return self._rejected_resolution(op_name, run_id, exc.code, str(exc))
+            return self._committed_resolution(op_name, comp_run)
+
+    def _rejected_resolution(
+        self,
+        action_name: str,
+        run_id: str,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "committed": False,
+            "status": "REJECTED",
+            "action": action_name,
+            "run_id": run_id,
+            "error_code": error_code,
+            "error": error_message,
+            "hint_zh": _translate_error_hint(error_code, error_message),
+            "zero_external_dirty_write": True,
+            "state_fingerprint": self.runtime.state_fingerprint(),
+        }
+
+    def _committed_resolution(
+        self,
+        action_name: str,
+        run: dict[str, Any],
+        *,
+        follow_up_run: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        diff_dict = run.get("object_diff") or {"object_changes": [], "link_changes": []}
+        return {
+            "ok": True,
+            "committed": True,
+            "status": str(run.get("status", "COMMITTED")),
+            "action": action_name,
+            "run_id": run.get("run_id"),
+            "run": run,
+            "follow_up_run": follow_up_run,
+            "diff": diff_dict,
+            "changes": _diff_summary(diff_dict),
+            "zero_external_dirty_write": True,
+            "state_fingerprint": self.runtime.state_fingerprint(),
+        }
+
+    def call_function(
+        self,
+        fn_name: str,
+        params: Mapping[str, Any] | None,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            result = self.runtime.call_function(fn_name, dict(params or {}), actor)
+            return {
+                "ok": True,
+                "function": fn_name,
+                "result": result,
+            }
+
+    # -- parallel sandboxes (runtime.fork) ---------------------------------
+    def create_sandbox(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            sid = f"SBX-{uuid.uuid4().hex[:8].upper()}"
+            fork_rt = self.runtime.fork()
+            base_fp = self.runtime.state_fingerprint()
+            self._sandboxes[sid] = _SandboxSession(
+                sandbox_id=sid,
+                fork_runtime=fork_rt,
+                base_fingerprint=base_fp,
+                created_at=_utc_now_iso(),
+                created_by=actor.actor_id,
+            )
+            return {
+                "ok": True,
+                "sandbox_id": sid,
+                "world_mode": fork_rt.world_mode,
+                "base_fingerprint": base_fp,
+                "steps": [],
+            }
+
+    def _require_sandbox(self, sid: str) -> _SandboxSession:
+        session = self._sandboxes.get(sid)
+        if session is None:
+            raise ObjectNotFoundError(f"sandbox {sid!r} not found")
+        return session
+
+    def _resolve_sandbox_step_actor(self, requested_actor_id: str | None, fallback: Actor) -> Actor:
+        if not requested_actor_id:
+            return fallback
+        if self.demo_actor_switch and requested_actor_id in self._demo_profiles:
+            return self._demo_profiles[requested_actor_id].to_actor(self.org_directory)
+        return fallback
+
+    def submit_sandbox_action(
+        self,
+        sid: str,
+        payload: _SandboxSubmitRequest,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self._require_sandbox(sid)
+            steps = list(payload.steps or ())
+            if not steps and payload.action:
+                steps = [
+                    _SandboxSubmitStep(
+                        action=payload.action,
+                        params=payload.params,
+                        actor_id=payload.actor_id,
+                    )
+                ]
+            if not steps:
+                raise ValueError("sandbox submit requires 'action' or non-empty 'steps'")
+
+            step_results: list[dict[str, Any]] = []
+            last_error_code: str | None = None
+            last_error_msg: str | None = None
+            all_ok = True
+
+            for idx, step in enumerate(steps, start=1):
+                step_actor = self._resolve_sandbox_step_actor(step.actor_id, actor)
+                step_run_id = f"{sid}-S{len(session.steps) + 1}-{idx}"
+                try:
+                    run = session.fork_runtime.submit_action(
+                        step_run_id,
+                        step.action,
+                        step.params,
+                        step_actor,
+                    )
+                    diff_dict = run.get("object_diff") or {"object_changes": [], "link_changes": []}
+                    step_rec = {
+                        "step_index": len(session.steps) + 1,
+                        "action": step.action,
+                        "params": dict(step.params),
+                        "actor_id": step_actor.actor_id,
+                        "run_id": step_run_id,
+                        "status": str(run.get("status", "COMMITTED")),
+                        "diff": diff_dict,
+                        "changes": _diff_summary(diff_dict),
+                    }
+                    session.steps.append(step_rec)
+                    step_results.append({"ok": True, **step_rec})
+                except OpenOntologyError as exc:
+                    all_ok = False
+                    last_error_code = getattr(exc, "code", None) or "SANDBOX_STEP_REJECTED"
+                    last_error_msg = str(exc)
+                    step_results.append(
+                        {
+                            "ok": False,
+                            "action": step.action,
+                            "params": dict(step.params),
+                            "actor_id": step_actor.actor_id,
+                            "status": "REJECTED",
+                            "error_code": last_error_code,
+                            "error": last_error_msg,
+                            "hint_zh": _translate_error_hint(last_error_code, last_error_msg),
+                        }
+                    )
+                    break
+
+            current_primary_fp = self.runtime.state_fingerprint()
+            return {
+                "ok": all_ok,
+                "sandbox_id": sid,
+                "step_results": step_results,
+                "steps": list(session.steps),
+                "primary_fingerprint_unchanged": current_primary_fp == session.base_fingerprint,
+                "base_fingerprint": session.base_fingerprint,
+                "current_primary_fingerprint": current_primary_fp,
+                "sandbox_fingerprint": session.fork_runtime.state_fingerprint(),
+                "error_code": last_error_code,
+                "error": last_error_msg,
+                "hint_zh": _translate_error_hint(last_error_code, last_error_msg) if last_error_code else "",
+                "zero_external_dirty_write": True,
+            }
+
+    def compare_sandbox_function(
+        self,
+        sid: str,
+        fn_name: str,
+        params: Mapping[str, Any] | None,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self._require_sandbox(sid)
+            p_dict = dict(params or {})
+
+            def _invoke(rt: OntologyRuntime) -> Any:
+                try:
+                    return rt.call_function(fn_name, p_dict, actor)
+                except OpenOntologyError as exc:
+                    return {"error": str(exc), "error_code": getattr(exc, "code", None)}
+
+            primary_res = _invoke(self.runtime)
+            sandbox_res = _invoke(session.fork_runtime)
+            return {
+                "ok": True,
+                "sandbox_id": sid,
+                "function": fn_name,
+                "primary": primary_res,
+                "sandbox": sandbox_res,
+            }
+
+    def diff_sandbox(self, sid: str, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            session = self._require_sandbox(sid)
+            created: list[dict[str, Any]] = []
+            updated: list[dict[str, Any]] = []
+            deleted: list[dict[str, Any]] = []
+
+            for ot_name, cls in self.runtime.spec.object_types.items():
+                prim_map = {
+                    obj.primary_key_value(): self._sanitize_properties(obj.model_dump(mode="json"))
+                    for obj in self.runtime.query_objects(cls, actor)
+                }
+                sbx_map = {
+                    obj.primary_key_value(): self._sanitize_properties(obj.model_dump(mode="json"))
+                    for obj in session.fork_runtime.query_objects(cls, actor)
+                }
+                all_ids = sorted(set(prim_map.keys()) | set(sbx_map.keys()))
+                for oid in all_ids:
+                    p_props = prim_map.get(oid)
+                    s_props = sbx_map.get(oid)
+                    if p_props is None and s_props is not None:
+                        created.append(
+                            {"object_type": ot_name, "object_id": oid, "after": s_props}
+                        )
+                    elif p_props is not None and s_props is None:
+                        deleted.append(
+                            {"object_type": ot_name, "object_id": oid, "before": p_props}
+                        )
+                    elif p_props != s_props and p_props is not None and s_props is not None:
+                        deltas = [
+                            {
+                                "field": k,
+                                "primary": p_props.get(k),
+                                "sandbox": s_props.get(k),
+                            }
+                            for k in sorted(set(p_props) | set(s_props))
+                            if p_props.get(k) != s_props.get(k)
+                        ]
+                        updated.append(
+                            {
+                                "object_type": ot_name,
+                                "object_id": oid,
+                                "before": p_props,
+                                "after": s_props,
+                                "field_deltas": deltas,
+                            }
+                        )
+
+            current_primary_fp = self.runtime.state_fingerprint()
+            return {
+                "ok": True,
+                "sandbox_id": sid,
+                "created": created,
+                "updated": updated,
+                "deleted": deleted,
+                "total_changes": len(created) + len(updated) + len(deleted),
+                "step_count": len(session.steps),
+                "steps": list(session.steps),
+                "primary_fingerprint_unchanged": current_primary_fp == session.base_fingerprint,
+                "zero_external_dirty_write": True,
+            }
+
+    def promote_sandbox(self, sid: str, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            session = self._require_sandbox(sid)
+            if not session.steps:
+                return {
+                    "ok": True,
+                    "sandbox_id": sid,
+                    "promoted_count": 0,
+                    "results": [],
+                    "state_fingerprint": self.runtime.state_fingerprint(),
+                }
+
+            results: list[dict[str, Any]] = []
+            all_ok = True
+            for step in session.steps:
+                res = self.submit_action(
+                    _ActionPayload(
+                        action=str(step["action"]),
+                        params=dict(step.get("params") or {}),
+                        run_id=f"PROMOTE-{sid}-{step['step_index']}-{uuid.uuid4().hex[:6]}",
+                    ),
+                    actor,
+                )
+                results.append(res)
+                if not res.get("ok") or not res.get("committed"):
+                    all_ok = False
+                    break
+
+            return {
+                "ok": all_ok,
+                "sandbox_id": sid,
+                "promoted_count": sum(1 for r in results if r.get("committed")),
+                "results": results,
+                "zero_external_dirty_write": True,
+                "state_fingerprint": self.runtime.state_fingerprint(),
+            }
+
+    def destroy_sandbox(self, sid: str) -> dict[str, Any]:
+        with self._lock:
+            session = self._require_sandbox(sid)
+            session.fork_runtime.close()
+            self._sandboxes.pop(sid, None)
+            current_primary_fp = self.runtime.state_fingerprint()
+            return {
+                "ok": True,
+                "sandbox_id": sid,
+                "destroyed": True,
+                "primary_fingerprint_unchanged": current_primary_fp == session.base_fingerprint,
+                "state_fingerprint": current_primary_fp,
+            }
+
+    # -- audit ledger ------------------------------------------------------
+    def get_audit(
+        self,
+        actor: Actor,
+        *,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            display = self._merged_display()
+            act_labels = display.get("actions") or {}
+            status_arg = status.strip().upper() if status and status.strip().upper() in ("COMMITTED", "REJECTED", "REVERTED") else None
+            runs = self.runtime.list_action_runs(status_arg)
+
+            ledger_by_run = {entry.run_id: entry for entry in self.autonomy_controller.ledger}
+            enriched_runs: list[dict[str, Any]] = []
+            for r in reversed(runs):
+                rid = str(r["run_id"])
+                led = ledger_by_run.get(rid)
+                diff_obj = r.get("object_diff") or {}
+                act_name = str(r.get("action_type", ""))
+                err_code = r.get("error_code")
+                err_msg = r.get("error_message")
+                mode_tag = "auto"
+                if led is not None:
+                    if led.effective_mode == "SHADOW":
+                        mode_tag = "shadow"
+                    elif led.outcome in ("ESCALATED_COMMITTED", "ESCALATION_REQUIRED"):
+                        mode_tag = "escalated"
+                    elif led.outcome == "AUTO_COMMITTED":
+                        mode_tag = "auto"
+                elif r.get("approved_by") or act_name in (
+                    self.work_queue_binding.accept_op if self.work_queue_binding else "",
+                    self.work_queue_binding.decline_op if self.work_queue_binding else "",
+                ):
+                    mode_tag = "human"
+                enriched_runs.append(
+                    {
+                        **r,
+                        "action_label": act_labels.get(act_name) or act_name,
+                        "status_label": _STATUS_ZH.get(str(r.get("status", "")), str(r.get("status", ""))),
+                        "governance_channel": mode_tag,
+                        "changes": _diff_summary(diff_obj),
+                        "hint_zh": _translate_error_hint(err_code, err_msg) if err_code else "",
+                        "external_dirty_writes": 0,
+                    }
+                )
+
+            shadow_entries = [
+                {
+                    **entry.model_dump(mode="json"),
+                    "action_label": act_labels.get(entry.action) or entry.action,
+                    "status_label": _STATUS_ZH.get(entry.outcome, entry.outcome),
+                    "hint_zh": (
+                        _translate_error_hint(entry.error_code, entry.error_message)
+                        if entry.error_code
+                        else ""
+                    ),
+                    "external_dirty_writes": 0,
+                }
+                for entry in reversed(self.autonomy_controller.ledger)
+            ]
+
+            return {
+                "ok": True,
+                "runs": enriched_runs,
+                "shadow_entries": shadow_entries,
+                "shadow_report": self.autonomy_controller.shadow_report(),
+                "summary": {
+                    "total_runs": len(runs),
+                    "committed": sum(1 for r in runs if r["status"] == "COMMITTED"),
+                    "rejected": sum(1 for r in runs if r["status"] == "REJECTED"),
+                    "reverted": sum(1 for r in runs if r["status"] == "REVERTED"),
+                    "external_dirty_writes": 0,
+                },
+            }
+
+    # -- admin endpoints (strictly role-gated) -----------------------------
+    def admin_devices(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            self._require_admin_ops(actor)
+            display = self._merged_display()
+            obj_labels = display.get("objects") or {}
+            reg = _extract_device_registry(self.runtime)
+
+            devices: list[dict[str, Any]] = []
+            coupled_types: set[str] = set()
+            if reg is not None:
+                for dev in reg.list_devices():
+                    if isinstance(dev, dict):
+                        item = {k: v for k, v in dev.items() if k != "bridge"}
+                        owned_t = list(item.get("owned_object_types") or ())
+                        shared_t = list(item.get("shared_object_types") or ())
+                        coupled_types.update(owned_t)
+                        devices.append({**item, "domain_mode": "coupled"})
+                    else:
+                        coupled_types.update(dev.owned_object_types)
+                        devices.append(
+                            {
+                                "device_id": dev.device_id,
+                                "name": dev.name,
+                                "kind": dev.kind,
+                                "endpoint": dev.endpoint,
+                                "status": dev.status,
+                                "status_label": _STATUS_ZH.get(dev.status, dev.status),
+                                "domain_mode": "coupled",
+                                "owned_object_types": list(dev.owned_object_types),
+                                "shared_object_types": list(dev.shared_object_types),
+                                "handled_actions": list(dev.handled_actions),
+                                "allow_source_revert": bool(dev.allow_source_revert),
+                                "metadata": dict(dev.metadata or {}),
+                            }
+                        )
+            elif self.runtime.source_bridge is not None:
+                devices.append(
+                    {
+                        "device_id": "primary_source_bridge",
+                        "name": "主外部系统连接桥",
+                        "kind": "source_bridge",
+                        "endpoint": "bound",
+                        "status": "MOUNTED",
+                        "status_label": "已连接",
+                        "domain_mode": "coupled",
+                        "owned_object_types": [],
+                        "shared_object_types": [],
+                        "handled_actions": [],
+                        "allow_source_revert": bool(self.runtime.source_bridge.allow_source_revert),
+                    }
+                )
+
+            standalone_domains = [
+                {
+                    "object_type": ot_name,
+                    "display_label": obj_labels.get(ot_name) or ot_name,
+                    "domain_mode": "standalone",
+                    "owned": bool(cls.owned_spec()),
+                }
+                for ot_name, cls in self.runtime.spec.object_types.items()
+                if ot_name not in coupled_types
+            ]
+
+            return {
+                "ok": True,
+                "world_mode": self.runtime.world_mode,
+                "devices": devices,
+                "standalone_object_types": standalone_domains,
+                "coupled_object_types": sorted(coupled_types),
+            }
+
+    def admin_get_autonomy(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            self._require_admin_ops(actor)
+            return {
+                "ok": True,
+                "policy": self.autonomy_controller.policy.to_dict(),
+                "shadow_report": self.autonomy_controller.shadow_report(),
+                "recent_ledger": [
+                    entry.model_dump(mode="json")
+                    for entry in reversed(self.autonomy_controller.ledger[-50:])
+                ],
+                "external_dirty_writes": 0,
+            }
+
+    def admin_update_autonomy(
+        self,
+        payload: _AutonomyUpdatePayload,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._require_admin_ops(actor)
+            cur = self.autonomy_controller.policy
+            new_default_mode = payload.default_mode or cur.default_mode
+            new_esc_action = (
+                payload.escalation_action
+                if payload.escalation_action is not None
+                else cur.default_escalation_action
+            )
+            new_esc_role = (
+                payload.escalation_assignee_role
+                if payload.escalation_assignee_role is not None
+                else cur.default_escalation_assignee_role
+            )
+
+            if payload.rules is not None:
+                new_rules = tuple(
+                    ActionAutonomyRule(
+                        action=r.action,
+                        roles=tuple(r.roles),
+                        mode=r.mode,
+                        ceiling_field=r.ceiling_field,
+                        max_value=r.max_value,
+                        escalation_action=r.escalation_action or new_esc_action,
+                        escalation_assignee_role=r.escalation_assignee_role or new_esc_role,
+                    )
+                    for r in payload.rules
+                )
+            else:
+                cur_wildcard = next((r for r in cur.rules if r.action == "*"), None)
+                other_rules = [r for r in cur.rules if r.action != "*"]
+                eff_max = (
+                    payload.max_value
+                    if payload.max_value is not None
+                    else (
+                        cur_wildcard.max_value
+                        if cur_wildcard and cur_wildcard.max_value is not None
+                        else 500_000.0
+                    )
+                )
+                eff_field = (
+                    payload.ceiling_field
+                    if payload.ceiling_field is not None
+                    else (cur_wildcard.ceiling_field if cur_wildcard else None)
+                )
+                new_wildcard = ActionAutonomyRule(
+                    action="*",
+                    mode=new_default_mode,
+                    ceiling_field=eff_field,
+                    max_value=eff_max,
+                    escalation_action=new_esc_action,
+                    escalation_assignee_role=new_esc_role,
+                )
+                new_rules = (new_wildcard, *other_rules)
+
+            updated_policy = AutonomyPolicy(
+                default_mode=new_default_mode,
+                default_escalation_action=new_esc_action,
+                default_escalation_assignee_role=new_esc_role,
+                rules=new_rules,
+            )
+            self.autonomy_controller.policy = updated_policy
+            return {
+                "ok": True,
+                "policy": updated_policy.to_dict(),
+                "shadow_report": self.autonomy_controller.shadow_report(),
+                "external_dirty_writes": 0,
+            }
+
+    def admin_org(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            self._require_admin_ops(actor)
+            units_out: list[dict[str, Any]] = []
+            members_out: list[dict[str, Any]] = []
+            if self.org_directory is not None:
+                units_out = [
+                    {
+                        "unit_id": u.unit_id,
+                        "name": u.name,
+                        "parent_id": u.parent_id,
+                        "unit_kind": u.unit_kind,
+                        "scope_tag": u.scope_tag,
+                    }
+                    for u in self.org_directory.list_units()
+                ]
+                for m in self.org_directory.list_members():
+                    try:
+                        resolved_actor = self.org_directory.resolve_actor(m.user_id)
+                        eff_tags = sorted(resolved_actor.clearance_tags)
+                    except OrgAuthorityError:
+                        eff_tags = []
+                    members_out.append(
+                        {
+                            "user_id": m.user_id,
+                            "display_name": m.display_name,
+                            "role": m.role,
+                            "unit_id": m.unit_id,
+                            "title": m.title,
+                            "active": m.active,
+                            "clearance_tags": eff_tags,
+                        }
+                    )
+
+            behavior = describe_behavior(self.runtime.spec, actor=actor)
+            return {
+                "ok": True,
+                "units": units_out,
+                "members": members_out,
+                "roles": behavior["roles"],
+            }
+
+    # -- NL assistant (RLS scoped, 100% offline capable) -------------------
+    def assistant_chat(
+        self,
+        payload: _AssistantPayload,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            question = (payload.message or payload.question or "").strip()
+            if not question:
+                return {
+                    "ok": True,
+                    "reply": "请输入您想查询的经营指标、单据异常、审批事项或假设推演问题。",
+                    "highlights": [],
+                    "cards": [],
+                    "rls_scope": sorted(actor.clearance_tags),
+                }
+
+            if self.assistant_responder is not None:
+                custom = self.assistant_responder(
+                    self.runtime,
+                    actor,
+                    question,
+                    {
+                        "display": self._merged_display(),
+                        "work_queue": (
+                            self.work_queue_binding.model_dump(mode="json")
+                            if self.work_queue_binding
+                            else None
+                        ),
+                    },
+                )
+                return {
+                    "ok": True,
+                    **custom,
+                    "rls_scope": sorted(actor.clearance_tags),
+                }
+
+            return self._generic_m2_assistant(question, actor)
+
+    def _generic_m2_assistant(self, question: str, actor: Actor) -> dict[str, Any]:
+        display = self._merged_display()
+        obj_labels = display.get("objects") or {}
+        type_summaries: list[str] = []
+        matched_cards: list[dict[str, Any]] = []
+        lower_q = question.lower()
+        total_visible = 0
+
+        for ot_name, cls in self.runtime.spec.object_types.items():
+            visible = self.runtime.query_objects(cls, actor)
+            total_visible += len(visible)
+            ot_label = obj_labels.get(ot_name) or ot_name
+            if visible:
+                type_summaries.append(f"{ot_label} {len(visible)} 条")
+            for obj in visible:
+                oid = obj.primary_key_value()
+                title = obj.title_value() or oid
+                blob = f"{ot_name} {ot_label} {oid} {title} {obj.to_properties()}".lower()
+                if any(tok in blob for tok in lower_q.split() if len(tok) >= 2):
+                    matched_cards.append(
+                        {
+                            "kind": "object",
+                            "title": f"{ot_label} · {title}",
+                            "subtitle": f"编号 {oid}",
+                            "object_type": ot_name,
+                            "object_id": oid,
+                        }
+                    )
+                elif ot_name.lower() in lower_q or ot_label.lower() in lower_q:
+                    matched_cards.append(
+                        {
+                            "kind": "object",
+                            "title": f"{ot_label} · {title}",
+                            "subtitle": f"编号 {oid}",
+                            "object_type": ot_name,
+                            "object_id": oid,
+                        }
+                    )
+
+        runs = self.runtime.list_action_runs()
+        rejected = [r for r in runs if r["status"] == "REJECTED"]
+        prof = self._actor_profile(actor)
+        reply = (
+            f"当前以「{prof['display_name']}（{actor.role}）」权限视角共检索到 "
+            f"{total_visible} 条可见记录：" + ("、".join(type_summaries[:6]) or "暂无数据") + "。"
+        )
+        if rejected:
+            last_rej = rejected[-1]
+            reply += (
+                f" 最近一次红线拦截为 {last_rej['action_type']}"
+                f"（{last_rej.get('error_code') or 'REJECTED'}），未对真实系统造成写入。"
+            )
+        return {
+            "ok": True,
+            "reply": reply,
+            "highlights": [
+                {"label": "可见对象总数", "value": str(total_visible)},
+                {"label": "累计审计记录", "value": str(len(runs))},
+                {"label": "红线拦截次数", "value": str(len(rejected))},
+            ],
+            "cards": matched_cards[:6],
+            "rls_scope": sorted(actor.clearance_tags),
+        }
+
+
+def _status_for_error(exc: Exception) -> int:
+    if isinstance(exc, PermissionDeniedError):
+        return HTTPStatus.FORBIDDEN
+    if isinstance(
+        exc,
+        (
+            KeyError,
+            ObjectNotFoundError,
+            UnknownObjectTypeError,
+            ActionNotFoundError,
+            FunctionNotFoundError,
+        ),
+    ):
+        return HTTPStatus.NOT_FOUND
+    if isinstance(exc, (OpenOntologyError, ValueError)):
+        return HTTPStatus.BAD_REQUEST
+    return HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+def create_console_app(
+    service: ConsoleService,
+    *,
+    static_dir: Path | str | None = None,
+) -> FastAPI:
+    """Create a FastAPI ASGI application wrapping ``ConsoleService`` + optional SPA bundle."""
+    app = FastAPI(title=service.app_title, docs_url=None, redoc_url=None)
+    resolved_static = (
+        Path(static_dir)
+        if static_dir is not None
+        else (Path(__file__).resolve().parent.parent / "web" / "dist")
+    )
+
+    @app.exception_handler(PermissionDeniedError)
+    def _handle_perm(_req: Request, exc: PermissionDeniedError) -> JSONResponse:
+        code = getattr(exc, "code", None) or "PERMISSION_DENIED"
+        return JSONResponse(
+            status_code=403,
+            content={
+                "ok": False,
+                "status": "REJECTED",
+                "error_code": code,
+                "error": str(exc),
+                "hint_zh": _translate_error_hint(code, str(exc)),
+                "zero_external_dirty_write": True,
+            },
+        )
+
+    @app.exception_handler(OpenOntologyError)
+    def _handle_ontology_err(_req: Request, exc: OpenOntologyError) -> JSONResponse:
+        code = getattr(exc, "code", None) or "ONTOLOGY_ERROR"
+        return JSONResponse(
+            status_code=_status_for_error(exc),
+            content={
+                "ok": False,
+                "status": "REJECTED",
+                "error_code": code,
+                "error": str(exc),
+                "hint_zh": _translate_error_hint(code, str(exc)),
+                "zero_external_dirty_write": True,
+            },
+        )
+
+    @app.exception_handler(ValueError)
+    def _handle_val_err(_req: Request, exc: ValueError) -> JSONResponse:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "status": "REJECTED",
+                "error_code": "INVALID_PARAMETER",
+                "error": str(exc),
+                "hint_zh": str(exc),
+                "zero_external_dirty_write": True,
+            },
+        )
+
+    def _actor_from_request(req: Request) -> Actor:
+        return service.resolve_request_actor(
+            req.headers,
+            query_actor_id=req.query_params.get("actor_id"),
+        )
+
+    @app.get("/api/health")
+    def api_health() -> dict[str, Any]:
+        return {"ok": True, "world_mode": service.runtime.world_mode}
+
+    @app.get("/api/meta")
+    def api_meta(req: Request) -> dict[str, Any]:
+        return service.get_meta(_actor_from_request(req))
+
+    @app.get("/api/tbox")
+    def api_tbox(req: Request) -> dict[str, Any]:
+        return service.get_tbox(_actor_from_request(req))
+
+    @app.get("/api/objects/{object_type}")
+    def api_list_objects(
+        object_type: str,
+        req: Request,
+        status: str | None = None,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        return service.list_objects(
+            object_type,
+            _actor_from_request(req),
+            status=status,
+            q=q,
+        )
+
+    @app.get("/api/objects/{object_type}/{object_id}/lineage")
+    def api_object_lineage(
+        object_type: str,
+        object_id: str,
+        req: Request,
+    ) -> dict[str, Any]:
+        return service.get_object_lineage(
+            object_type,
+            object_id,
+            _actor_from_request(req),
+        )
+
+    @app.get("/api/objects/{object_type}/{object_id}")
+    def api_get_object(
+        object_type: str,
+        object_id: str,
+        req: Request,
+    ) -> dict[str, Any]:
+        return service.get_single_object(
+            object_type,
+            object_id,
+            _actor_from_request(req),
+        )
+
+    @app.post("/api/actions/simulate")
+    def api_simulate_action(payload: _ActionPayload, req: Request) -> dict[str, Any]:
+        return service.simulate_action(payload, _actor_from_request(req))
+
+    @app.post("/api/actions/submit")
+    def api_submit_action(payload: _ActionPayload, req: Request) -> dict[str, Any]:
+        return service.submit_action(payload, _actor_from_request(req))
+
+    @app.post("/api/work-queue/{item_id}/resolve")
+    def api_resolve_work_queue(
+        item_id: str,
+        payload: _WorkQueueResolvePayload,
+        req: Request,
+    ) -> dict[str, Any]:
+        return service.resolve_work_queue_item(
+            item_id,
+            payload,
+            _actor_from_request(req),
+        )
+
+    def _unwrap_fn_params(body: dict[str, Any] | None) -> dict[str, Any]:
+        if not body:
+            return {}
+        if set(body.keys()) == {"params"} and isinstance(body.get("params"), dict):
+            return dict(body["params"])
+        return dict(body)
+
+    @app.post("/api/functions/{fn_name}")
+    def api_call_function(
+        fn_name: str,
+        req: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        return service.call_function(
+            fn_name,
+            _unwrap_fn_params(body),
+            _actor_from_request(req),
+        )
+
+    @app.post("/api/sandboxes")
+    def api_create_sandbox(req: Request) -> dict[str, Any]:
+        return service.create_sandbox(_actor_from_request(req))
+
+    @app.post("/api/sandboxes/{sid}/submit")
+    def api_sandbox_submit(
+        sid: str,
+        payload: _SandboxSubmitRequest,
+        req: Request,
+    ) -> dict[str, Any]:
+        return service.submit_sandbox_action(sid, payload, _actor_from_request(req))
+
+    @app.post("/api/sandboxes/{sid}/function/{fn_name}")
+    def api_sandbox_function(
+        sid: str,
+        fn_name: str,
+        req: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        return service.compare_sandbox_function(
+            sid,
+            fn_name,
+            _unwrap_fn_params(body),
+            _actor_from_request(req),
+        )
+
+    @app.get("/api/sandboxes/{sid}/objects/{object_type}")
+    def api_sandbox_objects(
+        sid: str,
+        object_type: str,
+        req: Request,
+        status: str | None = None,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        actor = _actor_from_request(req)
+        with service._lock:
+            sbx = service._require_sandbox(sid)
+            return service.list_objects(
+                object_type,
+                actor,
+                status=status,
+                q=q,
+                runtime_override=sbx.fork_runtime,
+            )
+
+    @app.get("/api/sandboxes/{sid}/diff")
+    def api_sandbox_diff(sid: str, req: Request) -> dict[str, Any]:
+        return service.diff_sandbox(sid, _actor_from_request(req))
+
+    @app.post("/api/sandboxes/{sid}/promote")
+    def api_sandbox_promote(sid: str, req: Request) -> dict[str, Any]:
+        return service.promote_sandbox(sid, _actor_from_request(req))
+
+    @app.delete("/api/sandboxes/{sid}")
+    def api_sandbox_destroy(sid: str, req: Request) -> dict[str, Any]:
+        _actor_from_request(req)
+        return service.destroy_sandbox(sid)
+
+    @app.get("/api/audit")
+    def api_audit(req: Request, status: str | None = None) -> dict[str, Any]:
+        return service.get_audit(_actor_from_request(req), status=status)
+
+    @app.get("/api/admin/devices")
+    def api_admin_devices(req: Request) -> dict[str, Any]:
+        return service.admin_devices(_actor_from_request(req))
+
+    @app.get("/api/admin/autonomy")
+    def api_admin_get_autonomy(req: Request) -> dict[str, Any]:
+        return service.admin_get_autonomy(_actor_from_request(req))
+
+    @app.put("/api/admin/autonomy")
+    def api_admin_put_autonomy(
+        payload: _AutonomyUpdatePayload,
+        req: Request,
+    ) -> dict[str, Any]:
+        return service.admin_update_autonomy(payload, _actor_from_request(req))
+
+    @app.get("/api/admin/org")
+    def api_admin_org(req: Request) -> dict[str, Any]:
+        return service.admin_org(_actor_from_request(req))
+
+    @app.post("/api/assistant/chat")
+    def api_assistant_chat(payload: _AssistantPayload, req: Request) -> dict[str, Any]:
+        return service.assistant_chat(payload, _actor_from_request(req))
+
+    @app.get("/{full_path:path}")
+    def spa_fallback(full_path: str) -> Any:
+        cleaned = (full_path or "").lstrip("/")
+        if cleaned == "api" or cleaned.startswith("api/"):
+            return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
+        if resolved_static.is_dir():
+            if cleaned:
+                candidate = (resolved_static / cleaned).resolve()
+                try:
+                    candidate.relative_to(resolved_static.resolve())
+                except ValueError:
+                    return JSONResponse(status_code=404, content={"ok": False, "error": "forbidden"})
+                if candidate.is_file():
+                    media_type, _ = mimetypes.guess_type(str(candidate))
+                    return FileResponse(candidate, media_type=media_type or "application/octet-stream")
+            index_file = resolved_static / "index.html"
+            if index_file.is_file():
+                return FileResponse(index_file, media_type="text/html; charset=utf-8")
+        return HTMLResponse(
+            "<html><body><h3>OpenOntology Console API Running</h3>"
+            "<p>Static frontend bundle not built at web/dist.</p></body></html>"
+        )
+
+    return app
+
+
+@dataclass
+class ConsoleServerHandle:
+    """Running Uvicorn thread handle for programmatic & E2E verification."""
+
+    service: ConsoleService
+    app: FastAPI
+    server: uvicorn.Server
+    thread: threading.Thread
+    sock: socket.socket
+    host: str
+    port: int
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def stop(self) -> None:
+        self.server.should_exit = True
+        self.thread.join(timeout=5.0)
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.service.close()
+
+
+def start_console_server(
+    service: ConsoleService,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    static_dir: Path | str | None = None,
+) -> ConsoleServerHandle:
+    """Start the pure M2 console ASGI server on a background thread and wait until ready."""
+    app = create_console_app(service, static_dir=static_dir)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.listen(128)
+    actual_host, actual_port = sock.getsockname()[:2]
+
+    config = uvicorn.Config(
+        app,
+        host=str(actual_host),
+        port=int(actual_port),
+        log_level="warning",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+
+    thread = threading.Thread(
+        target=server.run,
+        kwargs={"sockets": [sock]},
+        name=f"open-ontology-console-{actual_port}",
+        daemon=True,
+    )
+    thread.start()
+
+    deadline = threading.Event()
+    for _ in range(100):
+        if server.started or not thread.is_alive():
+            break
+        deadline.wait(0.02)
+
+    return ConsoleServerHandle(
+        service=service,
+        app=app,
+        server=server,
+        thread=thread,
+        sock=sock,
+        host=str(actual_host),
+        port=int(actual_port),
+    )
