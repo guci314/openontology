@@ -4,6 +4,7 @@ import {
   ConsoleMeta,
   SchemaCatalog,
   consoleApi,
+  getActiveActorId,
   setActiveActorId,
 } from './api/client';
 import { ShellLayout } from './shell/ShellLayout';
@@ -29,13 +30,31 @@ const AppShell: React.FC = () => {
     entityType: string;
     recordId: string;
   } | null>(null);
+  const [drawerHistory, setDrawerHistory] = useState<
+    Array<{ entityType: string; recordId: string }>
+  >([]);
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [pendingPresetId, setPendingPresetId] = useState<string | null>(null);
 
   const loadBootstrap = useCallback(async () => {
     try {
       setLoadError(null);
-      const [m, s] = await Promise.all([consoleApi.getMeta(), consoleApi.getSchema()]);
+      let m: ConsoleMeta;
+      try {
+        m = await consoleApi.getMeta();
+      } catch (err) {
+        if (getActiveActorId()) {
+          setActiveActorId(null);
+          m = await consoleApi.getMeta();
+        } else {
+          throw err;
+        }
+      }
+      if (m.demo_actor_switch && m.actor?.actor_id) {
+        setActiveActorId(m.actor.actor_id);
+      }
+      document.title = m.app_title || 'OpenOntology Digital Twin Console';
+      const s = await consoleApi.getSchema();
       setMeta(m);
       setSchema(s);
       setActivePack(resolveActivePack(m, s));
@@ -57,11 +76,38 @@ const AppShell: React.FC = () => {
     async (actorId: string) => {
       setActiveActorId(actorId);
       setDrawerTarget(null);
+      setDrawerHistory([]);
+      setPendingPresetId(null);
       await loadBootstrap();
       setRefreshTick((t) => t + 1);
     },
     [loadBootstrap]
   );
+
+  const openRootObject = useCallback((entityType: string, recordId: string) => {
+    setDrawerHistory([]);
+    setDrawerTarget({ entityType, recordId });
+  }, []);
+
+  const pushObjectDrilldown = useCallback(
+    (entityType: string, recordId: string) => {
+      if (drawerTarget) {
+        if (drawerTarget.entityType === entityType && drawerTarget.recordId === recordId) return;
+        setDrawerHistory((prev) => [...prev.slice(-9), drawerTarget]);
+      }
+      setDrawerTarget({ entityType, recordId });
+    },
+    [drawerTarget]
+  );
+
+  const popDrawerHistory = useCallback(() => {
+    setDrawerHistory((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      setDrawerTarget(last);
+      return prev.slice(0, -1);
+    });
+  }, []);
 
   if (loadError) {
     return (
@@ -100,14 +146,13 @@ const AppShell: React.FC = () => {
           path="/"
           element={
             <CockpitPage
+              key={meta.actor.actor_id}
               meta={meta}
               schema={schema}
               pack={activePack}
               refreshTick={refreshTick}
               onRefresh={handleRefresh}
-              onInspectObject={(entityType, recordId) =>
-                setDrawerTarget({ entityType, recordId })
-              }
+              onInspectObject={openRootObject}
             />
           }
         />
@@ -115,6 +160,7 @@ const AppShell: React.FC = () => {
           path="/sandbox"
           element={
             <SandboxPage
+              key={meta.actor.actor_id}
               meta={meta}
               schema={schema}
               pack={activePack}
@@ -126,12 +172,13 @@ const AppShell: React.FC = () => {
         />
         <Route
           path="/audit"
-          element={<AuditPage meta={meta} refreshTick={refreshTick} />}
+          element={<AuditPage key={meta.actor.actor_id} meta={meta} refreshTick={refreshTick} />}
         />
         <Route
           path="/admin"
           element={
             <AdminPage
+              key={meta.actor.actor_id}
               meta={meta}
               schema={schema}
               onPolicyUpdated={handleRefresh}
@@ -145,19 +192,21 @@ const AppShell: React.FC = () => {
         meta={meta}
         schema={schema}
         target={drawerTarget}
-        onClose={() => setDrawerTarget(null)}
-        onSelectObject={(entityType, recordId) =>
-          setDrawerTarget({ entityType, recordId })
-        }
+        canGoBack={drawerHistory.length > 0}
+        onBack={popDrawerHistory}
+        onClose={() => {
+          setDrawerTarget(null);
+          setDrawerHistory([]);
+        }}
+        onSelectObject={pushObjectDrilldown}
       />
 
       <AssistantDrawer
+        key={meta.actor.actor_id}
         open={assistantOpen}
         meta={meta}
         onClose={() => setAssistantOpen(false)}
-        onInspectObject={(entityType, recordId) =>
-          setDrawerTarget({ entityType, recordId })
-        }
+        onInspectObject={openRootObject}
         onSelectSandboxPreset={(pid) => setPendingPresetId(pid)}
       />
     </ShellLayout>

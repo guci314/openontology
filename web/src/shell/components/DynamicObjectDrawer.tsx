@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Layers, Shield, Sparkles, X } from 'lucide-react';
+import { ArrowLeft, Layers, Shield, Sparkles, X } from 'lucide-react';
 import type {
   ConsoleMeta,
   LineageResponse,
@@ -12,6 +12,7 @@ import {
   displayEnumValue,
   displayFieldName,
   displayYuanFieldLabel,
+  formatSmartFieldValue,
   getStatusBadgeMeta,
 } from '../i18nErrorMap';
 import { LineageGraph } from './LineageGraph';
@@ -20,6 +21,8 @@ interface DynamicObjectDrawerProps {
   meta: ConsoleMeta;
   schema: SchemaCatalog;
   target: { entityType: string; recordId: string } | null;
+  canGoBack?: boolean;
+  onBack?: () => void;
   onClose: () => void;
   onSelectObject: (entityType: string, recordId: string) => void;
 }
@@ -31,20 +34,13 @@ const formatDisplayValue = (
 ): string => {
   if (val === null || val === undefined || val === '') return '—';
   if (typeof val === 'boolean') return val ? '是' : '否';
-  if (fieldName.endsWith('_cents') && typeof val === 'number') {
-    return `¥${(val / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  }
-  if (
-    (fieldName.includes('amount') || fieldName === 'credit_limit' || fieldName === 'unit_price') &&
-    typeof val === 'number'
-  ) {
-    return `¥${val.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
-  }
   if (fieldName === 'status' || fieldName === 'stage' || fieldName === 'payment_state') {
     return getStatusBadgeMeta(val, meta.display).label;
   }
   if (typeof val === 'number') {
-    return val.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+    return formatSmartFieldValue(fieldName, val, meta, {
+      decimals: fieldName.endsWith('_cents') ? 2 : 0,
+    });
   }
   if (typeof val === 'string' && val.startsWith('{') && val.endsWith('}')) {
     try {
@@ -56,7 +52,9 @@ const formatDisplayValue = (
       return val;
     }
   }
-  if (Array.isArray(val)) return val.join(', ');
+  if (Array.isArray(val)) {
+    return val.map((x) => displayEnumValue(String(x), meta.display)).join(', ');
+  }
   if (typeof val === 'string') return displayEnumValue(val, meta.display);
   return String(val);
 };
@@ -65,6 +63,8 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
   meta,
   schema,
   target,
+  canGoBack,
+  onBack,
   onClose,
   onSelectObject,
 }) => {
@@ -79,6 +79,7 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
       return;
     }
     let cancelled = false;
+    setLineage(null);
     setLoading(true);
     setErrorMsg(null);
     consoleApi
@@ -87,7 +88,10 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
         if (!cancelled) setLineage(res);
       })
       .catch((err) => {
-        if (!cancelled) setErrorMsg(err instanceof Error ? err.message : '无权访问该记录或记录不存在');
+        if (!cancelled) {
+          setLineage(null);
+          setErrorMsg(err instanceof Error ? err.message : '无权访问该记录或记录不存在');
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -96,6 +100,17 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
       cancelled = true;
     };
   }, [target, meta.actor.actor_id]);
+
+  useEffect(() => {
+    if (!target) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [target, onClose]);
 
   if (!target) return null;
 
@@ -127,25 +142,36 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
         {/* Header */}
         <div className="flex items-start justify-between border-b border-slate-200 px-6 py-5">
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {canGoBack && onBack && (
+                <button
+                  type="button"
+                  onClick={onBack}
+                  data-testid="drawer-back-btn"
+                  className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  <ArrowLeft className="h-3 w-3" />
+                  <span>返回上一单据</span>
+                </button>
+              )}
               <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
                 {displayEntityName(target.entityType, meta.display)}
               </span>
-              {statusBadge && (
+              {!errorMsg && statusBadge && (
                 <span className="rounded-full bg-blue-50 px-2.5 py-0.5 text-xs font-medium text-blue-700 ring-1 ring-blue-200">
                   {statusBadge.label}
                 </span>
               )}
-              {record?.owned && (
+              {!errorMsg && record?.owned && (
                 <span className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700 ring-1 ring-sky-200">
-                  <Sparkles className="h-3 w-3" /> 企业扩展台账
+                  <Sparkles className="h-3 w-3" /> 扩展台账
                 </span>
               )}
             </div>
             <h3 className="mt-2 font-mono text-lg font-bold text-slate-900">
               {target.recordId}
             </h3>
-            {record?.title && record.title !== target.recordId && (
+            {!errorMsg && record?.title && record.title !== target.recordId && (
               <p className="text-sm text-slate-600">{record.title}</p>
             )}
           </div>
@@ -162,8 +188,18 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
         {/* Body */}
         <div className="flex-1 space-y-5 overflow-y-auto px-6 py-5">
           {errorMsg ? (
-            <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
-              {errorMsg}
+            <div className="space-y-3 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
+              <p>{errorMsg}</p>
+              {canGoBack && onBack && (
+                <button
+                  type="button"
+                  onClick={onBack}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-semibold text-rose-800 hover:bg-rose-100"
+                >
+                  <ArrowLeft className="h-3.5 w-3.5" />
+                  返回上一单据
+                </button>
+              )}
             </div>
           ) : (
             <>

@@ -21,14 +21,16 @@ from http import HTTPStatus
 import json
 import mimetypes
 from pathlib import Path
+import re
 import socket
 import threading
 from typing import Any, Callable, Iterable, Mapping, Sequence
 import uuid
 
 from fastapi import Body, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 import uvicorn
 
 from .aspects import SecurityAndAuthorityAspect
@@ -109,6 +111,15 @@ _STATUS_ZH: dict[str, str] = {
     "offboarded": "已离职",
     "onboarding": "待入职",
     "verified": "已核验",
+    "pending": "待处理",
+    "recorded": "已记录",
+    "agreed": "已生效",
+    "passed": "合格",
+    "HIGH": "高优",
+    "MEDIUM": "中等",
+    "LOW": "常规",
+    "DEBIT": "借方",
+    "CREDIT": "贷方",
 }
 
 _ERROR_ZH: dict[str, str] = {
@@ -168,6 +179,7 @@ def _merge_display(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[st
         "statuses",
         "cardinalities",
         "kinds",
+        "invariants",
     ):
         left = base.get(bucket) or {}
         right = extra.get(bucket) or {}
@@ -186,14 +198,51 @@ def _merge_display(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[st
     return merged
 
 
+def _format_validation_error_zh(
+    exc: ValidationError | RequestValidationError,
+    display: Mapping[str, Any] | None = None,
+) -> str:
+    fields_map = (display or {}).get("fields") or {}
+    parts: list[str] = []
+    for err in exc.errors():
+        loc = [str(x) for x in (err.get("loc") or ()) if str(x) not in ("body", "params")]
+        fname = loc[-1] if loc else ""
+        label = str(fields_map.get(fname) or fname or "输入参数")
+        etype = str(err.get("type") or "")
+        if "missing" in etype:
+            parts.append(f"「{label}」为必填项")
+        elif any(k in etype for k in ("int", "float", "decimal")):
+            parts.append(f"「{label}」须为有效数值")
+        elif "bool" in etype:
+            parts.append(f"「{label}」须为布尔值")
+        else:
+            parts.append(f"「{label}」格式不符合要求")
+    uniq = list(dict.fromkeys(parts))
+    if not uniq:
+        return "参数校验未通过，请核对必填字段与数值格式后重试。"
+    return "参数校验未通过：" + "；".join(uniq) + "。"
+
+
 def _translate_error_hint(error_code: str | None, error_message: str | None) -> str:
     code = str(error_code or "").strip()
+    msg = str(error_message or "").strip()
+    if "errors.pydantic.dev" in msg or "validation error" in msg.lower():
+        return "提交参数不完整或数值格式有误，请核对必填字段后重试。"
+    if code in ("OBJECT_NOT_FOUND", "OBJECT_TYPE_NOT_FOUND") or "not found" in msg.lower():
+        m = re.search(
+            r"(?:[:\s'\"])([A-Za-z0-9][A-Za-z0-9_.-]{0,63})['\"]?\s+(?:not found|does not exist)",
+            msg,
+            re.IGNORECASE,
+        )
+        if m:
+            return f"未找到编号为「{m.group(1)}」的目标记录，请核对编号后重试。"
+        return "未找到指定的目标记录，请核对编号后重试。"
     if code in _ERROR_ZH:
         return _ERROR_ZH[code]
     if code.startswith("APPROVAL_REQUIRED_"):
         return "触发治理审批阈值：需高一级负责人签批放行。"
-    if error_message:
-        return f"规则校验未通过（{error_message}），已阻止不合规写入，真实系统保持零改动。"
+    if msg:
+        return f"规则校验未通过（{msg}），已阻止不合规写入，真实系统保持零改动。"
     return ""
 
 
@@ -231,11 +280,20 @@ def _default_numeric_extractor(
     return 0.0
 
 
-def _diff_summary(diff: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _diff_summary(
+    diff: Mapping[str, Any],
+    *,
+    title_resolver: Callable[
+        [str, str, Mapping[str, Any] | None, Mapping[str, Any] | None], str
+    ]
+    | None = None,
+) -> list[dict[str, Any]]:
     changes: list[dict[str, Any]] = []
     for raw in diff.get("object_changes") or ():
         if not isinstance(raw, Mapping):
             continue
+        ot = str(raw.get("object_type") or "")
+        oid = str(raw.get("object_id") or "")
         before = raw.get("before") if isinstance(raw.get("before"), Mapping) else {}
         after = raw.get("after") if isinstance(raw.get("after"), Mapping) else {}
         field_deltas: list[dict[str, Any]] = []
@@ -249,11 +307,13 @@ def _diff_summary(diff: Mapping[str, Any]) -> list[dict[str, Any]]:
                         "after": after.get(key),
                     }
                 )
+        obj_title = title_resolver(ot, oid, before, after) if title_resolver and ot and oid else ""
         changes.append(
             {
                 "kind": raw.get("kind"),
-                "object_type": raw.get("object_type"),
-                "object_id": raw.get("object_id"),
+                "object_type": ot,
+                "object_id": oid,
+                "object_title": obj_title,
                 "before": dict(before) if before else None,
                 "after": dict(after) if after else None,
                 "field_deltas": field_deltas,
@@ -426,6 +486,9 @@ class ConsoleService:
         pack_hint: str = "",
         work_queue_binding: WorkQueueBinding | None = None,
         sandbox_presets: Sequence[Mapping[str, Any]] = (),
+        quick_prompts: Sequence[str] = (),
+        assistant_welcome: str = "",
+        value_unit_label: str = "",
         assistant_responder: Callable[
             [OntologyRuntime, Actor, str, Mapping[str, Any]], dict[str, Any]
         ]
@@ -444,6 +507,9 @@ class ConsoleService:
         self.app_subtitle = str(app_subtitle)
         self.pack_hint = str(pack_hint)
         self.sandbox_presets = [dict(item) for item in sandbox_presets]
+        self.quick_prompts = [str(item) for item in quick_prompts]
+        self.assistant_welcome = str(assistant_welcome)
+        self.value_unit_label = str(value_unit_label)
         self.assistant_responder = assistant_responder
         self.admin_roles = frozenset(admin_roles or _DEFAULT_ADMIN_ROLES)
         self._lock = threading.RLock()
@@ -654,6 +720,61 @@ class ConsoleService:
             "properties": props,
         }
 
+    def _visible_sandbox_presets(self, actor: Actor) -> list[dict[str, Any]]:
+        is_privileged = actor.role in self.admin_roles or "*" in actor.clearance_tags
+        out: list[dict[str, Any]] = []
+        for raw in self.sandbox_presets:
+            allowed_roles = tuple(raw.get("allowed_roles") or ())
+            req_clear = tuple(raw.get("required_clearance") or ())
+            if not is_privileged:
+                if allowed_roles and actor.role not in allowed_roles:
+                    continue
+                if req_clear and not actor.has_access(list(req_clear)):
+                    continue
+            out.append(
+                {
+                    k: v
+                    for k, v in raw.items()
+                    if k not in ("allowed_roles", "required_clearance")
+                }
+            )
+        return out
+
+    def _actor_display_name(self, actor_id: str) -> str:
+        Aid = str(actor_id or "").strip()
+        if not Aid:
+            return ""
+        prof = self._demo_profiles.get(Aid)
+        if prof is not None:
+            return prof.display_name
+        if self.org_directory is not None:
+            try:
+                return self.org_directory.get_member(Aid).display_name
+            except OrgAuthorityError:
+                pass
+        return Aid
+
+    def _resolve_object_title(
+        self,
+        ot: str,
+        oid: str,
+        before: Mapping[str, Any] | None = None,
+        after: Mapping[str, Any] | None = None,
+    ) -> str:
+        loaded = self.runtime.load_object(ot, oid)
+        if loaded is not None and loaded.title:
+            return str(loaded.title)
+        cls = self.runtime.spec.object_types.get(ot)
+        title_field = getattr(cls, "__title__", None) if cls is not None else None
+        for snap in (after, before):
+            if isinstance(snap, Mapping):
+                if title_field and snap.get(title_field):
+                    return str(snap[title_field])
+                for fallback_k in ("name", "title", "memo", "subject"):
+                    if snap.get(fallback_k):
+                        return str(snap[fallback_k])
+        return ""
+
     # -- endpoints ---------------------------------------------------------
     def get_meta(self, actor: Actor) -> dict[str, Any]:
         with self._lock:
@@ -668,13 +789,30 @@ class ConsoleService:
                     )
             reg = _extract_device_registry(self.runtime)
             device_count = len(reg.list_devices()) if reg is not None else (1 if self.runtime.source_bridge else 0)
+            actor_prof = self._actor_profile(actor)
+            prompts = self.quick_prompts or [
+                "当前有哪些待处理的协同事项？",
+                "当前可见记录与状态分布如何？",
+                "最近有哪些规则拦截或审计记录？",
+                "我当前的权限可见范围是什么？",
+            ]
+            welcome_tpl = self.assistant_welcome or (
+                "您好 {display_name}！我是运行在「{title}」权限视角内的智能助手，可为您检索可见记录、待办审批与平行沙盘推演。"
+            )
+            try:
+                welcome_text = welcome_tpl.format(
+                    display_name=actor_prof.get("display_name") or actor.actor_id,
+                    title=actor_prof.get("title") or actor.role,
+                )
+            except Exception:
+                welcome_text = welcome_tpl
             return {
                 "ok": True,
                 "world_mode": self.runtime.world_mode,
                 "app_title": self.app_title,
                 "app_subtitle": self.app_subtitle,
                 "pack_hint": self.pack_hint,
-                "actor": self._actor_profile(actor),
+                "actor": actor_prof,
                 "demo_actor_switch": self.demo_actor_switch,
                 "demo_actors": demo_list,
                 "display": display,
@@ -683,7 +821,10 @@ class ConsoleService:
                     if self.work_queue_binding is not None
                     else None
                 ),
-                "sandbox_presets": list(self.sandbox_presets),
+                "sandbox_presets": self._visible_sandbox_presets(actor),
+                "quick_prompts": prompts,
+                "assistant_welcome": welcome_text,
+                "value_unit_label": self.value_unit_label,
                 "autonomy_mode": self.autonomy_controller.policy.default_mode,
                 "state_fingerprint": self.runtime.state_fingerprint(),
                 "capabilities": {
@@ -701,6 +842,7 @@ class ConsoleService:
             field_overrides = display.get("field_overrides") or {}
             act_labels = display.get("actions") or {}
             fn_labels = display.get("functions") or {}
+            inv_labels = display.get("invariants") or {}
 
             scoped_tbox = describe_tbox(self.runtime.spec, actor=actor)
             scoped_type_names = {ot["name"] for ot in scoped_tbox["object_types"]}
@@ -733,13 +875,18 @@ class ConsoleService:
                     }
                 )
 
-            enriched_actions = [
-                {
-                    **act,
-                    "display_label": act_labels.get(act["name"]) or act["name"],
-                }
-                for act in behavior["actions"]
-            ]
+            enriched_actions = []
+            for act in behavior["actions"]:
+                act_def = self.runtime.spec.actions.get(act["name"])
+                enriched_actions.append(
+                    {
+                        **act,
+                        "display_label": act_labels.get(act["name"]) or act["name"],
+                        "touched_object_types": (
+                            list(act_def.touched_object_types) if act_def is not None else []
+                        ),
+                    }
+                )
 
             enriched_functions = []
             for fn_meta in behavior["functions"]:
@@ -754,25 +901,40 @@ class ConsoleService:
                     }
                 )
 
-            invariants = [
-                {
-                    "kind": "state",
-                    "name": inv.name,
-                    "code": inv.code,
-                    "description": inv.description,
-                }
+            def _inv_desc(name: str, code: str, raw_desc: str) -> str:
+                if inv_labels.get(name):
+                    return str(inv_labels[name])
+                if inv_labels.get(code):
+                    return str(inv_labels[code])
+                if raw_desc == "Status transitions must follow declared FSM edges.":
+                    return "单据状态流转必须严格遵循声明的状态机跃迁路径。"
+                return raw_desc or name
+
+            dedup_invs: dict[tuple[str, str], dict[str, Any]] = {}
+            raw_invs = [
+                ("state", inv.name, inv.code, _inv_desc(inv.name, inv.code, inv.description))
                 for inv in sorted(self.runtime.spec.invariants.values(), key=lambda i: i.name)
             ] + [
-                {
-                    "kind": "transition",
-                    "name": tinv.name,
-                    "code": tinv.code,
-                    "description": tinv.description,
-                }
+                ("transition", tinv.name, tinv.code, _inv_desc(tinv.name, tinv.code, tinv.description))
                 for tinv in sorted(
                     self.runtime.spec.transition_invariants.values(), key=lambda i: i.name
                 )
             ]
+            for kind_v, name_v, code_v, desc_v in raw_invs:
+                k_pair = (kind_v, code_v or name_v)
+                if k_pair not in dedup_invs:
+                    dedup_invs[k_pair] = {
+                        "kind": kind_v,
+                        "name": name_v,
+                        "code": code_v,
+                        "description": desc_v,
+                    }
+                else:
+                    existing_d = str(dedup_invs[k_pair]["description"])
+                    if desc_v and desc_v not in existing_d:
+                        dedup_invs[k_pair]["description"] = f"{existing_d}；{desc_v}"
+
+            invariants = list(dedup_invs.values())
 
             return {
                 "ok": True,
@@ -842,13 +1004,21 @@ class ConsoleService:
                 "item": self._serialize_instance(self.runtime, cls, obj),
             }
 
+    def _total_degree(self, ot: str, oid: str) -> int:
+        row = self.runtime.connection.execute(
+            "SELECT COUNT(*) AS n FROM ontology_links "
+            "WHERE (source_type = ? AND source_id = ?) OR (target_type = ? AND target_id = ?)",
+            (ot, oid, ot, oid),
+        ).fetchone()
+        return int(row["n"]) if row is not None else 0
+
     def _neighbor_edges(
         self,
         ot: str,
         oid: str,
         actor: Actor,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Collect 1-hop upstream sources and downstream targets strictly via RLS."""
+        """Collect 1-hop prerequisite (upstream) & follow-up (downstream) links strictly via RLS."""
         upstream: list[dict[str, Any]] = []
         downstream: list[dict[str, Any]] = []
         out_rows = self.runtime.connection.execute(
@@ -861,9 +1031,9 @@ class ConsoleService:
             loaded = self.runtime.load_object(t_type, t_id)
             if loaded is None or not actor.has_access(loaded.security_tags):
                 continue
-            downstream.append(
+            upstream.append(
                 {
-                    "direction": "downstream",
+                    "direction": "upstream",
                     "link_type": l_type,
                     "source_type": ot,
                     "source_id": oid,
@@ -884,9 +1054,9 @@ class ConsoleService:
             loaded = self.runtime.load_object(s_type, s_id)
             if loaded is None or not actor.has_access(loaded.security_tags):
                 continue
-            upstream.append(
+            downstream.append(
                 {
-                    "direction": "upstream",
+                    "direction": "downstream",
                     "link_type": l_type,
                     "source_type": s_type,
                     "source_id": s_id,
@@ -941,29 +1111,41 @@ class ConsoleService:
                 seen_edges.add(sig)
                 edges.append(dict(edge))
 
-            _ensure_node(root_cls.__name__, root_obj.primary_key_value(), 0, "root")
+            root_pk = root_obj.primary_key_value()
+            _ensure_node(root_cls.__name__, root_pk, 0, "root")
 
-            # Expand 2 hops upstream & downstream safely inside RLS visibility
+            # Expand 2 hops upstream & downstream within RLS, skipping fan-out across high-degree hubs
+            _HUB_DEGREE_LIMIT = 6
             frontier: list[tuple[str, str, int, str]] = [
-                (root_cls.__name__, root_obj.primary_key_value(), 0, "root")
+                (root_cls.__name__, root_pk, 0, "root")
             ]
             visited_expand: set[tuple[str, str]] = set()
             while frontier:
-                cur_type, cur_id, cur_hop, _ = frontier.pop(0)
+                cur_type, cur_id, cur_hop, cur_dir = frontier.pop(0)
                 if (cur_type, cur_id) in visited_expand or cur_hop >= 2:
                     continue
                 visited_expand.add((cur_type, cur_id))
                 up_list, down_list = self._neighbor_edges(cur_type, cur_id, actor)
-                for edge in [*up_list, *down_list]:
+                if cur_hop == 0:
+                    candidate_edges = [*up_list, *down_list]
+                elif cur_dir == "upstream":
+                    candidate_edges = up_list
+                else:
+                    candidate_edges = down_list
+
+                for edge in candidate_edges:
                     p_type = str(edge["peer_type"])
                     p_id = str(edge["peer_id"])
+                    if (p_type, p_id) == (root_cls.__name__, root_pk):
+                        continue
+                    node_dir = str(edge["direction"]) if cur_hop == 0 else cur_dir
                     try:
-                        _ensure_node(p_type, p_id, cur_hop + 1, str(edge["direction"]))
+                        _ensure_node(p_type, p_id, cur_hop + 1, node_dir)
                     except (ObjectNotFoundError, PermissionDeniedError, UnknownObjectTypeError):
                         continue
                     _add_edge(edge)
-                    if cur_hop + 1 < 2:
-                        frontier.append((p_type, p_id, cur_hop + 1, str(edge["direction"])))
+                    if cur_hop + 1 < 2 and self._total_degree(p_type, p_id) <= _HUB_DEGREE_LIMIT:
+                        frontier.append((p_type, p_id, cur_hop + 1, node_dir))
 
             # Attach generic target-referencing items (if binding present)
             if self.work_queue_binding is not None:
@@ -974,18 +1156,18 @@ class ConsoleService:
                         props = item_obj.model_dump(mode="json")
                         if (
                             str(props.get(wb.target_type_field, "")) == root_cls.__name__
-                            and str(props.get(wb.target_id_field, "")) == root_obj.primary_key_value()
+                            and str(props.get(wb.target_id_field, "")) == root_pk
                         ):
                             iid = item_obj.primary_key_value()
-                            _ensure_node(wb.object_type, iid, 1, "upstream")
+                            _ensure_node(wb.object_type, iid, 1, "downstream")
                             _add_edge(
                                 {
-                                    "direction": "upstream",
+                                    "direction": "downstream",
                                     "link_type": "governs_target",
                                     "source_type": wb.object_type,
                                     "source_id": iid,
                                     "target_type": root_cls.__name__,
-                                    "target_id": root_obj.primary_key_value(),
+                                    "target_id": root_pk,
                                     "peer_type": wb.object_type,
                                     "peer_id": iid,
                                 }
@@ -1009,6 +1191,7 @@ class ConsoleService:
         actor: Actor,
     ) -> dict[str, Any]:
         with self._lock:
+            display = self._merged_display()
             try:
                 sim = self.runtime.simulate_action(payload.action, payload.params, actor)
                 diff_dict = sim.diff.to_dict()
@@ -1019,10 +1202,24 @@ class ConsoleService:
                     "action": payload.action,
                     "read_versions": dict(sim.read_versions),
                     "diff": diff_dict,
-                    "changes": _diff_summary(diff_dict),
+                    "changes": _diff_summary(diff_dict, title_resolver=self._resolve_object_title),
                     "error_code": sim.error_code,
                     "error": sim.error,
                     "hint_zh": _translate_error_hint(sim.error_code, sim.error),
+                    "zero_external_dirty_write": True,
+                }
+            except ValidationError as exc:
+                hint = _format_validation_error_zh(exc, display)
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "status": "REJECTED",
+                    "action": payload.action,
+                    "diff": {"object_changes": [], "link_changes": []},
+                    "changes": [],
+                    "error_code": "INVALID_PARAMETER",
+                    "error": hint,
+                    "hint_zh": hint,
                     "zero_external_dirty_write": True,
                 }
             except InvariantError as exc:
@@ -1045,6 +1242,7 @@ class ConsoleService:
         actor: Actor,
     ) -> dict[str, Any]:
         with self._lock:
+            display = self._merged_display()
             run_id = (payload.run_id or "").strip() or f"RUN-{uuid.uuid4().hex[:12]}"
             try:
                 decision = self.autonomy_controller.execute(
@@ -1054,6 +1252,24 @@ class ConsoleService:
                     payload.action,
                     payload.params,
                 )
+            except ValidationError as exc:
+                hint = _format_validation_error_zh(exc, display)
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "committed": False,
+                    "status": "REJECTED",
+                    "outcome": "REJECTED",
+                    "action": payload.action,
+                    "run_id": run_id,
+                    "diff": {"object_changes": [], "link_changes": []},
+                    "changes": [],
+                    "error_code": "INVALID_PARAMETER",
+                    "error": hint,
+                    "hint_zh": hint,
+                    "zero_external_dirty_write": True,
+                    "state_fingerprint": self.runtime.state_fingerprint(),
+                }
             except InvariantError as exc:
                 return {
                     "ok": False,
@@ -1093,7 +1309,7 @@ class ConsoleService:
                 "run": run_obj,
                 "escalation": decision.escalation,
                 "diff": diff_dict,
-                "changes": _diff_summary(diff_dict),
+                "changes": _diff_summary(diff_dict, title_resolver=self._resolve_object_title),
                 "evaluated_value": decision.evaluated_value,
                 "max_value": decision.max_value,
                 "error_code": decision.error_code,
@@ -1288,7 +1504,8 @@ class ConsoleService:
     def _resolve_sandbox_step_actor(self, requested_actor_id: str | None, fallback: Actor) -> Actor:
         if not requested_actor_id:
             return fallback
-        if self.demo_actor_switch and requested_actor_id in self._demo_profiles:
+        is_privileged = fallback.role in self.admin_roles or "*" in fallback.clearance_tags
+        if is_privileged and self.demo_actor_switch and requested_actor_id in self._demo_profiles:
             return self._demo_profiles[requested_actor_id].to_actor(self.org_directory)
         return fallback
 
@@ -1299,6 +1516,7 @@ class ConsoleService:
         actor: Actor,
     ) -> dict[str, Any]:
         with self._lock:
+            display = self._merged_display()
             session = self._require_sandbox(sid, actor)
             steps = list(payload.steps or ())
             if not steps and payload.action:
@@ -1315,6 +1533,7 @@ class ConsoleService:
             step_results: list[dict[str, Any]] = []
             last_error_code: str | None = None
             last_error_msg: str | None = None
+            last_hint_zh = ""
             all_ok = True
 
             for idx, step in enumerate(steps, start=1):
@@ -1336,14 +1555,18 @@ class ConsoleService:
                         "run_id": step_run_id,
                         "status": str(run.get("status", "COMMITTED")),
                         "diff": diff_dict,
-                        "changes": _diff_summary(diff_dict),
+                        "changes": _diff_summary(
+                            diff_dict,
+                            title_resolver=self._resolve_object_title,
+                        ),
                     }
                     session.steps.append(step_rec)
                     step_results.append({"ok": True, **step_rec})
-                except OpenOntologyError as exc:
+                except ValidationError as exc:
                     all_ok = False
-                    last_error_code = getattr(exc, "code", None) or "SANDBOX_STEP_REJECTED"
-                    last_error_msg = str(exc)
+                    last_error_code = "INVALID_PARAMETER"
+                    last_hint_zh = _format_validation_error_zh(exc, display)
+                    last_error_msg = last_hint_zh
                     step_results.append(
                         {
                             "ok": False,
@@ -1353,7 +1576,30 @@ class ConsoleService:
                             "status": "REJECTED",
                             "error_code": last_error_code,
                             "error": last_error_msg,
-                            "hint_zh": _translate_error_hint(last_error_code, last_error_msg),
+                            "hint_zh": last_hint_zh,
+                        }
+                    )
+                    break
+                except OpenOntologyError as exc:
+                    all_ok = False
+                    last_error_code = (
+                        getattr(exc, "code", None)
+                        or ("PERMISSION_DENIED" if isinstance(exc, PermissionDeniedError) else None)
+                        or ("OBJECT_NOT_FOUND" if isinstance(exc, ObjectNotFoundError) else None)
+                        or "SANDBOX_STEP_REJECTED"
+                    )
+                    last_error_msg = str(exc)
+                    last_hint_zh = _translate_error_hint(last_error_code, last_error_msg)
+                    step_results.append(
+                        {
+                            "ok": False,
+                            "action": step.action,
+                            "params": dict(step.params),
+                            "actor_id": step_actor.actor_id,
+                            "status": "REJECTED",
+                            "error_code": last_error_code,
+                            "error": last_error_msg,
+                            "hint_zh": last_hint_zh,
                         }
                     )
                     break
@@ -1370,7 +1616,7 @@ class ConsoleService:
                 "sandbox_fingerprint": session.fork_runtime.state_fingerprint(),
                 "error_code": last_error_code,
                 "error": last_error_msg,
-                "hint_zh": _translate_error_hint(last_error_code, last_error_msg) if last_error_code else "",
+                "hint_zh": last_hint_zh,
                 "zero_external_dirty_write": True,
             }
 
@@ -1423,11 +1669,21 @@ class ConsoleService:
                     s_props = sbx_map.get(oid)
                     if p_props is None and s_props is not None:
                         created.append(
-                            {"object_type": ot_name, "object_id": oid, "after": s_props}
+                            {
+                                "object_type": ot_name,
+                                "object_id": oid,
+                                "object_title": self._resolve_object_title(ot_name, oid, None, s_props),
+                                "after": s_props,
+                            }
                         )
                     elif p_props is not None and s_props is None:
                         deleted.append(
-                            {"object_type": ot_name, "object_id": oid, "before": p_props}
+                            {
+                                "object_type": ot_name,
+                                "object_id": oid,
+                                "object_title": self._resolve_object_title(ot_name, oid, p_props, None),
+                                "before": p_props,
+                            }
                         )
                     elif p_props != s_props and p_props is not None and s_props is not None:
                         deltas = [
@@ -1443,6 +1699,7 @@ class ConsoleService:
                             {
                                 "object_type": ot_name,
                                 "object_id": oid,
+                                "object_title": self._resolve_object_title(ot_name, oid, p_props, s_props),
                                 "before": p_props,
                                 "after": s_props,
                                 "field_deltas": deltas,
@@ -1807,9 +2064,13 @@ class ConsoleService:
                     {
                         **r,
                         "action_label": act_labels.get(act_name) or act_name,
+                        "actor_display_name": self._actor_display_name(str(r.get("actor_id", ""))),
                         "status_label": _STATUS_ZH.get(str(r.get("status", "")), str(r.get("status", ""))),
                         "governance_channel": mode_tag,
-                        "changes": _diff_summary(diff_obj),
+                        "changes": _diff_summary(
+                            diff_obj,
+                            title_resolver=self._resolve_object_title,
+                        ),
                         "hint_zh": _translate_error_hint(err_code, err_msg) if err_code else "",
                         "external_dirty_writes": 0,
                     }
@@ -1819,6 +2080,7 @@ class ConsoleService:
                 {
                     **entry.model_dump(mode="json"),
                     "action_label": act_labels.get(entry.action) or entry.action,
+                    "actor_display_name": self._actor_display_name(entry.actor_id),
                     "status_label": _STATUS_ZH.get(entry.outcome, entry.outcome),
                     "hint_zh": (
                         _translate_error_hint(entry.error_code, entry.error_message)
@@ -2057,7 +2319,7 @@ class ConsoleService:
             if not question:
                 return {
                     "ok": True,
-                    "reply": "请输入您想查询的经营指标、单据异常、审批事项或假设推演问题。",
+                    "reply": "请输入您想查询的运行指标、记录异常、待办审批或假设推演问题。",
                     "highlights": [],
                     "cards": [],
                     "rls_scope": sorted(actor.clearance_tags),
@@ -2079,6 +2341,7 @@ class ConsoleService:
                             if self.work_queue_binding
                             else None
                         ),
+                        "visible_presets": self._visible_sandbox_presets(actor),
                         "visible_runs": visible_runs,
                         "visible_rejected_runs": [
                             r for r in visible_runs if r.get("status") == "REJECTED"
@@ -2096,6 +2359,8 @@ class ConsoleService:
     def _generic_m2_assistant(self, question: str, actor: Actor) -> dict[str, Any]:
         display = self._merged_display()
         obj_labels = display.get("objects") or {}
+        role_labels = display.get("roles") or {}
+        act_labels = display.get("actions") or {}
         type_summaries: list[str] = []
         matched_cards: list[dict[str, Any]] = []
         lower_q = question.lower()
@@ -2138,15 +2403,21 @@ class ConsoleService:
         )
         rejected = [r for r in runs if r["status"] == "REJECTED"]
         prof = self._actor_profile(actor)
+        role_zh = role_labels.get(actor.role) or prof.get("title") or actor.role
         reply = (
-            f"当前以「{prof['display_name']}（{actor.role}）」权限视角共检索到 "
+            f"当前以「{prof['display_name']}（{role_zh}）」权限视角共检索到 "
             f"{total_visible} 条可见记录：" + ("、".join(type_summaries[:6]) or "暂无数据") + "。"
         )
         if rejected:
             last_rej = rejected[-1]
+            act_zh = act_labels.get(last_rej["action_type"]) or last_rej["action_type"]
+            err_zh = _translate_error_hint(
+                last_rej.get("error_code"),
+                last_rej.get("error_message"),
+            )
             reply += (
-                f" 最近一次红线拦截为 {last_rej['action_type']}"
-                f"（{last_rej.get('error_code') or 'REJECTED'}），未对真实系统造成写入。"
+                f" 最近一次红线拦截为「{act_zh}」"
+                + (f"（{err_zh}）" if err_zh else "。")
             )
         return {
             "ok": True,
@@ -2219,6 +2490,36 @@ def create_console_app(
                 "error_code": code,
                 "error": str(exc),
                 "hint_zh": _translate_error_hint(code, str(exc)),
+                "zero_external_dirty_write": True,
+            },
+        )
+
+    @app.exception_handler(RequestValidationError)
+    def _handle_req_validation(_req: Request, exc: RequestValidationError) -> JSONResponse:
+        hint = _format_validation_error_zh(exc, service._merged_display())
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "status": "REJECTED",
+                "error_code": "INVALID_PARAMETER",
+                "error": hint,
+                "hint_zh": hint,
+                "zero_external_dirty_write": True,
+            },
+        )
+
+    @app.exception_handler(ValidationError)
+    def _handle_pydantic_validation(_req: Request, exc: ValidationError) -> JSONResponse:
+        hint = _format_validation_error_zh(exc, service._merged_display())
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "status": "REJECTED",
+                "error_code": "INVALID_PARAMETER",
+                "error": hint,
+                "hint_zh": hint,
                 "zero_external_dirty_write": True,
             },
         )

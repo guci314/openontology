@@ -71,6 +71,7 @@ export const EnterpriseKpiBar: React.FC<DomainKpiSlotProps> = ({
   const inProgressWos = workOrders.filter((w) => w.properties['status'] === 'in_progress').length;
   const allConserved = p2mDiag ? Boolean(p2mDiag['all_cost_conserved']) : true;
 
+  const hasGlAccess = glAccounts.length > 0;
   const bankAcc = glAccounts.find((a) => a.object_id === '1001');
   const bankCash = bankAcc
     ? (Number(bankAcc.properties['debit_total_cents'] || 0) -
@@ -154,31 +155,49 @@ export const EnterpriseKpiBar: React.FC<DomainKpiSlotProps> = ({
       {/* Card 4: Bank Cash & Trial Balance */}
       <button
         type="button"
-        onClick={() => bankAcc && onInspectObject('GlAccount', bankAcc.object_id)}
-        className="rounded-xl border border-slate-200/80 bg-white p-4 text-left shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition hover:border-blue-300"
+        onClick={() => hasGlAccess && bankAcc && onInspectObject('GlAccount', bankAcc.object_id)}
+        className={`rounded-xl border border-slate-200/80 bg-white p-4 text-left shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition ${
+          hasGlAccess ? 'hover:border-blue-300' : 'cursor-default'
+        }`}
       >
         <div className="flex items-center justify-between text-xs font-medium text-slate-500">
           <span>银行现金与试算平衡</span>
           <Banknote className="h-4 w-4 text-emerald-700" />
         </div>
-        <div
-          data-testid="kpi-bank-cash"
-          className="mt-2 font-mono text-2xl font-bold tabular-nums text-slate-900"
-        >
-          {fmtYuan(bankCash)}
-        </div>
-        <div className="mt-1 flex items-center justify-between text-[11px]">
-          <span
-            data-testid="kpi-trial-balance-badge"
-            className={`inline-flex items-center gap-1 font-semibold ${
-              isBalanced ? 'text-emerald-700' : 'text-rose-700'
-            }`}
-          >
-            <CheckCircle2 className="h-3.5 w-3.5" />
-            {isBalanced ? '复式总账试算平衡绿灯' : '试算存在不平差额'}
-          </span>
-          <span className="font-mono text-slate-400">2026-11</span>
-        </div>
+        {hasGlAccess ? (
+          <>
+            <div
+              data-testid="kpi-bank-cash"
+              className="mt-2 font-mono text-2xl font-bold tabular-nums text-slate-900"
+            >
+              {fmtYuan(bankCash)}
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[11px]">
+              <span
+                data-testid="kpi-trial-balance-badge"
+                className={`inline-flex items-center gap-1 font-semibold ${
+                  isBalanced ? 'text-emerald-700' : 'text-rose-700'
+                }`}
+              >
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                {isBalanced ? '复式总账试算平衡绿灯' : '试算存在不平差额'}
+              </span>
+              <span className="font-mono text-slate-400">2026-11</span>
+            </div>
+          </>
+        ) : (
+          <>
+            <div
+              data-testid="kpi-bank-cash"
+              className="mt-2 text-base font-bold text-slate-700"
+            >
+              仅 CFO/财务可见
+            </div>
+            <div className="mt-1 text-[11px] font-medium text-amber-700">
+              集团总账权限受限（仅 CFO/财务可见）
+            </div>
+          </>
+        )}
       </button>
     </div>
   );

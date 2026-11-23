@@ -198,12 +198,20 @@ ENTERPRISE_WORK_QUEUE = WorkQueueBinding(
     settled_run_param="settled_run_id",
 )
 
+ENTERPRISE_QUICK_PROMPTS: list[str] = [
+    "现在有哪些待我审批的异常或工单？",
+    "当前在手订单、应收和现金余额情况如何？",
+    "如果突发 ¥20,000 维修费对利润有什么影响？",
+    "我当前能看到哪些厂区的单据？",
+]
+
 ENTERPRISE_SANDBOX_PRESETS: list[dict[str, Any]] = [
     {
         "preset_id": "emergency_repair_20k",
         "title": "突发 ¥20,000 维修费测算",
         "subtitle": "在平行沙盘中过账华北压铸线突发维修费用凭证，实时评估银行现金、费用利润与试算平衡。",
         "badge": "财务压力测试",
+        "required_clearance": ["org:hq_fin"],
         "steps": [
             {
                 "action": "post_journal_entry",
@@ -217,6 +225,7 @@ ENTERPRISE_SANDBOX_PRESETS: list[dict[str, Any]] = [
         "title": "大单开票合规演练",
         "subtitle": "模拟 SO-301（¥180,000 伺服阀组）发货、开票过账、全额回款及总账入账全链路。",
         "badge": "O2C→R2R 闭环",
+        "required_clearance": ["org:hq_fin", "org:plant_north"],
         "steps": [
             {
                 "action": "complete_o2c_delivery",
@@ -250,6 +259,8 @@ ENTERPRISE_SANDBOX_PRESETS: list[dict[str, Any]] = [
         "title": "短磅争议解封试算",
         "subtitle": "批结短磅工单并按 95 吨实收金额 ¥95,000 重算 PO-101 与应付账单，立省 ¥5,000 损耗。",
         "badge": "P2P 争议裁决",
+        "allowed_roles": ["procurement_manager", "finance_director", "steward", "admin"],
+        "required_clearance": ["org:plant_north"],
         "steps": [
             {
                 "action": "complete_work_card",
@@ -352,31 +363,109 @@ def _merge_std_display(spec: OntologySpec) -> None:
                 "grantee": "被授权人",
                 "ceiling_cents": "授权额度（分）",
                 "order": "关联销售订单",
+                "order_id": "销售订单编号",
                 "customer": "客户档案",
                 "account": "客户账户",
                 "supplier": "供应商档案",
                 "purchase_order": "关联采购单",
+                "po_id": "采购订单编号",
+                "receipt_id": "收货验收单号",
+                "bill_id": "应付账单编号",
+                "delivery_id": "发货履约单号",
+                "invoice_id": "应收发票编号",
+                "entry_id": "总账凭证编号",
                 "work_order": "关联生产工单",
+                "work_order_id": "生产工单编号",
+                "work_card_id": "协同工单号",
+                "deal_id": "销售商机编号",
+                "ticket_id": "客户工单编号",
                 "bom": "BOM 配方",
-                "good_qty": "良品数量",
-                "scrap_qty": "报废数量",
+                "good_qty": "良品数量 (件)",
+                "scrap_qty": "报废数量 (件)",
                 "absorbed_cost_cents": "吸收成本（分）",
                 "issued_qty": "已领料数量",
                 "issued_cost_cents": "已投入成本（分）",
-                "completed_good_qty": "已完工良品",
-                "completed_scrap_qty": "已报废数量",
-                "planned_qty": "计划产量",
+                "completed_good_qty": "已完工良品 (件)",
+                "completed_scrap_qty": "已报废数量 (件)",
+                "planned_qty": "计划产量 (件)",
+                "ordered_qty": "订购数量 (吨)",
+                "received_qty": "实收数量 (吨)",
+                "expected_qty": "应收数量 (吨)",
+                "inspection_status": "质检结果",
                 "qty": "领料数量",
                 "unit_cost_cents": "单位成本（分）",
                 "total_cost_cents": "总成本（分）",
                 "allocation_rule": "成本分摊策略",
                 "source_event": "来源履约凭证",
                 "output_event": "产出履约凭证",
+                "settled_amount": "核定结算金额",
+                "payment_amount": "实收/实付金额",
+                "resolution_summary": "处理总结",
+                "reversal_entry_id": "冲正凭证编号",
+                "target_period_id": "冲正会计期间",
+                "memo": "凭证摘要",
+                "received_qty_delta": "实收偏差",
+            },
+            "field_overrides": {
+                "WorkOrder.planned_qty": "计划产量 (件)",
+                "WorkOrder.completed_good_qty": "已完工良品 (件)",
+                "WorkOrder.completed_scrap_qty": "已报废数量 (件)",
+                "P2pPurchaseOrder.ordered_qty": "订购数量 (吨)",
+                "P2pGoodsReceipt.expected_qty": "应收数量 (吨)",
+                "P2pGoodsReceipt.received_qty": "实收数量 (吨)",
             },
             "statuses": {
                 "enterprise_direct": "企业直销",
                 "key_account": "大客户直签",
                 "partner_oem": "OEM 伙伴",
+                "STRATEGIC": "战略大客户",
+                "VIP_KEY": "重点核心客户",
+                "STANDARD": "标准客户",
+                "HIGH": "高优",
+                "MEDIUM": "中等",
+                "LOW": "常规",
+                "ASSET": "资产类",
+                "LIABILITY": "负债类",
+                "EQUITY": "所有者权益",
+                "REVENUE": "营业收入",
+                "EXPENSE": "成本费用",
+                "DEBIT": "借方",
+                "CREDIT": "贷方",
+                "APPROVAL": "高危放行审批",
+                "HUMAN_TASK": "人工裁决协同",
+                "JOURNAL_POST": "总账入账凭证",
+                "PRODUCTION_OUTPUT": "完工入库事实",
+                "PRODUCTION_ISSUE": "生产领料事实",
+                "RECEIPT": "采购收货事实",
+                "SHIPMENT": "销售出库事实",
+                "INVOICE": "开票确认事实",
+                "PAYMENT": "资金收付事实",
+                "EXACT_LOT": "按批次实价",
+                "FIFO": "先进先出",
+                "recorded": "已记录",
+                "agreed": "已生效",
+                "pending": "待处理",
+                "passed": "检验合格",
+                "plant_north": "华北厂",
+                "plant_south": "华南厂",
+                "hq_fin": "集团财务",
+                "hq": "集团总部",
+            },
+            "invariants": {
+                "declarative_fsm_transitions": "单据状态流转必须严格遵循系统预设状态机跃迁路径。",
+                "process_document_state_transitions": "业务作业单据的初始状态、流转路线与作废前置状态必须符合流程规范。",
+                "business_non_negative_fields": "台账余额、库存、数量与应收/应付未清金额均不得为负。",
+                "p2m_work_order_cost_conservation": "生产工单累计产出吸收成本不得超过已领料投入总成本（成本守恒铁律）。",
+                "p2m_bom_positive_ratio": "BOM 配方单位耗量必须大于 0，最大允许损耗率须处于 0%~100% 之间。",
+                "r2r_gl_account_valid_enums": "总账科目类别与余额方向必须符合标准复式会计准则枚举。",
+                "r2r_journal_no_self_balancing": "复式记账凭证借方科目与贷方科目不得为同一科目。",
+                "voucher_backed_balance_conservation": "资金或存量结存余额变化必须与同事务凭证增量精确借贷配平。",
+                "work_card_segregation_of_duties": "职责分离（SoD）：禁止审批工单申请人自批自结自己提交的事项。",
+                "work_card_unique_active_intent": "同一目标单据的同类协同审批工单不得重复发起。",
+                "h2r_department_dag_acyclic": "组织部门层级必须保持无环树状结构，禁止循环指向。",
+                "h2r_job_position_closed_role": "岗位对应角色与授权角色均须在合法标准角色清单内。",
+                "h2r_mandate_no_self_grant": "职责分离（SoD）：动态授权的授权人与被授权人不得为同一人。",
+                "h2r_no_active_mandate_for_offboarded": "已离职员工名下不得保留任何生效中的审批授权。",
             },
         }
     )
@@ -432,6 +521,15 @@ def enterprise_assistant_responder(
 ) -> dict[str, Any]:
     """Deterministic, zero-key, strictly RLS-scoped enterprise NL assistant."""
     q = question.strip().lower()
+    display = context.get("display") or {}
+    obj_labels = display.get("objects") or {}
+    role_labels = display.get("roles") or {}
+    act_labels = display.get("actions") or {}
+    status_labels = display.get("statuses") or {}
+    visible_presets = {
+        str(p.get("preset_id") or ""): p for p in (context.get("visible_presets") or ())
+    }
+
     cards: list[dict[str, Any]] = []
     highlights: list[dict[str, Any]] = []
 
@@ -443,6 +541,8 @@ def enterprise_assistant_responder(
     wos = list(runtime.query_objects("WorkOrder", actor))
     sos = list(runtime.query_objects("O2cOrder", actor))
     invs = list(runtime.query_objects("O2cInvoice", actor))
+    gl_accounts = list(runtime.query_objects("GlAccount", actor))
+    has_gl_access = len(gl_accounts) > 0
 
     try:
         tb = runtime.call_function("compute_trial_balance", {"accounting_entity": "ENT-GROUP"}, actor)
@@ -450,7 +550,7 @@ def enterprise_assistant_responder(
         tb = {}
 
     bank_cash_yuan = 0.0
-    for acc in runtime.query_objects("GlAccount", actor):
+    for acc in gl_accounts:
         if acc.account_code == "1001":
             bank_cash_yuan = (acc.debit_total_cents - acc.credit_total_cents) / 100.0
             break
@@ -461,11 +561,14 @@ def enterprise_assistant_responder(
 
     if any(kw in q for kw in ("待办", "审批", "工单", "短磅", "异常", "card", "work")):
         for card in open_cards[:4]:
+            t_label = obj_labels.get(card.target_object_type) or card.target_object_type
+            r_label = role_labels.get(card.assignee_role) or card.assignee_role
+            s_label = status_labels.get(card.status) or card.status
             cards.append(
                 {
                     "kind": "object",
-                    "title": f"{card.card_id} · {card.target_object_type}:{card.target_object_id}",
-                    "subtitle": f"指派角色：{card.assignee_role} | 状态：{card.status}",
+                    "title": f"{card.card_id} · {t_label} {card.target_object_id}",
+                    "subtitle": f"指派岗位：{r_label} | 状态：{s_label}",
                     "object_type": "WorkCard",
                     "object_id": card.card_id,
                 }
@@ -479,7 +582,7 @@ def enterprise_assistant_responder(
             f"在您当前的权限视角下，共有 {len(open_cards)} 项待处理协同审批："
             + (
                 "；".join(
-                    f"{c.card_id}（{c.target_object_type} {c.target_object_id} → 需 {c.assignee_role}）"
+                    f"{c.card_id}（{obj_labels.get(c.target_object_type) or c.target_object_type} {c.target_object_id} → 需 {role_labels.get(c.assignee_role) or c.assignee_role}签批）"
                     for c in open_cards[:3]
                 )
                 if open_cards
@@ -489,6 +592,18 @@ def enterprise_assistant_responder(
         return {"reply": reply, "highlights": highlights, "cards": cards}
 
     if any(kw in q for kw in ("维修", "沙盘", "推演", "模拟", "假设", "如果", "what", "20000", "20,000")):
+        if not has_gl_access or "emergency_repair_20k" not in visible_presets:
+            highlights = [
+                {"label": "总账测算权限", "value": "仅 CFO/财务可见"},
+                {"label": "可见生产工单", "value": f"{len(wos)} 单"},
+                {"label": "推演对真实库影响", "value": "0 改动"},
+            ]
+            reply = (
+                "突发维修费用总账测算涉及全集团总账与银行现金科目（仅 CFO 及财务人员可见）。"
+                "您当前可在「平行沙盘推演」页使用「手动单步假设试演」对本厂区单据进行零脏写合规验证。"
+            )
+            return {"reply": reply, "highlights": highlights, "cards": cards}
+
         cards.append(
             {
                 "kind": "sandbox_preset",
@@ -498,15 +613,16 @@ def enterprise_assistant_responder(
                 "route": "/sandbox",
             }
         )
-        cards.append(
-            {
-                "kind": "sandbox_preset",
-                "title": "大单开票合规演练（SO-301 · ¥180,000）",
-                "subtitle": "演练发货→开票→回款全链路状态机",
-                "preset_id": "large_order_invoice_drill",
-                "route": "/sandbox",
-            }
-        )
+        if "large_order_invoice_drill" in visible_presets:
+            cards.append(
+                {
+                    "kind": "sandbox_preset",
+                    "title": "大单开票合规演练（SO-301 · ¥180,000）",
+                    "subtitle": "演练发货→开票→回款全链路状态机",
+                    "preset_id": "large_order_invoice_drill",
+                    "route": "/sandbox",
+                }
+            )
         reply = (
             f"当前主账套银行现金 ¥{bank_cash_yuan:,.0f}。"
             f"若模拟突发 ¥20,000 维修费入账，沙盘预估银行现金将变为 ¥{bank_cash_yuan - 20000:,.0f}，"
@@ -521,24 +637,29 @@ def enterprise_assistant_responder(
 
     if any(kw in q for kw in ("厂", "权限", "隔离", "rls", "可见", "范围", "north", "south")):
         for wo in wos[:4]:
+            org_code = str(getattr(wo, "org", "") or "")
+            org_zh = status_labels.get(org_code) or org_code or "集团"
+            st_zh = status_labels.get(wo.status) or wo.status
             cards.append(
                 {
                     "kind": "object",
                     "title": f"生产工单 {wo.work_order_id}（{getattr(wo, 'production_line', '产线')}）",
-                    "subtitle": f"厂区标签：{getattr(wo, 'org', '-')} | 状态：{wo.status}",
+                    "subtitle": f"所属厂区：{org_zh} | 状态：{st_zh}",
                     "object_type": "WorkOrder",
                     "object_id": wo.work_order_id,
                 }
             )
         orgs = sorted({str(getattr(x, "org", "")) for x in (*pos, *wos, *sos) if getattr(x, "org", "")})
+        orgs_zh = [status_labels.get(o) or o for o in orgs]
+        role_zh = role_labels.get(actor.role) or actor.role
         highlights = [
-            {"label": "可见厂区范围", "value": ", ".join(orgs) or "全部"},
+            {"label": "可见厂区范围", "value": "、".join(orgs_zh) or "总部"},
             {"label": "可见生产工单", "value": f"{len(wos)} 单"},
             {"label": "可见销售订单", "value": f"{len(sos)} 单"},
         ]
         reply = (
-            f"系统按您的岗位角色「{actor.role}」严格执行行级隔离（可见范围：{', '.join(sorted(actor.clearance_tags)) or '默认'}）。"
-            f"当前可见采购单 {len(pos)} 笔、生产工单 {len(wos)} 笔、销售订单 {len(sos)} 笔（所属厂区：{', '.join(orgs) or '总部'}）。"
+            f"系统按您的岗位角色「{role_zh}」严格执行厂区与子账行级隔离。"
+            f"当前可见采购单 {len(pos)} 笔、生产工单 {len(wos)} 笔、销售订单 {len(sos)} 笔（所属厂区：{'、'.join(orgs_zh) or '总部'}）。"
         )
         return {"reply": reply, "highlights": highlights, "cards": cards}
 
@@ -550,47 +671,65 @@ def enterprise_assistant_responder(
             {"label": "真实系统脏写", "value": "0 次"},
         ]
         if latest:
+            act_name = str(latest.get("action_type") or "")
+            act_zh = act_labels.get(act_name) or act_name
+            hint = str(latest.get("hint_zh") or "").strip()
+            if not hint:
+                from open_ontology.console_server import _translate_error_hint
+
+                hint = _translate_error_hint(latest.get("error_code"), latest.get("error_message"))
             reply = (
-                f"最近一次拦截发生在动作「{latest['action_type']}」，触发规则 {latest.get('error_code')}。"
-                "所有违规写入均在进入事务前被内核阻断，外部系统与主台账保持零脏写。"
+                f"您权限范围内最近一次拦截发生在动作「{act_zh}」"
+                + (f"（{hint}）" if hint else "。")
+                + "所有违规写入均在进入事务前被内核阻断，外部系统与主台账保持零脏写。"
             )
         else:
-            reply = "当前审计账本尚未记录违规拦截事件，系统运行正常。"
+            reply = "当前您权限范围内的审计账本尚未记录违规拦截事件，系统运行正常。"
         return {"reply": reply, "highlights": highlights, "cards": cards}
 
     # Default comprehensive executive brief scoped to current actor's RLS view
     balanced_text = "平衡绿灯" if tb.get("is_balanced", True) else "待核查"
+    cash_str = f"¥{bank_cash_yuan:,.0f}" if has_gl_access else "仅 CFO/财务可见"
     highlights = [
         {"label": "可见在手订单总额", "value": f"¥{so_total:,.0f}"},
         {"label": "应收未收余额", "value": f"¥{ar_residual:,.0f}"},
-        {"label": "银行存款余额", "value": f"¥{bank_cash_yuan:,.0f}"},
+        {"label": "银行存款余额", "value": cash_str},
         {"label": "待处理审批", "value": f"{len(open_cards)} 项"},
     ]
     for wo in wos[:2]:
+        org_zh = status_labels.get(str(getattr(wo, "org", "") or "")) or "集团"
         cards.append(
             {
                 "kind": "object",
                 "title": f"生产工单 {wo.work_order_id}",
-                "subtitle": f"厂区：{getattr(wo, 'org', '集团')} · 计划 {wo.planned_qty:.0f}",
+                "subtitle": f"厂区：{org_zh} · 计划 {wo.planned_qty:.0f} 件",
                 "object_type": "WorkOrder",
                 "object_id": wo.work_order_id,
             }
         )
     for po in pos[:2]:
+        st_zh = status_labels.get(po.status) or po.status
         cards.append(
             {
                 "kind": "object",
                 "title": f"采购单 {po.po_number}",
-                "subtitle": f"金额 ¥{po.amount_total:,.0f} · 状态 {po.status}",
+                "subtitle": f"金额 ¥{po.amount_total:,.0f} · 状态 {st_zh}",
                 "object_type": "P2pPurchaseOrder",
                 "object_id": po.po_id,
             }
         )
-    reply = (
-        f"截至目前，您权限范围内共有在手销售订单 ¥{so_total:,.0f}、待收应收账款 ¥{ar_residual:,.0f}、"
-        f"银行现金 ¥{bank_cash_yuan:,.0f}，总账试算状态为【{balanced_text}】。"
-        f"待办收件箱有 {len(open_cards)} 项异常或高额审批等待处理。"
-    )
+    if has_gl_access:
+        reply = (
+            f"截至目前，您权限范围内共有在手销售订单 ¥{so_total:,.0f}、待收应收账款 ¥{ar_residual:,.0f}、"
+            f"银行现金 ¥{bank_cash_yuan:,.0f}，总账试算状态为【{balanced_text}】。"
+            f"待办收件箱有 {len(open_cards)} 项异常或高额审批等待处理。"
+        )
+    else:
+        reply = (
+            f"截至目前，您当前厂区视角内共有在手销售订单 ¥{so_total:,.0f}、待收应收账款 ¥{ar_residual:,.0f}、"
+            f"可见生产工单 {len(wos)} 笔（集团总账银行现金余额仅 CFO/财务可见）。"
+            f"待办收件箱有 {len(open_cards)} 项审批事项等待处理。"
+        )
     return {"reply": reply, "highlights": highlights, "cards": cards}
 
 
@@ -613,7 +752,7 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
         ("DEPT-SOUTH-MFG", "华南精密装配厂", "DEPT-HQ", "org:plant_south", "active"),
         ("DEPT-SALES", "华实销售中心", "DEPT-HQ", "org:sales", "active"),
         ("DEPT-PROC", "集团采购中心", "DEPT-HQ", "org:proc", "active"),
-        ("DEPT-FIN", "集团财务中心", "DEPT-HQ", "org:fin", "active"),
+        ("DEPT-FIN", "集团财务中心", "DEPT-HQ", "org:hq_fin", "active"),
         ("DEPT-OLD-ARCH", "已撤并老车间", "DEPT-HQ", "org:legacy_arch", "archived"),
     ]
     for did, name, pid, stag, st in depts:
@@ -872,22 +1011,24 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
         ),
         actor=admin,
     )
-    rt.put_object(GrCls(receipt_id="GR-100", purchase_order="PO-100", expected_qty=100.0, status="pending"), actor=admin)
-    rt.put_object(BillCls(bill_id="BILL-100", purchase_order="PO-100", amount_total=100_000.0, amount_residual=100_000.0, status="draft"), actor=admin)
+    rt.put_object(GrCls(receipt_id="GR-100", purchase_order="PO-100", expected_qty=100.0, status="pending", org="plant_north"), actor=admin)
+    rt.put_object(BillCls(bill_id="BILL-100", purchase_order="PO-100", amount_total=100_000.0, amount_residual=100_000.0, status="draft", org="plant_north"), actor=admin)
     rt.submit_action("SEED-PO100-CONF", "confirm_p2p_order", {"po_id": "PO-100"}, proc_actor)
     rt.submit_action("SEED-PO100-RCV", "record_p2p_receipt", {"receipt_id": "GR-100", "received_qty": 95.0, "inspection_status": "passed"}, wh_actor)
-    rt.submit_action(
-        "SEED-PO100-WC-O",
-        "open_work_card",
-        {
-            "card_id": "WC-PO-100-HIST",
-            "card_kind": "HUMAN_TASK",
-            "target_object_type": "P2pPurchaseOrder",
-            "target_object_id": "PO-100",
-            "requested_action": "resolve_p2p_dispute",
-            "assignee_role": "procurement_manager",
-        },
-        wh_actor,
+    WcCls = spec.get_object_type("WorkCard")
+    rt.put_object(
+        WcCls(
+            card_id="WC-PO-100-HIST",
+            card_kind="HUMAN_TASK",
+            target_object_type="P2pPurchaseOrder",
+            target_object_id="PO-100",
+            requested_action="resolve_p2p_dispute",
+            requester_actor_id="act-wh",
+            assignee_role="procurement_manager",
+            status="OPEN",
+            org="plant_north",
+        ),
+        actor=admin,
     )
     rt.submit_action(
         "SEED-PO100-WC-C",
@@ -922,8 +1063,8 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
         ),
         actor=admin,
     )
-    rt.put_object(GrCls(receipt_id="GR-101", purchase_order="PO-101", expected_qty=100.0, status="pending"), actor=admin)
-    rt.put_object(BillCls(bill_id="BILL-101", purchase_order="PO-101", amount_total=100_000.0, amount_residual=100_000.0, status="draft"), actor=admin)
+    rt.put_object(GrCls(receipt_id="GR-101", purchase_order="PO-101", expected_qty=100.0, status="pending", org="plant_north"), actor=admin)
+    rt.put_object(BillCls(bill_id="BILL-101", purchase_order="PO-101", amount_total=100_000.0, amount_residual=100_000.0, status="draft", org="plant_north"), actor=admin)
     rt.submit_action("SEED-PO101-CONF", "confirm_p2p_order", {"po_id": "PO-101"}, proc_actor)
     rt.submit_action("SEED-PO101-RCV", "record_p2p_receipt", {"receipt_id": "GR-101", "received_qty": 95.0, "inspection_status": "passed"}, wh_actor)
 
@@ -944,22 +1085,21 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
         ),
         actor=admin,
     )
-    rt.put_object(GrCls(receipt_id="GR-102", purchase_order="PO-102", expected_qty=50.0, status="pending"), actor=admin)
-    rt.put_object(BillCls(bill_id="BILL-102", purchase_order="PO-102", amount_total=60_000.0, amount_residual=60_000.0, status="draft"), actor=admin)
+    rt.put_object(GrCls(receipt_id="GR-102", purchase_order="PO-102", expected_qty=50.0, status="pending", org="plant_south"), actor=admin)
+    rt.put_object(BillCls(bill_id="BILL-102", purchase_order="PO-102", amount_total=60_000.0, amount_residual=60_000.0, status="draft", org="plant_south"), actor=admin)
     rt.submit_action("SEED-PO102-CONF", "confirm_p2p_order", {"po_id": "PO-102"}, proc_actor)
 
-    # Confirmed events for historical GL
-    for eid, cid, kind, qty, amt in (
-        ("EVT-CAP-1", "CM-SALE-EV", "JOURNAL_POST", 1.0, 500_000.0),
-        ("EVT-P2P-RCV", "CM-PO-STEEL", "RECEIPT", 95.0, 95_000.0),
-        ("EVT-P2P-PAY", "CM-PO-STEEL", "PAYMENT", 1.0, 95_000.0),
-        ("EVT-P2M-ISS", "CM-SALE-EV", "PRODUCTION_ISSUE", 80.0, 80_000.0),
-        ("EVT-P2M-FG", "CM-SALE-EV", "PRODUCTION_OUTPUT", 50.0, 80_000.0),
-        ("EVT-O2C-SHIP", "CM-SALE-EV", "SHIPMENT", 50.0, 80_000.0),
-        ("EVT-O2C-INV", "CM-SALE-EV", "INVOICE", 50.0, 240_000.0),
-        ("EVT-O2C-PAY", "CM-SALE-EV", "PAYMENT", 1.0, 240_000.0),
-        ("EVT-SO301-INV", "CM-SALE-RAIL", "INVOICE", 30.0, 180_000.0),
-        ("EVT-SO301-PAY", "CM-SALE-RAIL", "PAYMENT", 1.0, 180_000.0),
+    # Confirmed events strictly aligned with settled / invoiced reality (no premature unshipped SO-301 events)
+    for eid, cid, kind, qty, amt, org_tag in (
+        ("EVT-CAP-1", "CM-SALE-EV", "JOURNAL_POST", 1.0, 500_000.0, "hq_fin"),
+        ("EVT-P2P-RCV", "CM-PO-STEEL", "RECEIPT", 95.0, 95_000.0, "plant_north"),
+        ("EVT-P2P-PAY", "CM-PO-STEEL", "PAYMENT", 1.0, 95_000.0, "plant_north"),
+        ("EVT-P2M-ISS", "CM-SALE-EV", "PRODUCTION_ISSUE", 80.0, 80_000.0, "plant_north"),
+        ("EVT-P2M-FG", "CM-SALE-EV", "PRODUCTION_OUTPUT", 50.0, 80_000.0, "plant_north"),
+        ("EVT-O2C-SHIP", "CM-SALE-EV", "SHIPMENT", 50.0, 80_000.0, "plant_north"),
+        ("EVT-O2C-INV", "CM-SALE-EV", "INVOICE", 50.0, 240_000.0, "plant_north"),
+        ("EVT-O2C-PAY", "CM-SALE-EV", "PAYMENT", 1.0, 240_000.0, "plant_north"),
+        ("EVT-SO302-INV", "CM-SALE-SOUTH", "INVOICE", 25.0, 150_000.0, "plant_south"),
     ):
         rt.put_object(
             EvtCls(
@@ -969,6 +1109,7 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
                 quantity=qty,
                 amount=amt,
                 status="confirmed",
+                org=org_tag,
             ),
             actor=admin,
         )
@@ -1157,8 +1298,8 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
         ),
         actor=admin,
     )
-    rt.put_object(DelCls(delivery_id="DEL-300", order="SO-300", status="pending"), actor=admin)
-    rt.put_object(InvCls(invoice_id="INV-300", order="SO-300", amount_total=240_000.0, amount_residual=240_000.0, status="draft"), actor=admin)
+    rt.put_object(DelCls(delivery_id="DEL-300", order="SO-300", status="pending", org="plant_north"), actor=admin)
+    rt.put_object(InvCls(invoice_id="INV-300", order="SO-300", amount_total=240_000.0, amount_residual=240_000.0, status="draft", org="plant_north"), actor=admin)
     rt.submit_action("SEED-SO300-CONF", "confirm_o2c_order", {"order_id": "SO-300"}, sales_actor)
     rt.submit_action("SEED-SO300-DEL", "complete_o2c_delivery", {"delivery_id": "DEL-300"}, wh_actor)
     rt.submit_action("SEED-SO300-INV", "post_o2c_invoice", {"invoice_id": "INV-300"}, fin_actor)
@@ -1178,8 +1319,8 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
         ),
         actor=admin,
     )
-    rt.put_object(DelCls(delivery_id="DEL-301", order="SO-301", status="pending"), actor=admin)
-    rt.put_object(InvCls(invoice_id="INV-301", order="SO-301", amount_total=180_000.0, amount_residual=180_000.0, status="draft"), actor=admin)
+    rt.put_object(DelCls(delivery_id="DEL-301", order="SO-301", status="pending", org="plant_north"), actor=admin)
+    rt.put_object(InvCls(invoice_id="INV-301", order="SO-301", amount_total=180_000.0, amount_residual=180_000.0, status="draft", org="plant_north"), actor=admin)
     rt.submit_action("SEED-SO301-CONF", "confirm_o2c_order", {"order_id": "SO-301"}, sales_actor)
 
     rt.put_object(
@@ -1196,13 +1337,13 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
         ),
         actor=admin,
     )
-    rt.put_object(DelCls(delivery_id="DEL-302", order="SO-302", status="pending"), actor=admin)
-    rt.put_object(InvCls(invoice_id="INV-302", order="SO-302", amount_total=150_000.0, amount_residual=150_000.0, status="draft"), actor=admin)
+    rt.put_object(DelCls(delivery_id="DEL-302", order="SO-302", status="pending", org="plant_south"), actor=admin)
+    rt.put_object(InvCls(invoice_id="INV-302", order="SO-302", amount_total=150_000.0, amount_residual=150_000.0, status="draft", org="plant_south"), actor=admin)
     rt.submit_action("SEED-SO302-CONF", "confirm_o2c_order", {"order_id": "SO-302"}, admin)
     rt.submit_action("SEED-SO302-DEL", "complete_o2c_delivery", {"delivery_id": "DEL-302"}, admin)
     rt.submit_action("SEED-SO302-INV", "post_o2c_invoice", {"invoice_id": "INV-302"}, admin)
 
-    # R2R Chart of Accounts + Open Fiscal Period + 8 Balanced Posted Entries + Draft Entries
+    # R2R Chart of Accounts (hq_fin RLS) + Open Fiscal Period + 9 Balanced Posted Entries + Draft Entries
     PerCls = spec.get_object_type("FiscalPeriod")
     AccCls = spec.get_object_type("GlAccount")
     JeCls = spec.get_object_type("JournalEntry")
@@ -1237,44 +1378,24 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
                 category=cat,
                 normal_side=side,
                 status="active",
+                org="hq_fin",
             ),
             actor=admin,
         )
 
-    for idx, (eid, ev_id, dr, cr, cents, memo) in enumerate(
+    for idx, (eid, ev_id, dr, cr, cents, memo, org_tag) in enumerate(
         (
-            ("JE-01-CAP", "EVT-CAP-1", "1001", "4001", 50_000_000, "股东注资实收资本到位"),
-            ("JE-02-P2P-RCV", "EVT-P2P-RCV", "1403", "2202", 9_500_000, "PO-100 鞍山特钢 95t 暂估入库"),
-            ("JE-03-P2P-PAY", "EVT-P2P-PAY", "2202", "1001", 9_500_000, "付清特钢货款 BILL-100"),
-            ("JE-04-P2M-ISS", "EVT-P2M-ISS", "1404", "1403", 8_000_000, "WO-200 压铸车架领用钢卷投料"),
-            ("JE-05-P2M-FG", "EVT-P2M-FG", "1405", "1404", 8_000_000, "WO-200 50套车架完工入库"),
-            ("JE-06-O2C-SHIP", "EVT-O2C-SHIP", "6401", "1405", 8_000_000, "SO-300 销售出库结转主营成本"),
-            ("JE-07-O2C-INV", "EVT-O2C-INV", "1122", "6001", 24_000_000, "SO-300 销售开票确认主营收入"),
-            ("JE-08-O2C-PAY", "EVT-O2C-PAY", "1001", "1122", 24_000_000, "SO-300 银行收到全额回款"),
+            ("JE-01-CAP", "EVT-CAP-1", "1001", "4001", 50_000_000, "股东注资实收资本到位", "hq_fin"),
+            ("JE-02-P2P-RCV", "EVT-P2P-RCV", "1403", "2202", 9_500_000, "PO-100 鞍山特钢 95t 暂估入库", "plant_north"),
+            ("JE-03-P2P-PAY", "EVT-P2P-PAY", "2202", "1001", 9_500_000, "付清特钢货款 BILL-100", "plant_north"),
+            ("JE-04-P2M-ISS", "EVT-P2M-ISS", "1404", "1403", 8_000_000, "WO-200 压铸车架领用钢卷投料", "plant_north"),
+            ("JE-05-P2M-FG", "EVT-P2M-FG", "1405", "1404", 8_000_000, "WO-200 50套车架完工入库", "plant_north"),
+            ("JE-06-O2C-SHIP", "EVT-O2C-SHIP", "6401", "1405", 8_000_000, "SO-300 销售出库结转主营成本", "plant_north"),
+            ("JE-07-O2C-INV", "EVT-O2C-INV", "1122", "6001", 24_000_000, "SO-300 销售开票确认主营收入", "plant_north"),
+            ("JE-08-O2C-PAY", "EVT-O2C-PAY", "1001", "1122", 24_000_000, "SO-300 银行收到全额回款", "plant_north"),
+            ("JE-09-SO302-INV", "EVT-SO302-INV", "1122", "6001", 15_000_000, "SO-302 华南阀组开票确认应收账款", "plant_south"),
         ),
         start=1,
-    ):
-        project_and_post_event_journal(
-            rt,
-            seed_actor=admin,
-            post_actor=fin_actor,
-            run_id=f"SEED-JE-{idx:02d}",
-            entry_id=eid,
-            accounting_entity="ENT-GROUP",
-            fiscal_period="2026-11",
-            source_event_id=ev_id,
-            debit_account=dr,
-            credit_account=cr,
-            amount_cents=cents,
-            memo=memo,
-        )
-
-    # Draft entries supporting WorkCard approval + Sandbox executive presets
-    for eid, ev_id, dr, cr, cents, memo in (
-        ("JE-TECH-50K", None, "6602", "1001", 5_000_000, "精密模具激光校准外包费（待CFO审批）"),
-        ("JE-MAINT-20K", None, "6602", "1001", 2_000_000, "华北压铸线主轴突发抢修费"),
-        ("JE-SO301-REV", "EVT-SO301-INV", "1122", "6001", 18_000_000, "SO-301 伺服阀组大单开票收入"),
-        ("JE-SO301-CASH", "EVT-SO301-PAY", "1001", "1122", 18_000_000, "SO-301 伺服阀组银行回款"),
     ):
         rt.put_object(
             JeCls(
@@ -1287,6 +1408,36 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
                 amount_cents=cents,
                 memo=memo,
                 status="draft",
+                org=org_tag,
+            ),
+            actor=admin,
+        )
+        rt.submit_action(
+            f"SEED-JE-{idx:02d}",
+            "post_journal_entry",
+            {"entry_id": eid},
+            fin_actor,
+        )
+
+    # Draft entries supporting WorkCard approval + Sandbox executive presets (strictly source-free until fulfilled)
+    for eid, ev_id, dr, cr, cents, memo, org_tag in (
+        ("JE-TECH-50K", None, "6602", "1001", 5_000_000, "精密模具激光校准外包费（待CFO审批）", "hq_fin"),
+        ("JE-MAINT-20K", None, "6602", "1001", 2_000_000, "华北压铸线主轴突发抢修费", "plant_north"),
+        ("JE-SO301-REV", None, "1122", "6001", 18_000_000, "SO-301 伺服阀组大单开票收入（沙盘演练）", "plant_north"),
+        ("JE-SO301-CASH", None, "1001", "1122", 18_000_000, "SO-301 伺服阀组银行回款（沙盘演练）", "plant_north"),
+    ):
+        rt.put_object(
+            JeCls(
+                entry_id=eid,
+                accounting_entity="ENT-GROUP",
+                fiscal_period="2026-11",
+                source_event=ev_id,
+                debit_account=dr,
+                credit_account=cr,
+                amount_cents=cents,
+                memo=memo,
+                status="draft",
+                org=org_tag,
             ),
             actor=admin,
         )
@@ -1362,7 +1513,7 @@ def _seed_standalone_enterprise_world(rt: OntologyRuntime, admin: Actor) -> tupl
             unit_id="DEPT-HQ",
             unit_name="集团总部",
             title="集团 CFO · 财务总监",
-            badge="全集团视角 · 拥有大额财务与全部工作流核准权",
+            badge="全集团视角 · 拥有财务大额核准与全局经营洞察权限",
             token=DEMO_TOKEN_SECRET["act-cfo"],
             actor=cfo_actor,
         ),
@@ -1428,7 +1579,19 @@ def build_standalone_enterprise_console(
 ) -> ConsoleService:
     spec = build_org_rls_enterprise_spec(
         overlays=[HUASHI_MFG_OVERLAY],
-        rls_object_types=("P2pPurchaseOrder", "WorkOrder", "O2cOrder", "WorkCard"),
+        rls_object_types=(
+            "P2pPurchaseOrder",
+            "P2pGoodsReceipt",
+            "P2pVendorBill",
+            "WorkOrder",
+            "O2cOrder",
+            "O2cDelivery",
+            "O2cInvoice",
+            "WorkCard",
+            "JournalEntry",
+            "GlAccount",
+            "FulfillmentEvent",
+        ),
         model_id="std_enterprise_world_model",
     )
     _attach_standard_functions(spec)
@@ -1486,10 +1649,13 @@ def build_standalone_enterprise_console(
         demo_actors=profiles,
         demo_actor_switch=demo_actor_switch,
         app_title="华实智能装备 · 企业数字孪生运营台",
-        app_subtitle="六闭环标准世界模型（独立自治模式）",
+        app_subtitle="五闭环业务运营 + 组织权限治理（独立自治模式）",
         pack_hint="enterprise",
         work_queue_binding=ENTERPRISE_WORK_QUEUE,
         sandbox_presets=ENTERPRISE_SANDBOX_PRESETS,
+        quick_prompts=ENTERPRISE_QUICK_PROMPTS,
+        assistant_welcome="您好 {display_name}！我是运行在「{title}」权限视图内的 AI 数字经营管家，可实时为您检索待批异常、销售应收指标与平行沙盘预演。",
+        value_unit_label="¥",
         assistant_responder=enterprise_assistant_responder,
         escalation_action="open_work_card",
         escalation_assignee_role="finance_director",
@@ -1561,6 +1727,9 @@ def _build_erp_console(
         pack_hint="enterprise",
         work_queue_binding=ENTERPRISE_WORK_QUEUE,
         sandbox_presets=ENTERPRISE_SANDBOX_PRESETS,
+        quick_prompts=ENTERPRISE_QUICK_PROMPTS,
+        assistant_welcome="您好 {display_name}！我是运行在「{title}」权限视图内的 AI 数字经营管家，可实时为您检索待批异常、外设挂载状态与平行沙盘预演。",
+        value_unit_label="¥",
         assistant_responder=enterprise_assistant_responder,
         escalation_action="open_work_card",
         escalation_assignee_role="finance_director",
@@ -1646,14 +1815,30 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
             "objects": {"Starship": "星际战舰", "WarpCore": "曲速核心"},
             "actions": {"jump_sector": "跃迁至目标星域", "refuel_ship": "燃料舱充能"},
             "functions": {"fleet_fuel_total": "舰队燃料汇总"},
+            "roles": {
+                "navigator": "星舰领航员",
+                "commander": "舰队指挥官",
+                "admin": "舰载系统管理员",
+            },
             "fields": {
                 "ship_id": "舰船编号",
                 "callsign": "呼号",
                 "sector": "所在星域",
+                "target_sector": "目标星域",
                 "fuel_cells": "燃料电池",
+                "cost_cells": "消耗燃料电池数",
+                "added_cells": "充能燃料格数",
+                "core": "关联曲速核心",
                 "core_id": "核心编号",
                 "label": "型号标签",
                 "output_gw": "功率 (GW)",
+                "status": "舰船状态",
+            },
+            "statuses": {
+                "alpha": "Alpha 星域",
+                "beta": "Beta 星域",
+                "omega": "Omega 星域",
+                "gamma": "Gamma 星域",
             },
         }
     )
@@ -1698,6 +1883,12 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
             ],
         }
     ]
+    starship_prompts = [
+        "当前可见星舰与曲速核心状态如何？",
+        "我当前的星域权限范围是什么？",
+        "最近有哪些跃迁拦截或审计记录？",
+        "查看 Enterprise 号战舰详情",
+    ]
     return ConsoleService(
         rt,
         default_actor=adm,
@@ -1707,6 +1898,9 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
         app_subtitle="Starship / WarpCore 领域无关验证模式",
         pack_hint="blind",
         sandbox_presets=presets,
+        quick_prompts=starship_prompts,
+        assistant_welcome="您好 {display_name}！我是运行在「{title}」权限视角内的星舰指挥终端智能助手，可为您检索可见战舰、燃料指标与星域跃迁沙盘推演。",
+        value_unit_label="",
     )
 
 

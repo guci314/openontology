@@ -1,20 +1,29 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { CheckCircle2, RefreshCw, ShieldAlert, ShieldCheck, UserCheck } from 'lucide-react';
+import { CheckCircle2, RefreshCw, Search, ShieldAlert, ShieldCheck, UserCheck } from 'lucide-react';
 import type { AuditResponse, AuditRunEntry, ConsoleMeta } from '../../api/client';
 import { consoleApi } from '../../api/client';
-import { displayFieldName, displayYuanFieldLabel, translateError } from '../i18nErrorMap';
+import {
+  displayFieldName,
+  displayRoleName,
+  displayYuanFieldLabel,
+  formatLocalTime,
+  formatSmartFieldValue,
+  translateError,
+} from '../i18nErrorMap';
 
 interface AuditPageProps {
   meta: ConsoleMeta;
   refreshTick: number;
 }
 
-type AuditFilter = 'ALL' | 'AUTO' | 'HUMAN' | 'REJECTED';
+type AuditFilter = 'ALL' | 'AUTO' | 'HUMAN' | 'SHADOW' | 'REJECTED' | 'REVERTED';
 
 export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
   const [data, setData] = useState<AuditResponse | null>(null);
   const [filter, setFilter] = useState<AuditFilter>('ALL');
+  const [searchTerm, setSearchTerm] = useState('');
   const [showAll, setShowAll] = useState(false);
+  const [expandedRunDiffs, setExpandedRunDiffs] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
 
   const loadAudit = useCallback(async () => {
@@ -31,11 +40,17 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
     loadAudit();
   }, [loadAudit]);
 
+  const needle = searchTerm.trim().toLowerCase();
   const filteredRuns: AuditRunEntry[] = (data?.runs || []).filter((r) => {
-    if (filter === 'ALL') return true;
-    if (filter === 'REJECTED') return r.status === 'REJECTED';
-    if (filter === 'HUMAN') return r.status === 'COMMITTED' && r.governance_channel === 'human';
-    if (filter === 'AUTO') return r.status === 'COMMITTED' && r.governance_channel !== 'human';
+    if (filter === 'REJECTED' && r.status !== 'REJECTED') return false;
+    if (filter === 'REVERTED' && r.status !== 'REVERTED') return false;
+    if (filter === 'HUMAN' && !(r.status === 'COMMITTED' && r.governance_channel === 'human')) return false;
+    if (filter === 'AUTO' && !(r.status === 'COMMITTED' && r.governance_channel !== 'human' && r.governance_channel !== 'shadow')) return false;
+    if (filter === 'SHADOW' && r.governance_channel !== 'shadow') return false;
+    if (needle) {
+      const hay = `${r.run_id} ${r.action_type} ${r.action_label} ${r.actor_id} ${r.actor_display_name || ''} ${JSON.stringify(r.changes || [])}`.toLowerCase();
+      if (!hay.includes(needle)) return false;
+    }
     return true;
   });
 
@@ -43,12 +58,9 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
   const runs = showAll ? filteredRuns : filteredRuns.slice(0, DEFAULT_LIMIT);
   const hiddenCount = Math.max(0, filteredRuns.length - runs.length);
 
-  const fmtAuditVal = (field: string, val: unknown): string => {
-    if (val === null || val === undefined || val === '') return '—';
-    if (field.endsWith('_cents') && typeof val === 'number') {
-      return `¥${(val / 100).toLocaleString('zh-CN')}`;
-    }
-    return String(val);
+  const formatInterceptReason = (run: AuditRunEntry): string => {
+    const raw = translateError(run.error_code, run.error_message, run.hint_zh);
+    return raw.replace(/^红线拦截[：:]\s*/, '');
   };
 
   return (
@@ -87,7 +99,7 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
         </div>
       </div>
 
-      {/* Filter tabs + Refresh */}
+      {/* Filter tabs + Search + Refresh */}
       <div className="rounded-xl border border-slate-200/80 bg-white shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -96,7 +108,9 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
                 ['ALL', '全部记录'],
                 ['AUTO', '自动放行'],
                 ['HUMAN', '人工签批'],
+                ['SHADOW', '影子演练'],
                 ['REJECTED', '红线拦截'],
+                ['REVERTED', '已回滚'],
               ] as const
             ).map(([k, label]) => (
               <button
@@ -114,14 +128,27 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
               </button>
             ))}
           </div>
-          <button
-            type="button"
-            onClick={loadAudit}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-            <span>刷新账本</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative w-48 sm:w-56">
+              <Search className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-400" />
+              <input
+                type="text"
+                data-testid="audit-search-input"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                placeholder="搜索流水号、动作或单据..."
+                className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-8 pr-3 text-xs text-slate-800 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white focus:outline-none"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={loadAudit}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+              <span>刷新账本</span>
+            </button>
+          </div>
         </div>
 
         <div className="divide-y divide-slate-100">
@@ -133,6 +160,10 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
             runs.map((run) => {
               const isRejected = run.status === 'REJECTED';
               const isHuman = run.governance_channel === 'human';
+              const isDiffExpanded = Boolean(expandedRunDiffs[run.run_id]);
+              const allChanges = run.changes || [];
+              const shownChanges =
+                allChanges.length > 3 && !isDiffExpanded ? allChanges.slice(0, 3) : allChanges;
               return (
                 <div key={run.run_id} className="p-5 transition hover:bg-slate-50/60">
                   <div className="flex flex-wrap items-start justify-between gap-3">
@@ -179,30 +210,39 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
                           )}
                         </div>
                         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-                          <span>执行账号：{run.actor_id}</span>
-                          <span>岗位角色：{meta.display?.roles?.[run.actor_role] || run.actor_role}</span>
+                          <span>
+                            执行人：{run.actor_display_name || run.actor_id}（
+                            {displayRoleName(run.actor_role, meta.display)}）
+                          </span>
                           <span className="font-mono text-[11px] text-slate-400">
                             流水：{run.run_id}
                           </span>
                         </div>
                       </div>
                     </div>
-                    <span className="font-mono text-[11px] text-slate-400">{run.executed_at}</span>
+                    <span className="font-mono text-[11px] text-slate-400">
+                      {formatLocalTime(run.executed_at)}
+                    </span>
                   </div>
 
                   {isRejected && (
                     <div className="mt-3 rounded-lg border border-rose-200/70 bg-rose-50/70 px-3.5 py-2.5 text-xs text-rose-800">
-                      拦截原因：{translateError(run.error_code, run.error_message, run.hint_zh)}
+                      拦截原因：{formatInterceptReason(run)}
                     </div>
                   )}
 
-                  {!isRejected && run.changes && run.changes.length > 0 && (
+                  {!isRejected && allChanges.length > 0 && (
                     <div className="mt-3 space-y-2 rounded-lg border border-slate-200/80 bg-slate-50/60 p-3">
-                      {run.changes.map((chg) => (
+                      {shownChanges.map((chg) => (
                         <div key={`${run.run_id}-${chg.object_type}:${chg.object_id}`} className="text-xs">
                           <div className="font-semibold text-slate-700">
                             {meta.display?.objects?.[chg.object_type] || chg.object_type} ·{' '}
                             <span className="font-mono">{chg.object_id}</span>
+                            {chg.object_title && chg.object_title !== chg.object_id && (
+                              <span className="ml-1.5 font-normal text-slate-500">
+                                {chg.object_title}
+                              </span>
+                            )}
                           </div>
                           {chg.field_deltas.length > 0 && (
                             <div className="mt-1 flex flex-wrap gap-2">
@@ -219,11 +259,11 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
                                     :
                                   </span>
                                   <span className="text-slate-400 line-through">
-                                    {fmtAuditVal(d.field, d.before)}
+                                    {formatSmartFieldValue(d.field, d.before, meta, { decimals: 0 })}
                                   </span>
                                   <span>→</span>
                                   <span className="font-semibold text-emerald-700">
-                                    {fmtAuditVal(d.field, d.after)}
+                                    {formatSmartFieldValue(d.field, d.after, meta, { decimals: 0 })}
                                   </span>
                                 </span>
                               ))}
@@ -231,6 +271,22 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
                           )}
                         </div>
                       ))}
+                      {allChanges.length > 3 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedRunDiffs((prev) => ({
+                              ...prev,
+                              [run.run_id]: !prev[run.run_id],
+                            }))
+                          }
+                          className="text-[11px] font-medium text-blue-700 hover:underline"
+                        >
+                          {isDiffExpanded
+                            ? '收起变更明细'
+                            : `展开全部 ${allChanges.length} 项变更明细`}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -245,7 +301,7 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
               onClick={() => setShowAll(true)}
               className="rounded-lg border border-slate-200 bg-white px-4 py-1.5 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50"
             >
-              展开其余 {hiddenCount} 条历史初始化流水
+              展开其余 {hiddenCount} 条历史记录
             </button>
           </div>
         )}

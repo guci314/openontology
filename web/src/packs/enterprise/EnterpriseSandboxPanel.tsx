@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowDownRight, ArrowUpRight, CheckCircle2, Scale } from 'lucide-react';
+import { ArrowDownRight, ArrowUpRight, CheckCircle2, Lock, Scale } from 'lucide-react';
 import type { DomainSandboxSlotProps } from '../../shell/packRegistry';
 import { consoleApi, type RecordInstance } from '../../api/client';
+import { formatSignedAmount } from '../../shell/i18nErrorMap';
 
 interface FinancialSnapshot {
   cashYuan: number;
@@ -42,9 +43,8 @@ export const EnterpriseSandboxPanel: React.FC<DomainSandboxSlotProps> = ({
   meta,
   sandboxId,
   sandboxDiff,
-  busy,
-  onRunPreset,
 }) => {
+  const [hasGlAccess, setHasGlAccess] = useState<boolean>(true);
   const [primarySnap, setPrimarySnap] = useState<FinancialSnapshot | null>(null);
   const [sandboxSnap, setSandboxSnap] = useState<FinancialSnapshot | null>(null);
 
@@ -69,7 +69,14 @@ export const EnterpriseSandboxPanel: React.FC<DomainSandboxSlotProps> = ({
         : Promise.resolve(null),
     ]).then(([primGl, primTb, sbxGl, sbxTb]) => {
       if (!active) return;
-      const pSnap = computeFinancialSnapshot(primGl.items || [], primTb?.result || null);
+      const visibleGl = primGl.items || [];
+      setHasGlAccess(visibleGl.length > 0);
+      if (visibleGl.length === 0) {
+        setPrimarySnap(null);
+        setSandboxSnap(null);
+        return;
+      }
+      const pSnap = computeFinancialSnapshot(visibleGl, primTb?.result || null);
       setPrimarySnap(pSnap);
       if (sandboxId && (sbxGl.items || []).length > 0) {
         setSandboxSnap(
@@ -82,7 +89,7 @@ export const EnterpriseSandboxPanel: React.FC<DomainSandboxSlotProps> = ({
     return () => {
       active = false;
     };
-  }, [meta.actor.actor_id, sandboxId, sandboxDiff?.step_count, sandboxDiff?.total_changes]);
+  }, [meta.actor.actor_id, sandboxId, sandboxDiff]);
 
   const metrics = [
     {
@@ -117,74 +124,70 @@ export const EnterpriseSandboxPanel: React.FC<DomainSandboxSlotProps> = ({
             财务经营全景对比 · 现实主账 vs 沙盘推演
           </h2>
         </div>
-        <div className="flex items-center gap-2">
-          {meta.sandbox_presets.slice(0, 3).map((p) => (
-            <button
-              key={p.preset_id}
-              type="button"
-              disabled={busy}
-              onClick={() => onRunPreset(p.preset_id)}
-              className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-700 transition hover:border-blue-300 hover:bg-blue-50 hover:text-blue-800 disabled:opacity-50"
-            >
-              {p.title}
-            </button>
-          ))}
-        </div>
+        <span className="whitespace-nowrap text-[11px] font-medium text-slate-400">
+          主账与分叉沙盘实时对照
+        </span>
       </div>
 
-      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        {metrics.map((m) => {
-          const delta = m.sandbox - m.primary;
-          const hasDelta = Math.abs(delta) > 0.01;
-          return (
-            <div
-              key={m.key}
-              className={`rounded-xl border p-3.5 ${
-                hasDelta ? 'border-blue-300 bg-blue-50/40' : 'border-slate-200 bg-slate-50/50'
-              }`}
-            >
-              <div className="text-[11px] font-medium text-slate-500">{m.label}</div>
-              <div className="mt-1.5 flex items-baseline justify-between gap-2">
-                <span className="text-[11px] text-slate-400">现实</span>
-                <span className="font-mono text-xs tabular-nums text-slate-600">
-                  {fmtYuan(m.primary)}
-                </span>
-              </div>
-              <div className="mt-1 flex items-baseline justify-between gap-2">
-                <span className="text-[11px] font-semibold text-slate-700">沙盘</span>
-                <span
-                  data-testid={`sandbox-metric-${m.key}`}
-                  className="font-mono text-base font-bold tabular-nums text-slate-900"
-                >
-                  {fmtYuan(m.sandbox)}
-                </span>
-              </div>
-              {hasDelta && (
-                <div
-                  className={`mt-1.5 inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${
-                    delta > 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'
-                  }`}
-                >
-                  {delta > 0 ? <ArrowUpRight className="h-3 w-3" /> : <ArrowDownRight className="h-3 w-3" />}
-                  {delta > 0 ? '+' : ''}
-                  {fmtYuan(delta)}
+      {!hasGlAccess ? (
+        <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 text-xs font-medium text-amber-900">
+          <Lock className="h-4 w-4 shrink-0 text-amber-700" />
+          <span>集团总账与银行现金全景对比权限受限（仅 CFO/财务可见）；您仍可在下方对本厂区单据执行沙盘对比。</span>
+        </div>
+      ) : (
+        <div className="mt-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+          {metrics.map((m) => {
+            const delta = m.sandbox - m.primary;
+            const hasDelta = Math.abs(delta) > 0.01;
+            return (
+              <div
+                key={m.key}
+                className={`rounded-xl border p-3.5 ${
+                  hasDelta ? 'border-blue-300 bg-blue-50/40' : 'border-slate-200 bg-slate-50/50'
+                }`}
+              >
+                <div className="text-[11px] font-medium text-slate-500">{m.label}</div>
+                <div className="mt-1.5 flex items-baseline justify-between gap-2">
+                  <span className="shrink-0 whitespace-nowrap text-[11px] text-slate-400">现实</span>
+                  <span className="whitespace-nowrap font-mono text-xs tabular-nums text-slate-600">
+                    {fmtYuan(m.primary)}
+                  </span>
                 </div>
-              )}
-            </div>
-          );
-        })}
+                <div className="mt-1 flex items-baseline justify-between gap-2">
+                  <span className="shrink-0 whitespace-nowrap text-[11px] font-semibold text-slate-700">沙盘</span>
+                  <span
+                    data-testid={`sandbox-metric-${m.key}`}
+                    className="whitespace-nowrap font-mono text-base font-bold tabular-nums text-slate-900"
+                  >
+                    {fmtYuan(m.sandbox)}
+                  </span>
+                </div>
+                {hasDelta && (
+                  <div
+                    className={`mt-1.5 inline-flex items-center gap-0.5 whitespace-nowrap rounded px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${
+                      delta > 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'
+                    }`}
+                  >
+                    {delta > 0 ? <ArrowUpRight className="h-3 w-3" /> : <ArrowDownRight className="h-3 w-3" />}
+                    {formatSignedAmount(delta, '¥', { withPlus: true })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
 
-        <div className="flex flex-col justify-between rounded-xl border border-emerald-200 bg-emerald-50/60 p-3.5">
-          <div className="text-[11px] font-medium text-emerald-800">复式试算平衡检验</div>
-          <div className="mt-2 flex items-center gap-1.5 text-sm font-bold text-emerald-800">
-            <CheckCircle2 className="h-4 w-4 text-emerald-600" />
-            <span>{sandboxSnap?.isBalanced ? '借贷严格平衡' : '存在借贷差额'}</span>
-          </div>
-          <div className="mt-1 text-[11px] text-emerald-700/80">
-            会计恒等式校验全程实时激活
+          <div className="flex flex-col justify-between rounded-xl border border-emerald-200 bg-emerald-50/60 p-3.5">
+            <div className="text-[11px] font-medium text-emerald-800">复式试算平衡检验</div>
+            <div className="mt-2 flex items-center gap-1.5 whitespace-nowrap text-sm font-bold text-emerald-800">
+              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+              <span>{sandboxSnap?.isBalanced ? '借贷严格平衡' : '存在借贷差额'}</span>
+            </div>
+            <div className="mt-1 text-[11px] text-emerald-700/80">
+              会计恒等式校验全程实时激活
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

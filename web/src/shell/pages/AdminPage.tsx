@@ -61,6 +61,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     'SHADOW' | 'COPILOT_ESCALATE' | 'AUTO_UNDER_CEILING'
   >('AUTO_UNDER_CEILING');
   const [ceilingValue, setCeilingValue] = useState<string>('300000');
+  const [expandDomains, setExpandDomains] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
 
@@ -98,7 +99,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       });
       setAutonomy(updated);
       setSelectedMode(updated.policy.default_mode);
-      setSaveFeedback(`已切换为「${modeToUse}」并即时生效。`);
+      const modeTitle =
+        AUTONOMY_MODES.find((m) => m.mode === updated.policy.default_mode)?.title ||
+        updated.policy.default_mode;
+      setSaveFeedback(`已切换为「${modeTitle}」并即时生效。`);
       onPolicyUpdated();
     } finally {
       setSaving(false);
@@ -107,8 +111,11 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
   if (!meta.capabilities.is_admin_ops) {
     return (
-      <div className="rounded-xl border border-amber-200 bg-amber-50 p-6 text-sm text-amber-900">
-        当前登录角色「{meta.actor.title}」不具备实施运维管理权限。请切换为财务总监或系统管理员查看。
+      <div
+        data-testid="admin-access-denied"
+        className="rounded-xl border border-amber-200 bg-amber-50 p-6 text-sm text-amber-900"
+      >
+        当前登录角色「{meta.actor.title}」不具备实施运维管理权限。请切换为拥有运维权限的管理员账号查看。
       </div>
     );
   }
@@ -133,7 +140,9 @@ export const AdminPage: React.FC<AdminPageProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-500">自动放行限额 (¥)：</span>
+            <span className="text-xs text-slate-500">
+              自动放行阈值{meta.value_unit_label ? ` (${meta.value_unit_label})` : ''}：
+            </span>
             <input
               type="number"
               value={ceilingValue}
@@ -268,11 +277,26 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               )}
 
               <div>
-                <div className="mb-1.5 text-[11px] font-medium text-slate-500">
-                  本引擎直接托管域 ({devices.standalone_object_types.length} 类)
+                <div className="mb-1.5 flex items-center justify-between text-[11px] font-medium text-slate-500">
+                  <span>本引擎直接托管域 ({devices.standalone_object_types.length} 类)</span>
+                  {devices.standalone_object_types.length > 14 && (
+                    <button
+                      type="button"
+                      data-testid="admin-toggle-domains-btn"
+                      onClick={() => setExpandDomains((v) => !v)}
+                      className="font-semibold text-blue-700 hover:underline"
+                    >
+                      {expandDomains
+                        ? '收起列表'
+                        : `+${devices.standalone_object_types.length - 14} 展开全部`}
+                    </button>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {devices.standalone_object_types.slice(0, 14).map((st) => (
+                  {(expandDomains
+                    ? devices.standalone_object_types
+                    : devices.standalone_object_types.slice(0, 14)
+                  ).map((st) => (
                     <span
                       key={st.object_type}
                       className="rounded-md bg-slate-100 px-2 py-0.5 text-[11px] text-slate-700"

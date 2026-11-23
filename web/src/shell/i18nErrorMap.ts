@@ -1,4 +1,4 @@
-import { DisplayDictionary } from '../api/client';
+import type { ConsoleMeta, DisplayDictionary } from '../api/client';
 
 const GENERIC_ERROR_HINTS: Record<string, string> = {
   PERMISSION_DENIED: '当前角色暂无执行权限，已被系统安全拦截。',
@@ -13,7 +13,7 @@ const GENERIC_ERROR_HINTS: Record<string, string> = {
 
 const GENERIC_STATUS_LABELS: Record<string, { label: string; tone: 'emerald' | 'amber' | 'rose' | 'sky' | 'slate' }> = {
   COMMITTED: { label: '已执行落库', tone: 'emerald' },
-  REJECTED: { label: '红线已拦截', tone: 'rose' },
+  REJECTED: { label: '已驳回', tone: 'rose' },
   REVERTED: { label: '已撤回冲正', tone: 'amber' },
   AUTO_COMMITTED: { label: '限额自动放行', tone: 'emerald' },
   ESCALATED_COMMITTED: { label: '已转人工签批', tone: 'amber' },
@@ -29,6 +29,11 @@ const GENERIC_STATUS_LABELS: Record<string, { label: string; tone: 'emerald' | '
   CONNECTED: { label: '实时连接', tone: 'emerald' },
   DEGRADED: { label: '降级待查', tone: 'amber' },
   UNPLUGGED: { label: '已断开安全态', tone: 'slate' },
+  HIGH: { label: '高优', tone: 'rose' },
+  MEDIUM: { label: '中等', tone: 'amber' },
+  LOW: { label: '常规', tone: 'slate' },
+  DEBIT: { label: '借方', tone: 'sky' },
+  CREDIT: { label: '贷方', tone: 'emerald' },
   active: { label: '启用中', tone: 'emerald' },
   draft: { label: '草稿待办', tone: 'slate' },
   confirmed: { label: '已确认', tone: 'sky' },
@@ -43,6 +48,10 @@ const GENERIC_STATUS_LABELS: Record<string, { label: string; tone: 'emerald' | '
   paid: { label: '已结清', tone: 'emerald' },
   partial: { label: '部分结清', tone: 'amber' },
   not_paid: { label: '待核销', tone: 'amber' },
+  pending: { label: '待处理', tone: 'slate' },
+  recorded: { label: '已记录', tone: 'emerald' },
+  agreed: { label: '已生效', tone: 'emerald' },
+  passed: { label: '合格', tone: 'emerald' },
   completed: { label: '已完成', tone: 'emerald' },
   closed: { label: '已关账锁定', tone: 'slate' },
   open: { label: '开放记账中', tone: 'emerald' },
@@ -54,6 +63,12 @@ const GENERIC_STATUS_LABELS: Record<string, { label: string; tone: 'emerald' | '
 };
 
 export function translateError(code?: string | null, fallback?: string | null, backendHint?: string): string {
+  const rawFallback = String(fallback || '');
+  if (rawFallback.includes('errors.pydantic.dev') || rawFallback.toLowerCase().includes('validation error')) {
+    return backendHint && !backendHint.includes('errors.pydantic.dev')
+      ? backendHint
+      : GENERIC_ERROR_HINTS.INVALID_PARAMETER;
+  }
   if (backendHint) return backendHint;
   const c = String(code || '').trim();
   if (c && GENERIC_ERROR_HINTS[c]) return GENERIC_ERROR_HINTS[c];
@@ -103,5 +118,67 @@ export function displayYuanFieldLabel(rawLabel: string, fieldName: string): stri
 }
 
 export function displayEnumValue(rawVal: string, display?: DisplayDictionary): string {
-  return display?.statuses?.[rawVal] || rawVal;
+  return display?.statuses?.[rawVal] || GENERIC_STATUS_LABELS[rawVal]?.label || rawVal;
+}
+
+export function formatSignedAmount(
+  val: number,
+  unit = '',
+  opts?: { withPlus?: boolean; decimals?: number }
+): string {
+  const absVal = Math.abs(val);
+  const decimals = opts?.decimals ?? 0;
+  const numStr = absVal.toLocaleString('zh-CN', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+  const sign = val < 0 ? '-' : val > 0 && opts?.withPlus ? '+' : '';
+  return `${sign}${unit}${numStr}`;
+}
+
+export function isCurrencyLikeField(fieldName: string): boolean {
+  return (
+    fieldName.endsWith('_cents') ||
+    fieldName.includes('amount') ||
+    fieldName.includes('limit') ||
+    fieldName.includes('price') ||
+    fieldName === 'settled_amount' ||
+    fieldName === 'payment_amount'
+  );
+}
+
+export function formatSmartFieldValue(
+  fieldName: string,
+  val: unknown,
+  meta?: ConsoleMeta,
+  opts?: { decimals?: number }
+): string {
+  if (val === null || val === undefined || val === '') return '—';
+  if (typeof val === 'boolean') return val ? '是' : '否';
+  const unit = meta?.value_unit_label ?? '';
+  if (typeof val === 'number') {
+    if (fieldName.endsWith('_cents')) {
+      return formatSignedAmount(val / 100, unit, { decimals: opts?.decimals ?? 0 });
+    }
+    if (isCurrencyLikeField(fieldName)) {
+      return formatSignedAmount(val, unit, { decimals: opts?.decimals ?? 0 });
+    }
+    return val.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+  }
+  if (typeof val === 'string') {
+    return displayEnumValue(val, meta?.display);
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => displayEnumValue(String(item), meta?.display)).join(', ');
+  }
+  return String(val);
+}
+
+export function formatLocalTime(iso?: string | null): string {
+  const raw = String(iso || '').trim();
+  if (!raw) return '—';
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }

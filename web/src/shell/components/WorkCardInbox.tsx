@@ -10,6 +10,7 @@ import {
 import {
   displayActionName,
   displayEntityName,
+  displayEnumValue,
   displayRoleName,
   getStatusBadgeMeta,
   translateError,
@@ -44,6 +45,7 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notes, setNotes] = useState<Record<string, string>>({});
+  const [cardErrors, setCardErrors] = useState<Record<string, string>>({});
   const [showCompleted, setShowCompleted] = useState(false);
 
   const effectiveQueue: WorkQueueDescriptor | null = React.useMemo(() => {
@@ -101,8 +103,15 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
   const handleResolve = async (item: RecordInstance, decision: 'approve' | 'reject') => {
     if (!effectiveQueue) return;
     setBusyId(item.object_id);
+    setCardErrors((prev) => {
+      if (!prev[item.object_id]) return prev;
+      const next = { ...prev };
+      delete next[item.object_id];
+      return next;
+    });
     try {
       const note = notes[item.object_id] || (decision === 'approve' ? '同意批准执行' : '审核驳回');
+      const assigneeRole = String(item.properties[effectiveQueue.assignee_role_field] || '');
       const res = await consoleApi.resolveWorkItem(item.object_id, decision, note, effectiveQueue.object_type);
       if (res.ok && res.committed) {
         onActionCompleted({
@@ -114,16 +123,19 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
         });
         await loadItems();
       } else {
-        onActionCompleted({
-          ok: false,
-          text: translateError(res.error_code, res.error, res.hint_zh),
-        });
+        let friendly = translateError(res.error_code, res.error, res.hint_zh);
+        if (res.error_code === 'WORK_CARD_ASSIGNEE_MISMATCH') {
+          friendly = `权限不足：该事项须由「${displayRoleName(assigneeRole, meta.display)}」签批。`;
+        } else if (res.error_code === 'SOD_SELF_APPROVAL_FORBIDDEN') {
+          friendly = '职责分离拦截：发起人不可审批自己提交的事项。';
+        }
+        setCardErrors((prev) => ({ ...prev, [item.object_id]: friendly }));
+        onActionCompleted({ ok: false, text: friendly });
       }
     } catch (err) {
-      onActionCompleted({
-        ok: false,
-        text: err instanceof Error ? err.message : '操作执行未通过校验',
-      });
+      const friendly = err instanceof Error ? err.message : '操作执行未通过校验';
+      setCardErrors((prev) => ({ ...prev, [item.object_id]: friendly }));
+      onActionCompleted({ ok: false, text: friendly });
     } finally {
       setBusyId(null);
     }
@@ -172,11 +184,11 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
             <p className="text-xs text-slate-500">只展示当前账号可见范围内的高优异常与签批事项</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <button
             type="button"
             onClick={() => setShowCompleted((v) => !v)}
-            className="rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:bg-slate-50"
+            className="shrink-0 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:bg-slate-50"
           >
             {showCompleted ? '只看待办' : `全部 (${items.length})`}
           </button>
@@ -229,7 +241,7 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
                       {it.object_id}
                     </span>
                     <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600">
-                      {String(p[effectiveQueue.kind_field] || '') === 'APPROVAL' ? '高危放行审批' : '人工裁决协同'}
+                      {displayEnumValue(String(p[effectiveQueue.kind_field] || ''), meta.display)}
                     </span>
                   </div>
                   <span
@@ -308,6 +320,14 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
                         </button>
                       </div>
                     </div>
+                    {cardErrors[it.object_id] && (
+                      <div
+                        data-testid={`workcard-error-${it.object_id}`}
+                        className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-800"
+                      >
+                        {cardErrors[it.object_id]}
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <p className="mt-2 rounded-lg bg-slate-50 px-2.5 py-1.5 text-xs text-slate-600">

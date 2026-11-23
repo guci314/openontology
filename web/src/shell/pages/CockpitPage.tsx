@@ -7,6 +7,7 @@ import {
   displayEnumValue,
   displayFieldName,
   displayYuanFieldLabel,
+  formatSmartFieldValue,
   getStatusBadgeMeta,
 } from '../i18nErrorMap';
 import type { DomainViewPack } from '../packRegistry';
@@ -53,8 +54,10 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
 
   const [selectedType, setSelectedType] = useState<string>('');
   const [records, setRecords] = useState<RecordInstance[]>([]);
+  const [allRecordsForStatus, setAllRecordsForStatus] = useState<RecordInstance[]>([]);
   const [loadingList, setLoadingList] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
@@ -64,6 +67,7 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
       const firstPopulated =
         orderedEntityTypes.find((t) => t.visible_count > 0) || orderedEntityTypes[0];
       setSelectedType(firstPopulated.name);
+      setStatusFilter('');
     }
   }, [orderedEntityTypes, selectedType]);
 
@@ -72,15 +76,19 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
     setLoadingList(true);
     try {
       const res = await consoleApi.listObjects(selectedType, {
+        status: statusFilter || undefined,
         q: searchTerm.trim() || undefined,
       });
       setRecords(res.items || []);
+      if (!statusFilter && !searchTerm.trim()) {
+        setAllRecordsForStatus(res.items || []);
+      }
     } catch {
       setRecords([]);
     } finally {
       setLoadingList(false);
     }
-  }, [selectedType, searchTerm, meta.actor.actor_id, refreshTick]);
+  }, [selectedType, statusFilter, searchTerm, meta.actor.actor_id, refreshTick]);
 
   useEffect(() => {
     loadRecords();
@@ -113,6 +121,20 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
     ];
     return prioritized.slice(0, 3);
   }, [selectedEntityMeta]);
+
+  const availableStatuses = useMemo(() => {
+    const vals = new Set<string>();
+    const sf = selectedEntityMeta?.status_field || 'status';
+    for (const s of selectedEntityMeta?.initial_statuses || []) vals.add(s);
+    for (const k of Object.keys(selectedEntityMeta?.transitions || {})) vals.add(k);
+    for (const r of allRecordsForStatus) {
+      const sv = r.properties[sf] ?? r.properties['stage'];
+      if (typeof sv === 'string' && sv) vals.add(sv);
+    }
+    return Array.from(vals);
+  }, [selectedEntityMeta, allRecordsForStatus]);
+
+  const hasActiveFilter = Boolean(searchTerm.trim() || statusFilter);
 
   const totalVisibleRecords = useMemo(
     () => schema.object_types.reduce((acc, t) => acc + (t.visible_count || 0), 0),
@@ -220,7 +242,10 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
           meta={meta}
           schema={schema}
           refreshTick={refreshTick}
-          onSelectEntityType={(et) => setSelectedType(et)}
+          onSelectEntityType={(et) => {
+            setSelectedType(et);
+            setStatusFilter('');
+          }}
         />
       )}
 
@@ -250,20 +275,38 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">实时业务台账与关系穿透</h2>
                   <p className="text-xs text-slate-500">
-                    点击任意单据行查看完整扩展字段与上下游血缘链
+                    点击任意记录行查看完整扩展字段与前后关联图谱
                   </p>
                 </div>
               </div>
 
-              <div className="relative w-full sm:w-56">
-                <Search className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-400" />
-                <input
-                  type="text"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  placeholder="搜索编号、名称或关键词..."
-                  className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-8 pr-3 text-xs text-slate-800 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white focus:outline-none"
-                />
+              <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+                {availableStatuses.length > 0 && (
+                  <select
+                    aria-label="按状态筛选"
+                    data-testid="cockpit-status-filter"
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value)}
+                    className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs text-slate-700 focus:border-blue-500 focus:bg-white focus:outline-none"
+                  >
+                    <option value="">全部状态</option>
+                    {availableStatuses.map((sv) => (
+                      <option key={sv} value={sv}>
+                        {getStatusBadgeMeta(sv, meta.display).label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <div className="relative flex-1 sm:w-52 sm:flex-initial">
+                  <Search className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-400" />
+                  <input
+                    type="text"
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    placeholder="搜索编号、名称或关键词..."
+                    className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-8 pr-3 text-xs text-slate-800 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white focus:outline-none"
+                  />
+                </div>
               </div>
             </div>
 
@@ -276,7 +319,10 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
                     key={t.name}
                     type="button"
                     data-testid={`entity-tab-${t.name}`}
-                    onClick={() => setSelectedType(t.name)}
+                    onClick={() => {
+                      setSelectedType(t.name);
+                      setStatusFilter('');
+                    }}
                     className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
                       active
                         ? 'bg-[#0F172A] text-white shadow-sm'
@@ -297,106 +343,109 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
             </div>
 
             {/* Records table */}
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="border-b border-slate-100 bg-slate-50/70 text-[11px] font-medium text-slate-500">
-                  <tr>
-                    <th className="px-4 py-2.5">编号 / 名称</th>
-                    {previewFields.map((fld) => (
-                      <th key={fld.name} className="px-3 py-2.5">
-                        {displayYuanFieldLabel(
-                          fld.display_label || displayFieldName(selectedType, fld.name, meta.display),
-                          fld.name
-                        )}
-                      </th>
-                    ))}
-                    <th className="px-4 py-2.5 text-right">当前状态</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {loadingList ? (
+            <div className="relative">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="border-b border-slate-100 bg-slate-50/70 text-[11px] font-medium text-slate-500">
                     <tr>
-                      <td colSpan={previewFields.length + 2} className="px-4 py-8 text-center text-slate-400">
-                        正在加载业务单据...
-                      </td>
+                      <th className="whitespace-nowrap px-4 py-2.5">编号 / 名称</th>
+                      {previewFields.map((fld) => (
+                        <th key={fld.name} className="whitespace-nowrap px-3 py-2.5">
+                          {displayYuanFieldLabel(
+                            fld.display_label || displayFieldName(selectedType, fld.name, meta.display),
+                            fld.name
+                          )}
+                        </th>
+                      ))}
+                      <th className="whitespace-nowrap px-4 py-2.5 text-right">当前状态</th>
                     </tr>
-                  ) : records.length === 0 ? (
-                    <tr>
-                      <td colSpan={previewFields.length + 2} className="px-4 py-10 text-center text-slate-400">
-                        当前权限视角下该分类暂无可见单据记录
-                      </td>
-                    </tr>
-                  ) : (
-                    records.map((rec) => {
-                      const stVal = rec.properties['status'] ?? rec.properties['stage'];
-                      const badge = getStatusBadgeMeta(stVal, meta.display);
-                      const orgVal = rec.properties['org'];
-                      return (
-                        <tr
-                          key={rec.object_id}
-                          data-testid={`record-row-${rec.object_id}`}
-                          onClick={() => onInspectObject(rec.object_type, rec.object_id)}
-                          className="cursor-pointer transition hover:bg-blue-50/40"
-                        >
-                          <td className="px-4 py-3">
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono font-semibold text-slate-900">
-                                {rec.object_id}
-                              </span>
-                              {Boolean(orgVal) && (
-                                <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
-                                  {String(orgVal) === 'plant_north'
-                                    ? '华北厂'
-                                    : String(orgVal) === 'plant_south'
-                                    ? '华南厂'
-                                    : String(orgVal)}
-                                </span>
-                              )}
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {loadingList ? (
+                      <tr>
+                        <td colSpan={previewFields.length + 2} className="px-4 py-8 text-center text-slate-400">
+                          正在加载业务单据...
+                        </td>
+                      </tr>
+                    ) : records.length === 0 ? (
+                      <tr>
+                        <td colSpan={previewFields.length + 2} className="px-4 py-10 text-center text-slate-400">
+                          {hasActiveFilter ? (
+                            <div className="flex flex-col items-center gap-2">
+                              <span>未找到匹配当前筛选条件的记录</span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSearchTerm('');
+                                  setStatusFilter('');
+                                }}
+                                className="rounded-lg border border-slate-200 bg-white px-3 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                              >
+                                清空筛选条件
+                              </button>
                             </div>
-                            {rec.title && rec.title !== rec.object_id && (
-                              <div className="mt-0.5 max-w-[230px] truncate text-[11px] text-slate-500">
-                                {rec.title}
+                          ) : (
+                            '当前权限视角下该分类暂无可见单据记录'
+                          )}
+                        </td>
+                      </tr>
+                    ) : (
+                      records.map((rec) => {
+                        const stVal = rec.properties['status'] ?? rec.properties['stage'];
+                        const badge = getStatusBadgeMeta(stVal, meta.display);
+                        const orgVal = rec.properties['org'];
+                        return (
+                          <tr
+                            key={rec.object_id}
+                            data-testid={`record-row-${rec.object_id}`}
+                            onClick={() => onInspectObject(rec.object_type, rec.object_id)}
+                            className="cursor-pointer transition hover:bg-blue-50/40"
+                          >
+                            <td className="whitespace-nowrap px-4 py-3">
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono font-semibold text-slate-900">
+                                  {rec.object_id}
+                                </span>
+                                {Boolean(orgVal) && (
+                                  <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
+                                    {displayEnumValue(String(orgVal), meta.display)}
+                                  </span>
+                                )}
                               </div>
-                            )}
-                          </td>
-                          {previewFields.map((fld) => {
-                            const v = rec.properties[fld.name];
-                            let formatted =
-                              v === null || v === undefined || v === ''
-                                ? '—'
-                                : typeof v === 'string'
-                                ? displayEnumValue(v, meta.display)
-                                : String(v);
-                            if (typeof v === 'number') {
-                              if (fld.name.endsWith('_cents')) {
-                                formatted = `¥${(v / 100).toLocaleString('zh-CN', { maximumFractionDigits: 0 })}`;
-                              } else if (fld.name.includes('amount') || fld.name.includes('limit') || fld.name.includes('price')) {
-                                formatted = `¥${v.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}`;
-                              } else {
-                                formatted = v.toLocaleString('zh-CN');
-                              }
-                            }
-                            return (
-                              <td key={fld.name} className="px-3 py-3 font-mono tabular-nums text-slate-700">
-                                <span className="inline-block max-w-[140px] truncate">{formatted}</span>
-                              </td>
-                            );
-                          })}
-                          <td className="px-4 py-3 text-right">
-                            <span
-                              className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${
-                                BADGE_CLS[badge.tone] || BADGE_CLS.slate
-                              }`}
-                            >
-                              {badge.label}
-                            </span>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
+                              {rec.title && rec.title !== rec.object_id && (
+                                <div className="mt-0.5 max-w-[230px] truncate text-[11px] text-slate-500">
+                                  {rec.title}
+                                </div>
+                              )}
+                            </td>
+                            {previewFields.map((fld) => {
+                              const v = rec.properties[fld.name];
+                              const formatted = formatSmartFieldValue(fld.name, v, meta, {
+                                decimals: 0,
+                              });
+                              return (
+                                <td key={fld.name} className="whitespace-nowrap px-3 py-3 font-mono tabular-nums text-slate-700">
+                                  <span className="inline-block max-w-[140px] truncate">{formatted}</span>
+                                </td>
+                              );
+                            })}
+                            <td className="whitespace-nowrap px-4 py-3 text-right">
+                              <span
+                                className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                                  BADGE_CLS[badge.tone] || BADGE_CLS.slate
+                                }`}
+                              >
+                                {badge.label}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="pointer-events-none absolute inset-y-0 right-0 w-4 bg-gradient-to-l from-white/80 to-transparent lg:hidden" />
             </div>
           </div>
         </div>

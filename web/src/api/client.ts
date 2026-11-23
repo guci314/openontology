@@ -25,6 +25,7 @@ export interface DisplayDictionary {
   statuses?: Record<string, string>;
   cardinalities?: Record<string, string>;
   kinds?: Record<string, string>;
+  invariants?: Record<string, string>;
 }
 
 export interface WorkQueueDescriptor {
@@ -73,6 +74,9 @@ export interface ConsoleMeta {
   display: DisplayDictionary;
   work_queue: WorkQueueDescriptor | null;
   sandbox_presets: SandboxPreset[];
+  quick_prompts?: string[];
+  assistant_welcome?: string;
+  value_unit_label?: string;
   autonomy_mode: string;
   state_fingerprint: Record<string, unknown>;
   capabilities: {
@@ -124,6 +128,7 @@ export interface SchemaActionMeta {
   description: string;
   allowed_roles: string[];
   revert_roles: string[];
+  touched_object_types?: string[];
   affects_source: boolean;
   visibility: string;
   params: {
@@ -226,6 +231,7 @@ export interface ObjectDeltaSummary {
   kind?: string;
   object_type: string;
   object_id: string;
+  object_title?: string;
   before?: Record<string, unknown> | null;
   after?: Record<string, unknown> | null;
   field_deltas: FieldDelta[];
@@ -259,15 +265,16 @@ export interface SandboxCreateResponse {
 export interface SandboxDiffResponse {
   ok: boolean;
   sandbox_id: string;
-  created: Array<{ object_type: string; object_id: string; after: Record<string, unknown> }>;
+  created: Array<{ object_type: string; object_id: string; object_title?: string; after: Record<string, unknown> }>;
   updated: Array<{
     object_type: string;
     object_id: string;
+    object_title?: string;
     before: Record<string, unknown>;
     after: Record<string, unknown>;
     field_deltas: FieldDelta[];
   }>;
-  deleted: Array<{ object_type: string; object_id: string; before: Record<string, unknown> }>;
+  deleted: Array<{ object_type: string; object_id: string; object_title?: string; before: Record<string, unknown> }>;
   total_changes: number;
   step_count: number;
   steps: Array<Record<string, unknown>>;
@@ -280,6 +287,7 @@ export interface AuditRunEntry {
   action_type: string;
   action_label: string;
   actor_id: string;
+  actor_display_name?: string;
   actor_role: string;
   params: Record<string, unknown>;
   status: 'COMMITTED' | 'REJECTED' | 'REVERTED';
@@ -403,10 +411,35 @@ export interface AdminOrgResponse {
   roles: SchemaCatalog['roles'];
 }
 
-let activeActorHeader: string | null = null;
+const ACTOR_STORAGE_KEY = 'oo_console_actor_id';
+
+function readStoredActorId(): string | null {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      const saved = window.sessionStorage.getItem(ACTOR_STORAGE_KEY);
+      return saved && saved.trim() ? saved.trim() : null;
+    }
+  } catch {
+    // ignore storage access failure
+  }
+  return null;
+}
+
+let activeActorHeader: string | null = readStoredActorId();
 
 export function setActiveActorId(actorId: string | null): void {
-  activeActorHeader = actorId;
+  activeActorHeader = actorId && actorId.trim() ? actorId.trim() : null;
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      if (activeActorHeader) {
+        window.sessionStorage.setItem(ACTOR_STORAGE_KEY, activeActorHeader);
+      } else {
+        window.sessionStorage.removeItem(ACTOR_STORAGE_KEY);
+      }
+    }
+  } catch {
+    // ignore storage write failure
+  }
 }
 
 export function getActiveActorId(): string | null {

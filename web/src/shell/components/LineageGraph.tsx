@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { ArrowRight, GitBranch } from 'lucide-react';
 import type { ConsoleMeta, LineageNode, LineageResponse } from '../../api/client';
 import { displayEntityName, getStatusBadgeMeta } from '../i18nErrorMap';
@@ -55,6 +55,14 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
   loading,
   onSelectNode,
 }) => {
+  const [expandUp, setExpandUp] = useState(false);
+  const [expandDown, setExpandDown] = useState(false);
+
+  useEffect(() => {
+    setExpandUp(false);
+    setExpandDown(false);
+  }, [lineage?.root.object_type, lineage?.root.object_id]);
+
   if (loading) {
     return (
       <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 text-xs text-slate-500">
@@ -64,15 +72,18 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
   }
   if (!lineage) return null;
 
+  const MAX_SIDE_CARDS = 10;
   const upstream = lineage.hops.upstream;
   const downstream = lineage.hops.downstream;
+  const visibleUp = expandUp ? upstream : upstream.slice(0, MAX_SIDE_CARDS);
+  const visibleDown = expandDown ? downstream : downstream.slice(0, MAX_SIDE_CARDS);
 
   return (
     <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
       <div className="mb-3 flex items-center justify-between">
         <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
           <GitBranch className="h-3.5 w-3.5 text-blue-700" />
-          <span>单据上下游关联图谱（受权可见范围）</span>
+          <span>单据前后关联图谱（受权可见范围）</span>
         </div>
         <span className="text-[11px] text-slate-400">点击卡片可穿透跳转</span>
       </div>
@@ -80,21 +91,32 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
       <div className="grid grid-cols-1 gap-3 md:grid-cols-3 md:items-start">
         <div className="space-y-2">
           <div className="text-[11px] font-medium text-slate-500">
-            上游关联引用 ({upstream.length})
+            前置档案与依赖 ({upstream.length})
           </div>
           {upstream.length === 0 ? (
             <div className="rounded-lg border border-dashed border-slate-200 px-3 py-3 text-center text-[11px] text-slate-400">
-              无上游引用的单据
+              无前置依赖单据
             </div>
           ) : (
-            upstream.map((n) => (
-              <NodeCard
-                key={`${n.object_type}:${n.object_id}`}
-                node={n}
-                meta={meta}
-                onSelect={() => onSelectNode(n.object_type, n.object_id)}
-              />
-            ))
+            <>
+              {visibleUp.map((n) => (
+                <NodeCard
+                  key={`${n.object_type}:${n.object_id}`}
+                  node={n}
+                  meta={meta}
+                  onSelect={() => onSelectNode(n.object_type, n.object_id)}
+                />
+              ))}
+              {upstream.length > MAX_SIDE_CARDS && (
+                <button
+                  type="button"
+                  onClick={() => setExpandUp((v) => !v)}
+                  className="w-full rounded-lg border border-slate-200 bg-white py-1.5 text-[11px] font-medium text-blue-700 hover:bg-blue-50"
+                >
+                  {expandUp ? '收起前置依赖' : `展开其余 ${upstream.length - MAX_SIDE_CARDS} 项`}
+                </button>
+              )}
+            </>
           )}
         </div>
 
@@ -114,21 +136,32 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
 
         <div className="space-y-2">
           <div className="text-[11px] font-medium text-slate-500">
-            下游依赖档案 ({downstream.length})
+            后续关联单据 ({downstream.length})
           </div>
           {downstream.length === 0 ? (
             <div className="rounded-lg border border-dashed border-slate-200 px-3 py-3 text-center text-[11px] text-slate-400">
-              无下游指向对象
+              无后续关联单据
             </div>
           ) : (
-            downstream.map((n) => (
-              <NodeCard
-                key={`${n.object_type}:${n.object_id}`}
-                node={n}
-                meta={meta}
-                onSelect={() => onSelectNode(n.object_type, n.object_id)}
-              />
-            ))
+            <>
+              {visibleDown.map((n) => (
+                <NodeCard
+                  key={`${n.object_type}:${n.object_id}`}
+                  node={n}
+                  meta={meta}
+                  onSelect={() => onSelectNode(n.object_type, n.object_id)}
+                />
+              ))}
+              {downstream.length > MAX_SIDE_CARDS && (
+                <button
+                  type="button"
+                  onClick={() => setExpandDown((v) => !v)}
+                  className="w-full rounded-lg border border-slate-200 bg-white py-1.5 text-[11px] font-medium text-blue-700 hover:bg-blue-50"
+                >
+                  {expandDown ? '收起后续单据' : `展开其余 ${downstream.length - MAX_SIDE_CARDS} 项`}
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>

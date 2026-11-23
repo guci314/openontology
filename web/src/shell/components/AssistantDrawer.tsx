@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Bot, Send, Sparkles, X, ArrowUpRight } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { AssistantCard, ConsoleMeta } from '../../api/client';
@@ -20,11 +20,11 @@ interface AssistantDrawerProps {
   onSelectSandboxPreset?: (presetId: string) => void;
 }
 
-const QUICK_PROMPTS = [
-  '现在有哪些待我审批的异常或工单？',
-  '当前在手订单、应收和现金余额情况如何？',
-  '如果突发 ¥20,000 维修费对利润有什么影响？',
-  '我当前能看到哪些厂区的单据？',
+const FALLBACK_QUICK_PROMPTS = [
+  '当前有哪些待处理的协同事项？',
+  '当前可见记录与状态分布如何？',
+  '最近有哪些规则拦截或审计记录？',
+  '我当前的权限可见范围是什么？',
 ];
 
 export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
@@ -37,15 +37,40 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
   const navigate = useNavigate();
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const welcomeText =
+    meta.assistant_welcome ||
+    `您好 ${meta.actor.display_name}！我是运行在「${meta.actor.title}」权限视角内的智能助手，可为您检索可见记录、待办审批与平行沙盘推演。`;
   const [messages, setMessages] = useState<AssistantMessage[]>([
     {
       id: 'welcome',
       sender: 'assistant',
-      text: `您好 ${meta.actor.display_name}！我是运行在「${meta.actor.title}」权限视图内的 AI 数字管家，可实时为您检索待批异常、现金指标与合规沙盘预演。`,
+      text: welcomeText,
     },
   ]);
+  const streamEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    streamEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [open, messages, busy]);
 
   if (!open) return null;
+
+  const quickPrompts =
+    meta.quick_prompts && meta.quick_prompts.length > 0
+      ? meta.quick_prompts
+      : FALLBACK_QUICK_PROMPTS;
 
   const sendQuestion = async (textToSend: string) => {
     const trimmed = textToSend.trim();
@@ -97,7 +122,7 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
               <Bot className="h-5 w-5" />
             </div>
             <div>
-              <h3 className="text-sm font-semibold text-slate-900">AI 数字经营管家</h3>
+              <h3 className="text-sm font-semibold text-slate-900">AI 数字智能管家</h3>
               <p className="text-xs text-slate-500">
                 当前视角：{meta.actor.display_name}（{meta.actor.unit_name || meta.actor.title}）
               </p>
@@ -120,12 +145,12 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
             <span>一键提问</span>
           </div>
           <div className="flex flex-wrap gap-1.5">
-            {QUICK_PROMPTS.map((q) => (
+            {quickPrompts.map((q) => (
               <button
                 key={q}
                 type="button"
                 onClick={() => sendQuestion(q)}
-                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] text-slate-700 transition hover:border-blue-300 hover:text-blue-700"
+                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-left text-[11px] text-slate-700 transition hover:border-blue-300 hover:text-blue-700"
               >
                 {q}
               </button>
@@ -195,6 +220,7 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
               )}
             </div>
           ))}
+          <div ref={streamEndRef} />
         </div>
 
         {/* Input box */}
@@ -211,7 +237,7 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
               data-testid="assistant-input"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="输入业务问题，例如：待我审批的工单..."
+              placeholder="输入问题，例如：当前有哪些待办或规则拦截..."
               className="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white focus:outline-none"
             />
             <button

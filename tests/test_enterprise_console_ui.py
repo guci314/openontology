@@ -45,6 +45,7 @@ if str(ROOT) not in sys.path:
 from open_ontology.console_server import create_console_app, start_console_server
 from examples.enterprise_console_app import (
     DEMO_TOKEN_SECRET,
+    ENTERPRISE_SANDBOX_PRESETS,
     build_console_service,
     build_starship_console,
 )
@@ -120,6 +121,16 @@ def test_group_a_shell_frontend_purity_and_zero_core_mutation() -> None:
         hits = [tok for tok in jargon_tokens if tok in text]
         assert hits == [], f"业务主页面/组件 {rel_path} 夹带技术黑话：{hits}"
 
+    leaked_domain_copy = ("外部ERP", "真实账套", "维修费", "华北厂", "华南厂", "财务总监")
+    index_html_text = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    for tok in leaked_domain_copy:
+        assert tok not in index_html_text, f"web/index.html 泄漏领域文案：{tok}"
+    for sf in shell_files:
+        text = sf.read_text(encoding="utf-8")
+        hits = [tok for tok in leaked_domain_copy if tok in text]
+        rel = sf.relative_to(ROOT)
+        assert hits == [], f"L1 UI 壳文件 {rel} 泄漏领域文案：{hits}"
+
     # Pure runtime core surface must remain completely untouched
     proc = subprocess.run(
         ["git", "diff", "--name-only", "HEAD", "--", "open_ontology/__init__.py", "open_ontology/runtime.py"],
@@ -144,6 +155,11 @@ def test_group_b_starship_blind_m2_console_contract() -> None:
         assert meta["ok"] is True
         assert meta["pack_hint"] == "blind"
         assert meta["actor"]["actor_id"] == "cmd-kirk"
+        assert meta["quick_prompts"]
+        prompts_joined = " ".join(meta["quick_prompts"])
+        for erp_word in ("维修费", "厂区", "应收", "ERP", "账套"):
+            assert erp_word not in prompts_joined
+            assert erp_word not in meta["assistant_welcome"]
 
         tbox = client.get("/api/tbox").json()
         assert {ot["name"] for ot in tbox["object_types"]} == {"WarpCore", "Starship"}
@@ -689,6 +705,116 @@ def test_group_c_security_sandbox_cross_actor_idor_and_eviction() -> None:
         svc.runtime.close()
 
 
+def test_group_c_wo26b_subledger_gl_rls_balance_lineage_and_sandbox_escalation() -> None:
+    svc = build_console_service(mode="standalone", demo_actor_switch=True)
+    try:
+        c = TestClient(create_console_app(svc))
+        south_hdr = {"X-Actor-Id": "act-south-sf"}
+        north_hdr = {"X-Actor-Id": "act-north-pm"}
+
+        # P0-1: Subledger & GL RLS isolation for South Shopfloor
+        assert [
+            x["object_id"]
+            for x in c.get("/api/objects/O2cInvoice", headers=south_hdr).json()["items"]
+        ] == ["INV-302"]
+        assert c.get("/api/objects/O2cInvoice/INV-300", headers=south_hdr).status_code == 403
+        assert [
+            x["object_id"]
+            for x in c.get("/api/objects/JournalEntry", headers=south_hdr).json()["items"]
+        ] == ["JE-09-SO302-INV"]
+        assert c.get("/api/objects/GlAccount", headers=south_hdr).json()["items"] == []
+        assert [
+            x["object_id"]
+            for x in c.get("/api/objects/P2pVendorBill", headers=south_hdr).json()["items"]
+        ] == ["BILL-102"]
+        assert c.get("/api/objects/WorkCard", headers=south_hdr).json()["items"] == []
+        assert c.get("/api/meta", headers=south_hdr).json()["sandbox_presets"] == []
+
+        # P0-1: Non-admin actor cannot escalate via step.actor_id inside sandbox
+        south_sbx = c.post("/api/sandboxes", headers=south_hdr)
+        assert south_sbx.status_code == 200
+        south_sid = south_sbx.json()["sandbox_id"]
+        esc_res = c.post(
+            f"/api/sandboxes/{south_sid}/submit",
+            headers=south_hdr,
+            json={"steps": ENTERPRISE_SANDBOX_PRESETS[2]["steps"]},
+        )
+        assert esc_res.status_code == 200
+        esc_body = esc_res.json()
+        assert esc_body["ok"] is False
+        assert esc_body["step_results"][0]["error_code"] == "PERMISSION_DENIED"
+        assert c.get(f"/api/sandboxes/{south_sid}/diff", headers=south_hdr).json()["step_count"] == 0
+
+        # P0-1: North PM GL isolation & RLS-scoped AI assistant highlights
+        assert c.get("/api/objects/GlAccount", headers=north_hdr).json()["items"] == []
+        north_chat = c.post(
+            "/api/assistant/chat",
+            headers=north_hdr,
+            json={"message": "当前在手订单、应收和现金余额情况如何？"},
+        ).json()
+        assert {"label": "应收未收余额", "value": "¥0"} in north_chat["highlights"]
+        assert {"label": "银行存款余额", "value": "仅 CFO/财务可见"} in north_chat["highlights"]
+
+        # P0-6: Seeded AR 1122 == unpaid posted O2cInvoice residual (¥150,000), balanced TB, no premature SO-301 events
+        ar_1122 = c.get("/api/objects/GlAccount/1122").json()["item"]["properties"]
+        assert ar_1122["debit_total_cents"] - ar_1122["credit_total_cents"] == 15_000_000
+        cash_1001 = c.get("/api/objects/GlAccount/1001").json()["item"]["properties"]
+        assert cash_1001["debit_total_cents"] - cash_1001["credit_total_cents"] == 64_500_000
+        invs = c.get("/api/objects/O2cInvoice").json()["items"]
+        unpaid_posted_cents = round(
+            sum(
+                float(it["properties"]["amount_residual"])
+                for it in invs
+                if it["properties"]["status"] == "posted"
+            )
+            * 100
+        )
+        assert unpaid_posted_cents == 15_000_000
+        tb = c.post(
+            "/api/functions/compute_trial_balance",
+            json={"accounting_entity": "ENT-GROUP"},
+        ).json()["result"]
+        assert tb["is_balanced"] is True
+        assert tb["accounting_equation_holds"] is True
+        evt_ids = {
+            it["object_id"] for it in c.get("/api/objects/FulfillmentEvent").json()["items"]
+        }
+        assert "EVT-SO302-INV" in evt_ids
+        assert "EVT-SO301-INV" not in evt_ids
+        assert "EVT-SO301-PAY" not in evt_ids
+
+        # P1-1: Lineage super-node cap & business upstream/downstream directions
+        lin = c.get("/api/objects/O2cOrder/SO-300/lineage").json()
+        assert len(lin["nodes"]) <= 10
+        assert {"DEL-300", "INV-300"} <= {n["object_id"] for n in lin["hops"]["downstream"]}
+        assert "CUST-EV" in {n["object_id"] for n in lin["hops"]["upstream"]}
+
+        # P1-4: Deduplicated Chinese TBox invariants
+        invs_tbox = c.get("/api/tbox").json()["invariants"]
+        assert len({(i["kind"], i["code"]) for i in invs_tbox}) == len(invs_tbox)
+        assert all("Status transitions must follow" not in i["description"] for i in invs_tbox)
+
+        # P0-3 & P1-2: Sandbox missing ID and Chinese Pydantic validation errors
+        cfo_sid = c.post("/api/sandboxes").json()["sandbox_id"]
+        bad_id_res = c.post(
+            f"/api/sandboxes/{cfo_sid}/submit",
+            json={"action": "post_journal_entry", "params": {"entry_id": "JE-NOT-EXIST"}},
+        ).json()
+        assert bad_id_res["ok"] is False
+        assert "JE-NOT-EXIST" in bad_id_res["hint_zh"]
+        assert c.get(f"/api/sandboxes/{cfo_sid}/diff").json()["step_count"] == 0
+
+        val_err_res = c.post(
+            f"/api/sandboxes/{cfo_sid}/submit",
+            json={"action": "post_journal_entry", "params": {}},
+        ).json()
+        assert val_err_res["ok"] is False
+        assert "errors.pydantic.dev" not in json.dumps(val_err_res, ensure_ascii=False)
+    finally:
+        svc.close()
+        svc.runtime.close()
+
+
 # ---------------------------------------------------------------------------
 # Group D: Headless Chromium Playwright E2E + 4 Desktop HD Screenshots
 # ---------------------------------------------------------------------------
@@ -746,11 +872,21 @@ def test_group_d_playwright_e2e_and_four_screenshots() -> None:
             for jword in ("TBox", "ABox", "ObjectType", "state_fingerprint", "InvariantError"):
                 assert jword not in cockpit_text
 
-            # Switch to North PM -> verify KPI orders total updates via RLS
+            # Switch to North PM -> verify KPI orders total updates via RLS + direct /admin URL + F5 reload persistence
             page.select_option('[data-testid="actor-switcher"]', "act-north-pm")
             page.wait_for_function(
                 "() => document.querySelector('[data-testid=\"kpi-orders-total\"]')?.textContent?.includes('420,000')"
             )
+            page.goto(f"{handle.base_url}/admin", wait_until="networkidle")
+            page.wait_for_selector('[data-testid="admin-access-denied"]')
+            page.reload(wait_until="networkidle")
+            page.wait_for_selector('[data-testid="admin-access-denied"]')
+            assert page.locator('[data-testid="actor-switcher"]').input_value() == "act-north-pm"
+            assert page.locator('[data-testid="admin-access-denied"]').is_visible()
+
+            page.click('[data-testid="nav-cockpit"]')
+            page.wait_for_selector('[data-testid="enterprise-kpi-bar"]')
+            assert "仅 CFO/财务可见" in page.inner_text('[data-testid="kpi-bank-cash"]')
 
             # Switch to South SF -> verify KPI updates and Admin nav tab hidden
             page.select_option('[data-testid="actor-switcher"]', "act-south-sf")
@@ -783,27 +919,72 @@ def test_group_d_playwright_e2e_and_four_screenshots() -> None:
             )
             page.click('[data-testid="close-assistant-drawer"]')
 
-            # Approve WorkCard WC-JE-BONUS-50K in Cockpit -> verify feedback banner
+            # Approve WorkCard WC-JE-BONUS-50K in Cockpit -> verify feedback banner (cash becomes ¥595,000)
             page.click('[data-testid="approve-WC-JE-BONUS-50K"]')
             page.wait_for_selector('[data-testid="cockpit-action-banner"]')
             assert "已批准" in page.inner_text('[data-testid="cockpit-action-banner"]')
+            page.wait_for_function(
+                "() => document.querySelector('[data-testid=\"kpi-bank-cash\"]')?.textContent?.includes('595,000')"
+            )
 
-            # 2. Navigate to `/sandbox` and execute executive repair preset
-            page.click('[data-testid="nav-sandbox"]')
+            # 2. P0-4: Jump from AI Assistant preset card to `/sandbox` and execute repair preset
+            page.click('[data-testid="open-assistant-btn"]')
+            page.wait_for_selector('[data-testid="assistant-drawer"]')
+            page.locator(
+                '[data-testid="assistant-drawer"] button',
+                has_text="如果突发 ¥20,000 维修费对利润有什么影响？",
+            ).click()
+            preset_jump = page.locator(
+                '[data-testid="assistant-drawer"] button',
+                has_text="立即前往平行沙盘：突发 ¥20,000 维修费测算",
+            )
+            preset_jump.wait_for(state="visible")
+            preset_jump.click()
             page.wait_for_selector('[data-testid="sandbox-page"]')
+            assert page.url.endswith("/sandbox")
             assert "沙盘模式：对真实软件零影响" in page.inner_text('[data-testid="sandbox-page"]')
-            page.click('[data-testid="sandbox-preset-emergency_repair_20k"]')
             page.wait_for_selector('[data-testid="sandbox-diff-list"]')
             page.wait_for_function(
                 "() => document.querySelector('[data-testid=\"sandbox-metric-cash\"]')?.textContent?.includes('575,000')"
             )
+            assert "-¥20,000" in page.inner_text('[data-testid="enterprise-sandbox-panel"]')
+            assert "¥-20,000" not in page.inner_text("body")
             page.wait_for_timeout(300)
             sandbox_text = page.inner_text("body")
             for jword in ("TBox", "ABox", "ObjectType", "state_fingerprint", "InvariantError"):
                 assert jword not in sandbox_text
             page.screenshot(path="/tmp/wo26_ui_sandbox.png", full_page=True)
+
+            # Reset sandbox -> verify step count returns to (0)
             page.click('[data-testid="sandbox-reset-btn"]')
-            page.wait_for_timeout(200)
+            page.wait_for_function(
+                "() => document.querySelector('[data-testid=\"sandbox-promote-btn\"]')?.textContent?.includes('(0)')"
+            )
+
+            # P0-3: Manual custom step with non-existent ID must show red error banner & keep 0 steps
+            page.select_option('[data-testid="sandbox-page"] form select', "post_journal_entry")
+            page.fill('[data-testid="sandbox-param-entry_id"]', "JE-NOT-EXIST")
+            page.click('[data-testid="sandbox-custom-submit"]')
+            page.wait_for_selector('[data-testid="sandbox-status-banner"]')
+            err_banner = page.inner_text('[data-testid="sandbox-status-banner"]')
+            assert "JE-NOT-EXIST" in err_banner
+            assert "已推演" not in err_banner
+            assert "(0)" in page.inner_text('[data-testid="sandbox-promote-btn"]')
+
+            # P2-2 & P2-1: Responsive viewports (1024x768 & 1280x800), then restore 1440x900
+            page.set_viewport_size({"width": 1024, "height": 768})
+            page.wait_for_timeout(150)
+            assert page.locator('[data-testid="enterprise-sandbox-panel"]').is_visible()
+            sha_box = page.locator('[data-testid="enterprise-sandbox-panel"] >> text=沙盘').first.bounding_box()
+            assert sha_box is not None and sha_box["height"] < 30
+
+            page.set_viewport_size({"width": 1280, "height": 800})
+            page.wait_for_timeout(150)
+            hdr_box = page.locator("header").bounding_box()
+            assert hdr_box is not None and hdr_box["height"] <= 76
+
+            page.set_viewport_size({"width": 1440, "height": 900})
+            page.wait_for_timeout(150)
 
             # 3. Navigate to `/audit`
             page.click('[data-testid="nav-audit"]')
