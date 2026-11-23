@@ -3,6 +3,7 @@
 子模块划分：
 * ``dsl.py``        —— L1 零 ``eval/exec`` 声明式蓝图/补丁模型、安全 AST 解释器与编译器
 * ``phenomenon.py`` —— 外部现象画像与拓扑排序声明式映射投影器
+* ``prover.py``     —— 可选 Z3 SMT 形式化核验器（懒加载，死锁 / 冗余 / 不变量归纳 / 升级兼容性证明）
 * ``friction.py``   —— M0 生产摩擦只读采集器与防噪聚类门禁
 * ``crucible.py``   —— 非拟人化五关确定性符号证伪熔炉（含 overlay/links 校验与全局复杂度上限）
 * ``governance.py`` —— 元自举 6 表治理本体（RBAC、乐观锁、版本栈多步回滚、哈希绑定）
@@ -130,6 +131,24 @@ from .phenomenon import (
     merge_projected_phenomena,
     toposort_entity_mappings,
 )
+from .prover import (
+    PROVER_UNAVAILABLE,
+    ActionReachabilityProof,
+    ConditionalSliceResult,
+    InvariantCounterexample,
+    InvariantPreservationProof,
+    LogicFragment,
+    ProofReport,
+    ProverUnavailableError,
+    RedundantRuleFinding,
+    UpgradeCompatibilityReport,
+    UpgradeRegressionItem,
+    prove_action_reachability,
+    prove_blueprint,
+    prove_invariant_preservation,
+    prove_redundant_rules,
+    prove_upgrade_compatibility,
+)
 from .resolution import (
     BlockedPairRecord,
     CrosswalkEntry,
@@ -222,6 +241,23 @@ __all__ = [
     "project_external_phenomenon",
     "project_single_record",
     "merge_projected_phenomena",
+    # Optional Z3 SMT formal prover (lazy-loaded)
+    "PROVER_UNAVAILABLE",
+    "ProverUnavailableError",
+    "LogicFragment",
+    "ConditionalSliceResult",
+    "ActionReachabilityProof",
+    "RedundantRuleFinding",
+    "InvariantCounterexample",
+    "InvariantPreservationProof",
+    "UpgradeRegressionItem",
+    "UpgradeCompatibilityReport",
+    "ProofReport",
+    "prove_action_reachability",
+    "prove_redundant_rules",
+    "prove_invariant_preservation",
+    "prove_upgrade_compatibility",
+    "prove_blueprint",
     # M2 4-tier entity resolution & crosswalk
     "EntityResolutionSpec",
     "SourceRef",

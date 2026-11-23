@@ -4,12 +4,13 @@
 
 ---
 
-## 最新执行检查点（2026-11-23 · 里程碑 WO-26 + WO-27A + WO-27B 动力学三分法与单一源码重构）
+## 最新执行检查点（2026-11-23 · 里程碑 WO-26 ~ WO-28 动力学三分法、单一源码与可选 Z3 形式化核验器）
 
-* **演进脉络**：在 `ec29958` 之上完成 `WO-26`（`console_server.py` + `web/` 现代四视角指挥台）、`WO-27A`（`4709857`：动力学三分法 `FunctionDef` / `EditFunctionDef` / `ActionDef`、彻底退役旧动作装饰器、`apply_overlay_to_spec` 与 **Gate 8**）与 **`WO-27B`**（单一源码标准领域蓝图投影 `export_spec_blueprint`、定制插件与零补丁世界模型）。
-* **WO-27A / WO-27B 核心交付**：
+* **演进脉络**：在 `ec29958` 之上完成 `WO-26`（`console_server.py` + `web/` 现代四视角指挥台）、`WO-27A`（`4709857`：动力学三分法 `FunctionDef` / `EditFunctionDef` / `ActionDef`、彻底退役旧动作装饰器、`apply_overlay_to_spec` 与 **Gate 8**）、`WO-27B`（`184ee3b`：单一源码标准领域蓝图投影 `export_spec_blueprint`、定制插件与零补丁世界模型），以及 **`WO-28`**（可选 `z3-solver` SMT 形式化核验器 `open_ontology/induction/prover.py` + `python -m open_ontology.design prove` + 多部门规则冲突量化基准 [wo28_enterprise_rule_prover_benchmark.py](file:///Users/guci/work/open-ontology/examples/wo28_enterprise_rule_prover_benchmark.py)）。
+* **WO-27A / WO-27B / WO-28 核心交付**：
   1. **动力学三分法与单一源码投影（`dsl.py` / `crucible.py` / `falsifier.py` / `design.py`）**：`export_spec_blueprint(spec, ...)` 直接由 Python `OntologySpec` 投影声明式蓝图；`compose_blueprints` / `compile_blueprint` / `SymbolicCrucible` / `DifferentialFalsifier` / `open_ontology.design` 全链路保留 `_base_specs` 底层图灵完备 `@spec.edit_function` / `@spec.function` / `@spec.invariant`。
   2. **淘汰 7 大标准领域双写 JSON 蓝图**：`examples/std_{core,crm,o2c,p2p,p2m,r2r,h2r}_ontology.py` 全部改为 `export_spec_blueprint(spec, ...)` 薄封装（`open_ontology/runtime.py` 保持 **0 行 diff / 1,328 行**）；`examples/std_enterprise_world_model.py`（`build_org_rls_enterprise_spec`）与 `examples/adapters/erp_world_mount.py` 消除 `_attach_standard_functions` 运行期动态补丁；`apply_overlay_to_spec` 支持 `custom_edit_functions` / `custom_functions` / `custom_invariants` 单调插件与规则动作收紧守卫。
+  3. **可选 Z3 形式化核验器（`prover.py` / `design prove` / `pyproject.toml`）**：在 `pyproject.toml` 声明可选 extra `prove = ["z3-solver>=4.13"]`（不进入核心依赖且 Gate 6 保持 `import open_ontology` 零加载）；纯 M2 编译器显式标注 `EXACT_QF_LIA` / `EXACT_QF_LRA` / `QF_NIA_HEURISTIC` / `BMC_BOUNDED(k=4)` / `UNKNOWN`，提供 `prove_action_reachability`（全局与跨部门窄切片死锁 + 最小 `unsat_core`）、`prove_redundant_rules`、`prove_invariant_preservation`（霍尔三元组与具体反例）及 `prove_upgrade_compatibility`。
 * **全量离线回归与双 ERP 实证**：
   - Python 3.13 离线全量回归 `/Users/guci/miniforge3/bin/python3 -m pytest --ignore=tests/test_agent_value_mcts.py -k "not odoo and not camel and not jsherp and not video_artifact_quality and not test_group_" -q` -> **`697 passed, 6 skipped, 81 deselected`**；
   - `tests/test_kinetic_split_and_overlay_on_spec.py` + `tests/test_std_world_model_domains.py` + `tests/test_wo24c_dual_erp_adapters.py`（含真实 Odoo 19 & 华夏 ERP 联调）-> **`37 passed`**。

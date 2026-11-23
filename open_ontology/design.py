@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .drivers import DeviceDriverRegistry, MountedDevice
 from .induction import (
+    PROVER_UNAVAILABLE,
     AdapterMappingSpec,
     CrucibleContext,
     CustomerOverlaySpec,
@@ -40,6 +41,7 @@ from .induction import (
     ExternalFieldProfile,
     ExternalPhenomenonProfile,
     FieldTransformSpec,
+    ProverUnavailableError,
     SeedOntology,
     SourceEntityBatch,
     SymbolicCrucible,
@@ -54,6 +56,7 @@ from .induction import (
     merge_projected_phenomena,
     project_external_phenomenon,
     project_single_record,
+    prove_blueprint,
     resolve_entities,
     toposort_entity_mappings,
 )
@@ -70,6 +73,7 @@ __all__ = [
     "verify_thin_driver_on_hidden_world",
     "run_design_check",
     "run_design_verify",
+    "run_design_prove",
     "main",
 ]
 
@@ -2222,10 +2226,216 @@ def verify_thin_driver_on_hidden_world(
     }
 
 
+def _load_overlay_arg(arg: str) -> CustomerOverlaySpec:
+    stripped = str(arg).strip()
+    if stripped.startswith("{"):
+        return CustomerOverlaySpec.model_validate(json.loads(stripped))
+    p = Path(arg)
+    if p.is_file() or arg.endswith(".json"):
+        if not p.is_file():
+            raise FileNotFoundError(f"overlay file not found: {arg}")
+        return CustomerOverlaySpec.model_validate(_load_json_file(p))
+    if ":" in arg:
+        loaded = load_symbol_arg(arg)
+        resolved = loaded() if callable(loaded) else loaded
+        if isinstance(resolved, CustomerOverlaySpec):
+            return copy.deepcopy(resolved)
+        if isinstance(resolved, Mapping):
+            return CustomerOverlaySpec.model_validate(resolved)
+    raise FileNotFoundError(f"overlay argument {arg!r} must be a .json path or 'module:symbol'")
+
+
+def _load_composed_blueprint(
+    blueprints: Sequence[str],
+    *,
+    model_id: str | None = None,
+) -> DeclarativeBlueprint:
+    loaded_pairs = [_load_blueprint_with_specs(bp_arg) for bp_arg in blueprints]
+    loaded_bps = [bp for bp, _ in loaded_pairs]
+    if not loaded_bps:
+        raise InvariantError("at least one --blueprint is required", code="EMPTY_OBJECT_TYPES")
+    if len(loaded_bps) == 1:
+        base_bp = copy.deepcopy(loaded_bps[0])
+        if model_id:
+            base_bp.model_id = model_id
+        return base_bp
+    target_mid = model_id or f"{loaded_bps[0].model_id}_composed"
+    return compose_blueprints(loaded_bps, model_id=target_mid, version=loaded_bps[0].version)
+
+
+def run_design_prove(
+    *,
+    blueprints: Sequence[str],
+    model_id: str | None = None,
+    overlays: Sequence[str] = (),
+    upgrade_to: Sequence[str] = (),
+    seed: str | None = None,
+    bmc_bound: int = 4,
+    check_redundancy: bool = True,
+    timeout_ms: int = 5000,
+) -> dict[str, Any]:
+    """Execute optional Z3 SMT formal proofs (deadlocks, redundancy, Hoare invariants, upgrades)."""
+    errors: list[str] = []
+    error_codes: list[str] = []
+    try:
+        base_bp = _load_composed_blueprint(blueprints, model_id=model_id)
+        overlay_specs = [_load_overlay_arg(ov_arg) for ov_arg in overlays]
+        upgrade_bp = (
+            _load_composed_blueprint(upgrade_to, model_id=model_id)
+            if upgrade_to
+            else None
+        )
+        _ = _load_seed_arg(seed)
+    except Exception as exc:
+        code = getattr(exc, "code", None) or type(exc).__name__
+        _add_error(errors, error_codes, f"{code}: {exc}", code=str(code))
+        return {
+            "ok": False,
+            "command": "prove",
+            "exit_code": 1,
+            "verdict": "ERROR",
+            "errors": errors,
+            "error_codes": error_codes,
+            "report": None,
+        }
+
+    try:
+        report = prove_blueprint(
+            base_bp,
+            overlay=overlay_specs or None,
+            upgrade_to=upgrade_bp,
+            bmc_bound=bmc_bound,
+            check_redundancy=check_redundancy,
+            timeout_ms=timeout_ms,
+        )
+    except ProverUnavailableError as exc:
+        _add_error(errors, error_codes, f"{PROVER_UNAVAILABLE}: {exc}", code=PROVER_UNAVAILABLE)
+        return {
+            "ok": False,
+            "command": "prove",
+            "exit_code": 1,
+            "verdict": PROVER_UNAVAILABLE,
+            "errors": errors,
+            "error_codes": error_codes,
+            "report": None,
+        }
+    except Exception as exc:
+        code = getattr(exc, "code", None) or type(exc).__name__
+        _add_error(errors, error_codes, f"{code}: {exc}", code=str(code))
+        return {
+            "ok": False,
+            "command": "prove",
+            "exit_code": 1,
+            "verdict": "ERROR",
+            "errors": errors,
+            "error_codes": error_codes,
+            "report": None,
+        }
+
+    for r in report.reachability:
+        if r.status == "TOTAL_DEADLOCK":
+            _add_error(
+                errors,
+                error_codes,
+                f"TOTAL_DEADLOCK: action {r.action_name!r} unsatisfiable (core={r.unsat_core})",
+                code="TOTAL_DEADLOCK",
+            )
+        elif r.status == "CONDITIONAL_DEADLOCK":
+            for ds in r.deadlocked_slices:
+                _add_error(
+                    errors,
+                    error_codes,
+                    f"CONDITIONAL_DEADLOCK: action {r.action_name!r} slice={ds.slice_name!r} core={ds.unsat_core}",
+                    code="CONDITIONAL_DEADLOCK",
+                )
+    for inv_res in report.invariant_preservation:
+        if inv_res.status == "VIOLATED":
+            for ce in inv_res.counterexamples:
+                _add_error(
+                    errors,
+                    error_codes,
+                    (
+                        f"INVARIANT_VIOLATION: action {inv_res.action_name!r} breaks "
+                        f"{ce.violated_invariant!r} ({ce.violated_code}) with params={ce.params}"
+                    ),
+                    code="INVARIANT_VIOLATION",
+                )
+    if report.upgrade_compatibility is not None and not report.upgrade_compatibility.compatible:
+        for reg in report.upgrade_compatibility.regressions:
+            _add_error(
+                errors,
+                error_codes,
+                f"UPGRADE_REGRESSION: {reg.regression_kind} on {reg.action_name!r}: {reg.detail}",
+                code=reg.regression_kind,
+            )
+
+    exit_code = 0 if report.ok else 2
+    verdict = "PROVED" if report.ok else "FALSIFIED"
+    return {
+        "ok": report.ok,
+        "command": "prove",
+        "exit_code": exit_code,
+        "verdict": verdict,
+        "errors": errors,
+        "error_codes": error_codes,
+        "blueprint_fingerprint": report.blueprint_fingerprint,
+        "report": report.model_dump(mode="json"),
+    }
+
+
+def _format_prove_human_report(res: Mapping[str, Any]) -> str:
+    rep = res.get("report")
+    if not isinstance(rep, Mapping):
+        return "\n".join(res.get("errors") or [str(res.get("verdict") or "PROVE ERROR")])
+    lines = [
+        f"design prove [{res.get('verdict')}]: model={rep.get('model_id')}@{rep.get('version')} "
+        f"(actions={rep.get('total_actions_checked')}, rules={rep.get('total_rules_checked')}, "
+        f"elapsed={rep.get('elapsed_ms')}ms)",
+        f"  total_deadlocks={rep.get('total_deadlock_count')}, "
+        f"conditional_deadlocks={rep.get('conditional_deadlock_count')}, "
+        f"invariant_violations={rep.get('invariant_violation_count')}, "
+        f"redundant_rules={rep.get('redundant_rule_count')}",
+        f"  logic_fragments={rep.get('logic_fragment_counts')}",
+    ]
+    for r in rep.get("reachability") or ():
+        if r.get("status") == "TOTAL_DEADLOCK":
+            lines.append(f"  [TOTAL_DEADLOCK] {r['action_name']}: unsat_core={r.get('unsat_core')}")
+        elif r.get("status") == "CONDITIONAL_DEADLOCK":
+            for ds in r.get("deadlocked_slices") or ():
+                lines.append(
+                    f"  [CONDITIONAL_DEADLOCK] {r['action_name']} slice={ds['slice_name']!r}: "
+                    f"unsat_core={ds.get('unsat_core')} [{ds.get('logic_fragment')}]"
+                )
+    for inv in rep.get("invariant_preservation") or ():
+        if inv.get("status") == "VIOLATED":
+            for ce in inv.get("counterexamples") or ():
+                lines.append(
+                    f"  [INVARIANT_VIOLATION] {inv['action_name']} -> {ce['violated_invariant']} "
+                    f"({ce.get('violated_code')}): params={ce.get('params')} after={ce.get('after')}"
+                )
+    for rr in rep.get("redundant_rules") or ():
+        lines.append(
+            f"  [REDUNDANT_RULE] {rr['action_name']}.{rr['rule_name']} ({rr['reason']}): "
+            f"entailed_by={rr.get('entailed_by')}"
+        )
+    up = rep.get("upgrade_compatibility")
+    if isinstance(up, Mapping):
+        lines.append(
+            f"  [UPGRADE] {up.get('base_v1_id')} -> {up.get('base_v2_id')}: "
+            f"compatible={up.get('compatible')} regressions={len(up.get('regressions') or ())}"
+        )
+        for reg in up.get("regressions") or ():
+            lines.append(
+                f"    - {reg.get('regression_kind')} on {reg.get('action_name')}: "
+                f"core={reg.get('unsat_core')} {reg.get('detail')}"
+            )
+    return "\n".join(lines)
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m open_ontology.design",
-        description="OpenOntology Design-Time compiler check & Popperian verification CLI (Pure M2)",
+        description="OpenOntology Design-Time compiler check, formal proof & Popperian verification CLI (Pure M2)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2278,6 +2488,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                 default=None,
                 help="Optional explicit target action filter for falsifier (repeatable)",
             )
+
+    prove_p = sub.add_parser("prove", help="Optional Z3 SMT formal verifier for deadlocks, redundancy, invariants, and upgrades")
+    prove_p.add_argument(
+        "--blueprint",
+        action="append",
+        required=True,
+        help="Blueprint JSON path or 'module:symbol' (repeatable; multiple blueprints compose)",
+    )
+    prove_p.add_argument("--model-id", default=None, help="Override composed model_id")
+    prove_p.add_argument(
+        "--overlay",
+        action="append",
+        default=[],
+        help="Optional CustomerOverlaySpec JSON path or 'module:symbol' (repeatable)",
+    )
+    prove_p.add_argument(
+        "--upgrade-to",
+        action="append",
+        default=[],
+        help="Optional upgraded target blueprint(s) to check overlay regression compatibility",
+    )
+    prove_p.add_argument("--seed", default=None, help="Optional SeedOntology 'module:SYMBOL'")
+    prove_p.add_argument("--bmc-bound", type=int, default=4, help="Bounded model checking row bound k (default: 4)")
+    prove_p.add_argument(
+        "--check-redundancy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detect vacuous or subsumed precondition rules (default: enabled)",
+    )
+    prove_p.add_argument("--timeout-ms", type=int, default=5000, help="Per-check Z3 timeout in ms")
+    prove_p.add_argument("--json", action="store_true", default=False, help="Emit structured JSON ProofReport")
     return parser
 
 
@@ -2297,7 +2538,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             forbidden_literals=args.forbidden_literal,
             max_driver_lines=args.max_driver_lines,
         )
-    else:
+    elif args.command == "verify":
         res = run_design_verify(
             blueprints=args.blueprint,
             model_id=args.model_id,
@@ -2313,6 +2554,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             forbidden_literals=args.forbidden_literal,
             max_driver_lines=args.max_driver_lines,
         )
+    else:
+        res = run_design_prove(
+            blueprints=args.blueprint,
+            model_id=args.model_id,
+            overlays=args.overlay,
+            upgrade_to=args.upgrade_to,
+            seed=args.seed,
+            bmc_bound=args.bmc_bound,
+            check_redundancy=args.check_redundancy,
+            timeout_ms=args.timeout_ms,
+        )
+        if args.json:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        else:
+            print(_format_prove_human_report(res))
+        return int(res.get("exit_code", 0 if res.get("ok") else 2))
 
     print(json.dumps(res, ensure_ascii=False, indent=2))
     return 0 if res.get("ok") else 1
