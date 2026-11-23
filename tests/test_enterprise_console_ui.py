@@ -121,7 +121,24 @@ def test_group_a_shell_frontend_purity_and_zero_core_mutation() -> None:
         hits = [tok for tok in jargon_tokens if tok in text]
         assert hits == [], f"业务主页面/组件 {rel_path} 夹带技术黑话：{hits}"
 
-    leaked_domain_copy = ("外部ERP", "真实账套", "维修费", "华北厂", "华南厂", "财务总监")
+    leaked_domain_copy = (
+        "外部ERP",
+        "真实账套",
+        "维修费",
+        "华北厂",
+        "华南厂",
+        "财务总监",
+        "经营驾驶舱",
+        "业务台账",
+        "单据",
+        "客户自有",
+        "已开票",
+        "已发货",
+        "已过账",
+        "已赢单",
+        "DELIVERY_REQUIRED_BEFORE_INVOICE",
+        "OPEN_HIGH_PRIORITY_TICKET_BLOCKS_WIN",
+    )
     index_html_text = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     for tok in leaked_domain_copy:
         assert tok not in index_html_text, f"web/index.html 泄漏领域文案：{tok}"
@@ -130,6 +147,12 @@ def test_group_a_shell_frontend_purity_and_zero_core_mutation() -> None:
         hits = [tok for tok in leaked_domain_copy if tok in text]
         rel = sf.relative_to(ROOT)
         assert hits == [], f"L1 UI 壳文件 {rel} 泄漏领域文案：{hits}"
+
+    console_server_text = (ROOT / "open_ontology" / "console_server.py").read_text(
+        encoding="utf-8"
+    )
+    server_hits = [tok for tok in leaked_domain_copy if tok in console_server_text]
+    assert server_hits == [], f"open_ontology/console_server.py 泄漏领域文案：{server_hits}"
 
     # Pure runtime core surface must remain completely untouched
     proc = subprocess.run(
@@ -867,10 +890,12 @@ def test_group_d_playwright_e2e_and_four_screenshots() -> None:
             assert "¥570,000" in page.inner_text('[data-testid="kpi-orders-total"]')
             page.screenshot(path="/tmp/wo26_ui_cockpit.png", full_page=True)
 
-            # Assert zero jargon on /
+            # Assert zero jargon & L2 enterprise terminology on /
             cockpit_text = page.inner_text("body")
             for jword in ("TBox", "ABox", "ObjectType", "state_fingerprint", "InvariantError"):
                 assert jword not in cockpit_text
+            assert "经营驾驶舱" in cockpit_text
+            assert "实时业务台账与关系穿透" in cockpit_text
 
             # Switch to North PM -> verify KPI orders total updates via RLS + direct /admin URL + F5 reload persistence
             page.select_option('[data-testid="actor-switcher"]', "act-north-pm")
@@ -1008,6 +1033,50 @@ def test_group_d_playwright_e2e_and_four_screenshots() -> None:
             page.wait_for_selector('[data-testid="autonomy-save-feedback"]')
             page.wait_for_timeout(250)
             page.screenshot(path="/tmp/wo26_ui_admin.png", full_page=True)
+
+            # 5. Pure M2 blind-test ontology (Starship) in real Chromium browser
+            star_svc = build_starship_console(demo_actor_switch=True)
+            star_handle = start_console_server(
+                star_svc,
+                host="127.0.0.1",
+                port=0,
+                static_dir=ROOT / "web" / "dist",
+            )
+            try:
+                star_page = context.new_page()
+                star_page.on(
+                    "console",
+                    lambda msg: console_errors.append(msg.text) if msg.type == "error" else None,
+                )
+                star_page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+                star_page.on(
+                    "requestfailed",
+                    lambda req: failed_requests.append(f"{req.method} {req.url}"),
+                )
+                star_page.on(
+                    "response",
+                    lambda resp: bad_responses.append(f"{resp.status} {resp.url}")
+                    if resp.status >= 400
+                    else None,
+                )
+                star_page.goto(f"{star_handle.base_url}/", wait_until="networkidle")
+                star_page.wait_for_selector('[data-testid="record-row-SS-01"]')
+                assert "总览工作台" in star_page.inner_text('[data-testid="nav-cockpit"]')
+                star_body = star_page.inner_text("body")
+                for forbidden in ("经营驾驶舱", "业务台账", "单据", "客户"):
+                    assert forbidden not in star_body, (
+                        f"Starship 首页泄漏企业文案：{forbidden}"
+                    )
+                star_page.click('[data-testid="record-row-SS-01"]')
+                star_page.wait_for_selector('[data-testid="object-detail-drawer"]')
+                star_drawer_body = star_page.inner_text("body")
+                for forbidden in ("经营驾驶舱", "业务台账", "单据", "客户"):
+                    assert forbidden not in star_drawer_body, (
+                        f"Starship 详情抽屉泄漏企业文案：{forbidden}"
+                    )
+                star_page.close()
+            finally:
+                star_handle.stop()
 
             browser.close()
     finally:

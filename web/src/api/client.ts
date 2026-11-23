@@ -26,6 +26,7 @@ export interface DisplayDictionary {
   cardinalities?: Record<string, string>;
   kinds?: Record<string, string>;
   invariants?: Record<string, string>;
+  errors?: Record<string, string>;
 }
 
 export interface WorkQueueDescriptor {

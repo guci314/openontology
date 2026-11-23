@@ -10,7 +10,7 @@ import {
   formatSmartFieldValue,
   getStatusBadgeMeta,
 } from '../i18nErrorMap';
-import type { DomainViewPack } from '../packRegistry';
+import { type DomainViewPack, resolveShellTerminology } from '../packRegistry';
 import { WorkCardInbox } from '../components/WorkCardInbox';
 
 interface CockpitPageProps {
@@ -38,6 +38,7 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
   onRefresh,
   onInspectObject,
 }) => {
+  const terms = resolveShellTerminology(pack);
   const orderedEntityTypes = useMemo(() => {
     const preferred = pack?.preferredTypes || [];
     const prefRank = new Map(preferred.map((name, i) => [name, i]));
@@ -163,7 +164,8 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
         </div>
         <div className="flex items-center gap-3 font-mono text-[11px] text-slate-500">
           <span>
-            可见台账记录：<strong className="tabular-nums text-slate-900">{totalVisibleRecords}</strong> 条
+            {terms.catalogCountPrefix}：
+            <strong className="tabular-nums text-slate-900">{totalVisibleRecords}</strong> 条
           </span>
           <span className="rounded bg-emerald-50 px-2 py-0.5 font-sans font-medium text-emerald-700">
             行级数据隔离生效中
@@ -206,7 +208,7 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div className="rounded-xl border border-slate-200/80 bg-white p-4 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
-            <div className="text-xs font-medium text-slate-500">业务台账分类</div>
+            <div className="text-xs font-medium text-slate-500">{terms.catalogCategoryLabel}</div>
             <div className="mt-2 font-mono text-2xl font-bold tabular-nums text-slate-900">
               {schema.object_types.length} 类
             </div>
@@ -256,6 +258,7 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
             meta={meta}
             schema={schema}
             workQueue={meta.work_queue || pack?.workQueueFallback || null}
+            terminology={terms}
             refreshTick={refreshTick}
             onActionCompleted={(b) => {
               setBanner(b);
@@ -273,7 +276,7 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
                   <FileText className="h-4 w-4" />
                 </div>
                 <div>
-                  <h2 className="text-sm font-semibold text-slate-900">实时业务台账与关系穿透</h2>
+                  <h2 className="text-sm font-semibold text-slate-900">{terms.catalogTitle}</h2>
                   <p className="text-xs text-slate-500">
                     点击任意记录行查看完整扩展字段与前后关联图谱
                   </p>
@@ -364,7 +367,7 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
                     {loadingList ? (
                       <tr>
                         <td colSpan={previewFields.length + 2} className="px-4 py-8 text-center text-slate-400">
-                          正在加载业务单据...
+                          正在加载{terms.recordNoun}记录...
                         </td>
                       </tr>
                     ) : records.length === 0 ? (
@@ -385,7 +388,7 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
                               </button>
                             </div>
                           ) : (
-                            '当前权限视角下该分类暂无可见单据记录'
+                            `当前权限视角下该分类暂无可见${terms.recordNoun}记录`
                           )}
                         </td>
                       </tr>

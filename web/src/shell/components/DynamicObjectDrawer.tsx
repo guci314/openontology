@@ -15,11 +15,13 @@ import {
   formatSmartFieldValue,
   getStatusBadgeMeta,
 } from '../i18nErrorMap';
+import { type DomainViewPack, resolveShellTerminology } from '../packRegistry';
 import { LineageGraph } from './LineageGraph';
 
 interface DynamicObjectDrawerProps {
   meta: ConsoleMeta;
   schema: SchemaCatalog;
+  pack?: DomainViewPack | null;
   target: { entityType: string; recordId: string } | null;
   canGoBack?: boolean;
   onBack?: () => void;
@@ -62,12 +64,14 @@ const formatDisplayValue = (
 export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
   meta,
   schema,
+  pack,
   target,
   canGoBack,
   onBack,
   onClose,
   onSelectObject,
 }) => {
+  const terms = resolveShellTerminology(pack);
   const [lineage, setLineage] = useState<LineageResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -151,7 +155,7 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
                   className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
                 >
                   <ArrowLeft className="h-3 w-3" />
-                  <span>返回上一单据</span>
+                  <span>{terms.drawerBackLabel}</span>
                 </button>
               )}
               <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
@@ -164,7 +168,7 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
               )}
               {!errorMsg && record?.owned && (
                 <span className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700 ring-1 ring-sky-200">
-                  <Sparkles className="h-3 w-3" /> 扩展台账
+                  <Sparkles className="h-3 w-3" /> {terms.drawerOwnedBadge}
                 </span>
               )}
             </div>
@@ -197,7 +201,7 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
                   className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-semibold text-rose-800 hover:bg-rose-100"
                 >
                   <ArrowLeft className="h-3.5 w-3.5" />
-                  返回上一单据
+                  {terms.drawerBackLabel}
                 </button>
               )}
             </div>
@@ -207,6 +211,7 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
                 meta={meta}
                 lineage={lineage}
                 loading={loading}
+                terminology={terms}
                 onSelectNode={(et, rid) => onSelectObject(et, rid)}
               />
 
@@ -214,7 +219,7 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
                 <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
                     <Layers className="h-3.5 w-3.5 text-slate-500" />
-                    <span>单据详细属性与客户自有扩展字段</span>
+                    <span>{terms.drawerAttrsTitle}</span>
                   </div>
                   {record && record.security_tags.length > 0 && (
                     <span className="inline-flex items-center gap-1 text-[11px] text-slate-500">

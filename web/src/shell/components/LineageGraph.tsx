@@ -2,11 +2,13 @@ import React, { useEffect, useState } from 'react';
 import { ArrowRight, GitBranch } from 'lucide-react';
 import type { ConsoleMeta, LineageNode, LineageResponse } from '../../api/client';
 import { displayEntityName, getStatusBadgeMeta } from '../i18nErrorMap';
+import { type ShellTerminology, resolveShellTerminology } from '../packRegistry';
 
 interface LineageGraphProps {
   meta: ConsoleMeta;
   lineage: LineageResponse | null;
   loading: boolean;
+  terminology?: ShellTerminology;
   onSelectNode: (entityType: string, recordId: string) => void;
 }
 
@@ -53,8 +55,10 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
   meta,
   lineage,
   loading,
+  terminology,
   onSelectNode,
 }) => {
+  const terms = resolveShellTerminology(null, terminology);
   const [expandUp, setExpandUp] = useState(false);
   const [expandDown, setExpandDown] = useState(false);
 
@@ -66,7 +70,7 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
   if (loading) {
     return (
       <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 text-xs text-slate-500">
-        正在检索当前单据的 1~2 跳上下游关联图谱...
+        正在检索当前{terms.recordNoun}的 1~2 跳上下游关联图谱...
       </div>
     );
   }
@@ -83,7 +87,7 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
       <div className="mb-3 flex items-center justify-between">
         <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
           <GitBranch className="h-3.5 w-3.5 text-blue-700" />
-          <span>单据前后关联图谱（受权可见范围）</span>
+          <span>{terms.lineageTitle}</span>
         </div>
         <span className="text-[11px] text-slate-400">点击卡片可穿透跳转</span>
       </div>
@@ -95,7 +99,7 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
           </div>
           {upstream.length === 0 ? (
             <div className="rounded-lg border border-dashed border-slate-200 px-3 py-3 text-center text-[11px] text-slate-400">
-              无前置依赖单据
+              无前置依赖{terms.recordNoun}
             </div>
           ) : (
             <>
@@ -123,7 +127,7 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
         <div className="flex flex-col justify-center space-y-2">
           <div className="flex items-center justify-center gap-1 text-[11px] font-semibold text-blue-700">
             <ArrowRight className="hidden h-3 w-3 text-slate-400 md:inline" />
-            <span>当前聚焦单据</span>
+            <span>当前聚焦{terms.recordNoun}</span>
             <ArrowRight className="hidden h-3 w-3 text-slate-400 md:inline" />
           </div>
           <NodeCard
@@ -136,11 +140,11 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
 
         <div className="space-y-2">
           <div className="text-[11px] font-medium text-slate-500">
-            后续关联单据 ({downstream.length})
+            后续关联{terms.recordNoun} ({downstream.length})
           </div>
           {downstream.length === 0 ? (
             <div className="rounded-lg border border-dashed border-slate-200 px-3 py-3 text-center text-[11px] text-slate-400">
-              无后续关联单据
+              无后续关联{terms.recordNoun}
             </div>
           ) : (
             <>
@@ -158,7 +162,9 @@ export const LineageGraph: React.FC<LineageGraphProps> = ({
                   onClick={() => setExpandDown((v) => !v)}
                   className="w-full rounded-lg border border-slate-200 bg-white py-1.5 text-[11px] font-medium text-blue-700 hover:bg-blue-50"
                 >
-                  {expandDown ? '收起后续单据' : `展开其余 ${downstream.length - MAX_SIDE_CARDS} 项`}
+                  {expandDown
+                    ? `收起后续${terms.recordNoun}`
+                    : `展开其余 ${downstream.length - MAX_SIDE_CARDS} 项`}
                 </button>
               )}
             </>

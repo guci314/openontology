@@ -11,9 +11,11 @@ import {
   UserCheck,
 } from 'lucide-react';
 import type { ConsoleMeta } from '../api/client';
+import { type DomainViewPack, resolveShellTerminology } from './packRegistry';
 
 interface ShellLayoutProps {
   meta: ConsoleMeta;
+  pack?: DomainViewPack | null;
   onSwitchActor: (actorId: string) => Promise<void>;
   onOpenAssistant: () => void;
   children: React.ReactNode;
@@ -21,10 +23,12 @@ interface ShellLayoutProps {
 
 export const ShellLayout: React.FC<ShellLayoutProps> = ({
   meta,
+  pack,
   onSwitchActor,
   onOpenAssistant,
   children,
 }) => {
+  const terms = resolveShellTerminology(pack);
   const modeLabel =
     meta.world_mode === 'coupled' ? '实时外设耦合模式' : '独立自治沙盘内核';
   const modeTone =
@@ -69,7 +73,7 @@ export const ShellLayout: React.FC<ShellLayoutProps> = ({
           <nav className="flex shrink-0 items-center gap-1 rounded-xl bg-slate-100/80 p-1">
             <NavLink to="/" end className={navCls} data-testid="nav-cockpit">
               <LayoutDashboard className="h-3.5 w-3.5 shrink-0 xl:h-4 xl:w-4" />
-              <span>经营驾驶舱</span>
+              <span>{terms.cockpitNavLabel}</span>
             </NavLink>
             <NavLink to="/sandbox" className={navCls} data-testid="nav-sandbox">
               <FlaskConical className="h-3.5 w-3.5 shrink-0 xl:h-4 xl:w-4" />

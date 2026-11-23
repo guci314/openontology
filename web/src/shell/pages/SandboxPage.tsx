@@ -24,7 +24,7 @@ import {
   formatSmartFieldValue,
   translateError,
 } from '../i18nErrorMap';
-import type { DomainViewPack } from '../packRegistry';
+import { type DomainViewPack, resolveShellTerminology } from '../packRegistry';
 
 interface SandboxPageProps {
   meta: ConsoleMeta;
@@ -43,6 +43,7 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
   onConsumePendingPreset,
   onPromotedToPrimary,
 }) => {
+  const terms = resolveShellTerminology(pack);
   const [sandboxId, setSandboxId] = useState<string | null>(null);
   const sandboxIdRef = useRef<string | null>(null);
   const [diff, setDiff] = useState<SandboxDiffResponse | null>(null);
@@ -288,7 +289,7 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
       await refreshDiff(created.sandbox_id);
       setStatusBanner({
         ok: true,
-        text: '已清空并销毁旧沙盘分支，主业务系统状态零变化。',
+        text: '已清空并销毁旧沙盘分支，主世界状态零变化。',
       });
     } finally {
       setBusy(false);
@@ -452,7 +453,7 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
           <div className="rounded-xl border border-slate-200/80 bg-white p-5 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
             <h2 className="text-sm font-semibold text-slate-900">手动单步假设试演</h2>
             <p className="mt-0.5 text-xs text-slate-500">
-              任选业务操作在平行空间验证合规性与关键指标变化
+              {terms.sandboxManualSubtitle}
             </p>
             <form onSubmit={handleRunCustomStep} noValidate className="mt-4 space-y-3">
               <div>
@@ -577,10 +578,10 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div>
                 <h2 className="text-sm font-semibold text-slate-900">
-                  现状 vs 沙盘 · 逐单据变更明细对比
+                  {terms.sandboxDiffTitle}
                 </h2>
                 <p className="text-xs text-slate-500">
-                  共 {diff?.step_count || 0} 步推演，引发 {diff?.total_changes || 0} 项单据变动
+                  共 {diff?.step_count || 0} 步推演，引发 {diff?.total_changes || 0} 项{terms.recordNoun}变动
                 </p>
               </div>
               <span className="whitespace-nowrap rounded-full bg-emerald-50 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700 ring-1 ring-emerald-200">

@@ -138,6 +138,7 @@ const AppShell: React.FC = () => {
   return (
     <ShellLayout
       meta={meta}
+      pack={activePack}
       onSwitchActor={handleSwitchActor}
       onOpenAssistant={() => setAssistantOpen(true)}
     >
@@ -172,7 +173,14 @@ const AppShell: React.FC = () => {
         />
         <Route
           path="/audit"
-          element={<AuditPage key={meta.actor.actor_id} meta={meta} refreshTick={refreshTick} />}
+          element={
+            <AuditPage
+              key={meta.actor.actor_id}
+              meta={meta}
+              pack={activePack}
+              refreshTick={refreshTick}
+            />
+          }
         />
         <Route
           path="/admin"
@@ -191,6 +199,7 @@ const AppShell: React.FC = () => {
       <DynamicObjectDrawer
         meta={meta}
         schema={schema}
+        pack={activePack}
         target={drawerTarget}
         canGoBack={drawerHistory.length > 0}
         onBack={popDrawerHistory}

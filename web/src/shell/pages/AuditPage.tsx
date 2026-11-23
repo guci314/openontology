@@ -10,15 +10,18 @@ import {
   formatSmartFieldValue,
   translateError,
 } from '../i18nErrorMap';
+import { type DomainViewPack, resolveShellTerminology } from '../packRegistry';
 
 interface AuditPageProps {
   meta: ConsoleMeta;
+  pack?: DomainViewPack | null;
   refreshTick: number;
 }
 
 type AuditFilter = 'ALL' | 'AUTO' | 'HUMAN' | 'SHADOW' | 'REJECTED' | 'REVERTED';
 
-export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
+export const AuditPage: React.FC<AuditPageProps> = ({ meta, pack, refreshTick }) => {
+  const terms = resolveShellTerminology(pack);
   const [data, setData] = useState<AuditResponse | null>(null);
   const [filter, setFilter] = useState<AuditFilter>('ALL');
   const [searchTerm, setSearchTerm] = useState('');
@@ -136,7 +139,7 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
                 data-testid="audit-search-input"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                placeholder="搜索流水号、动作或单据..."
+                placeholder={terms.auditSearchPlaceholder}
                 className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-8 pr-3 text-xs text-slate-800 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white focus:outline-none"
               />
             </div>
@@ -146,7 +149,7 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-              <span>刷新账本</span>
+              <span>刷新记录</span>
             </button>
           </div>
         </div>

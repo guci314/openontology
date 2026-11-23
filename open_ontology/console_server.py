@@ -93,23 +93,8 @@ _STATUS_ZH: dict[str, str] = {
     "in_progress": "进行中",
     "completed": "已完成",
     "cancelled": "已取消",
-    "disputed": "争议挂起",
-    "received": "已收货",
-    "billed": "已开票",
-    "delivered": "已发货",
-    "invoiced": "已开票",
-    "posted": "已过账",
-    "reversed": "已冲正",
-    "paid": "已结清",
-    "partial": "部分结清",
-    "not_paid": "未核销",
-    "open": "开放记账",
-    "closing": "结账中",
-    "closed": "已关账",
     "active": "启用中",
     "archived": "已归档",
-    "offboarded": "已离职",
-    "onboarding": "待入职",
     "verified": "已核验",
     "pending": "待处理",
     "recorded": "已记录",
@@ -118,8 +103,6 @@ _STATUS_ZH: dict[str, str] = {
     "HIGH": "高优",
     "MEDIUM": "中等",
     "LOW": "常规",
-    "DEBIT": "借方",
-    "CREDIT": "贷方",
 }
 
 _ERROR_ZH: dict[str, str] = {
@@ -129,19 +112,9 @@ _ERROR_ZH: dict[str, str] = {
     "SOD_SELF_APPROVAL_FORBIDDEN": "触发职责分离红线：发起人不得审批自己提交的事项。",
     "UNBOUND_SOURCE_BRIDGE": "外部系统连接器未挂载或已断开，已阻止对真实系统的写入。",
     "DEVICE_STATE_MISMATCH": "外部系统回读状态与预期不一致，本事务已安全中止并保持零脏写。",
-    "ILLEGAL_DOCUMENT_TRANSITION": "当前单据状态不允许直接跃迁到目标状态。",
+    "ILLEGAL_DOCUMENT_TRANSITION": "当前对象状态不允许直接跃迁到目标状态。",
     "WORK_CARD_ASSIGNEE_MISMATCH": "当前账号角色与该待办事项的指派审批角色不匹配。",
     "WORK_CARD_NOT_ACTIVE": "该待办事项已结束处理，不能重复操作。",
-    "COST_CONSERVATION_VIOLATION": "违反成本守恒铁律：核销吸收成本不得超过已投入物料总成本。",
-    "SELF_BALANCING_ACCOUNT_FORBIDDEN": "违反复式记账规范：借方与贷方不得为同一科目。",
-    "PERIOD_CLOSED_POSTING_FORBIDDEN": "该会计期间已关账，严禁补记或修改凭证。",
-    "PO_DISPUTED_BLOCKED": "关联采购单处于争议挂起状态，须先完成差异裁决后方可过账。",
-    "ORDER_NOT_BILLABLE": "订单当前阶段尚不满足开票条件，请先完成履约发货。",
-    "DELIVERY_REQUIRED_BEFORE_INVOICE": "红线拦截：未完成发货出库前严禁提前开具客户发票。",
-    "RECEIPT_REQUIRED_BEFORE_BILL": "红线拦截：未完成收货验收前严禁过账应付账单。",
-    "OPEN_HIGH_PRIORITY_TICKET_BLOCKS_WIN": "客户尚有未关闭的高优先级客诉，须先闭环客诉才可赢单。",
-    "APPROVAL_REQUIRED_MANUAL_JOURNAL": "触发大额手工调账红线：需财务总监签批复核后方可过账。",
-    "APPROVAL_REQUIRED_SCRAP_RATIO_EXCEEDED": "损耗率超出标准上限，已转交厂长签批放行。",
 }
 
 _SENSITIVE_FIELDS: frozenset[str] = frozenset({"auth_token_hash", "password", "secret"})
@@ -180,6 +153,7 @@ def _merge_display(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[st
         "cardinalities",
         "kinds",
         "invariants",
+        "errors",
     ):
         left = base.get(bucket) or {}
         right = extra.get(bucket) or {}
@@ -223,7 +197,11 @@ def _format_validation_error_zh(
     return "参数校验未通过：" + "；".join(uniq) + "。"
 
 
-def _translate_error_hint(error_code: str | None, error_message: str | None) -> str:
+def _translate_error_hint(
+    error_code: str | None,
+    error_message: str | None,
+    display: Mapping[str, Any] | None = None,
+) -> str:
     code = str(error_code or "").strip()
     msg = str(error_message or "").strip()
     if "errors.pydantic.dev" in msg or "validation error" in msg.lower():
@@ -237,6 +215,9 @@ def _translate_error_hint(error_code: str | None, error_message: str | None) -> 
         if m:
             return f"未找到编号为「{m.group(1)}」的目标记录，请核对编号后重试。"
         return "未找到指定的目标记录，请核对编号后重试。"
+    custom_errors = (display or {}).get("errors") or {}
+    if code and code in custom_errors:
+        return str(custom_errors[code])
     if code in _ERROR_ZH:
         return _ERROR_ZH[code]
     if code.startswith("APPROVAL_REQUIRED_"):
@@ -907,7 +888,7 @@ class ConsoleService:
                 if inv_labels.get(code):
                     return str(inv_labels[code])
                 if raw_desc == "Status transitions must follow declared FSM edges.":
-                    return "单据状态流转必须严格遵循声明的状态机跃迁路径。"
+                    return "对象状态流转必须严格遵循声明的状态机跃迁路径。"
                 return raw_desc or name
 
             dedup_invs: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1205,7 +1186,7 @@ class ConsoleService:
                     "changes": _diff_summary(diff_dict, title_resolver=self._resolve_object_title),
                     "error_code": sim.error_code,
                     "error": sim.error,
-                    "hint_zh": _translate_error_hint(sim.error_code, sim.error),
+                    "hint_zh": _translate_error_hint(sim.error_code, sim.error, display=display),
                     "zero_external_dirty_write": True,
                 }
             except ValidationError as exc:
@@ -1232,7 +1213,7 @@ class ConsoleService:
                     "changes": [],
                     "error_code": exc.code,
                     "error": str(exc),
-                    "hint_zh": _translate_error_hint(exc.code, str(exc)),
+                    "hint_zh": _translate_error_hint(exc.code, str(exc), display=display),
                     "zero_external_dirty_write": True,
                 }
 
@@ -1283,7 +1264,7 @@ class ConsoleService:
                     "changes": [],
                     "error_code": exc.code,
                     "error": str(exc),
-                    "hint_zh": _translate_error_hint(exc.code, str(exc)),
+                    "hint_zh": _translate_error_hint(exc.code, str(exc), display=display),
                     "zero_external_dirty_write": True,
                     "state_fingerprint": self.runtime.state_fingerprint(),
                 }
@@ -1315,7 +1296,11 @@ class ConsoleService:
                 "error_code": decision.error_code,
                 "error": decision.error_message,
                 "hint_zh": (
-                    _translate_error_hint(decision.error_code, decision.error_message)
+                    _translate_error_hint(
+                        decision.error_code,
+                        decision.error_message,
+                        display=display,
+                    )
                     if not ok
                     else ""
                 ),
@@ -1430,7 +1415,11 @@ class ConsoleService:
             "run_id": run_id,
             "error_code": error_code,
             "error": error_message,
-            "hint_zh": _translate_error_hint(error_code, error_message),
+            "hint_zh": _translate_error_hint(
+                error_code,
+                error_message,
+                display=self._merged_display(),
+            ),
             "zero_external_dirty_write": True,
             "state_fingerprint": self.runtime.state_fingerprint(),
         }
@@ -1597,7 +1586,11 @@ class ConsoleService:
                         or "SANDBOX_STEP_REJECTED"
                     )
                     final_error_msg = str(exc)
-                    last_hint_zh = _translate_error_hint(final_error_code, final_error_msg)
+                    last_hint_zh = _translate_error_hint(
+                        final_error_code,
+                        final_error_msg,
+                        display=display,
+                    )
                     step_results.append(
                         {
                             "ok": False,
@@ -2036,6 +2029,7 @@ class ConsoleService:
         with self._lock:
             display = self._merged_display()
             act_labels = display.get("actions") or {}
+            status_labels = display.get("statuses") or _STATUS_ZH
             status_arg = status.strip().upper() if status and status.strip().upper() in ("COMMITTED", "REJECTED", "REVERTED") else None
             runs = self._filter_runs_for_actor(
                 self.runtime.list_action_runs(status_arg),
@@ -2073,13 +2067,17 @@ class ConsoleService:
                         **r,
                         "action_label": act_labels.get(act_name) or act_name,
                         "actor_display_name": self._actor_display_name(str(r.get("actor_id", ""))),
-                        "status_label": _STATUS_ZH.get(str(r.get("status", "")), str(r.get("status", ""))),
+                        "status_label": status_labels.get(str(r.get("status", "")), str(r.get("status", ""))),
                         "governance_channel": mode_tag,
                         "changes": _diff_summary(
                             diff_obj,
                             title_resolver=self._resolve_object_title,
                         ),
-                        "hint_zh": _translate_error_hint(err_code, err_msg) if err_code else "",
+                        "hint_zh": (
+                            _translate_error_hint(err_code, err_msg, display=display)
+                            if err_code
+                            else ""
+                        ),
                         "external_dirty_writes": 0,
                     }
                 )
@@ -2089,9 +2087,13 @@ class ConsoleService:
                     **entry.model_dump(mode="json"),
                     "action_label": act_labels.get(entry.action) or entry.action,
                     "actor_display_name": self._actor_display_name(entry.actor_id),
-                    "status_label": _STATUS_ZH.get(entry.outcome, entry.outcome),
+                    "status_label": status_labels.get(entry.outcome, entry.outcome),
                     "hint_zh": (
-                        _translate_error_hint(entry.error_code, entry.error_message)
+                        _translate_error_hint(
+                            entry.error_code,
+                            entry.error_message,
+                            display=display,
+                        )
                         if entry.error_code
                         else ""
                     ),
@@ -2120,6 +2122,7 @@ class ConsoleService:
             self._require_admin_ops(actor)
             display = self._merged_display()
             obj_labels = display.get("objects") or {}
+            status_labels = display.get("statuses") or _STATUS_ZH
             reg = _extract_device_registry(self.runtime)
 
             devices: list[dict[str, Any]] = []
@@ -2141,7 +2144,7 @@ class ConsoleService:
                                 "kind": dev.kind,
                                 "endpoint": dev.endpoint,
                                 "status": dev.status,
-                                "status_label": _STATUS_ZH.get(dev.status, dev.status),
+                                "status_label": status_labels.get(dev.status, dev.status),
                                 "domain_mode": "coupled",
                                 "owned_object_types": list(dev.owned_object_types),
                                 "shared_object_types": list(dev.shared_object_types),
@@ -2422,6 +2425,7 @@ class ConsoleService:
             err_zh = _translate_error_hint(
                 last_rej.get("error_code"),
                 last_rej.get("error_message"),
+                display=display,
             )
             reply += (
                 f" 最近一次红线拦截为「{act_zh}」"
@@ -2482,7 +2486,11 @@ def create_console_app(
                 "status": "REJECTED",
                 "error_code": code,
                 "error": str(exc),
-                "hint_zh": _translate_error_hint(code, str(exc)),
+                "hint_zh": _translate_error_hint(
+                    code,
+                    str(exc),
+                    display=service._merged_display(),
+                ),
                 "zero_external_dirty_write": True,
             },
         )
@@ -2497,7 +2505,11 @@ def create_console_app(
                 "status": "REJECTED",
                 "error_code": code,
                 "error": str(exc),
-                "hint_zh": _translate_error_hint(code, str(exc)),
+                "hint_zh": _translate_error_hint(
+                    code,
+                    str(exc),
+                    display=service._merged_display(),
+                ),
                 "zero_external_dirty_write": True,
             },
         )

@@ -15,11 +15,13 @@ import {
   getStatusBadgeMeta,
   translateError,
 } from '../i18nErrorMap';
+import { type ShellTerminology, resolveShellTerminology } from '../packRegistry';
 
 interface WorkCardInboxProps {
   meta: ConsoleMeta;
   schema: SchemaCatalog;
   workQueue: WorkQueueDescriptor | null;
+  terminology?: ShellTerminology;
   refreshTick: number;
   onActionCompleted: (banner: { ok: boolean; text: string }) => void;
   onInspectObject: (entityType: string, recordId: string) => void;
@@ -37,10 +39,12 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
   meta,
   schema,
   workQueue,
+  terminology,
   refreshTick,
   onActionCompleted,
   onInspectObject,
 }) => {
+  const terms = resolveShellTerminology(null, terminology);
   const [items, setItems] = useState<RecordInstance[]>([]);
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -118,12 +122,12 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
           ok: true,
           text:
             decision === 'approve'
-              ? `已批准并完成结算「${item.object_id}」，业务台账与审计流已同步更新。`
-              : `已驳回工单「${item.object_id}」，目标单据保持原状。`,
+              ? `已批准并完成结算「${item.object_id}」，核心记录与审计流已同步更新。`
+              : `已驳回事项「${item.object_id}」，目标${terms.recordNoun}保持原状。`,
         });
         await loadItems();
       } else {
-        let friendly = translateError(res.error_code, res.error, res.hint_zh);
+        let friendly = translateError(res.error_code, res.error, res.hint_zh, meta.display);
         if (res.error_code === 'WORK_CARD_ASSIGNEE_MISMATCH') {
           friendly = `权限不足：该事项须由「${displayRoleName(assigneeRole, meta.display)}」签批。`;
         } else if (res.error_code === 'SOD_SELF_APPROVAL_FORBIDDEN') {
@@ -149,7 +153,7 @@ export const WorkCardInbox: React.FC<WorkCardInboxProps> = ({
           <span>协同审批收件箱</span>
         </div>
         <p className="mt-3 text-xs leading-relaxed text-slate-500">
-          当前业务模型未配置待办协同队列。您可以在右侧单据列表中浏览并查看各实体明细与关联关系。
+          当前模型未配置待办协同队列。您可以在右侧{terms.recordNoun}列表中浏览并查看各实体明细与关联关系。
         </p>
       </div>
     );

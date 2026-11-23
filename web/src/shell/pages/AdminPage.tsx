@@ -255,7 +255,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             <div className="space-y-3 text-xs">
               {devices.devices.length === 0 ? (
                 <div className="rounded-lg border border-emerald-200 bg-emerald-50/50 p-3.5 text-emerald-900">
-                  当前工作模式为 <strong>独立数字孪生（standalone）</strong>，所有核心台账均由本引擎本地安全托管。
+                  当前工作模式为 <strong>独立数字孪生（standalone）</strong>，所有核心对象数据均由本引擎本地安全托管。
                 </div>
               ) : (
                 devices.devices.map((d) => (

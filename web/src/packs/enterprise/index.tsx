@@ -25,6 +25,20 @@ export function registerEnterprisePack(): void {
       }
       return hits >= 3;
     },
+    terminology: {
+      cockpitNavLabel: '经营驾驶舱',
+      catalogTitle: '实时业务台账与关系穿透',
+      catalogCategoryLabel: '业务台账分类',
+      catalogCountPrefix: '可见台账记录',
+      recordNoun: '单据',
+      drawerBackLabel: '返回上一单据',
+      drawerOwnedBadge: '扩展台账',
+      drawerAttrsTitle: '单据详细属性与客户自有扩展字段',
+      lineageTitle: '单据前后关联图谱（受权可见范围）',
+      sandboxDiffTitle: '现状 vs 沙盘 · 逐单据变更明细对比',
+      sandboxManualSubtitle: '任选业务操作在平行空间验证合规性与关键指标变化',
+      auditSearchPlaceholder: '搜索流水号、动作或单据...',
+    },
     preferredTypes: [
       'O2cOrder',
       'P2pPurchaseOrder',

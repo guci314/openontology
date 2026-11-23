@@ -2,19 +2,21 @@ import type { ConsoleMeta, DisplayDictionary } from '../api/client';
 
 const GENERIC_ERROR_HINTS: Record<string, string> = {
   PERMISSION_DENIED: '当前角色暂无执行权限，已被系统安全拦截。',
-  SOD_SELF_APPROVAL_FORBIDDEN: '触发职责分离合规红线：申请人不可审批自己提交的工单。',
+  SOD_SELF_APPROVAL_FORBIDDEN: '触发职责分离合规红线：申请人不可审批自己提交的事项。',
   UNBOUND_SOURCE_BRIDGE: '外部系统连接处于断开状态，已阻止不安全的写入操作。',
   DEVICE_STATE_MISMATCH: '外部系统回读状态校验不一致，本次事务已自动中止且保持零脏写。',
-  ILLEGAL_DOCUMENT_TRANSITION: '当前单据状态尚不满足流转条件，禁止跳步执行。',
-  WORK_CARD_ASSIGNEE_MISMATCH: '该事项已指派给其他审批岗位，请切换到对应负责人账号处理。',
+  ILLEGAL_DOCUMENT_TRANSITION: '当前对象状态尚不满足流转条件，禁止跳步执行。',
+  WORK_CARD_ASSIGNEE_MISMATCH: '该事项已指派给其他审批角色，请切换到对应负责人账号处理。',
   WORK_CARD_NOT_ACTIVE: '该待办事项已审批结束，无需重复处理。',
   INVALID_PARAMETER: '提交参数不完整或数值格式有误，请核对后重试。',
 };
 
-const GENERIC_STATUS_LABELS: Record<string, { label: string; tone: 'emerald' | 'amber' | 'rose' | 'sky' | 'slate' }> = {
+type BadgeTone = 'emerald' | 'amber' | 'rose' | 'sky' | 'slate';
+
+const GENERIC_STATUS_LABELS: Record<string, { label: string; tone: BadgeTone }> = {
   COMMITTED: { label: '已执行落库', tone: 'emerald' },
   REJECTED: { label: '已驳回', tone: 'rose' },
-  REVERTED: { label: '已撤回冲正', tone: 'amber' },
+  REVERTED: { label: '已撤回', tone: 'amber' },
   AUTO_COMMITTED: { label: '限额自动放行', tone: 'emerald' },
   ESCALATED_COMMITTED: { label: '已转人工签批', tone: 'amber' },
   ESCALATION_REQUIRED: { label: '需人工审批', tone: 'amber' },
@@ -32,37 +34,40 @@ const GENERIC_STATUS_LABELS: Record<string, { label: string; tone: 'emerald' | '
   HIGH: { label: '高优', tone: 'rose' },
   MEDIUM: { label: '中等', tone: 'amber' },
   LOW: { label: '常规', tone: 'slate' },
-  DEBIT: { label: '借方', tone: 'sky' },
-  CREDIT: { label: '贷方', tone: 'emerald' },
   active: { label: '启用中', tone: 'emerald' },
-  draft: { label: '草稿待办', tone: 'slate' },
+  draft: { label: '草稿', tone: 'slate' },
   confirmed: { label: '已确认', tone: 'sky' },
   released: { label: '已下达', tone: 'sky' },
   in_progress: { label: '执行中', tone: 'sky' },
-  disputed: { label: '争议挂起', tone: 'rose' },
-  received: { label: '已收货待账', tone: 'sky' },
-  delivered: { label: '已发货', tone: 'sky' },
-  invoiced: { label: '已开票', tone: 'emerald' },
-  billed: { label: '已对账开票', tone: 'emerald' },
-  posted: { label: '已过账', tone: 'emerald' },
-  paid: { label: '已结清', tone: 'emerald' },
-  partial: { label: '部分结清', tone: 'amber' },
-  not_paid: { label: '待核销', tone: 'amber' },
   pending: { label: '待处理', tone: 'slate' },
   recorded: { label: '已记录', tone: 'emerald' },
   agreed: { label: '已生效', tone: 'emerald' },
   passed: { label: '合格', tone: 'emerald' },
   completed: { label: '已完成', tone: 'emerald' },
-  closed: { label: '已关账锁定', tone: 'slate' },
-  open: { label: '开放记账中', tone: 'emerald' },
   resolved: { label: '已闭环', tone: 'emerald' },
   RESOLVED: { label: '已闭环', tone: 'emerald' },
-  CLOSED_WON: { label: '已赢单', tone: 'emerald' },
-  PROPOSAL: { label: '方案报价', tone: 'sky' },
-  NEGOTIATION: { label: '商务谈判', tone: 'amber' },
 };
 
-export function translateError(code?: string | null, fallback?: string | null, backendHint?: string): string {
+function inferNeutralStatusTone(key: string, label: string): BadgeTone {
+  const lower = key.toLowerCase();
+  if (lower.includes('reject') || lower.includes('fail') || lower.includes('breach') || label.includes('挂起')) {
+    return 'rose';
+  }
+  if (lower.includes('partial') || label.startsWith('待') || label.includes('部分')) {
+    return 'amber';
+  }
+  if (label.includes('锁') || label.includes('撤') || label.includes('归档')) {
+    return 'slate';
+  }
+  return 'slate';
+}
+
+export function translateError(
+  code?: string | null,
+  fallback?: string | null,
+  backendHint?: string,
+  display?: DisplayDictionary
+): string {
   const rawFallback = String(fallback || '');
   if (rawFallback.includes('errors.pydantic.dev') || rawFallback.toLowerCase().includes('validation error')) {
     return backendHint && !backendHint.includes('errors.pydantic.dev')
@@ -71,22 +76,27 @@ export function translateError(code?: string | null, fallback?: string | null, b
   }
   if (backendHint) return backendHint;
   const c = String(code || '').trim();
+  if (c && display?.errors?.[c]) return display.errors[c];
   if (c && GENERIC_ERROR_HINTS[c]) return GENERIC_ERROR_HINTS[c];
   if (c.startsWith('APPROVAL_REQUIRED_')) return '金额或风险指标超出自动放行阈值，须转人工复核签批。';
   if (fallback) return `校验拦截：${fallback}`;
-  return '规则校验未通过，真实业务数据保持零改动。';
+  return '规则校验未通过，主系统核心数据保持零改动。';
 }
 
 export function getStatusBadgeMeta(
   rawStatus: unknown,
   display?: DisplayDictionary
-): { label: string; tone: 'emerald' | 'amber' | 'rose' | 'sky' | 'slate' } {
+): { label: string; tone: BadgeTone } {
   const key = String(rawStatus ?? '');
-  if (GENERIC_STATUS_LABELS[key]) return GENERIC_STATUS_LABELS[key];
+  const generic = GENERIC_STATUS_LABELS[key];
   const fromDict = display?.statuses?.[key];
   if (fromDict) {
-    return { label: fromDict, tone: 'slate' };
+    return {
+      label: fromDict,
+      tone: generic?.tone || inferNeutralStatusTone(key, fromDict),
+    };
   }
+  if (generic) return generic;
   return { label: key || '-', tone: 'slate' };
 }
 
