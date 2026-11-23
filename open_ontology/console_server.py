@@ -15,6 +15,7 @@ domain schema or external vendor protocol:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -449,6 +450,12 @@ class _AssistantPayload(BaseModel):
     question: str = ""
 
 
+class _BlueprintProvePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    force_refresh: bool = False
+
+
 class ConsoleService:
     """Thread-safe pure M2 backend service driving the console REST & SPA surface."""
 
@@ -495,6 +502,7 @@ class ConsoleService:
         self.admin_roles = frozenset(admin_roles or _DEFAULT_ADMIN_ROLES)
         self._lock = threading.RLock()
         self._sandboxes: dict[str, _SandboxSession] = {}
+        self._proof_cache: dict[tuple[str, bool], dict[str, Any]] = {}
 
         self._demo_profiles: dict[str, DemoActorProfile] = {}
         self._demo_order: list[str] = []
@@ -815,6 +823,122 @@ class ConsoleService:
                 },
             }
 
+    def _collect_invariants(self, display: Mapping[str, Any]) -> list[dict[str, Any]]:
+        inv_labels = display.get("invariants") or {}
+
+        def _inv_desc(name: str, code: str, raw_desc: str) -> str:
+            if inv_labels.get(name):
+                return str(inv_labels[name])
+            if inv_labels.get(code):
+                return str(inv_labels[code])
+            if raw_desc == "Status transitions must follow declared FSM edges.":
+                return "对象状态流转必须严格遵循声明的状态机跃迁路径。"
+            return raw_desc or name
+
+        dedup_invs: dict[tuple[str, str], dict[str, Any]] = {}
+        raw_invs = [
+            ("state", inv.name, inv.code, _inv_desc(inv.name, inv.code, inv.description))
+            for inv in sorted(self.runtime.spec.invariants.values(), key=lambda i: i.name)
+        ] + [
+            ("transition", tinv.name, tinv.code, _inv_desc(tinv.name, tinv.code, tinv.description))
+            for tinv in sorted(
+                self.runtime.spec.transition_invariants.values(), key=lambda i: i.name
+            )
+        ]
+        for kind_v, name_v, code_v, desc_v in raw_invs:
+            k_pair = (kind_v, code_v or name_v)
+            if k_pair not in dedup_invs:
+                dedup_invs[k_pair] = {
+                    "kind": kind_v,
+                    "name": name_v,
+                    "code": code_v,
+                    "description": desc_v,
+                }
+            else:
+                existing_d = str(dedup_invs[k_pair]["description"])
+                if desc_v and desc_v not in existing_d:
+                    dedup_invs[k_pair]["description"] = f"{existing_d}；{desc_v}"
+
+        return list(dedup_invs.values())
+
+    def _export_runtime_blueprint(
+        self,
+        display: Mapping[str, Any],
+    ) -> tuple[Any, str, str, str]:
+        from .induction.dsl import blueprint_fingerprint, export_spec_blueprint
+
+        ont_raw = self.runtime.spec.display.get("ontologies") or {}
+        merged_ont = display.get("ontologies") or {}
+        raw_id = getattr(self.runtime.spec, "name", None) or (
+            str(list(ont_raw.keys())[-1]) if ont_raw else "model_under_proof"
+        )
+        safe_id = re.sub(r"[^A-Za-z0-9_]", "_", str(raw_id)).strip("_") or "model_under_proof"
+        if safe_id[0].isdigit():
+            safe_id = f"m_{safe_id}"
+        spec_name = str(
+            merged_ont.get(raw_id) or ont_raw.get(raw_id) or self.app_title or raw_id
+        )
+        spec_version = str(getattr(self.runtime.spec, "version", None) or "1.0")
+        bp = export_spec_blueprint(self.runtime.spec, model_id=safe_id)
+        return bp, spec_name, spec_version, blueprint_fingerprint(bp)
+
+    def _describe_devices_by_object(
+        self,
+    ) -> tuple[dict[str, list[dict[str, str]]], set[str]]:
+        reg = _extract_device_registry(self.runtime)
+        by_type: dict[str, list[dict[str, str]]] = {}
+        synced: set[str] = set()
+        if reg is not None:
+            for dev in reg.list_devices():
+                if isinstance(dev, dict):
+                    did = str(dev.get("device_id", ""))
+                    name = str(dev.get("name", did))
+                    kind = str(dev.get("kind", ""))
+                    status = str(dev.get("status", ""))
+                    owned_t = [str(x) for x in (dev.get("owned_object_types") or ())]
+                    shared_t = [str(x) for x in (dev.get("shared_object_types") or ())]
+                else:
+                    did = dev.device_id
+                    name = dev.name
+                    kind = dev.kind
+                    status = dev.status
+                    owned_t = list(dev.owned_object_types)
+                    shared_t = list(dev.shared_object_types)
+                for ot_name in owned_t:
+                    synced.add(ot_name)
+                    by_type.setdefault(ot_name, []).append(
+                        {
+                            "device_id": did,
+                            "name": name,
+                            "kind": kind,
+                            "status": status,
+                            "binding": "owned",
+                        }
+                    )
+                for ot_name in shared_t:
+                    synced.add(ot_name)
+                    by_type.setdefault(ot_name, []).append(
+                        {
+                            "device_id": did,
+                            "name": name,
+                            "kind": kind,
+                            "status": status,
+                            "binding": "shared",
+                        }
+                    )
+        return by_type, synced
+
+    def _resolve_action_autonomy_label(self, action_name: str, actor: Actor) -> str:
+        rule = self.autonomy_controller.policy.resolve(action_name, actor.role)
+        mode = str(rule.mode or "")
+        if mode == "SHADOW":
+            return "shadow"
+        if mode == "COPILOT_ESCALATE":
+            return "confirm"
+        if mode in ("AUTO_UNDER_CEILING", "FULL_AUTO"):
+            return "auto"
+        return mode.lower() or "auto"
+
     def get_tbox(self, actor: Actor) -> dict[str, Any]:
         with self._lock:
             display = self._merged_display()
@@ -823,7 +947,6 @@ class ConsoleService:
             field_overrides = display.get("field_overrides") or {}
             act_labels = display.get("actions") or {}
             fn_labels = display.get("functions") or {}
-            inv_labels = display.get("invariants") or {}
 
             scoped_tbox = describe_tbox(self.runtime.spec, actor=actor)
             scoped_type_names = {ot["name"] for ot in scoped_tbox["object_types"]}
@@ -882,40 +1005,7 @@ class ConsoleService:
                     }
                 )
 
-            def _inv_desc(name: str, code: str, raw_desc: str) -> str:
-                if inv_labels.get(name):
-                    return str(inv_labels[name])
-                if inv_labels.get(code):
-                    return str(inv_labels[code])
-                if raw_desc == "Status transitions must follow declared FSM edges.":
-                    return "对象状态流转必须严格遵循声明的状态机跃迁路径。"
-                return raw_desc or name
-
-            dedup_invs: dict[tuple[str, str], dict[str, Any]] = {}
-            raw_invs = [
-                ("state", inv.name, inv.code, _inv_desc(inv.name, inv.code, inv.description))
-                for inv in sorted(self.runtime.spec.invariants.values(), key=lambda i: i.name)
-            ] + [
-                ("transition", tinv.name, tinv.code, _inv_desc(tinv.name, tinv.code, tinv.description))
-                for tinv in sorted(
-                    self.runtime.spec.transition_invariants.values(), key=lambda i: i.name
-                )
-            ]
-            for kind_v, name_v, code_v, desc_v in raw_invs:
-                k_pair = (kind_v, code_v or name_v)
-                if k_pair not in dedup_invs:
-                    dedup_invs[k_pair] = {
-                        "kind": kind_v,
-                        "name": name_v,
-                        "code": code_v,
-                        "description": desc_v,
-                    }
-                else:
-                    existing_d = str(dedup_invs[k_pair]["description"])
-                    if desc_v and desc_v not in existing_d:
-                        dedup_invs[k_pair]["description"] = f"{existing_d}；{desc_v}"
-
-            invariants = list(dedup_invs.values())
+            invariants = self._collect_invariants(display)
 
             return {
                 "ok": True,
@@ -928,6 +1018,451 @@ class ConsoleService:
                 "roles": behavior["roles"],
                 "invariants": invariants,
             }
+
+    def get_blueprint(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            display = self._merged_display()
+            obj_labels = display.get("objects") or {}
+            field_labels = display.get("fields") or {}
+            field_overrides = display.get("field_overrides") or {}
+            act_labels = display.get("actions") or {}
+            ef_labels = display.get("edit_functions") or {}
+            fn_labels = display.get("functions") or {}
+            link_labels = display.get("links") or display.get("object_properties") or {}
+            card_labels = display.get("cardinalities") or {
+                "many-to-one": "N:1",
+                "one-to-many": "1:N",
+                "many-to-many": "M:N",
+                "one-to-one": "1:1",
+            }
+
+            bp, spec_name, spec_version, bp_fp = self._export_runtime_blueprint(display)
+            bp_actions = {act_bp.name: act_bp for act_bp in bp.actions}
+
+            scoped_tbox = describe_tbox(self.runtime.spec, actor=actor)
+            scoped_type_names = {ot["name"] for ot in scoped_tbox["object_types"]}
+            tbox = describe_tbox(self.runtime.spec)
+            scoped_behavior = describe_behavior(self.runtime.spec, actor=actor)
+            scoped_action_names = {a["name"] for a in scoped_behavior["actions"]}
+
+            devices_by_type, device_synced_types = self._describe_devices_by_object()
+            pk_to_type = {
+                str(cls.primary_key_name()): name
+                for name, cls in self.runtime.spec.object_types.items()
+            }
+
+            actions_out: list[dict[str, Any]] = []
+            for act_def in sorted(self.runtime.spec.actions.values(), key=lambda a: a.name):
+                aname = act_def.name
+                act_bp = bp_actions.get(aname)
+                touched = list(act_def.touched_object_types or ())
+                if not touched and act_bp is not None:
+                    seen_t: list[str] = []
+                    for mut in act_bp.mutations:
+                        if mut.object_type not in seen_t:
+                            seen_t.append(mut.object_type)
+                    if seen_t:
+                        touched = seen_t
+                if not touched and act_def.params is not None:
+                    inferred: list[str] = []
+                    for pname in getattr(act_def.params, "model_fields", {}):
+                        mapped = pk_to_type.get(pname)
+                        if mapped and mapped not in inferred:
+                            inferred.append(mapped)
+                    touched = inferred
+
+                rule_summary: dict[str, Any] | None = None
+                if act_def.implementation_kind == "rule":
+                    pres = list(act_bp.preconditions) if act_bp is not None else []
+                    muts = list(act_bp.mutations) if act_bp is not None else []
+                    rule_summary = {
+                        "precondition_count": len(pres),
+                        "preconditions": [
+                            {
+                                "name": p.name,
+                                "code": p.code,
+                                "description": p.description,
+                            }
+                            for p in pres
+                        ],
+                        "mutation_count": len(muts),
+                        "mutations": [
+                            {
+                                "op": m.op,
+                                "object_type": m.object_type,
+                                "set_fields": sorted(str(k) for k in m.set_fields.keys()),
+                            }
+                            for m in muts
+                        ],
+                    }
+
+                actions_out.append(
+                    {
+                        "name": aname,
+                        "display_label": str(act_labels.get(aname) or aname),
+                        "description": str(act_def.description or ""),
+                        "implementation_kind": str(act_def.implementation_kind),
+                        "edit_function_name": act_def.edit_function,
+                        "allowed_roles": list(act_def.allowed_roles),
+                        "in_role_scope": aname in scoped_action_names,
+                        "touched_object_types": touched,
+                        "params_schema": (
+                            act_def.params.model_json_schema()
+                            if act_def.params is not None
+                            else {}
+                        ),
+                        "rule_summary": rule_summary,
+                        "autonomy_mode": self._resolve_action_autonomy_label(aname, actor),
+                    }
+                )
+
+            edit_functions_out: list[dict[str, Any]] = []
+            for ef in sorted(self.runtime.spec.edit_functions.values(), key=lambda e: e.name):
+                bound_actions = [
+                    a["name"]
+                    for a in actions_out
+                    if a["edit_function_name"] == ef.name
+                ]
+                ef_touched = list(ef.touched_object_types or ())
+                if not ef_touched:
+                    seen_ef: list[str] = []
+                    for bname in bound_actions:
+                        bact = next((x for x in actions_out if x["name"] == bname), None)
+                        if bact:
+                            for ot_t in bact["touched_object_types"]:
+                                if ot_t not in seen_ef:
+                                    seen_ef.append(ot_t)
+                    ef_touched = seen_ef
+                edit_functions_out.append(
+                    {
+                        "name": ef.name,
+                        "display_label": str(
+                            ef_labels.get(ef.name) or act_labels.get(ef.name) or ef.name
+                        ),
+                        "description": str(ef.description or ""),
+                        "touched_object_types": ef_touched,
+                        "bound_actions": bound_actions,
+                        "params_schema": (
+                            ef.params.model_json_schema() if ef.params is not None else {}
+                        ),
+                    }
+                )
+
+            functions_out: list[dict[str, Any]] = []
+            for fn_def in sorted(self.runtime.spec.functions.values(), key=lambda f: f.name):
+                functions_out.append(
+                    {
+                        "name": fn_def.name,
+                        "display_label": str(fn_labels.get(fn_def.name) or fn_def.name),
+                        "description": str(fn_def.description or ""),
+                        "read_only": bool(fn_def.read_only),
+                        "params_schema": (
+                            fn_def.params.model_json_schema()
+                            if fn_def.params is not None
+                            else {}
+                        ),
+                    }
+                )
+
+            object_types_out: list[dict[str, Any]] = []
+            base_doc = str(
+                getattr(
+                    next(iter(self.runtime.spec.object_types.values())).__mro__[-3],
+                    "__doc__",
+                    "",
+                )
+                or ""
+            ) if self.runtime.spec.object_types else ""
+
+            for ot in sorted(tbox["object_types"], key=lambda o: str(o["name"])):
+                ot_name = str(ot["name"])
+                cls = self.runtime.spec.get_object_type(ot_name)
+                visible_count = len(self.runtime.query_objects(cls, actor))
+                status_field = getattr(cls, "__status_field__", None)
+                initial_statuses = [
+                    str(s) for s in (getattr(cls, "__initial_statuses__", ()) or ())
+                ]
+                raw_transitions = getattr(cls, "__transitions__", {}) or {}
+                transitions: dict[str, list[str]] = {
+                    str(k): [str(dst) for dst in v]
+                    for k, v in raw_transitions.items()
+                }
+                terminal_statuses: list[str] = []
+                if transitions:
+                    ordered_states: list[str] = []
+                    for st in initial_statuses:
+                        if st not in ordered_states:
+                            ordered_states.append(st)
+                    for src_s, dst_list in transitions.items():
+                        if src_s not in ordered_states:
+                            ordered_states.append(src_s)
+                        for dst_s in dst_list:
+                            if dst_s not in ordered_states:
+                                ordered_states.append(dst_s)
+                    terminal_statuses = [
+                        st
+                        for st in ordered_states
+                        if len(transitions.get(st, ())) == 0
+                    ]
+
+                cls_doc = str(getattr(cls, "__doc__", "") or "").strip()
+                clean_doc = ""
+                if cls_doc and cls_doc != base_doc.strip():
+                    clean_doc = cls_doc.splitlines()[0].strip()
+
+                owned_set = set(ot.get("owned_fields") or ())
+                fully_owned = cls.is_fully_owned()
+                type_is_synced = (
+                    ot_name in device_synced_types or cls.is_read_only_source()
+                ) and not fully_owned
+
+                fields_out: list[dict[str, Any]] = []
+                for fld in ot["fields"]:
+                    fname = str(fld["name"])
+                    flabel = str(
+                        field_overrides.get(f"{ot_name}.{fname}")
+                        or field_labels.get(fname)
+                        or fname
+                    )
+                    is_overlay_ext = (
+                        (not fully_owned and fname in owned_set)
+                        or fname.startswith("x_")
+                    )
+                    if is_overlay_ext:
+                        ownership = "overlay_extension"
+                    elif type_is_synced:
+                        ownership = "external_synced"
+                    else:
+                        ownership = "ontology_owned"
+
+                    fields_out.append(
+                        {
+                            "name": fname,
+                            "display_label": flabel,
+                            "type": str(fld.get("type", "Any")),
+                            "required": bool(fld.get("required", False)),
+                            "is_primary_key": fname == str(ot["primary_key"]),
+                            "is_status_field": bool(status_field and fname == status_field),
+                            "ownership": ownership,
+                        }
+                    )
+
+                object_types_out.append(
+                    {
+                        "name": ot_name,
+                        "display_label": str(obj_labels.get(ot_name) or ot_name),
+                        "description": clean_doc,
+                        "primary_key": str(ot["primary_key"]),
+                        "status_field": status_field,
+                        "initial_statuses": initial_statuses,
+                        "transitions": transitions,
+                        "terminal_statuses": terminal_statuses,
+                        "fields": fields_out,
+                        "attached_devices": list(devices_by_type.get(ot_name, [])),
+                        "touched_by_actions": [
+                            a["name"]
+                            for a in actions_out
+                            if ot_name in a["touched_object_types"]
+                        ],
+                        "in_role_scope": ot_name in scoped_type_names,
+                        "visible_count": visible_count,
+                    }
+                )
+
+            links_out: list[dict[str, Any]] = []
+            for prop in sorted(
+                tbox["object_properties"],
+                key=lambda p: (str(p.get("domain", "")), str(p.get("field", ""))),
+            ):
+                pname = str(prop.get("name", ""))
+                fname = str(prop.get("field", ""))
+                card = str(prop.get("cardinality", "many-to-one"))
+                raw_label = (
+                    link_labels.get(pname)
+                    or field_overrides.get(pname)
+                    or field_labels.get(fname)
+                    or fname
+                    or pname
+                )
+                links_out.append(
+                    {
+                        "name": pname,
+                        "field": fname,
+                        "display_label": str(raw_label),
+                        "source": str(prop.get("domain", "")),
+                        "target": str(prop.get("range", "")),
+                        "cardinality": card,
+                        "cardinality_label": str(card_labels.get(card, card)),
+                        "inverse_name": prop.get("inverse_name"),
+                        "description": str(prop.get("description") or ""),
+                    }
+                )
+
+            invariants_out = self._collect_invariants(display)
+            rule_count = sum(
+                1 for a in actions_out if a["implementation_kind"] == "rule"
+            )
+            ef_action_count = sum(
+                1 for a in actions_out if a["implementation_kind"] == "edit_function"
+            )
+            fsm_object_count = sum(
+                1 for o in object_types_out if o["status_field"] or o["transitions"]
+            )
+
+            return {
+                "ok": True,
+                "spec_name": spec_name,
+                "spec_version": spec_version,
+                "blueprint_fingerprint": bp_fp,
+                "summary": {
+                    "object_type_count": len(object_types_out),
+                    "link_count": len(links_out),
+                    "action_count": len(actions_out),
+                    "rule_action_count": rule_count,
+                    "edit_function_action_count": ef_action_count,
+                    "edit_function_count": len(edit_functions_out),
+                    "function_count": len(functions_out),
+                    "invariant_count": len(invariants_out),
+                    "fsm_object_count": fsm_object_count,
+                },
+                "object_types": object_types_out,
+                "links": links_out,
+                "actions": actions_out,
+                "edit_functions": edit_functions_out,
+                "functions": functions_out,
+                "invariants": invariants_out,
+            }
+
+    def prove_current_blueprint(
+        self,
+        actor: Actor,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        del actor  # Authenticated by _resolve_actor before entry
+        from .induction.prover import ProverUnavailableError, prove_blueprint
+
+        with self._lock:
+            display = self._merged_display()
+            _, _, _, bp_fp = self._export_runtime_blueprint(display)
+            cache_key = (bp_fp, True)
+            if not force_refresh and cache_key in self._proof_cache:
+                cached_payload = copy.deepcopy(self._proof_cache[cache_key])
+                cached_payload["cached"] = True
+                return cached_payload
+
+        try:
+            report = prove_blueprint(self.runtime.spec, check_redundancy=True)
+        except ProverUnavailableError:
+            return {
+                "ok": True,
+                "prover_available": False,
+                "reason": "PROVER_UNAVAILABLE",
+                "message": "未安装可选形式化证明器依赖（核心运行态零影响）。",
+                "install_hint": "pip install 'open-ontology[prove]'",
+            }
+
+        with self._lock:
+            display = self._merged_display()
+            act_labels = display.get("actions") or {}
+            inv_labels = display.get("invariants") or {}
+            declared_invs = self._collect_invariants(display)
+
+            deadlocked_actions = (
+                report.total_deadlock_count + report.conditional_deadlock_count
+            )
+            reachable_actions = sum(
+                1 for r in report.reachability if r.status == "REACHABLE"
+            )
+            total_invariants = len(report.invariant_preservation)
+            preserved_invariants = sum(
+                1 for p in report.invariant_preservation if p.status == "PROVED"
+            )
+            violated_invariants = report.invariant_violation_count
+
+            frag_counts = dict(report.logic_fragment_counts)
+            total_frags = sum(frag_counts.values())
+            exact_frags = sum(
+                cnt
+                for frag, cnt in frag_counts.items()
+                if frag.startswith("EXACT_QF_LIA") or frag.startswith("EXACT_QF_LRA")
+            )
+            exact_linear_ratio = (
+                round(exact_frags / total_frags, 4) if total_frags > 0 else 1.0
+            )
+
+            action_proofs = [
+                {
+                    **item.model_dump(mode="json"),
+                    "display_label": str(
+                        act_labels.get(item.action_name) or item.action_name
+                    ),
+                }
+                for item in report.reachability
+            ]
+            invariant_proofs = [
+                {
+                    **item.model_dump(mode="json"),
+                    "display_label": str(
+                        act_labels.get(item.action_name) or item.action_name
+                    ),
+                    "checked_invariant_labels": [
+                        str(inv_labels.get(n) or n) for n in item.checked_invariants
+                    ],
+                    "violated_invariant_labels": [
+                        str(inv_labels.get(n) or n) for n in item.violated_invariants
+                    ],
+                }
+                for item in report.invariant_preservation
+            ]
+            redundant_rules = [
+                {
+                    **item.model_dump(mode="json"),
+                    "action_display_label": str(
+                        act_labels.get(item.action_name) or item.action_name
+                    ),
+                    "rule_display_label": str(
+                        inv_labels.get(item.rule_name) or item.rule_name
+                    ),
+                }
+                for item in report.redundant_rules
+            ]
+
+            verdict = (
+                "PROVEN_CLEAN"
+                if (
+                    report.ok
+                    and deadlocked_actions == 0
+                    and violated_invariants == 0
+                )
+                else "ISSUES_FOUND"
+            )
+
+            result: dict[str, Any] = {
+                "ok": True,
+                "prover_available": True,
+                "cached": False,
+                "verdict": verdict,
+                "elapsed_ms": report.elapsed_ms,
+                "blueprint_fingerprint": report.blueprint_fingerprint,
+                "summary": {
+                    "total_actions": report.total_actions_checked,
+                    "reachable_actions": reachable_actions,
+                    "deadlocked_actions": deadlocked_actions,
+                    "total_invariants": total_invariants,
+                    "preserved_invariants": preserved_invariants,
+                    "violated_invariants": violated_invariants,
+                    "declared_invariant_count": len(declared_invs),
+                    "redundant_rule_count": report.redundant_rule_count,
+                    "exact_linear_ratio": exact_linear_ratio,
+                    "fragment_counts": frag_counts,
+                },
+                "action_proofs": action_proofs,
+                "invariant_proofs": invariant_proofs,
+                "redundant_rules": redundant_rules,
+            }
+            self._proof_cache[cache_key] = copy.deepcopy(result)
+            return result
 
     def list_objects(
         self,
@@ -2575,6 +3110,20 @@ def create_console_app(
     @app.get("/api/tbox")
     def api_tbox(req: Request) -> dict[str, Any]:
         return service.get_tbox(_actor_from_request(req))
+
+    @app.get("/api/blueprint")
+    def api_blueprint(req: Request) -> dict[str, Any]:
+        return service.get_blueprint(_actor_from_request(req))
+
+    @app.post("/api/blueprint/prove")
+    def api_blueprint_prove(
+        req: Request,
+        payload: _BlueprintProvePayload | None = Body(default=None),
+    ) -> dict[str, Any]:
+        return service.prove_current_blueprint(
+            _actor_from_request(req),
+            force_refresh=bool(payload.force_refresh if payload is not None else False),
+        )
 
     @app.get("/api/objects/{object_type}")
     def api_list_objects(

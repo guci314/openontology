@@ -9,6 +9,7 @@ import {
 } from './api/client';
 import { ShellLayout } from './shell/ShellLayout';
 import { CockpitPage } from './shell/pages/CockpitPage';
+import { BlueprintPage } from './shell/pages/BlueprintPage';
 import { SandboxPage } from './shell/pages/SandboxPage';
 import { AuditPage } from './shell/pages/AuditPage';
 import { AdminPage } from './shell/pages/AdminPage';
@@ -154,6 +155,16 @@ const AppShell: React.FC = () => {
               refreshTick={refreshTick}
               onRefresh={handleRefresh}
               onInspectObject={openRootObject}
+            />
+          }
+        />
+        <Route
+          path="/blueprint"
+          element={
+            <BlueprintPage
+              key={meta.actor.actor_id}
+              meta={meta}
+              pack={activePack}
             />
           }
         />

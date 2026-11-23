@@ -110,6 +110,7 @@ def test_group_a_shell_frontend_purity_and_zero_core_mutation() -> None:
     jargon_tokens = ("TBox", "ABox", "ObjectType", "state_fingerprint", "InvariantError")
     for rel_path in (
         "pages/CockpitPage.tsx",
+        "pages/BlueprintPage.tsx",
         "pages/SandboxPage.tsx",
         "pages/AuditPage.tsx",
         "components/WorkCardInbox.tsx",

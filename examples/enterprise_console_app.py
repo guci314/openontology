@@ -45,7 +45,13 @@ from open_ontology.console_server import (
     create_console_app,
     start_console_server,
 )
-from open_ontology.induction import CustomerOverlaySpec, FieldSpec, InvariantRuleSpec
+from open_ontology.induction import (
+    ActionBlueprint,
+    ActionMutationSpec,
+    CustomerOverlaySpec,
+    FieldSpec,
+    InvariantRuleSpec,
+)
 from open_ontology.org_authority import OrgDirectory, hash_auth_token
 
 from examples.adapters.erp_world_mount import (
@@ -175,6 +181,74 @@ HUASHI_MFG_OVERLAY = CustomerOverlaySpec(
             ),
         ],
     },
+    add_actions=[
+        ActionBlueprint(
+            name="annotate_order_risk_note",
+            display_label="标注销售订单风控备注",
+            description="声明式规则动作：仅更新企业自有扩展风控备注，不写回外部主业务系统。",
+            allowed_roles=["sales_rep", "sales_manager", "finance_director", "admin"],
+            affects_source=False,
+            params=[
+                FieldSpec(name="order_id", field_type="str", required=True),
+                FieldSpec(name="risk_note", field_type="str", required=True),
+            ],
+            preconditions=[
+                InvariantRuleSpec(
+                    name="order_not_cancelled_for_risk_note",
+                    code="ORDER_CANCELLED_NO_RISK_NOTE",
+                    target_type="O2cOrder",
+                    id_param="order_id",
+                    must_hold={
+                        "op": "ne",
+                        "left": {"ref": "obj.status"},
+                        "right": {"lit": "cancelled"},
+                    },
+                    description="已取消订单不再追加风控备注。",
+                ),
+            ],
+            mutations=[
+                ActionMutationSpec(
+                    op="modify",
+                    object_type="O2cOrder",
+                    id_param="order_id",
+                    set_fields={"risk_note": {"ref": "param.risk_note"}},
+                ),
+            ],
+        ),
+        ActionBlueprint(
+            name="upgrade_account_vip_tier",
+            display_label="调级客户战略等级",
+            description="声明式规则动作：在合规等级枚举内调整客户战略分级。",
+            allowed_roles=["sales_manager", "finance_director", "admin"],
+            affects_source=False,
+            params=[
+                FieldSpec(name="account_id", field_type="str", required=True),
+                FieldSpec(name="vip_tier", field_type="str", required=True),
+            ],
+            preconditions=[
+                InvariantRuleSpec(
+                    name="valid_vip_tier_enum",
+                    code="INVALID_VIP_TIER",
+                    target_type="CrmAccount",
+                    id_param="account_id",
+                    must_hold={
+                        "op": "in",
+                        "left": {"ref": "param.vip_tier"},
+                        "right": {"lit": ["STANDARD", "VIP_KEY", "STRATEGIC"]},
+                    },
+                    description="客户战略等级必须为 STANDARD / VIP_KEY / STRATEGIC。",
+                ),
+            ],
+            mutations=[
+                ActionMutationSpec(
+                    op="modify",
+                    object_type="CrmAccount",
+                    id_param="account_id",
+                    set_fields={"vip_tier": {"ref": "param.vip_tier"}},
+                ),
+            ],
+        ),
+    ],
 )
 
 ENTERPRISE_WORK_QUEUE = WorkQueueBinding(
@@ -320,6 +394,10 @@ def _merge_std_display(spec: OntologySpec) -> None:
         {
             "ontologies": {
                 "std_enterprise_world_model": "华实智能装备企业数字孪生标准世界模型",
+            },
+            "actions": {
+                "annotate_order_risk_note": "标注销售订单风控备注",
+                "upgrade_account_vip_tier": "调级客户战略等级",
             },
             "roles": {
                 "finance_director": "财务总监 (CFO)",
@@ -1790,6 +1868,13 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
         __title__ = "callsign"
         __aggregate_root__ = True
         __security_tag_fields__ = ("sector",)
+        __status_field__ = "status"
+        __initial_statuses__ = ("active", "docked")
+        __transitions__ = {
+            "docked": ("active", "retired"),
+            "active": ("docked", "retired"),
+            "retired": (),
+        }
         ship_id: str
         callsign: str
         sector: str = "alpha"
@@ -1834,6 +1919,7 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
         "jump_sector",
         edit_function="jump_sector",
         allowed_roles=("navigator", "commander", "admin"),
+        touched_object_types=("Starship",),
     )
 
     @blind_spec.edit_function("refuel_ship", RefuelCoreParams)
@@ -1847,6 +1933,7 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
         "refuel_ship",
         edit_function="refuel_ship",
         allowed_roles=("commander", "admin"),
+        touched_object_types=("Starship",),
     )
 
     @blind_spec.function("fleet_fuel_total", FleetFuelParams, description="计算当前可见舰队燃料总量与跃迁能量值")
@@ -1857,6 +1944,26 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
             "total_fuel_cells": sum(int(s.fuel_cells) for s in ships),
             "total_value": sum(s.fuel_cells * 10 + (50 if s.sector == "omega" else 0) for s in ships),
         }
+
+    @blind_spec.invariant(
+        "starship_non_negative_fuel",
+        code="NEGATIVE_FUEL",
+        description="星际战舰燃料电池储备与曲速核心功率严禁为负。",
+    )
+    def starship_non_negative_fuel(view: Any) -> bool:
+        for s in view.query(Starship):
+            if int(s.fuel_cells) < 0:
+                raise InvariantError(
+                    f"Starship:{s.ship_id} fuel_cells={s.fuel_cells} < 0",
+                    code="NEGATIVE_FUEL",
+                )
+        for core in view.query(WarpCore):
+            if int(core.output_gw) < 0:
+                raise InvariantError(
+                    f"WarpCore:{core.core_id} output_gw={core.output_gw} < 0",
+                    code="NEGATIVE_FUEL",
+                )
+        return True
 
     blind_spec.update_display(
         {
@@ -1888,6 +1995,8 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
                 "beta": "Beta 星域",
                 "omega": "Omega 星域",
                 "gamma": "Gamma 星域",
+                "docked": "停泊待命",
+                "retired": "已退役",
             },
         }
     )
