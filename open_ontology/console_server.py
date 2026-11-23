@@ -62,6 +62,8 @@ _DEFAULT_ADMIN_ROLES: frozenset[str] = frozenset(
     {"admin", "steward", "finance_director", "hr_director"}
 )
 
+_MAX_SANDBOXES = 32
+
 _STATUS_ZH: dict[str, str] = {
     "OPEN": "待处理",
     "IN_PROGRESS": "处理中",
@@ -611,8 +613,6 @@ class ConsoleService:
             raise PermissionDeniedError(f"unknown demo actor_id {requested_id!r}")
 
         if not self.demo_actor_switch and (self._token_map or self.org_directory is not None):
-            if self.default_actor is not None:
-                return self.default_actor
             raise PermissionDeniedError("authentication required")
         return self.default_actor
 
@@ -1250,6 +1250,13 @@ class ConsoleService:
     # -- parallel sandboxes (runtime.fork) ---------------------------------
     def create_sandbox(self, actor: Actor) -> dict[str, Any]:
         with self._lock:
+            while len(self._sandboxes) >= _MAX_SANDBOXES:
+                oldest_sid = next(iter(self._sandboxes))
+                oldest = self._sandboxes.pop(oldest_sid)
+                try:
+                    oldest.fork_runtime.close()
+                except Exception:
+                    pass
             sid = f"SBX-{uuid.uuid4().hex[:8].upper()}"
             fork_rt = self.runtime.fork()
             base_fp = self.runtime.state_fingerprint()
@@ -1268,10 +1275,14 @@ class ConsoleService:
                 "steps": [],
             }
 
-    def _require_sandbox(self, sid: str) -> _SandboxSession:
+    def _require_sandbox(self, sid: str, actor: Actor) -> _SandboxSession:
         session = self._sandboxes.get(sid)
         if session is None:
             raise ObjectNotFoundError(f"sandbox {sid!r} not found")
+        if session.created_by != actor.actor_id and actor.role not in self.admin_roles:
+            raise PermissionDeniedError(
+                f"actor {actor.actor_id!r} cannot access sandbox {sid!r}"
+            )
         return session
 
     def _resolve_sandbox_step_actor(self, requested_actor_id: str | None, fallback: Actor) -> Actor:
@@ -1288,7 +1299,7 @@ class ConsoleService:
         actor: Actor,
     ) -> dict[str, Any]:
         with self._lock:
-            session = self._require_sandbox(sid)
+            session = self._require_sandbox(sid, actor)
             steps = list(payload.steps or ())
             if not steps and payload.action:
                 steps = [
@@ -1371,7 +1382,7 @@ class ConsoleService:
         actor: Actor,
     ) -> dict[str, Any]:
         with self._lock:
-            session = self._require_sandbox(sid)
+            session = self._require_sandbox(sid, actor)
             p_dict = dict(params or {})
 
             def _invoke(rt: OntologyRuntime) -> Any:
@@ -1392,7 +1403,7 @@ class ConsoleService:
 
     def diff_sandbox(self, sid: str, actor: Actor) -> dict[str, Any]:
         with self._lock:
-            session = self._require_sandbox(sid)
+            session = self._require_sandbox(sid, actor)
             created: list[dict[str, Any]] = []
             updated: list[dict[str, Any]] = []
             deleted: list[dict[str, Any]] = []
@@ -1454,7 +1465,7 @@ class ConsoleService:
 
     def promote_sandbox(self, sid: str, actor: Actor) -> dict[str, Any]:
         with self._lock:
-            session = self._require_sandbox(sid)
+            session = self._require_sandbox(sid, actor)
             if not session.steps:
                 return {
                     "ok": True,
@@ -1489,9 +1500,9 @@ class ConsoleService:
                 "state_fingerprint": self.runtime.state_fingerprint(),
             }
 
-    def destroy_sandbox(self, sid: str) -> dict[str, Any]:
+    def destroy_sandbox(self, sid: str, actor: Actor) -> dict[str, Any]:
         with self._lock:
-            session = self._require_sandbox(sid)
+            session = self._require_sandbox(sid, actor)
             session.fork_runtime.close()
             self._sandboxes.pop(sid, None)
             current_primary_fp = self.runtime.state_fingerprint()
@@ -1502,6 +1513,253 @@ class ConsoleService:
                 "primary_fingerprint_unchanged": current_primary_fp == session.base_fingerprint,
                 "state_fingerprint": current_primary_fp,
             }
+
+    # -- pure-M2 audit / activity RLS filtering -----------------------------
+    @staticmethod
+    def _tags_from_snapshot(cls: type[Any] | None, snap: Mapping[str, Any] | None) -> list[str]:
+        if cls is None or not isinstance(snap, Mapping):
+            return []
+        tags: list[str] = []
+        for fld in getattr(cls, "__security_tag_fields__", ()) or ():
+            val = snap.get(fld)
+            if isinstance(val, str):
+                s = val.strip()
+                if s:
+                    tags.append(f"{fld}:{s}")
+            elif isinstance(val, (list, tuple, set)):
+                for elem in val:
+                    s = str(elem).strip()
+                    if s:
+                        tags.append(f"{fld}:{s}")
+        return tags
+
+    def _is_activity_visible_to_actor(
+        self,
+        *,
+        action_name: str,
+        run_actor_id: str,
+        params: Mapping[str, Any] | None,
+        diff: Mapping[str, Any] | None,
+        read_versions: Mapping[str, Any] | None,
+        actor: Actor,
+    ) -> bool:
+        """Pure-M2 fail-closed RLS check for action runs and shadow ledger entries."""
+        if actor.role in self.admin_roles or "*" in actor.clearance_tags:
+            return True
+
+        items_by_key: dict[tuple[str, str], tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]] = {}
+        queue: list[tuple[str, str, int]] = []
+        enqueued_depth: dict[tuple[str, str], int] = {}
+
+        def _add_item(
+            ot: str,
+            oid: str,
+            before_m: Mapping[str, Any] | None,
+            after_m: Mapping[str, Any] | None,
+            depth: int,
+        ) -> None:
+            if not ot or not oid:
+                return
+            key = (ot, oid)
+            prev_b, prev_a = items_by_key.get(key, (None, None))
+            items_by_key[key] = (before_m or prev_b, after_m or prev_a)
+            if key not in enqueued_depth or depth < enqueued_depth[key]:
+                enqueued_depth[key] = depth
+                queue.append((ot, oid, depth))
+
+        for raw in (diff or {}).get("object_changes") or ():
+            if not isinstance(raw, Mapping):
+                continue
+            ot = str(raw.get("object_type") or "")
+            oid = str(raw.get("object_id") or "")
+            b_m = raw.get("before") if isinstance(raw.get("before"), Mapping) else None
+            a_m = raw.get("after") if isinstance(raw.get("after"), Mapping) else None
+            _add_item(ot, oid, b_m, a_m, 0)
+
+        for rk in (read_versions or {}).keys():
+            if isinstance(rk, str) and ":" in rk:
+                ot, _, oid = rk.partition(":")
+                if ot in self.runtime.spec.object_types and oid:
+                    _add_item(ot, oid, None, None, 0)
+
+        if isinstance(params, Mapping):
+            if self.work_queue_binding is not None:
+                wb = self.work_queue_binding
+                p_ot = params.get(wb.target_type_field)
+                p_id = params.get(wb.target_id_field)
+                if isinstance(p_ot, str) and p_ot and isinstance(p_id, str) and p_id:
+                    _add_item(p_ot, p_id, None, None, 0)
+            for val in params.values():
+                if isinstance(val, str) and 0 < len(val) <= 128:
+                    s_val = val.strip()
+                    for ot_name in self.runtime.spec.object_types:
+                        if self.runtime.load_object(ot_name, s_val) is not None:
+                            _add_item(ot_name, s_val, None, None, 0)
+
+        idx = 0
+        while idx < len(queue):
+            ot, oid, depth = queue[idx]
+            idx += 1
+            if depth >= 2:
+                continue
+            cls = self.runtime.spec.object_types.get(ot)
+            loaded = self.runtime.load_object(ot, oid)
+            before_m, after_m = items_by_key[(ot, oid)]
+            cand_maps = [
+                m
+                for m in (before_m, after_m, loaded.data if loaded is not None else None)
+                if isinstance(m, Mapping)
+            ]
+            if cls is not None:
+                prop_map = getattr(cls, "__object_properties__", None) or {}
+                for fname, decl in prop_map.items():
+                    tgt_type = getattr(decl, "range", "")
+                    if not tgt_type:
+                        continue
+                    for pmap in cand_maps:
+                        raw_ref = pmap.get(fname)
+                        if isinstance(raw_ref, str) and raw_ref:
+                            _add_item(tgt_type, raw_ref, None, None, depth + 1)
+                        elif isinstance(raw_ref, (list, tuple, set)):
+                            for elem in raw_ref:
+                                if isinstance(elem, str) and elem:
+                                    _add_item(tgt_type, elem, None, None, depth + 1)
+            if self.work_queue_binding is not None and ot == self.work_queue_binding.object_type:
+                wb = self.work_queue_binding
+                for pmap in cand_maps:
+                    t_ot = pmap.get(wb.target_type_field)
+                    t_id = pmap.get(wb.target_id_field)
+                    if isinstance(t_ot, str) and t_ot and isinstance(t_id, str) and t_id:
+                        _add_item(t_ot, t_id, None, None, depth + 1)
+
+        has_accessible_tagged = False
+        for (ot, oid), (before_m, after_m) in items_by_key.items():
+            cls = self.runtime.spec.object_types.get(ot)
+            loaded = self.runtime.load_object(ot, oid)
+            tag_sets: list[list[str]] = []
+            b_tags = self._tags_from_snapshot(cls, before_m)
+            if b_tags:
+                tag_sets.append(b_tags)
+            a_tags = self._tags_from_snapshot(cls, after_m)
+            if a_tags:
+                tag_sets.append(a_tags)
+            if loaded is not None and loaded.security_tags:
+                tag_sets.append(list(loaded.security_tags))
+            for tag_list in tag_sets:
+                if not actor.has_access(tag_list):
+                    return False
+                has_accessible_tagged = True
+
+        if has_accessible_tagged:
+            return True
+
+        if run_actor_id and run_actor_id == actor.actor_id:
+            return True
+
+        if self.work_queue_binding is not None:
+            wb = self.work_queue_binding
+            if action_name in (wb.accept_op, wb.decline_op, wb.claim_op or "") or any(
+                ot == wb.object_type for ot, _ in items_by_key
+            ):
+                assignee_roles: set[str] = set()
+                requesters: set[str] = set()
+                if isinstance(params, Mapping):
+                    rv = params.get(wb.assignee_role_field)
+                    if isinstance(rv, str) and rv:
+                        assignee_roles.add(rv)
+                    rq = params.get(wb.requester_field)
+                    if isinstance(rq, str) and rq:
+                        requesters.add(rq)
+                for (ot, oid), (before_m, after_m) in items_by_key.items():
+                    if ot != wb.object_type:
+                        continue
+                    loaded = self.runtime.load_object(ot, oid)
+                    for pmap in (
+                        before_m,
+                        after_m,
+                        loaded.data if loaded is not None else None,
+                    ):
+                        if not isinstance(pmap, Mapping):
+                            continue
+                        rv = pmap.get(wb.assignee_role_field)
+                        if isinstance(rv, str) and rv:
+                            assignee_roles.add(rv)
+                        rq = pmap.get(wb.requester_field)
+                        if isinstance(rq, str) and rq:
+                            requesters.add(rq)
+                return actor.actor_id in requesters or actor.role in assignee_roles
+
+        act_def = self.runtime.spec.actions.get(action_name)
+        if act_def is None:
+            return False
+        if act_def.allowed_roles:
+            return actor.role in act_def.allowed_roles
+        return not actor.clearance_tags or "*" in actor.clearance_tags
+
+    def _filter_runs_for_actor(
+        self,
+        runs: Sequence[dict[str, Any]],
+        actor: Actor,
+    ) -> list[dict[str, Any]]:
+        return [
+            r
+            for r in runs
+            if self._is_activity_visible_to_actor(
+                action_name=str(r.get("action_type", "")),
+                run_actor_id=str(r.get("actor_id", "")),
+                params=r.get("params") if isinstance(r.get("params"), Mapping) else None,
+                diff=r.get("object_diff") if isinstance(r.get("object_diff"), Mapping) else None,
+                read_versions=(
+                    r.get("read_versions") if isinstance(r.get("read_versions"), Mapping) else None
+                ),
+                actor=actor,
+            )
+        ]
+
+    def _filter_shadow_for_actor(
+        self,
+        entries: Sequence[Any],
+        actor: Actor,
+    ) -> list[Any]:
+        return [
+            entry
+            for entry in entries
+            if self._is_activity_visible_to_actor(
+                action_name=str(entry.action),
+                run_actor_id=str(entry.actor_id),
+                params=entry.params if isinstance(entry.params, Mapping) else None,
+                diff=entry.diff if isinstance(entry.diff, Mapping) else None,
+                read_versions=None,
+                actor=actor,
+            )
+        ]
+
+    @staticmethod
+    def _build_shadow_report(entries: Sequence[Any]) -> dict[str, Any]:
+        shadow_entries = [e for e in entries if e.mode == "SHADOW"]
+        shadow_ok = sum(1 for e in shadow_entries if e.outcome == "SHADOW_RECORDED")
+        shadow_rej = sum(1 for e in shadow_entries if e.outcome == "SHADOW_WOULD_REJECT")
+        error_dist: dict[str, int] = {}
+        outcome_dist: dict[str, int] = {}
+        for entry in entries:
+            outcome_dist[entry.outcome] = outcome_dist.get(entry.outcome, 0) + 1
+            if entry.error_code:
+                error_dist[entry.error_code] = error_dist.get(entry.error_code, 0) + 1
+        return {
+            "total": len(entries),
+            "shadow_total": len(shadow_entries),
+            "shadow_would_approve": shadow_ok,
+            "shadow_would_reject": shadow_rej,
+            "shadow_would_approve_rate": (
+                round(shadow_ok / len(shadow_entries), 4) if shadow_entries else 0.0
+            ),
+            "auto_committed": sum(1 for e in entries if e.outcome == "AUTO_COMMITTED"),
+            "escalated": sum(
+                1 for e in entries if e.outcome in ("ESCALATED_COMMITTED", "ESCALATION_REQUIRED")
+            ),
+            "error_code_distribution": error_dist,
+            "outcome_distribution": outcome_dist,
+        }
 
     # -- audit ledger ------------------------------------------------------
     def get_audit(
@@ -1514,9 +1772,16 @@ class ConsoleService:
             display = self._merged_display()
             act_labels = display.get("actions") or {}
             status_arg = status.strip().upper() if status and status.strip().upper() in ("COMMITTED", "REJECTED", "REVERTED") else None
-            runs = self.runtime.list_action_runs(status_arg)
+            runs = self._filter_runs_for_actor(
+                self.runtime.list_action_runs(status_arg),
+                actor,
+            )
+            visible_ledger = self._filter_shadow_for_actor(
+                self.autonomy_controller.ledger,
+                actor,
+            )
 
-            ledger_by_run = {entry.run_id: entry for entry in self.autonomy_controller.ledger}
+            ledger_by_run = {entry.run_id: entry for entry in visible_ledger}
             enriched_runs: list[dict[str, Any]] = []
             for r in reversed(runs):
                 rid = str(r["run_id"])
@@ -1562,14 +1827,14 @@ class ConsoleService:
                     ),
                     "external_dirty_writes": 0,
                 }
-                for entry in reversed(self.autonomy_controller.ledger)
+                for entry in reversed(visible_ledger)
             ]
 
             return {
                 "ok": True,
                 "runs": enriched_runs,
                 "shadow_entries": shadow_entries,
-                "shadow_report": self.autonomy_controller.shadow_report(),
+                "shadow_report": self._build_shadow_report(visible_ledger),
                 "summary": {
                     "total_runs": len(runs),
                     "committed": sum(1 for r in runs if r["status"] == "COMMITTED"),
@@ -1799,6 +2064,10 @@ class ConsoleService:
                 }
 
             if self.assistant_responder is not None:
+                visible_runs = self._filter_runs_for_actor(
+                    self.runtime.list_action_runs(),
+                    actor,
+                )
                 custom = self.assistant_responder(
                     self.runtime,
                     actor,
@@ -1810,6 +2079,10 @@ class ConsoleService:
                             if self.work_queue_binding
                             else None
                         ),
+                        "visible_runs": visible_runs,
+                        "visible_rejected_runs": [
+                            r for r in visible_runs if r.get("status") == "REJECTED"
+                        ],
                     },
                 )
                 return {
@@ -1859,7 +2132,10 @@ class ConsoleService:
                         }
                     )
 
-        runs = self.runtime.list_action_runs()
+        runs = self._filter_runs_for_actor(
+            self.runtime.list_action_runs(),
+            actor,
+        )
         rejected = [r for r in runs if r["status"] == "REJECTED"]
         prof = self._actor_profile(actor)
         reply = (
@@ -2092,7 +2368,7 @@ def create_console_app(
     ) -> dict[str, Any]:
         actor = _actor_from_request(req)
         with service._lock:
-            sbx = service._require_sandbox(sid)
+            sbx = service._require_sandbox(sid, actor)
             return service.list_objects(
                 object_type,
                 actor,
@@ -2111,8 +2387,7 @@ def create_console_app(
 
     @app.delete("/api/sandboxes/{sid}")
     def api_sandbox_destroy(sid: str, req: Request) -> dict[str, Any]:
-        _actor_from_request(req)
-        return service.destroy_sandbox(sid)
+        return service.destroy_sandbox(sid, _actor_from_request(req))
 
     @app.get("/api/audit")
     def api_audit(req: Request, status: str | None = None) -> dict[str, Any]:

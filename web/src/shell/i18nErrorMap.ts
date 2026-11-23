@@ -94,3 +94,14 @@ export function displayActionName(actionName: string, display?: DisplayDictionar
 export function displayRoleName(roleName: string, display?: DisplayDictionary): string {
   return display?.roles?.[roleName] || roleName;
 }
+
+export function displayYuanFieldLabel(rawLabel: string, fieldName: string): string {
+  if (fieldName.endsWith('_cents')) {
+    return rawLabel.replace(/[（(]分[)）]$/, '');
+  }
+  return rawLabel;
+}
+
+export function displayEnumValue(rawVal: string, display?: DisplayDictionary): string {
+  return display?.statuses?.[rawVal] || rawVal;
+}

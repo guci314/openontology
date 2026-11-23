@@ -2,7 +2,13 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertCircle, CheckCircle2, FileText, Search, Shield } from 'lucide-react';
 import type { ConsoleMeta, RecordInstance, SchemaCatalog } from '../../api/client';
 import { consoleApi } from '../../api/client';
-import { displayEntityName, displayFieldName, getStatusBadgeMeta } from '../i18nErrorMap';
+import {
+  displayEntityName,
+  displayEnumValue,
+  displayFieldName,
+  displayYuanFieldLabel,
+  getStatusBadgeMeta,
+} from '../i18nErrorMap';
 import type { DomainViewPack } from '../packRegistry';
 import { WorkCardInbox } from '../components/WorkCardInbox';
 
@@ -298,7 +304,10 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
                     <th className="px-4 py-2.5">编号 / 名称</th>
                     {previewFields.map((fld) => (
                       <th key={fld.name} className="px-3 py-2.5">
-                        {fld.display_label || displayFieldName(selectedType, fld.name, meta.display)}
+                        {displayYuanFieldLabel(
+                          fld.display_label || displayFieldName(selectedType, fld.name, meta.display),
+                          fld.name
+                        )}
                       </th>
                     ))}
                     <th className="px-4 py-2.5 text-right">当前状态</th>
@@ -352,7 +361,12 @@ export const CockpitPage: React.FC<CockpitPageProps> = ({
                           </td>
                           {previewFields.map((fld) => {
                             const v = rec.properties[fld.name];
-                            let formatted = v === null || v === undefined || v === '' ? '—' : String(v);
+                            let formatted =
+                              v === null || v === undefined || v === ''
+                                ? '—'
+                                : typeof v === 'string'
+                                ? displayEnumValue(v, meta.display)
+                                : String(v);
                             if (typeof v === 'number') {
                               if (fld.name.endsWith('_cents')) {
                                 formatted = `¥${(v / 100).toLocaleString('zh-CN', { maximumFractionDigits: 0 })}`;

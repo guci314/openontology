@@ -29,6 +29,7 @@ Covers 4 verification gates:
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -403,6 +404,286 @@ def test_group_c_enterprise_api_auth_rls_workcard_sandbox_and_autonomy() -> None
         card_ids = {card.get("object_id") for card in chat_north["cards"]}
         assert "WO-202" not in card_ids
         assert "WO-202" not in chat_north["reply"]
+    finally:
+        svc.close()
+        svc.runtime.close()
+
+
+def test_group_c_security_bearer_fail_closed_anonymous_403() -> None:
+    """When demo_actor_switch=False, unauthenticated requests must fail closed with HTTP 403."""
+    strict_svc = build_console_service(mode="standalone", demo_actor_switch=False)
+    try:
+        strict_client = TestClient(create_console_app(strict_svc))
+
+        # Anonymous requests without Bearer token must be rejected across all protected surfaces
+        assert strict_client.get("/api/meta").status_code == 403
+        assert strict_client.get("/api/objects/O2cOrder").status_code == 403
+        assert strict_client.get("/api/admin/devices").status_code == 403
+        assert strict_client.post("/api/sandboxes").status_code == 403
+        assert strict_client.get("/api/audit").status_code == 403
+        assert strict_client.post("/api/assistant/chat", json={"message": "拦截统计"}).status_code == 403
+
+        # Malformed or invalid Bearer credentials fail closed
+        assert strict_client.get("/api/objects/O2cOrder", headers={"Authorization": "Basic abc"}).status_code == 403
+        assert strict_client.get("/api/objects/O2cOrder", headers={"Authorization": "Bearer invalid"}).status_code == 403
+
+        # Valid Bearer token is authenticated and scoped to plant_north only
+        north_auth = {"Authorization": f"Bearer {DEMO_TOKEN_SECRET['act-north-pm']}"}
+        orders = strict_client.get("/api/objects/O2cOrder", headers=north_auth)
+        assert orders.status_code == 200
+        order_ids = {it["object_id"] for it in orders.json()["items"]}
+        assert order_ids == {"SO-300", "SO-301"}
+        assert strict_client.get("/api/admin/devices", headers=north_auth).status_code == 403
+
+        # Anonymous DELETE on existing sandbox must be rejected with HTTP 403
+        created = strict_client.post("/api/sandboxes", headers=north_auth)
+        assert created.status_code == 200
+        sid = created.json()["sandbox_id"]
+        assert strict_client.delete(f"/api/sandboxes/{sid}").status_code == 403
+        assert strict_client.delete(f"/api/sandboxes/{sid}", headers=north_auth).status_code == 200
+    finally:
+        strict_svc.close()
+        strict_svc.runtime.close()
+
+
+def test_group_c_security_audit_and_assistant_cross_plant_rls() -> None:
+    """Audit runs, shadow ledger, summary counts, and assistant replies obey strict cross-plant RLS."""
+    svc = build_console_service(mode="standalone", demo_actor_switch=True)
+    try:
+        c = TestClient(create_console_app(svc))
+        cfo_hdr = {"X-Actor-Id": "act-cfo"}
+        north_hdr = {"X-Actor-Id": "act-north-pm"}
+
+        # Generate CFO GL and South plant shadow/rejected events on top of seeded history
+        assert c.put("/api/admin/autonomy", headers=cfo_hdr, json={"default_mode": "SHADOW"}).status_code == 200
+        assert (
+            c.post(
+                "/api/actions/submit",
+                headers=cfo_hdr,
+                json={"action": "confirm_p2p_order", "params": {"po_id": "PO-102"}},
+            ).status_code
+            == 200
+        )
+        assert (
+            c.post(
+                "/api/actions/submit",
+                headers=cfo_hdr,
+                json={"action": "post_journal_entry", "params": {"entry_id": "JE-MAINT-20K"}},
+            ).status_code
+            == 200
+        )
+        assert (
+            c.put(
+                "/api/admin/autonomy",
+                headers=cfo_hdr,
+                json={"default_mode": "AUTO_UNDER_CEILING", "max_value": 500000.0},
+            ).status_code
+            == 200
+        )
+        # Trigger rejected runs in South plant & CFO GL domain (both shadow ledger and runtime runs)
+        c.post(
+            "/api/actions/submit",
+            headers=cfo_hdr,
+            json={"action": "confirm_p2p_order", "params": {"po_id": "PO-102"}},
+        )
+        c.post(
+            "/api/actions/submit",
+            headers=cfo_hdr,
+            json={"action": "post_journal_entry", "params": {"entry_id": "JE-01-CAP"}},
+        )
+        cfo_actor = svc._demo_profiles["act-cfo"].to_actor(svc.org_directory)
+        for rid, act_name, act_params in (
+            ("RED-SOUTH-PO102", "confirm_p2p_order", {"po_id": "PO-102"}),
+            ("RED-CFO-JE01", "post_journal_entry", {"entry_id": "JE-01-CAP"}),
+        ):
+            try:
+                svc.runtime.submit_action(rid, act_name, act_params, cfo_actor)
+            except Exception:
+                pass
+
+        # North PM must see ZERO South plant or CFO GL runs / shadow entries
+        north_audit = c.get("/api/audit", headers=north_hdr).json()
+        assert north_audit["ok"] is True
+        runs_blob = json.dumps(north_audit["runs"], ensure_ascii=False)
+        shadow_blob = json.dumps(north_audit["shadow_entries"], ensure_ascii=False)
+        forbidden_ids = (
+            "PO-102",
+            "WO-202",
+            "SO-302",
+            "DEL-302",
+            "INV-302",
+            "CONS-202-1",
+            "OUT-202-1",
+            "SEED-JE-",
+            "JE-MAINT-20K",
+            "JE-01-CAP",
+            "RED-SOUTH-PO102",
+            "RED-CFO-JE01",
+        )
+        for leaked_id in forbidden_ids:
+            assert leaked_id not in runs_blob, f"Cross-plant/GL run leaked to act-north-pm: {leaked_id}"
+            assert leaked_id not in shadow_blob, f"Cross-plant/GL shadow leaked to act-north-pm: {leaked_id}"
+
+        assert north_audit["summary"]["total_runs"] == len(north_audit["runs"])
+        assert north_audit["summary"]["committed"] == sum(
+            1 for r in north_audit["runs"] if r["status"] == "COMMITTED"
+        )
+        assert north_audit["summary"]["rejected"] == sum(
+            1 for r in north_audit["runs"] if r["status"] == "REJECTED"
+        )
+        assert north_audit["shadow_report"]["total"] == len(north_audit["shadow_entries"])
+        assert "PRE-SHD-01" not in shadow_blob
+        assert [e["run_id"] for e in north_audit["shadow_entries"]] == ["PRE-SHD-02"]
+
+        north_rej = c.get("/api/audit?status=REJECTED", headers=north_hdr).json()
+        cfo_audit = c.get("/api/audit", headers=cfo_hdr).json()
+        cfo_rej = c.get("/api/audit?status=REJECTED", headers=cfo_hdr).json()
+        assert north_rej["summary"]["rejected"] == 1
+        assert cfo_rej["summary"]["rejected"] >= 3
+        assert len(cfo_audit["shadow_entries"]) >= 6
+
+        # Assistant must only summarize RLS-visible rejected runs
+        chat_north = c.post(
+            "/api/assistant/chat",
+            headers=north_hdr,
+            json={"message": "最近有哪些红线拦截、审计和报错？"},
+        ).json()
+        assert chat_north["ok"] is True
+        chat_blob = json.dumps(chat_north, ensure_ascii=False)
+        for leaked_id in ("PO-102", "WO-202", "SO-302", "JE-MAINT-20K", "JE-01-CAP", "post_journal_entry"):
+            assert leaked_id not in chat_blob, f"Assistant leaked {leaked_id} to act-north-pm"
+        assert {"label": "累计红线拦截", "value": f"{north_rej['summary']['rejected']} 次"} in chat_north["highlights"]
+
+        # CFO retains full global audit view
+        cfo_run_ids = {r["run_id"] for r in cfo_audit["runs"]}
+        assert "SEED-JE-01" in cfo_run_ids
+        assert "SEED-SO302-INV" in cfo_run_ids
+        assert "SEED-Z-RED-INV301" in cfo_run_ids
+        assert "RED-SOUTH-PO102" in cfo_run_ids
+    finally:
+        svc.close()
+        svc.runtime.close()
+
+    # Blind M2 verification on Starship: nav-alpha must never see sector:beta runs or shadow entries
+    star_svc = build_starship_console(demo_actor_switch=True)
+    try:
+        sc = TestClient(create_console_app(star_svc))
+        cmd_hdr = {"X-Actor-Id": "cmd-kirk"}
+        alpha_hdr = {"X-Actor-Id": "nav-alpha"}
+
+        sc.post(
+            "/api/actions/submit",
+            headers=cmd_hdr,
+            json={"action": "refuel_ship", "params": {"ship_id": "SS-02", "added_cells": 2}},
+        )
+        sc.put("/api/admin/autonomy", headers=cmd_hdr, json={"default_mode": "SHADOW"})
+        sc.post(
+            "/api/actions/submit",
+            headers=cmd_hdr,
+            json={"action": "jump_sector", "params": {"ship_id": "SS-02", "target_sector": "omega", "cost_cells": 99}},
+        )
+        sc.put("/api/admin/autonomy", headers=cmd_hdr, json={"default_mode": "AUTO_UNDER_CEILING", "max_value": 100.0})
+        sc.post(
+            "/api/actions/submit",
+            headers=cmd_hdr,
+            json={"action": "jump_sector", "params": {"ship_id": "SS-02", "target_sector": "omega", "cost_cells": 99}},
+        )
+        cmd_actor = star_svc._demo_profiles["cmd-kirk"].to_actor(star_svc.org_directory)
+        alpha_actor = star_svc._demo_profiles["nav-alpha"].to_actor(star_svc.org_directory)
+        try:
+            star_svc.runtime.submit_action(
+                "STAR-BETA-REJ",
+                "jump_sector",
+                {"ship_id": "SS-02", "target_sector": "omega", "cost_cells": 99},
+                cmd_actor,
+            )
+        except Exception:
+            pass
+        try:
+            star_svc.runtime.submit_action(
+                "STAR-ALPHA-REJ",
+                "jump_sector",
+                {"ship_id": "SS-01", "target_sector": "omega", "cost_cells": 99},
+                alpha_actor,
+            )
+        except Exception:
+            pass
+
+        alpha_audit = sc.get("/api/audit", headers=alpha_hdr).json()
+        assert "SS-02" not in json.dumps(alpha_audit["runs"], ensure_ascii=False)
+        assert "SS-02" not in json.dumps(alpha_audit["shadow_entries"], ensure_ascii=False)
+        assert "STAR-BETA-REJ" not in json.dumps(alpha_audit["runs"], ensure_ascii=False)
+        assert alpha_audit["summary"]["total_runs"] == len(alpha_audit["runs"]) == 1
+        assert alpha_audit["runs"][0]["run_id"] == "STAR-ALPHA-REJ"
+        assert alpha_audit["shadow_report"]["total"] == len(alpha_audit["shadow_entries"]) == 0
+
+        alpha_chat = sc.post(
+            "/api/assistant/chat",
+            headers=alpha_hdr,
+            json={"message": "拦截审计 Starship"},
+        ).json()
+        assert "SS-02" not in json.dumps(alpha_chat, ensure_ascii=False)
+        assert any(h["label"] == "红线拦截次数" and h["value"] == "1" for h in alpha_chat["highlights"])
+
+        cmd_audit = sc.get("/api/audit", headers=cmd_hdr).json()
+        assert "SS-02" in json.dumps(cmd_audit["runs"], ensure_ascii=False)
+        assert len(cmd_audit["shadow_entries"]) >= 2
+    finally:
+        star_svc.close()
+        star_svc.runtime.close()
+
+
+def test_group_c_security_sandbox_cross_actor_idor_and_eviction() -> None:
+    """Sandboxes reject non-owner non-admin IDOR across all 6 endpoints and evict bounded sessions."""
+    svc = build_console_service(mode="standalone", demo_actor_switch=True)
+    try:
+        c = TestClient(create_console_app(svc))
+        north_hdr = {"X-Actor-Id": "act-north-pm"}
+        south_hdr = {"X-Actor-Id": "act-south-sf"}
+        fin_hdr = {"X-Actor-Id": "act-fin"}
+        cfo_hdr = {"X-Actor-Id": "act-cfo"}
+
+        sbx = c.post("/api/sandboxes", headers=north_hdr).json()
+        assert sbx["ok"] is True
+        sid = sbx["sandbox_id"]
+
+        for intruder in (south_hdr, fin_hdr):
+            assert c.get(f"/api/sandboxes/{sid}/diff", headers=intruder).status_code == 403
+            assert c.get(f"/api/sandboxes/{sid}/objects/WorkOrder", headers=intruder).status_code == 403
+            assert (
+                c.post(
+                    f"/api/sandboxes/{sid}/submit",
+                    headers=intruder,
+                    json={"action": "release_work_order", "params": {"work_order_id": "WO-201"}},
+                ).status_code
+                == 403
+            )
+            assert (
+                c.post(
+                    f"/api/sandboxes/{sid}/function/compute_trial_balance",
+                    headers=intruder,
+                    json={},
+                ).status_code
+                == 403
+            )
+            assert c.post(f"/api/sandboxes/{sid}/promote", headers=intruder).status_code == 403
+            assert c.delete(f"/api/sandboxes/{sid}", headers=intruder).status_code == 403
+
+        # Owner and admin are allowed to inspect and manage the sandbox
+        assert c.get(f"/api/sandboxes/{sid}/diff", headers=north_hdr).status_code == 200
+        assert c.get(f"/api/sandboxes/{sid}/objects/WorkOrder", headers=north_hdr).status_code == 200
+        assert c.get(f"/api/sandboxes/{sid}/diff", headers=cfo_hdr).status_code == 200
+        assert c.delete(f"/api/sandboxes/{sid}", headers=north_hdr).status_code == 200
+
+        # Bounded sandbox eviction (> 32 concurrent sandboxes evicts oldest)
+        created_ids: list[str] = []
+        for _ in range(35):
+            r = c.post("/api/sandboxes", headers=north_hdr)
+            assert r.status_code == 200
+            created_ids.append(r.json()["sandbox_id"])
+        assert len(svc._sandboxes) <= 32
+        assert c.get(f"/api/sandboxes/{created_ids[0]}/diff", headers=north_hdr).status_code == 404
+        assert c.get(f"/api/sandboxes/{created_ids[-1]}/diff", headers=north_hdr).status_code == 200
     finally:
         svc.close()
         svc.runtime.close()

@@ -9,7 +9,9 @@ import type {
 import { consoleApi } from '../../api/client';
 import {
   displayEntityName,
+  displayEnumValue,
   displayFieldName,
+  displayYuanFieldLabel,
   getStatusBadgeMeta,
 } from '../i18nErrorMap';
 import { LineageGraph } from './LineageGraph';
@@ -55,6 +57,7 @@ const formatDisplayValue = (
     }
   }
   if (Array.isArray(val)) return val.join(', ');
+  if (typeof val === 'string') return displayEnumValue(val, meta.display);
   return String(val);
 };
 
@@ -189,9 +192,11 @@ export const DynamicObjectDrawer: React.FC<DynamicObjectDrawerProps> = ({
                   <dl className="divide-y divide-slate-100">
                     {orderedFields.map((fld) => {
                       const rawVal = props[fld.name];
-                      const label =
-                        ('display_label' in fld && fld.display_label) ||
-                        displayFieldName(target.entityType, fld.name, meta.display);
+                      const rawLabel =
+                        'display_label' in fld && fld.display_label
+                          ? String(fld.display_label)
+                          : displayFieldName(target.entityType, fld.name, meta.display);
+                      const label = displayYuanFieldLabel(rawLabel, fld.name);
                       const isRel = fld.property_kind === 'object' && fld.range && rawVal;
                       const isOwned = fld.owned || ownedSet.has(fld.name);
 

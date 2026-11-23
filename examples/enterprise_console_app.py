@@ -373,6 +373,11 @@ def _merge_std_display(spec: OntologySpec) -> None:
                 "source_event": "来源履约凭证",
                 "output_event": "产出履约凭证",
             },
+            "statuses": {
+                "enterprise_direct": "企业直销",
+                "key_account": "大客户直签",
+                "partner_oem": "OEM 伙伴",
+            },
         }
     )
 
@@ -538,7 +543,7 @@ def enterprise_assistant_responder(
         return {"reply": reply, "highlights": highlights, "cards": cards}
 
     if any(kw in q for kw in ("拦截", "红线", "审计", "报错", "为什么", "block")):
-        rejected = [r for r in runtime.list_action_runs("REJECTED")]
+        rejected = list(context.get("visible_rejected_runs") or ())
         latest = rejected[-1] if rejected else None
         highlights = [
             {"label": "累计红线拦截", "value": f"{len(rejected)} 次"},

@@ -19,6 +19,7 @@ import {
   displayActionName,
   displayEntityName,
   displayFieldName,
+  displayYuanFieldLabel,
   translateError,
 } from '../i18nErrorMap';
 import type { DomainViewPack } from '../packRegistry';
@@ -472,7 +473,10 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
                           className="grid grid-cols-12 items-center gap-2 px-3 py-2 text-xs"
                         >
                           <span className="col-span-4 font-medium text-slate-600">
-                            {displayFieldName(u.object_type, fd.field, meta.display)}
+                            {displayYuanFieldLabel(
+                              displayFieldName(u.object_type, fd.field, meta.display),
+                              fd.field
+                            )}
                           </span>
                           <span className="col-span-4 font-mono tabular-nums text-slate-400 line-through">
                             {fd.field.endsWith('_cents') && typeof fd.primary === 'number'

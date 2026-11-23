@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { CheckCircle2, RefreshCw, ShieldAlert, ShieldCheck, UserCheck } from 'lucide-react';
 import type { AuditResponse, AuditRunEntry, ConsoleMeta } from '../../api/client';
 import { consoleApi } from '../../api/client';
-import { displayFieldName, translateError } from '../i18nErrorMap';
+import { displayFieldName, displayYuanFieldLabel, translateError } from '../i18nErrorMap';
 
 interface AuditPageProps {
   meta: ConsoleMeta;
@@ -212,7 +212,11 @@ export const AuditPage: React.FC<AuditPageProps> = ({ meta, refreshTick }) => {
                                   className="inline-flex items-center gap-1 rounded bg-white px-2 py-0.5 font-mono text-[11px] text-slate-700 ring-1 ring-slate-200"
                                 >
                                   <span className="font-sans text-slate-500">
-                                    {displayFieldName(chg.object_type, d.field, meta.display)}:
+                                    {displayYuanFieldLabel(
+                                      displayFieldName(chg.object_type, d.field, meta.display),
+                                      d.field
+                                    )}
+                                    :
                                   </span>
                                   <span className="text-slate-400 line-through">
                                     {fmtAuditVal(d.field, d.before)}
