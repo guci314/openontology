@@ -266,12 +266,11 @@ def _has_completed_scrap_work_card(ctx: Any, output_id: str) -> bool:
     return False
 
 
-@spec.action(
+@spec.edit_function(
     "release_work_order",
     ReleaseWorkOrderParams,
-    allowed_roles=("production_planner", "plant_manager", "ops", "steward", "ai_agent", "admin"),
-    touched_object_types=("WorkOrder",),
     description="校验 BOM 有效与正计划量后将草稿生产工单下达至车间（draft -> released）。",
+    touched_object_types=("WorkOrder",),
 )
 def release_work_order(ctx: Any, params: ReleaseWorkOrderParams) -> None:
     wo = ctx.require(WorkOrder, params.work_order_id)
@@ -303,13 +302,19 @@ def release_work_order(ctx: Any, params: ReleaseWorkOrderParams) -> None:
         )
     ctx.modify(wo, status="released")
 
+spec.declare_action(
+    "release_work_order",
+    edit_function="release_work_order",
+    allowed_roles=("production_planner", "plant_manager", "ops", "steward", "ai_agent", "admin"),
+    description="校验 BOM 有效与正计划量后将草稿生产工单下达至车间（draft -> released）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "issue_material_to_work_order",
     IssueMaterialToWorkOrderParams,
-    allowed_roles=("warehouse", "shopfloor", "production_planner", "plant_manager", "ops", "steward", "ai_agent", "admin"),
-    touched_object_types=("WorkOrder", "MaterialConsumption"),
     description="向已下达或生产中工单领料投料，自动推进至 in_progress 并累加投入成本。",
+    touched_object_types=("WorkOrder", "MaterialConsumption"),
 )
 def issue_material_to_work_order(ctx: Any, params: IssueMaterialToWorkOrderParams) -> None:
     wo = ctx.require(WorkOrder, params.work_order_id)
@@ -366,13 +371,19 @@ def issue_material_to_work_order(ctx: Any, params: IssueMaterialToWorkOrderParam
         status="in_progress",
     )
 
+spec.declare_action(
+    "issue_material_to_work_order",
+    edit_function="issue_material_to_work_order",
+    allowed_roles=("warehouse", "shopfloor", "production_planner", "plant_manager", "ops", "steward", "ai_agent", "admin"),
+    description="向已下达或生产中工单领料投料，自动推进至 in_progress 并累加投入成本。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "record_production_output",
     RecordProductionOutputParams,
-    allowed_roles=("shopfloor", "production_planner", "plant_manager", "ops", "steward", "ai_agent", "admin"),
-    touched_object_types=("WorkOrder", "ProductionOutput"),
     description="登记工单完工与报废产出；强守未投料禁报工、吸收成本守恒及超损耗率 WorkCard 审批门禁。",
+    touched_object_types=("WorkOrder", "ProductionOutput"),
 )
 def record_production_output(ctx: Any, params: RecordProductionOutputParams) -> None:
     wo = ctx.require(WorkOrder, params.work_order_id)
@@ -448,13 +459,19 @@ def record_production_output(ctx: Any, params: RecordProductionOutputParams) -> 
         completed_scrap_qty=cum_scrap,
     )
 
+spec.declare_action(
+    "record_production_output",
+    edit_function="record_production_output",
+    allowed_roles=("shopfloor", "production_planner", "plant_manager", "ops", "steward", "ai_agent", "admin"),
+    description="登记工单完工与报废产出；强守未投料禁报工、吸收成本守恒及超损耗率 WorkCard 审批门禁。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "close_work_order",
     CloseWorkOrderParams,
-    allowed_roles=("production_planner", "plant_manager", "shopfloor", "ops", "steward", "ai_agent", "admin"),
-    touched_object_types=("WorkOrder",),
     description="完工关闭工单（须已领料且有良品产出）或取消未领料工单（已领料工单禁直接取消）。",
+    touched_object_types=("WorkOrder",),
 )
 def close_work_order(ctx: Any, params: CloseWorkOrderParams) -> None:
     wo = ctx.require(WorkOrder, params.work_order_id)
@@ -493,6 +510,13 @@ def close_work_order(ctx: Any, params: CloseWorkOrderParams) -> None:
             code="WORK_ORDER_NO_GOOD_OUTPUT",
         )
     ctx.modify(wo, status="completed")
+
+spec.declare_action(
+    "close_work_order",
+    edit_function="close_work_order",
+    allowed_roles=("production_planner", "plant_manager", "shopfloor", "ops", "steward", "ai_agent", "admin"),
+    description="完工关闭工单（须已领料且有良品产出）或取消未领料工单（已领料工单禁直接取消）。",
+)
 
 
 @spec.function(

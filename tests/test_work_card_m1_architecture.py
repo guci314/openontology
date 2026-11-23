@@ -148,12 +148,7 @@ def _build_o2c_work_card_spec(*, coupled_source: bool = False) -> tuple[Ontology
                 )
         return True
 
-    @s.action(
-        "confirm_order",
-        _ConfirmOrderParams,
-        allowed_roles=("ai_agent", "steward", "admin"),
-        affects_source=coupled_source,
-    )
+    @s.edit_function("confirm_order", _ConfirmOrderParams)
     def _confirm_order(ctx: EditBatch, params: _ConfirmOrderParams) -> None:
         order = ctx.require(SalesOrder, params.order_id)
         cust = ctx.require(Customer, str(order.customer))
@@ -164,12 +159,14 @@ def _build_o2c_work_card_spec(*, coupled_source: bool = False) -> tuple[Ontology
             )
         ctx.modify(order, status="confirmed")
 
-    @s.action(
-        "cancel_order",
-        _CancelOrderParams,
+    s.declare_action(
+        "confirm_order",
+        edit_function="confirm_order",
         allowed_roles=("ai_agent", "steward", "admin"),
-        affects_source=False,
+        affects_source=coupled_source,
     )
+
+    @s.edit_function("cancel_order", _CancelOrderParams)
     def _cancel_order(ctx: EditBatch, params: _CancelOrderParams) -> None:
         order = ctx.require(SalesOrder, params.order_id)
         active_cards = [
@@ -186,12 +183,14 @@ def _build_o2c_work_card_spec(*, coupled_source: bool = False) -> tuple[Ontology
             )
         ctx.modify(order, status="cancelled")
 
-    @s.action(
-        "open_support_case",
-        _OpenCaseParams,
-        allowed_roles=("ai_agent", "ops", "steward", "admin"),
+    s.declare_action(
+        "cancel_order",
+        edit_function="cancel_order",
+        allowed_roles=("ai_agent", "steward", "admin"),
         affects_source=False,
     )
+
+    @s.edit_function("open_support_case", _OpenCaseParams)
     def _open_case(ctx: EditBatch, params: _OpenCaseParams) -> None:
         ctx.require(Customer, params.customer_id)
         ctx.create(
@@ -203,15 +202,24 @@ def _build_o2c_work_card_spec(*, coupled_source: bool = False) -> tuple[Ontology
             )
         )
 
-    @s.action(
-        "resolve_support_case",
-        _ResolveCaseParams,
-        allowed_roles=("ops", "steward", "admin"),
+    s.declare_action(
+        "open_support_case",
+        edit_function="open_support_case",
+        allowed_roles=("ai_agent", "ops", "steward", "admin"),
         affects_source=False,
     )
+
+    @s.edit_function("resolve_support_case", _ResolveCaseParams)
     def _resolve_case(ctx: EditBatch, params: _ResolveCaseParams) -> None:
         case = ctx.require(SupportCase, params.case_id)
         ctx.modify(case, status="RESOLVED")
+
+    s.declare_action(
+        "resolve_support_case",
+        edit_function="resolve_support_case",
+        allowed_roles=("ops", "steward", "admin"),
+        affects_source=False,
+    )
 
     register_work_card_primitives(s)
     return s, Customer, SupportCase, SalesOrder
@@ -859,15 +867,17 @@ def test_complete_work_card_blocks_privilege_escalation_on_target_action() -> No
     class _AdminOverrideParams(BaseModel):
         order_id: str
 
-    @spec.action(
-        "admin_override_order",
-        _AdminOverrideParams,
-        allowed_roles=("admin",),
-        affects_source=False,
-    )
+    @spec.edit_function("admin_override_order", _AdminOverrideParams)
     def _admin_override_order(ctx: EditBatch, params: _AdminOverrideParams) -> None:
         order = ctx.require(SalesOrder, params.order_id)
         ctx.modify(order, status="confirmed")
+
+    spec.declare_action(
+        "admin_override_order",
+        edit_function="admin_override_order",
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
 
     admin_actor = Actor(actor_id="human:admin-1", role="admin", clearance_tags={"*"})
     rt = OntologyRuntime(spec, db_path=":memory:")

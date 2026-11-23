@@ -81,13 +81,7 @@ def _build_routing_spec() -> tuple[OntologySpec, type[ObjectType], type[ObjectTy
     class EmptyParams(BaseModel):
         pass
 
-    @spec.action(
-        "assign_lane",
-        AssignLaneParams,
-        allowed_roles=("ops", "director"),
-        revert_roles=("director",),
-        affects_source=True,
-    )
+    @spec.edit_function("assign_lane", AssignLaneParams)
     def assign_lane(ctx: Any, params: AssignLaneParams) -> None:
         task = ctx.require(DeliveryTask, params.task_id)
         lane = ctx.require(RouteLane, params.lane_id)
@@ -100,12 +94,15 @@ def _build_routing_spec() -> tuple[OntologySpec, type[ObjectType], type[ObjectTy
             )
         ctx.modify(task, status="routed", lane_id=lane.lane_id)
 
-    @spec.action(
-        "complete_delivery",
-        DeliverParams,
+    spec.declare_action(
+        "assign_lane",
+        edit_function="assign_lane",
         allowed_roles=("ops", "director"),
+        revert_roles=("director",),
         affects_source=True,
     )
+
+    @spec.edit_function("complete_delivery", DeliverParams)
     def complete_delivery(ctx: Any, params: DeliverParams) -> None:
         task = ctx.require(DeliveryTask, params.task_id)
         if task.status != "routed" or not task.lane_id:
@@ -115,15 +112,24 @@ def _build_routing_spec() -> tuple[OntologySpec, type[ObjectType], type[ObjectTy
             raise InvariantError("assigned lane is closed", code="LANE_CLOSED")
         ctx.modify(task, status="delivered")
 
-    @spec.action(
-        "annotate_task",
-        NoteParams,
+    spec.declare_action(
+        "complete_delivery",
+        edit_function="complete_delivery",
         allowed_roles=("ops", "director"),
-        affects_source=False,
+        affects_source=True,
     )
+
+    @spec.edit_function("annotate_task", NoteParams)
     def annotate_task(ctx: Any, params: NoteParams) -> None:
         task = ctx.require(DeliveryTask, params.task_id)
         ctx.modify(task, dispatch_note=params.dispatch_note)
+
+    spec.declare_action(
+        "annotate_task",
+        edit_function="annotate_task",
+        allowed_roles=("ops", "director"),
+        affects_source=False,
+    )
 
     @spec.function("eval_delivery_value", EmptyParams, description="评估调度棋盘终局分")
     def eval_delivery_value(view: Any, _params: EmptyParams) -> float:

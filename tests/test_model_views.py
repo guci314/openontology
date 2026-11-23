@@ -76,15 +76,17 @@ def _build_spec() -> OntologySpec:
     def widget_briefing(runtime: Any, params: WidgetFunctionParams) -> dict[str, Any]:
         return {"widget_id": params.widget_id}
 
-    @spec.action(
+    @spec.edit_function("activate_widget", WidgetActionParams, description="激活部件")
+    def activate_widget(runtime: Any, params: WidgetActionParams) -> None:
+        return None
+
+    spec.declare_action(
         "activate_widget",
-        params=WidgetActionParams,
+        edit_function="activate_widget",
         allowed_roles=("ops",),
         revert_roles=("manager",),
         description="激活部件",
     )
-    def activate_widget(runtime: Any, params: WidgetActionParams) -> None:
-        return None
 
     @spec.automation(
         "watch_widget",
@@ -187,6 +189,8 @@ def test_describe_behavior_keeps_existing_contract_shape():
     assert set(action) == {
         "name",
         "description",
+        "implementation_kind",
+        "edit_function",
         "allowed_roles",
         "revert_roles",
         "affects_source",
@@ -195,6 +199,8 @@ def test_describe_behavior_keeps_existing_contract_shape():
     }
     assert action["visibility"] == "public"
     assert action["name"] == "activate_widget"
+    assert action["implementation_kind"] == "edit_function"
+    assert action["edit_function"] == "activate_widget"
     assert action["allowed_roles"] == ["ops"]
     assert action["revert_roles"] == ["manager"]
     assert action["affects_source"] is True
@@ -355,26 +361,28 @@ def test_role_def_validation_and_behavior_projection():
     with pytest.raises(UnknownRoleError):
         strict_spec.object_type(SecretItem)
 
-    @strict_spec.action("do_op", params=WidgetActionParams, allowed_roles=("operator",))
+    @strict_spec.edit_function("do_op", params=WidgetActionParams)
     def do_op(runtime: Any, params: WidgetActionParams) -> None:
         return None
 
-    with pytest.raises(UnknownRoleError):
-
-        @strict_spec.action("bad_op", params=WidgetActionParams, allowed_roles=("ghost",))
-        def bad_op(runtime: Any, params: WidgetActionParams) -> None:
-            return None
+    strict_spec.declare_action("do_op", edit_function="do_op", allowed_roles=("operator",))
 
     with pytest.raises(UnknownRoleError):
+        strict_spec.declare_action(
+            "bad_op",
+            edit_function="do_op",
+            params=WidgetActionParams,
+            allowed_roles=("ghost",),
+        )
 
-        @strict_spec.action(
+    with pytest.raises(UnknownRoleError):
+        strict_spec.declare_action(
             "bad_revert_role",
+            edit_function="do_op",
             params=WidgetActionParams,
             allowed_roles=("operator",),
             revert_roles=("missing_mgr",),
         )
-        def bad_revert_role(runtime: Any, params: WidgetActionParams) -> None:
-            return None
 
     behavior = describe_behavior(strict_spec)
     assert behavior["roles"] == [
@@ -410,22 +418,28 @@ def test_describe_openapi_filters_actions_by_role_and_rewrites_refs():
     s.interface("Named", required_fields=("name",))
     s.object_type(Widget)
 
-    @s.action("public_worker", params=ComplexActionParams, allowed_roles=("worker",))
+    @s.edit_function("public_worker", ComplexActionParams)
     def public_worker(runtime: Any, params: ComplexActionParams) -> None:
         return None
 
-    @s.action("admin_only", params=WidgetActionParams, allowed_roles=("admin",))
+    s.declare_action("public_worker", edit_function="public_worker", allowed_roles=("worker",))
+
+    @s.edit_function("admin_only", WidgetActionParams)
     def admin_only(runtime: Any, params: WidgetActionParams) -> None:
         return None
 
-    @s.action(
+    s.declare_action("admin_only", edit_function="admin_only", allowed_roles=("admin",))
+
+    @s.edit_function("secret_internal", WidgetActionParams)
+    def secret_internal(runtime: Any, params: WidgetActionParams) -> None:
+        return None
+
+    s.declare_action(
         "secret_internal",
-        params=WidgetActionParams,
+        edit_function="secret_internal",
         allowed_roles=("worker",),
         visibility="private",
     )
-    def secret_internal(runtime: Any, params: WidgetActionParams) -> None:
-        return None
 
     doc = describe_openapi(
         s,

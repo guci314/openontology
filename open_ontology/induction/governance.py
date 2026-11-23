@@ -279,11 +279,9 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
         },
     }
 
-    @spec.action(
+    @spec.edit_function(
         "record_friction_cluster",
         _RecordFrictionParams,
-        allowed_roles=("falsifier", "steward"),
-        affects_source=False,
         description="登记经聚类去噪后的 M0 生产摩擦证据簇",
     )
     def _record_friction(ctx: EditBatch, params: _RecordFrictionParams) -> None:
@@ -309,11 +307,17 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             )
         )
 
-    @spec.action(
+    spec.declare_action(
+        "record_friction_cluster",
+        edit_function="record_friction_cluster",
+        allowed_roles=("falsifier", "steward"),
+        affects_source=False,
+        description="登记经聚类去噪后的 M0 生产摩擦证据簇",
+    )
+
+    @spec.edit_function(
         "propose_genesis_model",
         _ProposeGenesisParams,
-        allowed_roles=("ontology_builder",),
-        affects_source=False,
         description="由 Ontology Builder 提交 0->1 创世候选蓝图",
     )
     def _propose_genesis(ctx: EditBatch, params: _ProposeGenesisParams) -> None:
@@ -340,11 +344,17 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             )
         )
 
-    @spec.action(
+    spec.declare_action(
+        "propose_genesis_model",
+        edit_function="propose_genesis_model",
+        allowed_roles=("ontology_builder",),
+        affects_source=False,
+        description="由 Ontology Builder 提交 0->1 创世候选蓝图",
+    )
+
+    @spec.edit_function(
         "propose_evolution_patch",
         _ProposeEvolutionParams,
-        allowed_roles=("ontology_evolver",),
-        affects_source=False,
         description="由 Ontology Evolver 提交 1->N 演化差异补丁提案",
     )
     def _propose_evolution(ctx: EditBatch, params: _ProposeEvolutionParams) -> None:
@@ -377,11 +387,17 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             )
         )
 
-    @spec.action(
+    spec.declare_action(
+        "propose_evolution_patch",
+        edit_function="propose_evolution_patch",
+        allowed_roles=("ontology_evolver",),
+        affects_source=False,
+        description="由 Ontology Evolver 提交 1->N 演化差异补丁提案",
+    )
+
+    @spec.edit_function(
         "revise_proposal",
         _ReviseProposalParams,
-        allowed_roles=("ontology_builder", "ontology_evolver"),
-        affects_source=False,
         description="根据 Symbolic Crucible 反例修订被拒提案",
     )
     def _revise_proposal(ctx: EditBatch, params: _ReviseProposalParams) -> None:
@@ -404,11 +420,17 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             last_report_blueprint_hash="",
         )
 
-    @spec.action(
+    spec.declare_action(
+        "revise_proposal",
+        edit_function="revise_proposal",
+        allowed_roles=("ontology_builder", "ontology_evolver"),
+        affects_source=False,
+        description="根据 Symbolic Crucible 反例修订被拒提案",
+    )
+
+    @spec.edit_function(
         "record_falsification_report",
         _RecordFalsificationParams,
-        allowed_roles=("falsifier",),
-        affects_source=False,
         description="由非拟人化 Symbolic Crucible 签发绑定 blueprint_hash 的不可篡改证伪报告",
     )
     def _record_report(ctx: EditBatch, params: _RecordFalsificationParams) -> None:
@@ -443,6 +465,14 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             last_report_passed=params.passed,
             last_report_blueprint_hash=actual_hash,
         )
+
+    spec.declare_action(
+        "record_falsification_report",
+        edit_function="record_falsification_report",
+        allowed_roles=("falsifier",),
+        affects_source=False,
+        description="由非拟人化 Symbolic Crucible 签发绑定 blueprint_hash 的不可篡改证伪报告",
+    )
 
     def _assert_optimistic_base(ctx: EditBatch, prop: ModelProposal) -> ActiveModelHead | None:
         head = ctx.get(ActiveModelHead, prop.model_id)
@@ -482,11 +512,9 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
                 code="BLUEPRINT_HASH_MISMATCH",
             )
 
-    @spec.action(
+    @spec.edit_function(
         "request_crystallization",
         _RequestCrystallizationParams,
-        allowed_roles=("ontology_builder", "ontology_evolver", "steward"),
-        affects_source=False,
         description="将五关全绿的提案同步推进为 AWAITING_APPROVAL 等待 Steward t1 签批",
     )
     def _request_crystallization(ctx: EditBatch, params: _RequestCrystallizationParams) -> None:
@@ -506,11 +534,17 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             approval_note=params.approval_note,
         )
 
-    @spec.action(
+    spec.declare_action(
+        "request_crystallization",
+        edit_function="request_crystallization",
+        allowed_roles=("ontology_builder", "ontology_evolver", "steward"),
+        affects_source=False,
+        description="将五关全绿的提案同步推进为 AWAITING_APPROVAL 等待 Steward t1 签批",
+    )
+
+    @spec.edit_function(
         "approve_crystallization",
         _ApproveCrystallizationParams,
-        allowed_roles=("steward",),
-        affects_source=False,
         description="Steward 在 t1 现场重算基线与哈希并同步结晶新模型版本（无跨期 diff 队列）",
     )
     def _approve_crystallization(ctx: EditBatch, params: _ApproveCrystallizationParams) -> None:
@@ -604,11 +638,17 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             approval_note=params.approval_note or prop.approval_note,
         )
 
-    @spec.action(
-        "reject_crystallization",
-        _RejectCrystallizationParams,
+    spec.declare_action(
+        "approve_crystallization",
+        edit_function="approve_crystallization",
         allowed_roles=("steward",),
         affects_source=False,
+        description="Steward 在 t1 现场重算基线与哈希并同步结晶新模型版本（无跨期 diff 队列）",
+    )
+
+    @spec.edit_function(
+        "reject_crystallization",
+        _RejectCrystallizationParams,
         description="Steward 同步驳回处于 AWAITING_APPROVAL 状态的演进提案",
     )
     def _reject_crystallization(ctx: EditBatch, params: _RejectCrystallizationParams) -> None:
@@ -630,11 +670,17 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             rejection_reason=params.reason,
         )
 
-    @spec.action(
-        "rollback_crystallization",
-        _RollbackCrystallizationParams,
+    spec.declare_action(
+        "reject_crystallization",
+        edit_function="reject_crystallization",
         allowed_roles=("steward",),
         affects_source=False,
+        description="Steward 同步驳回处于 AWAITING_APPROVAL 状态的演进提案",
+    )
+
+    @spec.edit_function(
+        "rollback_crystallization",
+        _RollbackCrystallizationParams,
         description="Steward 将已结晶版本回退至栈中上一稳定版本，并停用该版本新增的黄金回归用例",
     )
     def _rollback(ctx: EditBatch, params: _RollbackCrystallizationParams) -> None:
@@ -671,6 +717,14 @@ def build_induction_governance_spec(*, allow_self_approval: bool = False) -> Ont
             version_stack_json=json.dumps(stack, ensure_ascii=False),
             inactive_versions_json=json.dumps(inactive, ensure_ascii=False),
         )
+
+    spec.declare_action(
+        "rollback_crystallization",
+        edit_function="rollback_crystallization",
+        allowed_roles=("steward",),
+        affects_source=False,
+        description="Steward 将已结晶版本回退至栈中上一稳定版本，并停用该版本新增的黄金回归用例",
+    )
 
     return spec
 

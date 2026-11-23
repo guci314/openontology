@@ -136,9 +136,15 @@ def test_anti_smuggling_catches_blackbox_god_action() -> None:
     class MagicParams(BaseModel):
         goal: str
 
-    @spec.action("execute_magic_goal", MagicParams, allowed_roles=("ai_agent",))
+    @spec.edit_function("execute_magic_goal", MagicParams)
     def _noop_handler(ctx, params: MagicParams) -> None:
         return None  # Black-box pass-through: mutates zero ontology objects!
+
+    spec.declare_action(
+        "execute_magic_goal",
+        edit_function="execute_magic_goal",
+        allowed_roles=("ai_agent",),
+    )
 
     m0 = [{"object_type": "DummyToken", "data": {"token_id": "T-1", "label": "ok"}}]
     actor = Actor(actor_id="agent:1", role="ai_agent")

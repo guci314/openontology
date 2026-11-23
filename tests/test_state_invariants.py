@@ -84,12 +84,7 @@ def _make_bank_spec(
     spec.role("operator")
     spec.object_type(_Account)
 
-    @spec.action(
-        "create_account",
-        _CreateAccountParams,
-        allowed_roles=("admin", "operator"),
-        affects_source=False,
-    )
+    @spec.edit_function("create_account", _CreateAccountParams)
     def create_account(ctx, params):
         ctx.create(
             _Account(
@@ -99,6 +94,13 @@ def _make_bank_spec(
             )
         )
 
+    spec.declare_action(
+        "create_account",
+        edit_function="create_account",
+        allowed_roles=("admin", "operator"),
+        affects_source=False,
+    )
+
     if require_approval:
         register_work_card_primitives(
             spec,
@@ -106,13 +108,7 @@ def _make_bank_spec(
             resolver_roles=("admin",),
         )
 
-    @spec.action(
-        "adjust_balance",
-        _AdjustParams,
-        allowed_roles=("admin", "operator"),
-        revert_roles=("admin",),
-        affects_source=False,
-    )
+    @spec.edit_function("adjust_balance", _AdjustParams)
     def adjust_balance(ctx, params):
         if require_approval and ctx.actor.role != "admin":
             raise InvariantError(
@@ -122,12 +118,15 @@ def _make_bank_spec(
         acc = ctx.require(_Account, params.account_id)
         ctx.modify(acc, balance=acc.balance + params.delta)
 
-    @spec.action(
-        "delete_account",
-        _DeleteAccountParams,
-        allowed_roles=("admin",),
+    spec.declare_action(
+        "adjust_balance",
+        edit_function="adjust_balance",
+        allowed_roles=("admin", "operator"),
+        revert_roles=("admin",),
         affects_source=False,
     )
+
+    @spec.edit_function("delete_account", _DeleteAccountParams)
     def delete_account(ctx, params):
         acc = ctx.require(_Account, params.account_id)
         ctx.delete(acc)
@@ -135,18 +134,27 @@ def _make_bank_spec(
         remaining_ids = {item.account_id for item in ctx.query(_Account)}
         assert params.account_id not in remaining_ids
 
-    @spec.action(
-        "retag_account",
-        _RetagParams,
-        allowed_roles=("admin", "operator"),
+    spec.declare_action(
+        "delete_account",
+        edit_function="delete_account",
+        allowed_roles=("admin",),
         affects_source=False,
     )
+
+    @spec.edit_function("retag_account", _RetagParams)
     def retag_account(ctx, params):
         acc = ctx.require(_Account, params.account_id)
         ctx.modify(acc, tenant=params.tenant)
         visible_ids = {item.account_id for item in ctx.query(_Account)}
         if not ctx.actor.has_access([f"tenant:{params.tenant}"]):
             assert params.account_id not in visible_ids
+
+    spec.declare_action(
+        "retag_account",
+        edit_function="retag_account",
+        allowed_roles=("admin", "operator"),
+        affects_source=False,
+    )
 
     if global_cap is not None:
 
@@ -374,12 +382,7 @@ def test_invariant_enforced_on_approve_and_revert():
         spec_reserve.role("admin")
         spec_reserve.object_type(_Account)
 
-        @spec_reserve.action(
-            "create_account",
-            _CreateAccountParams,
-            allowed_roles=("admin",),
-            affects_source=False,
-        )
+        @spec_reserve.edit_function("create_account", _CreateAccountParams)
         def _create(ctx, params):
             ctx.create(
                 _Account(
@@ -389,15 +392,24 @@ def test_invariant_enforced_on_approve_and_revert():
                 )
             )
 
-        @spec_reserve.action(
-            "adjust_balance",
-            _AdjustParams,
+        spec_reserve.declare_action(
+            "create_account",
+            edit_function="create_account",
             allowed_roles=("admin",),
             affects_source=False,
         )
+
+        @spec_reserve.edit_function("adjust_balance", _AdjustParams)
         def _adjust(ctx, params):
             acc = ctx.require(_Account, params.account_id)
             ctx.modify(acc, balance=acc.balance + params.delta)
+
+        spec_reserve.declare_action(
+            "adjust_balance",
+            edit_function="adjust_balance",
+            allowed_roles=("admin",),
+            affects_source=False,
+        )
 
         @spec_reserve.invariant("min_reserve", code="RESERVE_BELOW_MIN")
         def _min_reserve(ctx):

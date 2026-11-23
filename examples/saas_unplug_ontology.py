@@ -219,11 +219,9 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
     class OverviewParams(BaseModel):
         pass
 
-    @spec.action(
+    @spec.edit_function(
         "create_customer_and_order",
         CreateCustomerOrderParams,
-        allowed_roles=("ai_agent", "cs_agent", "store_manager", "sales"),
-        affects_source=not standalone,
         description="原生建客下单：创建 Customer + ShopOrder 并建立 customer_orders 边。",
     )
     def create_customer_and_order(ctx: Any, params: CreateCustomerOrderParams) -> None:
@@ -253,11 +251,17 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
         ctx.create(order)
         ctx.link(customer, customer_orders, order)
 
-    @spec.action(
+    spec.declare_action(
+        "create_customer_and_order",
+        edit_function="create_customer_and_order",
+        allowed_roles=("ai_agent", "cs_agent", "store_manager", "sales"),
+        affects_source=not standalone,
+        description="原生建客下单：创建 Customer + ShopOrder 并建立 customer_orders 边。",
+    )
+
+    @spec.edit_function(
         "open_support_ticket",
         OpenTicketParams,
-        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
-        affects_source=not standalone,
         description="原生建客诉工单：校验订单存在并建立 order_tickets 边。",
     )
     def open_support_ticket(ctx: Any, params: OpenTicketParams) -> None:
@@ -282,12 +286,17 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
         ctx.create(ticket)
         ctx.link(order, order_tickets, ticket)
 
-    @spec.action(
+    spec.declare_action(
+        "open_support_ticket",
+        edit_function="open_support_ticket",
+        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
+        affects_source=not standalone,
+        description="原生建客诉工单：校验订单存在并建立 order_tickets 边。",
+    )
+
+    @spec.edit_function(
         "ai_triage_ticket",
         TriageParams,
-        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
-        revert_roles=("store_manager",),
-        affects_source=False,
         description="AI 智能分诊与反欺诈评分：写客户风控字段与工单分诊备注（单平面自有写）。",
     )
     def ai_triage_ticket(ctx: Any, params: TriageParams) -> None:
@@ -312,24 +321,36 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
             ),
         )
 
-    @spec.action(
-        "mark_ticket_triaged",
-        TriageStatusParams,
+    spec.declare_action(
+        "ai_triage_ticket",
+        edit_function="ai_triage_ticket",
         allowed_roles=("ai_agent", "cs_agent", "store_manager"),
         revert_roles=("store_manager",),
-        affects_source=not standalone,
+        affects_source=False,
+        description="AI 智能分诊与反欺诈评分：写客户风控字段与工单分诊备注（单平面自有写）。",
+    )
+
+    @spec.edit_function(
+        "mark_ticket_triaged",
+        TriageStatusParams,
         description="工单分诊状态推进：单平面推进 SupportTicket.status 为 triaged。",
     )
     def mark_ticket_triaged(ctx: Any, params: TriageStatusParams) -> None:
         ticket = ctx.require(SupportTicket, params.ticket_id)
         ctx.modify(ticket, status="triaged")
 
-    @spec.action(
-        "process_return_and_refund",
-        RefundParams,
+    spec.declare_action(
+        "mark_ticket_triaged",
+        edit_function="mark_ticket_triaged",
         allowed_roles=("ai_agent", "cs_agent", "store_manager"),
         revert_roles=("store_manager",),
         affects_source=not standalone,
+        description="工单分诊状态推进：单平面推进 SupportTicket.status 为 triaged。",
+    )
+
+    @spec.edit_function(
+        "process_return_and_refund",
+        RefundParams,
         description="跨订单 + 工单 + 资金的核心治理动作（单平面源状态变更，大额 AI 请求需店长签批）。",
     )
     def process_return_and_refund(ctx: Any, params: RefundParams) -> None:
@@ -382,12 +403,18 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
             lifetime_value_cents=customer.lifetime_value_cents - params.amount_cents,
         )
 
-    @spec.action(
-        "record_refund_voucher",
-        RefundParams,
+    spec.declare_action(
+        "process_return_and_refund",
+        edit_function="process_return_and_refund",
         allowed_roles=("ai_agent", "cs_agent", "store_manager"),
         revert_roles=("store_manager",),
-        affects_source=False,
+        affects_source=not standalone,
+        description="跨订单 + 工单 + 资金的核心治理动作（单平面源状态变更，大额 AI 请求需店长签批）。",
+    )
+
+    @spec.edit_function(
+        "record_refund_voucher",
+        RefundParams,
         description="登记全自有退款凭证 RefundRecord 并关联 ticket_refund 边（单平面自有写）。",
     )
     def record_refund_voucher(ctx: Any, params: RefundParams) -> None:
@@ -402,6 +429,15 @@ def build_saas_ontology(standalone: bool = False) -> SaasOntologyBundle:
         )
         ctx.create(refund)
         ctx.link(ticket, ticket_refund, refund)
+
+    spec.declare_action(
+        "record_refund_voucher",
+        edit_function="record_refund_voucher",
+        allowed_roles=("ai_agent", "cs_agent", "store_manager"),
+        revert_roles=("store_manager",),
+        affects_source=False,
+        description="登记全自有退款凭证 RefundRecord 并关联 ticket_refund 边（单平面自有写）。",
+    )
 
     @spec.function(
         "workspace_overview",

@@ -322,12 +322,13 @@ def build_declarative_spec(
 
             return _handler
 
-        spec.action(
+        spec.declare_rule_action(
             name=act_name,
             params=params_cls,
+            handler=_make_handler(target_cls, op, field_name, param_field),
             allowed_roles=["admin", "ops", "ai_agent"],
             description=str(ad.get("description") or ad.get("display") or act_name),
-        )(_make_handler(target_cls, op, field_name, param_field))
+        )
 
         if ad.get("display"):
             act_display[act_name] = str(ad["display"])
@@ -389,10 +390,9 @@ class MetaAdminService:
         ):
             spec.add_object_type(cls)
 
-        @spec.action(
-            name="create_model_spec",
-            params=CreateModelSpecParams,
-            allowed_roles=["admin", "ai_agent"],
+        @spec.edit_function(
+            "create_model_spec",
+            CreateModelSpecParams,
             description="声明式创建并校验新的 M1 领域模型",
         )
         def _create_model(ctx: Any, params: CreateModelSpecParams) -> dict[str, Any]:
@@ -413,10 +413,15 @@ class MetaAdminService:
             ctx.create(obj)
             return {"model_id": params.model_id}
 
-        @spec.action(
-            name="provision_runtime",
-            params=ProvisionRuntimeParams,
+        spec.declare_action(
+            "create_model_spec",
+            edit_function="create_model_spec",
             allowed_roles=["admin", "ai_agent"],
+        )
+
+        @spec.edit_function(
+            "provision_runtime",
+            ProvisionRuntimeParams,
             description="装配内存或 SQLite 运行时宿体",
         )
         def _provision_runtime(ctx: Any, params: ProvisionRuntimeParams) -> dict[str, Any]:
@@ -432,10 +437,15 @@ class MetaAdminService:
             ctx.create(obj)
             return {"runtime_id": params.runtime_id}
 
-        @spec.action(
-            name="create_world",
-            params=CreateWorldParams,
+        spec.declare_action(
+            "provision_runtime",
+            edit_function="provision_runtime",
             allowed_roles=["admin", "ai_agent"],
+        )
+
+        @spec.edit_function(
+            "create_world",
+            CreateWorldParams,
             description="绑定领域模型与宿体，创建新的世界状态",
         )
         def _create_world(ctx: Any, params: CreateWorldParams) -> dict[str, Any]:
@@ -454,10 +464,15 @@ class MetaAdminService:
             ctx.create(obj)
             return {"world_id": params.world_id}
 
-        @spec.action(
-            name="fork_world",
-            params=ForkWorldParams,
+        spec.declare_action(
+            "create_world",
+            edit_function="create_world",
             allowed_roles=["admin", "ai_agent"],
+        )
+
+        @spec.edit_function(
+            "fork_world",
+            ForkWorldParams,
             description="从现有世界状态毫秒级克隆平行沙盘",
         )
         def _fork_world(ctx: Any, params: ForkWorldParams) -> dict[str, Any]:
@@ -476,10 +491,15 @@ class MetaAdminService:
             ctx.create(obj)
             return {"world_id": params.new_world_id}
 
-        @spec.action(
-            name="register_device",
-            params=RegisterDeviceParams,
+        spec.declare_action(
+            "fork_world",
+            edit_function="fork_world",
             allowed_roles=["admin", "ai_agent"],
+        )
+
+        @spec.edit_function(
+            "register_device",
+            RegisterDeviceParams,
             description="注册外部工具/设备（OpenAPI）",
         )
         def _register_device(ctx: Any, params: RegisterDeviceParams) -> dict[str, Any]:
@@ -493,10 +513,15 @@ class MetaAdminService:
             ctx.create(obj)
             return {"device_id": params.device_id}
 
-        @spec.action(
-            name="sync_device_to_world",
-            params=SyncDeviceParams,
+        spec.declare_action(
+            "register_device",
+            edit_function="register_device",
             allowed_roles=["admin", "ai_agent"],
+        )
+
+        @spec.edit_function(
+            "sync_device_to_world",
+            SyncDeviceParams,
             description="从外部设备拉取最新数据并同步写入目标世界状态的 Backing 平面",
         )
         def _sync_device_to_world(ctx: Any, params: SyncDeviceParams) -> dict[str, Any]:
@@ -525,10 +550,15 @@ class MetaAdminService:
             ctx.create(rec)
             return {"sync_id": rec.id, "row_count": len(rows)}
 
-        @spec.action(
-            name="create_adapter",
-            params=CreateAdapterParams,
+        spec.declare_action(
+            "sync_device_to_world",
+            edit_function="sync_device_to_world",
             allowed_roles=["admin", "ai_agent"],
+        )
+
+        @spec.edit_function(
+            "create_adapter",
+            CreateAdapterParams,
             description="创建绑定外部设备与世界状态的轻量级同步适配器，支持异构字段映射与周期轮询",
         )
         def _create_adapter(ctx: Any, params: CreateAdapterParams) -> dict[str, Any]:
@@ -563,10 +593,15 @@ class MetaAdminService:
             ctx.create(obj)
             return {"adapter_id": params.adapter_id, "status": "RUNNING"}
 
-        @spec.action(
-            name="toggle_adapter",
-            params=ToggleAdapterParams,
+        spec.declare_action(
+            "create_adapter",
+            edit_function="create_adapter",
             allowed_roles=["admin", "ai_agent"],
+        )
+
+        @spec.edit_function(
+            "toggle_adapter",
+            ToggleAdapterParams,
             description="暂停或恢复指定设备适配器（RUNNING / PAUSED）",
         )
         def _toggle_adapter(ctx: Any, params: ToggleAdapterParams) -> dict[str, Any]:
@@ -576,6 +611,12 @@ class MetaAdminService:
             adp = adapters[params.adapter_id]
             ctx.modify(adp, status=params.status)
             return {"adapter_id": params.adapter_id, "status": params.status}
+
+        spec.declare_action(
+            "toggle_adapter",
+            edit_function="toggle_adapter",
+            allowed_roles=["admin", "ai_agent"],
+        )
 
         return spec
 

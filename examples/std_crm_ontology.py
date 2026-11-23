@@ -131,12 +131,11 @@ class ResolveCrmTicketParams(BaseModel):
     resolution_summary: str = ""
 
 
-@spec.action(
+@spec.edit_function(
     "win_crm_deal",
     WinCrmDealParams,
-    allowed_roles=("sales_rep", "sales_manager", "finance_director", "steward", "ai_agent", "admin"),
-    touched_object_types=("CrmDeal",),
     description="将处于报价/谈判阶段的 CRM 商机推进为赢单（CLOSED_WON）。",
+    touched_object_types=("CrmDeal",),
 )
 def win_crm_deal(ctx: Any, params: WinCrmDealParams) -> None:
     deal = ctx.require(CrmDeal, params.deal_id)
@@ -147,13 +146,19 @@ def win_crm_deal(ctx: Any, params: WinCrmDealParams) -> None:
         )
     ctx.modify(deal, stage="CLOSED_WON")
 
+spec.declare_action(
+    "win_crm_deal",
+    edit_function="win_crm_deal",
+    allowed_roles=("sales_rep", "sales_manager", "finance_director", "steward", "ai_agent", "admin"),
+    description="将处于报价/谈判阶段的 CRM 商机推进为赢单（CLOSED_WON）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "lose_crm_deal",
     LoseCrmDealParams,
-    allowed_roles=("sales_rep", "sales_manager", "steward", "ai_agent", "admin"),
-    touched_object_types=("CrmDeal",),
     description="将进行中的 CRM 商机标记为输单（CLOSED_LOST）并记录输单原因。",
+    touched_object_types=("CrmDeal",),
 )
 def lose_crm_deal(ctx: Any, params: LoseCrmDealParams) -> None:
     deal = ctx.require(CrmDeal, params.deal_id)
@@ -164,13 +169,19 @@ def lose_crm_deal(ctx: Any, params: LoseCrmDealParams) -> None:
         )
     ctx.modify(deal, stage="CLOSED_LOST", loss_reason=params.loss_reason)
 
+spec.declare_action(
+    "lose_crm_deal",
+    edit_function="lose_crm_deal",
+    allowed_roles=("sales_rep", "sales_manager", "steward", "ai_agent", "admin"),
+    description="将进行中的 CRM 商机标记为输单（CLOSED_LOST）并记录输单原因。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "resolve_crm_ticket",
     ResolveCrmTicketParams,
-    allowed_roles=("support_agent", "ops", "steward", "ai_agent", "admin"),
-    touched_object_types=("CrmTicket",),
     description="将待处理/处理中的客户工单解决为 RESOLVED。",
+    touched_object_types=("CrmTicket",),
 )
 def resolve_crm_ticket(ctx: Any, params: ResolveCrmTicketParams) -> None:
     ticket = ctx.require(CrmTicket, params.ticket_id)
@@ -180,6 +191,13 @@ def resolve_crm_ticket(ctx: Any, params: ResolveCrmTicketParams) -> None:
             code="INVALID_TICKET_STATUS",
         )
     ctx.modify(ticket, status="RESOLVED", resolution_summary=params.resolution_summary)
+
+spec.declare_action(
+    "resolve_crm_ticket",
+    edit_function="resolve_crm_ticket",
+    allowed_roles=("support_agent", "ops", "steward", "ai_agent", "admin"),
+    description="将待处理/处理中的客户工单解决为 RESOLVED。",
+)
 
 
 spec.update_display(

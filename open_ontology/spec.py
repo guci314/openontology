@@ -7,8 +7,9 @@ This module contains the *declaration* layer only:
 * :data:`AutoID`          -- system-generated identifier annotation
 * :class:`ObjectProperty` -- OWL object property annotation & descriptor
 * :class:`FunctionDef`    -- read-only computation
+* :class:`EditFunctionDef` -- Turing-complete atomic write kernel
 * :class:`ActionDef`      -- governed kinetic action
-* :class:`OntologySpec`   -- registry / decorator DSL
+* :class:`OntologySpec`   -- registry / declaration DSL
 
 No SQL and no mutation lives here.
 """
@@ -30,7 +31,14 @@ from typing import (
     get_origin,
 )
 
-from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    WithJsonSchema,
+    field_validator,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 
 __all__ = [
@@ -42,6 +50,7 @@ __all__ = [
     "RoleDef",
     "ScopedViewSpec",
     "FunctionDef",
+    "EditFunctionDef",
     "ActionDef",
     "AutomationDef",
     "InvariantDef",
@@ -55,6 +64,7 @@ __all__ = [
     "UnknownObjectPropertyError",
     "UnknownRoleError",
     "ActionNotFoundError",
+    "EditFunctionNotFoundError",
     "FunctionNotFoundError",
     "AutomationNotFoundError",
     "InvariantError",
@@ -93,6 +103,10 @@ class UnknownObjectPropertyError(OpenOntologyError):
 
 class ActionNotFoundError(OpenOntologyError):
     """Raised when an action is not registered in the spec."""
+
+
+class EditFunctionNotFoundError(OpenOntologyError):
+    """Raised when an edit function is not registered in the spec."""
 
 
 class FunctionNotFoundError(OpenOntologyError):
@@ -533,7 +547,7 @@ class ScopedViewSpec(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Function / action declarations
+# Function / edit-function / action declarations
 # ---------------------------------------------------------------------------
 class FunctionDef(BaseModel):
     """Read-only computation registered on the spec."""
@@ -548,6 +562,18 @@ class FunctionDef(BaseModel):
     view_tags: tuple[str, ...] = ()
 
 
+class EditFunctionDef(BaseModel):
+    """Atomic Turing-complete write transformation kernel (free of governance shell)."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    name: str
+    params: Any  # type[BaseModel]
+    handler: Any  # Callable[[EditBatch, BaseModel], Any]
+    description: str = ""
+    touched_object_types: tuple[str, ...] = ()
+
+
 class ActionDef(BaseModel):
     """Governed kinetic action registered on the spec."""
 
@@ -556,6 +582,8 @@ class ActionDef(BaseModel):
     name: str
     params: Any  # type[BaseModel]
     handler: Any  # Callable[[EditBatch, BaseModel], None]
+    implementation_kind: Literal["rule", "edit_function"] = "edit_function"
+    edit_function: str | None = None
     allowed_roles: tuple[str, ...] = ()
     revert_roles: tuple[str, ...] = ()
     affects_source: bool = True
@@ -563,6 +591,23 @@ class ActionDef(BaseModel):
     description: str = ""
     view_tags: tuple[str, ...] = ()
     touched_object_types: tuple[str, ...] = ()
+    submission_criteria: tuple[Any, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_implementation_binding(self) -> "ActionDef":
+        if self.implementation_kind == "edit_function":
+            if not isinstance(self.edit_function, str) or not self.edit_function.strip():
+                raise ValueError(
+                    f"ActionDef {self.name!r} with implementation_kind='edit_function' "
+                    "requires a non-empty edit_function name"
+                )
+        elif self.implementation_kind == "rule":
+            if self.edit_function is not None:
+                raise ValueError(
+                    f"ActionDef {self.name!r} with implementation_kind='rule' "
+                    "must have edit_function=None"
+                )
+        return self
 
 
 class AutomationDef(BaseModel):
@@ -722,6 +767,7 @@ class OntologySpec:
         self.roles: dict[str, RoleDef] = {}
         self.views: dict[str, ScopedViewSpec] = {}
         self.functions: dict[str, FunctionDef] = {}
+        self.edit_functions: dict[str, EditFunctionDef] = {}
         self.actions: dict[str, ActionDef] = {}
         self.automations: dict[str, AutomationDef] = {}
         self.invariants: dict[str, InvariantDef] = {}
@@ -755,6 +801,7 @@ class OntologySpec:
             kind="transition invariant",
         )
         _merge_spec_registry(self.functions, parent.functions, kind="function")
+        _merge_spec_registry(self.edit_functions, parent.edit_functions, kind="edit function")
         _merge_spec_registry(self.actions, parent.actions, kind="action")
         _merge_spec_registry(self.automations, parent.automations, kind="automation")
         for section, mapping in parent.display.items():
@@ -1191,11 +1238,45 @@ class OntologySpec:
             raise FunctionNotFoundError(f"unknown function: {name!r}")
         return self.functions[name]
 
-    # -- actions -----------------------------------------------------------
-    def action(
+    # -- edit functions ----------------------------------------------------
+    def edit_function(
         self,
         name: str,
         params: type[BaseModel],
+        *,
+        description: str = "",
+        touched_object_types: Iterable[str] = (),
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a pure Turing-complete write kernel (free of governance shell)."""
+        clean = str(name).strip()
+        if not clean:
+            raise ValueError("edit_function name must not be empty")
+        _validate_params(params, clean)
+        self._rebuild_model(params)
+
+        def decorator(handler: Callable[..., Any]) -> Callable[..., Any]:
+            self.edit_functions[clean] = EditFunctionDef(
+                name=clean,
+                params=params,
+                handler=handler,
+                description=description or (handler.__doc__ or "").strip(),
+                touched_object_types=tuple(touched_object_types),
+            )
+            return handler
+
+        return decorator
+
+    def get_edit_function(self, name: str) -> EditFunctionDef:
+        if name not in self.edit_functions:
+            raise EditFunctionNotFoundError(f"unknown edit function: {name!r}")
+        return self.edit_functions[name]
+
+    # -- actions -----------------------------------------------------------
+    def declare_action(
+        self,
+        name: str,
+        *,
+        edit_function: str,
         allowed_roles: Sequence[str] = (),
         revert_roles: Sequence[str] = (),
         description: str = "",
@@ -1203,33 +1284,97 @@ class OntologySpec:
         visibility: Literal["public", "private"] = "public",
         view_tags: Iterable[str] = (),
         touched_object_types: Iterable[str] = (),
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        submission_criteria: Sequence[Any] = (),
+        params: type[BaseModel] | None = None,
+    ) -> ActionDef:
+        """Bind a governed Action shell onto an already-registered EditFunctionDef."""
+        clean = str(name).strip()
+        if not clean:
+            raise ValueError("action name must not be empty")
         if self.read_only_source and affects_source:
             raise GovernanceViolationError(
-                f"action {name!r} cannot declare affects_source=True on a "
+                f"action {clean!r} cannot declare affects_source=True on a "
                 "read_only_source OntologySpec"
             )
-        _validate_params(params, name)
-        self._validate_roles(allowed_roles, context=f"action {name!r} allowed_roles")
-        self._validate_roles(revert_roles, context=f"action {name!r} revert_roles")
-        self._rebuild_model(params)
+        ef = self.get_edit_function(edit_function)
+        if params is None:
+            eff_params = ef.params
+        else:
+            _validate_params(params, clean)
+            if params is not ef.params and not issubclass(params, ef.params):
+                raise TypeError(
+                    f"action {clean!r} params {params.__name__} must match or subclass "
+                    f"edit_function {ef.name!r} params {ef.params.__name__}"
+                )
+            self._rebuild_model(params)
+            eff_params = params
+        self._validate_roles(allowed_roles, context=f"action {clean!r} allowed_roles")
+        self._validate_roles(revert_roles, context=f"action {clean!r} revert_roles")
+        eff_touched = tuple(touched_object_types) or ef.touched_object_types
+        eff_desc = description or ef.description
+        action_def = ActionDef(
+            name=clean,
+            params=eff_params,
+            handler=ef.handler,
+            implementation_kind="edit_function",
+            edit_function=ef.name,
+            allowed_roles=tuple(allowed_roles),
+            revert_roles=tuple(revert_roles),
+            affects_source=affects_source,
+            visibility=visibility,
+            description=eff_desc,
+            view_tags=tuple(view_tags),
+            touched_object_types=eff_touched,
+            submission_criteria=tuple(submission_criteria),
+        )
+        self.actions[clean] = action_def
+        return action_def
 
-        def decorator(handler: Callable[..., Any]) -> Callable[..., Any]:
-            self.actions[name] = ActionDef(
-                name=name,
-                params=params,
-                handler=handler,
-                allowed_roles=tuple(allowed_roles),
-                revert_roles=tuple(revert_roles),
-                affects_source=affects_source,
-                visibility=visibility,
-                description=description or (handler.__doc__ or "").strip(),
-                view_tags=tuple(view_tags),
-                touched_object_types=tuple(touched_object_types),
+    def declare_rule_action(
+        self,
+        name: str,
+        *,
+        params: type[BaseModel],
+        handler: Callable[..., Any],
+        allowed_roles: Sequence[str] = (),
+        revert_roles: Sequence[str] = (),
+        description: str = "",
+        affects_source: bool = True,
+        visibility: Literal["public", "private"] = "public",
+        view_tags: Iterable[str] = (),
+        touched_object_types: Iterable[str] = (),
+        submission_criteria: Sequence[Any] = (),
+    ) -> ActionDef:
+        """Register a non-Turing-complete declarative rule Action."""
+        clean = str(name).strip()
+        if not clean:
+            raise ValueError("action name must not be empty")
+        if self.read_only_source and affects_source:
+            raise GovernanceViolationError(
+                f"action {clean!r} cannot declare affects_source=True on a "
+                "read_only_source OntologySpec"
             )
-            return handler
-
-        return decorator
+        _validate_params(params, clean)
+        self._validate_roles(allowed_roles, context=f"action {clean!r} allowed_roles")
+        self._validate_roles(revert_roles, context=f"action {clean!r} revert_roles")
+        self._rebuild_model(params)
+        action_def = ActionDef(
+            name=clean,
+            params=params,
+            handler=handler,
+            implementation_kind="rule",
+            edit_function=None,
+            allowed_roles=tuple(allowed_roles),
+            revert_roles=tuple(revert_roles),
+            affects_source=affects_source,
+            visibility=visibility,
+            description=description or (handler.__doc__ or "").strip(),
+            view_tags=tuple(view_tags),
+            touched_object_types=tuple(touched_object_types),
+            submission_criteria=tuple(submission_criteria),
+        )
+        self.actions[clean] = action_def
+        return action_def
 
     def get_action(self, name: str) -> ActionDef:
         if name not in self.actions:
@@ -1245,6 +1390,7 @@ class OntologySpec:
             "roles": sorted(self.roles),
             "views": sorted(self.views),
             "functions": sorted(self.functions),
+            "edit_functions": sorted(self.edit_functions),
             "actions": sorted(self.actions),
             "automations": sorted(self.automations),
         }

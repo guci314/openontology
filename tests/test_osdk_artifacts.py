@@ -36,12 +36,7 @@ def _build_runtime() -> tuple[OntologyRuntime, Actor]:
     spec = OntologySpec()
     spec.add_object_type(_DemoItem)
 
-    @spec.action(
-        name="close_item",
-        params=_CloseItemParams,
-        allowed_roles=["admin", "ops"],
-        revert_roles=["admin"],
-    )
+    @spec.edit_function("close_item", _CloseItemParams)
     def _close_handler(ctx, params: _CloseItemParams) -> dict:
         obj = ctx.get(_DemoItem, params.item_id)
         if obj.status == "CLOSED":
@@ -50,6 +45,13 @@ def _build_runtime() -> tuple[OntologyRuntime, Actor]:
             raise InvariantError("admin approval required", code="APPROVAL_REQUIRED_ADMIN")
         ctx.modify(obj, status="CLOSED")
         return {"closed": params.item_id}
+
+    spec.declare_action(
+        "close_item",
+        edit_function="close_item",
+        allowed_roles=["admin", "ops"],
+        revert_roles=["admin"],
+    )
 
     rt = OntologyRuntime(spec, db_path=":memory:")
     admin = Actor(actor_id="u:admin", role="admin", clearance_tags={"*"})

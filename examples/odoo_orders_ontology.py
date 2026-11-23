@@ -161,12 +161,9 @@ def customer_unshipped_summary(
 # ---------------------------------------------------------------------------
 # Governed actions
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "cancel_order",
     CancelOrderParams,
-    allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
-    revert_roles=("ops_manager",),
-    affects_source=True,
     description="取消一张尚未发货的订单（AI 代理取消大额订单须由运营主管通过 WorkCard 签批）。",
 )
 def cancel_order(ctx: Any, params: CancelOrderParams) -> None:
@@ -200,24 +197,37 @@ def cancel_order(ctx: Any, params: CancelOrderParams) -> None:
 
     ctx.modify(order, status="cancelled")
 
+spec.declare_action(
+    "cancel_order",
+    edit_function="cancel_order",
+    allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
+    revert_roles=("ops_manager",),
+    affects_source=True,
+    description="取消一张尚未发货的订单（AI 代理取消大额订单须由运营主管通过 WorkCard 签批）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "assign_order",
     AssignOrderParams,
-    allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
-    affects_source=False,
     description="只修改订单的 Ontology 自有字段：指派人与运营备注。",
 )
 def assign_order(ctx: Any, params: AssignOrderParams) -> None:
     order = ctx.require(Order, params.order_id)
     ctx.modify(order, assignee=params.assignee, ops_note=params.ops_note)
 
-
-@spec.action(
-    "add_order_note",
-    AddOrderNoteParams,
+spec.declare_action(
+    "assign_order",
+    edit_function="assign_order",
     allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
     affects_source=False,
+    description="只修改订单的 Ontology 自有字段：指派人与运营备注。",
+)
+
+
+@spec.edit_function(
+    "add_order_note",
+    AddOrderNoteParams,
     description="创建纯 Ontology 自有的运营备注单并挂到订单上。",
 )
 def add_order_note(ctx: Any, params: AddOrderNoteParams) -> None:
@@ -231,3 +241,11 @@ def add_order_note(ctx: Any, params: AddOrderNoteParams) -> None:
     )
     ctx.create(note)
     ctx.link(order, ORDER_NOTES, note)
+
+spec.declare_action(
+    "add_order_note",
+    edit_function="add_order_note",
+    allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
+    affects_source=False,
+    description="创建纯 Ontology 自有的运营备注单并挂到订单上。",
+)

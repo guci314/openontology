@@ -66,6 +66,7 @@ from .disambiguation import (
     default_disambiguation_options,
 )
 from .dsl import (
+    ALLOWED_EXPR_OPS,
     ActionBlueprint,
     ActionMutationSpec,
     CustomerOverlaySpec,
@@ -84,6 +85,7 @@ from .dsl import (
     apply_adapter_mapping_patch,
     apply_evolution_patch,
     apply_overlay,
+    apply_overlay_to_spec,
     blueprint_fingerprint,
     compile_blueprint,
     compose_blueprints,
@@ -176,6 +178,7 @@ __all__ = [
     "CRUCIBLE_ACTOR",
     "STEWARD_ACTOR",
     # L1 zero-exec declarative DSL
+    "ALLOWED_EXPR_OPS",
     "FieldSpec",
     "RelationSpec",
     "ObjectTypeBlueprint",
@@ -198,6 +201,7 @@ __all__ = [
     "eval_predicate",
     "compose_blueprints",
     "apply_overlay",
+    "apply_overlay_to_spec",
     "apply_evolution_patch",
     "apply_adapter_mapping_patch",
     "migrate_m0_snapshot",

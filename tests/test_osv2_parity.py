@@ -112,30 +112,36 @@ def portfolio_value(ctx: Any, params: EmptyParams) -> dict[str, Any]:
     return {"total_value": round(total, 2)}
 
 
-@spec.action(
-    "set_quality_grade",
-    SetGradeParams,
-    allowed_roles=("ops", "finance", "admin"),
-    affects_source=False,
-)
+@spec.edit_function("set_quality_grade", SetGradeParams)
 def set_quality_grade(ctx: Any, params: SetGradeParams) -> None:
     coil = ctx.require(SteelCoil, params.asset_id)
     ctx.modify(coil, quality_grade=params.quality_grade)
 
+spec.declare_action(
+    "set_quality_grade",
+    edit_function="set_quality_grade",
+    allowed_roles=("ops", "finance", "admin"),
+    affects_source=False,
+)
 
-@spec.action("adjust_price", AdjustPriceParams, allowed_roles=("ops", "finance", "admin"))
+
+@spec.edit_function("adjust_price", AdjustPriceParams)
 def adjust_price(ctx: Any, params: AdjustPriceParams) -> None:
     coil = ctx.require(SteelCoil, params.asset_id)
     if params.unit_price_ton <= 0:
         raise InvariantError("price must be positive", code="INVALID_PRICE")
     ctx.modify(coil, unit_price_ton=params.unit_price_ton)
 
+spec.declare_action(
+    "adjust_price",
+    edit_function="adjust_price",
+    allowed_roles=("ops", "finance", "admin"),
+)
 
-@spec.action(
+
+@spec.edit_function(
     "request_price_change",
     AdjustPriceParams,
-    allowed_roles=("ops", "finance", "finance_manager", "admin"),
-    revert_roles=("finance_manager",),
     description="超过 2 万元/吨的改价需要财务经理批准",
 )
 def request_price_change(ctx: Any, params: AdjustPriceParams) -> None:
@@ -146,6 +152,14 @@ def request_price_change(ctx: Any, params: AdjustPriceParams) -> None:
             code="APPROVAL_REQUIRED_PREMIUM_PRICE",
         )
     ctx.modify(coil, unit_price_ton=params.unit_price_ton)
+
+spec.declare_action(
+    "request_price_change",
+    edit_function="request_price_change",
+    allowed_roles=("ops", "finance", "finance_manager", "admin"),
+    revert_roles=("finance_manager",),
+    description="超过 2 万元/吨的改价需要财务经理批准",
+)
 
 
 AUTO_RUN_IDS = itertools.count(1)

@@ -349,6 +349,119 @@ def _assert_work_card_assignee_and_sod(
         )
 
 
+def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
+    cid = params.card_id.strip() or f"WC-{uuid.uuid4().hex[:10].upper()}"
+    if ctx.get(WorkCard, cid) is not None:
+        raise InvariantError(f"WorkCard:{cid} already exists", code="WORK_CARD_EXISTS")
+    if params.card_kind == "APPROVAL":
+        try:
+            act_def = ctx.spec.get_action(params.requested_action)
+            act_def.params.model_validate_json(params.requested_params_json or "{}")
+        except Exception as exc:
+            raise InvariantError(
+                f"invalid APPROVAL intent for action {params.requested_action!r}: {exc}",
+                code="INVALID_WORK_CARD_INTENT",
+            ) from exc
+    ctx.create(
+        WorkCard(
+            card_id=cid,
+            card_kind=params.card_kind,
+            target_object_type=params.target_object_type,
+            target_object_id=params.target_object_id,
+            requested_action=params.requested_action,
+            requested_params_json=params.requested_params_json or "{}",
+            requester_actor_id=ctx.actor.actor_id,
+            assignee_role=params.assignee_role,
+            assignee_dept=params.assignee_dept,
+            status="OPEN",
+            sla_due_at=params.sla_due_at,
+            external_ref=params.external_ref,
+        )
+    )
+
+
+def _claim_work_card(ctx: Any, params: ClaimWorkCardParams) -> None:
+    card = ctx.require(WorkCard, params.card_id)
+    _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=False)
+    ctx.modify(
+        card,
+        status="IN_PROGRESS",
+        claimed_by_actor_id=ctx.actor.actor_id,
+        external_ref=params.external_ref or card.external_ref,
+    )
+
+
+def _complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> None:
+    card = ctx.require(WorkCard, params.card_id)
+    _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
+    if card.card_kind == "APPROVAL":
+        target_action = ctx.spec.get_action(card.requested_action)
+        if target_action.affects_source:
+            if not params.settled_run_id.strip():
+                raise InvariantError(
+                    f"APPROVAL WorkCard:{card.card_id} for source-backed action "
+                    f"{card.requested_action!r} requires settled_run_id via settle_work_card",
+                    code="SOURCE_APPROVAL_REQUIRES_SETTLED_RUN",
+                )
+        else:
+            if (
+                target_action.allowed_roles
+                and ctx.actor.role not in target_action.allowed_roles
+            ):
+                raise PermissionDeniedError(
+                    f"actor {ctx.actor.actor_id!r} role {ctx.actor.role!r} may not execute "
+                    f"{target_action.name!r}; allowed roles: {list(target_action.allowed_roles)}"
+                )
+            target_params = target_action.params.model_validate_json(
+                card.requested_params_json or "{}"
+            )
+            target_action.handler(ctx, target_params)
+    ctx.modify(
+        card,
+        status="COMPLETED",
+        resolved_by_actor_id=ctx.actor.actor_id,
+        resolution_note=params.resolution_note or card.resolution_note,
+        external_ref=params.external_ref or card.external_ref,
+    )
+
+
+def _reject_work_card(ctx: Any, params: RejectWorkCardParams) -> None:
+    card = ctx.require(WorkCard, params.card_id)
+    _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
+    ctx.modify(
+        card,
+        status="REJECTED",
+        resolved_by_actor_id=ctx.actor.actor_id,
+        resolution_note=params.resolution_note or card.resolution_note,
+    )
+
+
+def _mark_sla_breached(ctx: Any, params: MarkWorkCardSlaBreachedParams) -> None:
+    card = ctx.require(WorkCard, params.card_id)
+    ctx.modify(
+        card,
+        status="SLA_BREACHED",
+        resolution_note=params.resolution_note or card.resolution_note,
+    )
+
+
+def _cancel_work_card(ctx: Any, params: CancelWorkCardParams) -> None:
+    card = ctx.require(WorkCard, params.card_id)
+    if ctx.actor.actor_id != card.requester_actor_id and ctx.actor.role not in (
+        "steward",
+        "admin",
+    ):
+        raise InvariantError(
+            f"actor {ctx.actor.actor_id!r} may not cancel WorkCard:{card.card_id}",
+            code="WORK_CARD_CANCEL_FORBIDDEN",
+        )
+    ctx.modify(
+        card,
+        status="CANCELLED",
+        resolution_note=params.resolution_note or card.resolution_note,
+    )
+
+
 def register_work_card_primitives(
     target_spec: OntologySpec,
     *,
@@ -452,173 +565,75 @@ def register_work_card_primitives(
             return True
 
     all_card_roles = tuple(dict.fromkeys([*eff_openers, *eff_resolvers]))
-
-    if "open_work_card" not in target_spec.actions:
-
-        @target_spec.action(
+    work_card_specs: tuple[
+        tuple[str, type[BaseModel], Any, tuple[str, ...], tuple[str, ...], str], ...
+    ] = (
+        (
             "open_work_card",
             OpenWorkCardParams,
-            allowed_roles=eff_openers,
-            affects_source=False,
-            touched_object_types=("WorkCard",),
-            description="开立 M1 WorkCard（只记录原始意图与参数，绝不缓存 object_diff_json）。",
-        )
-        def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
-            cid = params.card_id.strip() or f"WC-{uuid.uuid4().hex[:10].upper()}"
-            if ctx.get(WorkCard, cid) is not None:
-                raise InvariantError(f"WorkCard:{cid} already exists", code="WORK_CARD_EXISTS")
-            if params.card_kind == "APPROVAL":
-                try:
-                    act_def = ctx.spec.get_action(params.requested_action)
-                    act_def.params.model_validate_json(params.requested_params_json or "{}")
-                except Exception as exc:
-                    raise InvariantError(
-                        f"invalid APPROVAL intent for action {params.requested_action!r}: {exc}",
-                        code="INVALID_WORK_CARD_INTENT",
-                    ) from exc
-            ctx.create(
-                WorkCard(
-                    card_id=cid,
-                    card_kind=params.card_kind,
-                    target_object_type=params.target_object_type,
-                    target_object_id=params.target_object_id,
-                    requested_action=params.requested_action,
-                    requested_params_json=params.requested_params_json or "{}",
-                    requester_actor_id=ctx.actor.actor_id,
-                    assignee_role=params.assignee_role,
-                    assignee_dept=params.assignee_dept,
-                    status="OPEN",
-                    sla_due_at=params.sla_due_at,
-                    external_ref=params.external_ref,
-                )
-            )
-
-    if "claim_work_card" not in target_spec.actions:
-
-        @target_spec.action(
+            _open_work_card,
+            eff_openers,
+            (),
+            "开立 M1 WorkCard（只记录原始意图与参数，绝不缓存 object_diff_json）。",
+        ),
+        (
             "claim_work_card",
             ClaimWorkCardParams,
-            allowed_roles=eff_resolvers,
-            affects_source=False,
-            touched_object_types=("WorkCard",),
-            description="认领推进 WorkCard（OPEN/SLA_BREACHED -> IN_PROGRESS）并记录外部回执号。",
-        )
-        def _claim_work_card(ctx: Any, params: ClaimWorkCardParams) -> None:
-            card = ctx.require(WorkCard, params.card_id)
-            _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=False)
-            ctx.modify(
-                card,
-                status="IN_PROGRESS",
-                claimed_by_actor_id=ctx.actor.actor_id,
-                external_ref=params.external_ref or card.external_ref,
-            )
-
-    if "complete_work_card" not in target_spec.actions:
-
-        @target_spec.action(
+            _claim_work_card,
+            eff_resolvers,
+            (),
+            "认领推进 WorkCard（OPEN/SLA_BREACHED -> IN_PROGRESS）并记录外部回执号。",
+        ),
+        (
             "complete_work_card",
             CompleteWorkCardParams,
-            allowed_roles=eff_resolvers,
-            revert_roles=eff_resolvers,
-            affects_source=False,
-            touched_object_types=("WorkCard",),
-            description="批结 WorkCard；若为 APPROVAL 卡且目标动作纯自有则在 t1 当场重算执行，源系统写动作须经 settle_work_card 提供 settled_run_id。",
-        )
-        def _complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> None:
-            card = ctx.require(WorkCard, params.card_id)
-            _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
-            if card.card_kind == "APPROVAL":
-                target_action = ctx.spec.get_action(card.requested_action)
-                if target_action.affects_source:
-                    if not params.settled_run_id.strip():
-                        raise InvariantError(
-                            f"APPROVAL WorkCard:{card.card_id} for source-backed action "
-                            f"{card.requested_action!r} requires settled_run_id via settle_work_card",
-                            code="SOURCE_APPROVAL_REQUIRES_SETTLED_RUN",
-                        )
-                else:
-                    if (
-                        target_action.allowed_roles
-                        and ctx.actor.role not in target_action.allowed_roles
-                    ):
-                        raise PermissionDeniedError(
-                            f"actor {ctx.actor.actor_id!r} role {ctx.actor.role!r} may not execute "
-                            f"{target_action.name!r}; allowed roles: {list(target_action.allowed_roles)}"
-                        )
-                    target_params = target_action.params.model_validate_json(
-                        card.requested_params_json or "{}"
-                    )
-                    target_action.handler(ctx, target_params)
-            ctx.modify(
-                card,
-                status="COMPLETED",
-                resolved_by_actor_id=ctx.actor.actor_id,
-                resolution_note=params.resolution_note or card.resolution_note,
-                external_ref=params.external_ref or card.external_ref,
-            )
-
-    if "reject_work_card" not in target_spec.actions:
-
-        @target_spec.action(
+            _complete_work_card,
+            eff_resolvers,
+            eff_resolvers,
+            "批结 WorkCard；若为 APPROVAL 卡且目标动作纯自有则在 t1 当场重算执行，源系统写动作须经 settle_work_card 提供 settled_run_id。",
+        ),
+        (
             "reject_work_card",
             RejectWorkCardParams,
-            allowed_roles=eff_resolvers,
-            affects_source=False,
-            touched_object_types=("WorkCard",),
-            description="驳回 WorkCard（校验 SoD 后跃迁为 REJECTED）。",
-        )
-        def _reject_work_card(ctx: Any, params: RejectWorkCardParams) -> None:
-            card = ctx.require(WorkCard, params.card_id)
-            _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
-            ctx.modify(
-                card,
-                status="REJECTED",
-                resolved_by_actor_id=ctx.actor.actor_id,
-                resolution_note=params.resolution_note or card.resolution_note,
-            )
-
-    if "mark_work_card_sla_breached" not in target_spec.actions:
-
-        @target_spec.action(
+            _reject_work_card,
+            eff_resolvers,
+            (),
+            "驳回 WorkCard（校验 SoD 后跃迁为 REJECTED）。",
+        ),
+        (
             "mark_work_card_sla_breached",
             MarkWorkCardSlaBreachedParams,
-            allowed_roles=all_card_roles,
-            affects_source=False,
-            touched_object_types=("WorkCard",),
-            description="标记超时未处理 WorkCard 为 SLA_BREACHED。",
-        )
-        def _mark_sla_breached(ctx: Any, params: MarkWorkCardSlaBreachedParams) -> None:
-            card = ctx.require(WorkCard, params.card_id)
-            ctx.modify(
-                card,
-                status="SLA_BREACHED",
-                resolution_note=params.resolution_note or card.resolution_note,
-            )
-
-    if "cancel_work_card" not in target_spec.actions:
-
-        @target_spec.action(
+            _mark_sla_breached,
+            all_card_roles,
+            (),
+            "标记超时未处理 WorkCard 为 SLA_BREACHED。",
+        ),
+        (
             "cancel_work_card",
             CancelWorkCardParams,
-            allowed_roles=all_card_roles,
-            affects_source=False,
-            touched_object_types=("WorkCard",),
-            description="撤销不再需要的 WorkCard（仅原申请人或 steward/admin 可撤销）。",
-        )
-        def _cancel_work_card(ctx: Any, params: CancelWorkCardParams) -> None:
-            card = ctx.require(WorkCard, params.card_id)
-            if ctx.actor.actor_id != card.requester_actor_id and ctx.actor.role not in (
-                "steward",
-                "admin",
-            ):
-                raise InvariantError(
-                    f"actor {ctx.actor.actor_id!r} may not cancel WorkCard:{card.card_id}",
-                    code="WORK_CARD_CANCEL_FORBIDDEN",
-                )
-            ctx.modify(
-                card,
-                status="CANCELLED",
-                resolution_note=params.resolution_note or card.resolution_note,
+            _cancel_work_card,
+            all_card_roles,
+            (),
+            "撤销不再需要的 WorkCard（仅原申请人或 steward/admin 可撤销）。",
+        ),
+    )
+
+    for act_name, params_cls, ef_handler, act_allowed, act_revert, desc in work_card_specs:
+        if act_name not in target_spec.edit_functions:
+            target_spec.edit_function(
+                act_name,
+                params_cls,
+                description=desc,
+                touched_object_types=("WorkCard",),
+            )(ef_handler)
+        if act_name not in target_spec.actions:
+            target_spec.declare_action(
+                act_name,
+                edit_function=act_name,
+                allowed_roles=act_allowed,
+                revert_roles=act_revert,
+                affects_source=False,
+                description=desc,
             )
 
     target_spec.update_display(

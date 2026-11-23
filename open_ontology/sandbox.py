@@ -239,8 +239,9 @@ class EditBatch:
         object_type, _, object_id = key.partition(":")
         return object_type, object_id
 
-    def _model_for(self, cls: type[ObjectType], data: dict[str, Any]) -> ObjectType:
-        return cls(**data)
+    def _model_for(self, cls: type[ObjectType] | str, data: dict[str, Any]) -> ObjectType:
+        resolved_cls = self.spec.get_object_type(cls)
+        return resolved_cls(**data)
 
     def _project(self, obj: ObjectType) -> ObjectType:
         """读出口投影：只有注入了脱敏回调的只读批处理才会脱敏。"""
@@ -377,10 +378,11 @@ class EditBatch:
 
     # -- reads -------------------------------------------------------------
     def get(
-        self, cls: type[ObjectType], object_id: str
+        self, cls: type[ObjectType] | str, object_id: str
     ) -> ObjectType | None:
         """Read one object with read-your-own-writes and RLS enforcement."""
-        object_type = self.spec.get_object_type(cls).__name__
+        resolved_cls = self.spec.get_object_type(cls)
+        object_type = resolved_cls.__name__
         object_id = str(object_id)
         key = self._key(object_type, object_id)
 
@@ -391,7 +393,7 @@ class EditBatch:
             self.actor.can_access(self._meta(object_type, self._objects[key])[1])
             if key in self._versions:
                 self.read_versions.setdefault(key, self._versions[key])
-            return self._project(self._model_for(cls, self._objects[key]))
+            return self._project(self._model_for(resolved_cls, self._objects[key]))
 
         row = self._load_visible(object_type, object_id)
         if row is None:
@@ -400,9 +402,9 @@ class EditBatch:
         self._original[key] = copy.deepcopy(row.data)
         self._versions[key] = row.version
         self.read_versions[key] = row.version
-        return self._project(self._model_for(cls, row.data))
+        return self._project(self._model_for(resolved_cls, row.data))
 
-    def query(self, cls: type[ObjectType]) -> list[ObjectType]:
+    def query(self, cls: type[ObjectType] | str) -> list[ObjectType]:
         """List every visible instance of ``cls`` (polymorphic for abstract supertypes)."""
         if (
             isinstance(cls, type)
@@ -413,13 +415,14 @@ class EditBatch:
             for sub_cls in self.spec.subtypes_of(cls):
                 combined.extend(self.query(sub_cls))
             return combined
-        object_type = self.spec.get_object_type(cls).__name__
+        resolved_cls = self.spec.get_object_type(cls)
+        object_type = resolved_cls.__name__
         results: dict[str, ObjectType] = {}
         for row in self.loader.load_all(object_type):
             if not self.actor.has_access(row.security_tags):
                 continue
             key = self._key(object_type, row.object_id)
-            results[key] = self._project(self._model_for(cls, row.data))
+            results[key] = self._project(self._model_for(resolved_cls, row.data))
             if key not in self._versions:
                 self._versions[key] = row.version
                 self.read_versions[key] = row.version
@@ -432,7 +435,7 @@ class EditBatch:
                 results.pop(key, None)
                 continue
             if self.actor.has_access(self._meta(otype, data)[1]):
-                results[key] = self._project(self._model_for(cls, data))
+                results[key] = self._project(self._model_for(resolved_cls, data))
             else:
                 results.pop(key, None)
         return list(results.values())
@@ -477,6 +480,8 @@ class EditBatch:
     # -- writes ------------------------------------------------------------
     def create(self, obj: ObjectType) -> ObjectType:
         cls = self.spec.get_object_type(type(obj))
+        if type(obj) is not cls:
+            obj = cls(**obj.model_dump())
         object_type = cls.__name__
         object_id = obj.primary_key_value()
         key = self._key(object_type, object_id)
@@ -517,7 +522,7 @@ class EditBatch:
 
         before_props = self._objects[key]
         merged = {**before_props, **updates}
-        validated = type(obj)(**merged)
+        validated = cls(**merged)
         self.actor.can_access(validated.security_tags())
 
         after_props = validated.to_properties()
@@ -681,11 +686,12 @@ class EditBatch:
         )
 
     # -- convenience -------------------------------------------------------
-    def require(self, cls: type[ObjectType], object_id: str) -> ObjectType:
+    def require(self, cls: type[ObjectType] | str, object_id: str) -> ObjectType:
         """Like :meth:`get` but raises when missing."""
         obj = self.get(cls, object_id)
         if obj is None:
-            raise ObjectNotFoundError(f"{cls.__name__}:{object_id} not found")
+            cls_name = cls if isinstance(cls, str) else cls.__name__
+            raise ObjectNotFoundError(f"{cls_name}:{object_id} not found")
         return obj
 
     def invalidate(self, message: str, code: str | None = None) -> None:

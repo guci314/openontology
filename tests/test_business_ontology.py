@@ -169,19 +169,40 @@ def test_append_only_blocks_action_update_delete_but_allows_revert():
 
     s.object_type(LogEntry)
 
-    @s.action("append_log", WriteParams, allowed_roles=("admin",), affects_source=False)
+    @s.edit_function("append_log", WriteParams)
     def append_log(ctx, params):
         ctx.create(LogEntry(log_id=params.log_id, amount=params.amount))
 
-    @s.action("tamper_log", WriteParams, allowed_roles=("admin",), affects_source=False)
+    s.declare_action(
+        "append_log",
+        edit_function="append_log",
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+
+    @s.edit_function("tamper_log", WriteParams)
     def tamper_log(ctx, params):
         row = ctx.require(LogEntry, params.log_id)
         ctx.modify(row, amount=params.amount)
 
-    @s.action("purge_log", TargetParams, allowed_roles=("admin",), affects_source=False)
+    s.declare_action(
+        "tamper_log",
+        edit_function="tamper_log",
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+
+    @s.edit_function("purge_log", TargetParams)
     def purge_log(ctx, params):
         row = ctx.require(LogEntry, params.log_id)
         ctx.delete(row)
+
+    s.declare_action(
+        "purge_log",
+        edit_function="purge_log",
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
 
     rt = OntologyRuntime(s)
     try:
@@ -226,18 +247,20 @@ def test_transition_invariant_supports_one_and_two_arg_handlers_and_approval_rec
 
     register_work_card_primitives(s, opener_roles=("worker", "admin"), resolver_roles=("admin",))
 
-    @s.action(
-        "set_value",
-        StepParams,
-        allowed_roles=("worker", "admin"),
-        revert_roles=("admin",),
-        affects_source=False,
-    )
+    @s.edit_function("set_value", StepParams)
     def set_value(ctx, params):
         if params.needs_approval and ctx.actor.role != "admin":
             raise InvariantError("needs admin approval", code="APPROVAL_REQUIRED_STEP")
         c = ctx.require(Counter, params.cid)
         ctx.modify(c, value=params.target)
+
+    s.declare_action(
+        "set_value",
+        edit_function="set_value",
+        allowed_roles=("worker", "admin"),
+        revert_roles=("admin",),
+        affects_source=False,
+    )
 
     @s.transition_invariant("monotonic_increase", code="NON_MONOTONIC")
     def monotonic_increase(diff) -> bool:
@@ -391,12 +414,7 @@ def _make_wms_spec() -> tuple[
         delta: int
         emit_voucher: bool = True
 
-    @wms.action(
-        "post_stock_move",
-        AdjustWithVoucherParams,
-        allowed_roles=("warehouse", "manager"),
-        affects_source=False,
-    )
+    @wms.edit_function("post_stock_move", AdjustWithVoucherParams)
     def post_stock_move(ctx, params):
         led = ctx.require(InternalStockLedger, params.ledger)
         ctx.modify(led, on_hand_qty=led.on_hand_qty + params.delta)
@@ -409,68 +427,85 @@ def _make_wms_spec() -> tuple[
                 )
             )
 
+    wms.declare_action(
+        "post_stock_move",
+        edit_function="post_stock_move",
+        allowed_roles=("warehouse", "manager"),
+        affects_source=False,
+    )
+
     class ReserveParams(BaseModel):
         ledger: ObjectProperty[ParasiticStockLedger]
         delta: int
 
-    @wms.action(
-        "reserve_stock",
-        ReserveParams,
-        allowed_roles=("warehouse", "manager"),
-        affects_source=False,
-    )
+    @wms.edit_function("reserve_stock", ReserveParams)
     def reserve_stock(ctx, params):
         led = ctx.require(ParasiticStockLedger, params.ledger)
         ctx.modify(led, ai_reserved_qty=led.ai_reserved_qty + params.delta)
+
+    wms.declare_action(
+        "reserve_stock",
+        edit_function="reserve_stock",
+        allowed_roles=("warehouse", "manager"),
+        affects_source=False,
+    )
 
     class TicketCreateParams(BaseModel):
         ticket_id: str
         status: str = "open"
 
-    @wms.action(
-        "create_ticket",
-        TicketCreateParams,
-        allowed_roles=("warehouse", "manager"),
-        affects_source=False,
-    )
+    @wms.edit_function("create_ticket", TicketCreateParams)
     def create_ticket(ctx, params):
         ctx.create(PickTicket(ticket_id=params.ticket_id, status=params.status))
 
-    @wms.action(
-        "advance_ticket",
-        TicketCreateParams,
+    wms.declare_action(
+        "create_ticket",
+        edit_function="create_ticket",
         allowed_roles=("warehouse", "manager"),
         affects_source=False,
     )
+
+    @wms.edit_function("advance_ticket", TicketCreateParams)
     def advance_ticket(ctx, params):
         t = ctx.require(PickTicket, params.ticket_id)
         ctx.modify(t, status=params.status)
 
+    wms.declare_action(
+        "advance_ticket",
+        edit_function="advance_ticket",
+        allowed_roles=("warehouse", "manager"),
+        affects_source=False,
+    )
+
     class TicketDeleteParams(BaseModel):
         ticket_id: str
 
-    @wms.action(
+    @wms.edit_function("delete_ticket", TicketDeleteParams)
+    def delete_ticket(ctx, params):
+        ctx.delete(ctx.require(PickTicket, params.ticket_id))
+
+    wms.declare_action(
         "delete_ticket",
-        TicketDeleteParams,
+        edit_function="delete_ticket",
         allowed_roles=("manager",),
         affects_source=False,
     )
-    def delete_ticket(ctx, params):
-        ctx.delete(ctx.require(PickTicket, params.ticket_id))
 
     class TamperVoucherParams(BaseModel):
         voucher_id: str
         qty_delta: int
 
-    @wms.action(
-        "tamper_voucher",
-        TamperVoucherParams,
-        allowed_roles=("manager",),
-        affects_source=False,
-    )
+    @wms.edit_function("tamper_voucher", TamperVoucherParams)
     def tamper_voucher(ctx, params):
         v = ctx.require(StockMoveVoucher, params.voucher_id)
         ctx.modify(v, qty_delta=params.qty_delta)
+
+    wms.declare_action(
+        "tamper_voucher",
+        edit_function="tamper_voucher",
+        allowed_roles=("manager",),
+        affects_source=False,
+    )
 
     return (
         wms,

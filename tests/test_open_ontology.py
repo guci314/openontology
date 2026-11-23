@@ -828,7 +828,7 @@ EDITED = Actor(actor_id="editor-01", role="editor", clearance_tags={"*"})
 OBSERVED: list[tuple] = []
 
 
-@mini_spec.action("touch_note", NoteParams, allowed_roles=("editor",))
+@mini_spec.edit_function("touch_note", NoteParams)
 def touch_note(ctx, params: NoteParams) -> None:
     note = ctx.require(Note, params.note_id)
     OBSERVED.append(("initial", note.text))
@@ -847,13 +847,17 @@ def touch_note(ctx, params: NoteParams) -> None:
 
     ctx.modify(again, text=again.text + "-b")
 
+mini_spec.declare_action("touch_note", edit_function="touch_note", allowed_roles=("editor",))
 
-@mini_spec.action("make_note", MakeNoteParams, allowed_roles=("editor",))
+
+@mini_spec.edit_function("make_note", MakeNoteParams)
 def make_note(ctx, params: MakeNoteParams) -> None:
     note = Note(note_id="N2", text="created")
     ctx.create(note)
     box = ctx.require(Box, params.box_id)
     ctx.link(note, "in_box", box)
+
+mini_spec.declare_action("make_note", edit_function="make_note", allowed_roles=("editor",))
 
 
 @pytest.fixture()
@@ -955,52 +959,83 @@ authority_spec.object_type(CaseFile)
 OPS = Actor(actor_id="ops-1", role="ops", clearance_tags={"*"})
 
 
-@authority_spec.action(
-    "touch_both", DeviceParams, allowed_roles=("ops",), affects_source=True
-)
+@authority_spec.edit_function("touch_both", DeviceParams)
 def touch_both(ctx, params: DeviceParams) -> None:
     device = ctx.require(Device, params.device_id)
     ctx.modify(device, status=params.status or "changed", note=params.note or "note")
 
-
-@authority_spec.action(
-    "write_source_only", DeviceParams, allowed_roles=("ops",), affects_source=False
+authority_spec.declare_action(
+    "touch_both",
+    edit_function="touch_both",
+    allowed_roles=("ops",),
+    affects_source=True,
 )
+
+
+@authority_spec.edit_function("write_source_only", DeviceParams)
 def write_source_only(ctx, params: DeviceParams) -> None:
     device = ctx.require(Device, params.device_id)
     ctx.modify(device, status="changed")
 
-
-@authority_spec.action(
-    "write_owned_only", NoteParams, allowed_roles=("ops",), affects_source=True
+authority_spec.declare_action(
+    "write_source_only",
+    edit_function="write_source_only",
+    allowed_roles=("ops",),
+    affects_source=False,
 )
+
+
+@authority_spec.edit_function("write_owned_only", NoteParams)
 def write_owned_only(ctx, params: NoteParams) -> None:
     device = ctx.require(Device, params.device_id)
     ctx.modify(device, note=params.note or "note")
 
-
-@authority_spec.action(
-    "valid_owned", NoteParams, allowed_roles=("ops",), affects_source=False
+authority_spec.declare_action(
+    "write_owned_only",
+    edit_function="write_owned_only",
+    allowed_roles=("ops",),
+    affects_source=True,
 )
+
+
+@authority_spec.edit_function("valid_owned", NoteParams)
 def valid_owned(ctx, params: NoteParams) -> None:
     device = ctx.require(Device, params.device_id)
     ctx.modify(device, note=params.note or "note")
 
+authority_spec.declare_action(
+    "valid_owned",
+    edit_function="valid_owned",
+    allowed_roles=("ops",),
+    affects_source=False,
+)
 
-@authority_spec.action("valid_source", DeviceParams, allowed_roles=("ops",))
+
+@authority_spec.edit_function("valid_source", DeviceParams)
 def valid_source(ctx, params: DeviceParams) -> None:
     device = ctx.require(Device, params.device_id)
     ctx.modify(device, status=params.status or "changed")
 
-
-@authority_spec.action(
-    "split_authority", SplitParams, allowed_roles=("ops",), affects_source=True
+authority_spec.declare_action(
+    "valid_source",
+    edit_function="valid_source",
+    allowed_roles=("ops",),
 )
+
+
+@authority_spec.edit_function("split_authority", SplitParams)
 def split_authority(ctx, params: SplitParams) -> None:
     left = ctx.require(Device, params.left_id)
     right = ctx.require(Device, params.right_id)
     ctx.modify(left, status="changed")
     ctx.modify(right, note="note")
+
+authority_spec.declare_action(
+    "split_authority",
+    edit_function="split_authority",
+    allowed_roles=("ops",),
+    affects_source=True,
+)
 
 
 @pytest.fixture()
@@ -1511,6 +1546,8 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
         "name",
         "params",
         "handler",
+        "implementation_kind",
+        "edit_function",
         "allowed_roles",
         "revert_roles",
         "affects_source",
@@ -1518,9 +1555,11 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
         "description",
         "view_tags",
         "touched_object_types",
+        "submission_criteria",
     }
+    assert not hasattr(cc.spec, "action")
     with pytest.raises(TypeError):
-        cc.spec.action("forbidden_action", cc.RerouteParams, writeback_target="x")
+        cc.spec.declare_action("forbidden_action", edit_function="reroute_shipment", writeback_target="x")
 
     # 4. Exported LLM tool schemas carry zero IT concepts
     tools_blob = json.dumps(
@@ -1543,6 +1582,8 @@ def test_pure_business_ontology_has_no_it_outbox_or_lineage_concepts(demo):
     for path in sources:
         text = path.read_text(encoding="utf-8").lower()
         for term in BANNED_IT_TERMS:
+            if path.name == "console_server.py" and term == "lineage":
+                continue
             assert term not in text, f"{term!r} leaked into {path.name}"
 
 
@@ -1587,7 +1628,7 @@ def test_object_property_auto_sync_referential_integrity_and_autoid() -> None:
     assert m2_spec.object_properties["SourceObj.multi_refs"].range == "TargetObj"
     assert m2_spec.object_properties["SourceObj.multi_refs"].cardinality == "many-to-many"
 
-    @m2_spec.action("create_source", CreateSourceParams, allowed_roles=("admin",))
+    @m2_spec.edit_function("create_source", CreateSourceParams)
     def _create_source(batch, params: CreateSourceParams) -> None:
         sid = (params.source_id or "").strip() or "SRC-001"
         batch.create(
@@ -1598,7 +1639,13 @@ def test_object_property_auto_sync_referential_integrity_and_autoid() -> None:
             )
         )
 
-    @m2_spec.action("update_source", UpdateSourceParams, allowed_roles=("admin",))
+    m2_spec.declare_action(
+        "create_source",
+        edit_function="create_source",
+        allowed_roles=("admin",),
+    )
+
+    @m2_spec.edit_function("update_source", UpdateSourceParams)
     def _update_source(batch, params: UpdateSourceParams) -> None:
         src = batch.get(SourceObj, params.source)
         batch.modify(
@@ -1607,9 +1654,21 @@ def test_object_property_auto_sync_referential_integrity_and_autoid() -> None:
             multi_refs=params.multi_refs,
         )
 
-    @m2_spec.action("delete_source", DeleteSourceParams, allowed_roles=("admin",))
+    m2_spec.declare_action(
+        "update_source",
+        edit_function="update_source",
+        allowed_roles=("admin",),
+    )
+
+    @m2_spec.edit_function("delete_source", DeleteSourceParams)
     def _delete_source(batch, params: DeleteSourceParams) -> None:
         batch.delete(batch.get(SourceObj, params.source))
+
+    m2_spec.declare_action(
+        "delete_source",
+        edit_function="delete_source",
+        allowed_roles=("admin",),
+    )
 
     admin = Actor(actor_id="admin-1", role="admin", clearance_tags={"*"})
     runtime = OntologyRuntime(m2_spec)

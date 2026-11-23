@@ -322,12 +322,11 @@ def _has_completed_mandate_escalation_card(ctx: Any, mandate_id: str) -> bool:
     return False
 
 
-@spec.action(
+@spec.edit_function(
     "reparent_department",
     ReparentDepartmentParams,
-    allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
-    touched_object_types=("Department",),
     description="变更部门上级归属节点；强制校验 DAG 防环（禁指向自身或任何后代）及同主体隔离。",
+    touched_object_types=("Department",),
 )
 def reparent_department(ctx: Any, params: ReparentDepartmentParams) -> None:
     dept = ctx.require(Department, params.department_id)
@@ -371,13 +370,19 @@ def reparent_department(ctx: Any, params: ReparentDepartmentParams) -> None:
 
     ctx.modify(dept, parent_department=parent.department_id)
 
+spec.declare_action(
+    "reparent_department",
+    edit_function="reparent_department",
+    allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
+    description="变更部门上级归属节点；强制校验 DAG 防环（禁指向自身或任何后代）及同主体隔离。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "assign_employee_position",
     AssignEmployeePositionParams,
-    allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
-    touched_object_types=("Employee",),
     description="员工入职转正或调岗；禁止对已离职员工调岗，并校验目标部门/岗位激活且相互匹配。",
+    touched_object_types=("Employee",),
 )
 def assign_employee_position(ctx: Any, params: AssignEmployeePositionParams) -> None:
     emp = ctx.require(Employee, params.employee_id)
@@ -417,24 +422,19 @@ def assign_employee_position(ctx: Any, params: AssignEmployeePositionParams) -> 
         status=next_status,
     )
 
+spec.declare_action(
+    "assign_employee_position",
+    edit_function="assign_employee_position",
+    allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
+    description="员工入职转正或调岗；禁止对已离职员工调岗，并校验目标部门/岗位激活且相互匹配。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "grant_authority_mandate",
     GrantAuthorityMandateParams,
-    allowed_roles=(
-        "hr_admin",
-        "hr_director",
-        "plant_manager",
-        "procurement_manager",
-        "sales_manager",
-        "finance_director",
-        "chief_accountant",
-        "steward",
-        "ai_agent",
-        "admin",
-    ),
-    touched_object_types=("AuthorityMandate",),
     description="授予动态权限委派：强守闭集角色校验、双边在职校验、SoD 禁自授权及上限越权拦截/升级审批。",
+    touched_object_types=("AuthorityMandate",),
 )
 def grant_authority_mandate(ctx: Any, params: GrantAuthorityMandateParams) -> None:
     if params.role_name not in VALID_STD_ROLE_NAMES:
@@ -518,13 +518,30 @@ def grant_authority_mandate(ctx: Any, params: GrantAuthorityMandateParams) -> No
         )
     )
 
+spec.declare_action(
+    "grant_authority_mandate",
+    edit_function="grant_authority_mandate",
+    allowed_roles=(
+        "hr_admin",
+        "hr_director",
+        "plant_manager",
+        "procurement_manager",
+        "sales_manager",
+        "finance_director",
+        "chief_accountant",
+        "steward",
+        "ai_agent",
+        "admin",
+    ),
+    description="授予动态权限委派：强守闭集角色校验、双边在职校验、SoD 禁自授权及上限越权拦截/升级审批。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "offboard_employee",
     OffboardEmployeeParams,
-    allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
-    touched_object_types=("Employee", "AuthorityMandate"),
     description="办理员工离职并在同一原子事务内自动吊销其作为授权人与被授权人的全部 active AuthorityMandate。",
+    touched_object_types=("Employee", "AuthorityMandate"),
 )
 def offboard_employee(ctx: Any, params: OffboardEmployeeParams) -> None:
     emp = ctx.require(Employee, params.employee_id)
@@ -544,6 +561,13 @@ def offboard_employee(ctx: Any, params: OffboardEmployeeParams) -> None:
         ) and mandate.status == "active":
             ctx.modify(mandate, status="revoked")
     ctx.modify(emp, status="offboarded")
+
+spec.declare_action(
+    "offboard_employee",
+    edit_function="offboard_employee",
+    allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
+    description="办理员工离职并在同一原子事务内自动吊销其作为授权人与被授权人的全部 active AuthorityMandate。",
+)
 
 
 @spec.function(

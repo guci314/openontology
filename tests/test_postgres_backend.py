@@ -115,23 +115,20 @@ def _build_ledger_item_spec(
         doc_id: str
         title: str
 
-    @spec.action(
-        "annotate_item",
-        AnnotateItemParams,
-        allowed_roles=("admin", "ai_agent"),
-        revert_roles=("admin",),
-        affects_source=False,
-    )
+    @spec.edit_function("annotate_item", AnnotateItemParams)
     def annotate_item(ctx: Any, params: AnnotateItemParams) -> None:
         item = ctx.require(LedgerItem, params.item_id)
         ctx.modify(item, ops_tag=params.ops_tag, note=params.note)
 
-    @spec.action(
-        "bump_doc",
-        BumpDocParams,
+    spec.declare_action(
+        "annotate_item",
+        edit_function="annotate_item",
         allowed_roles=("admin", "ai_agent"),
         revert_roles=("admin",),
+        affects_source=False,
     )
+
+    @spec.edit_function("bump_doc", BumpDocParams)
     def bump_doc(ctx: Any, params: BumpDocParams) -> None:
         doc = ctx.require(WorkDoc, params.doc_id)
         if barrier is not None:
@@ -146,15 +143,24 @@ def _build_ledger_item_spec(
                 time.sleep(0.02)
         ctx.modify(doc, counter=doc.counter + params.delta)
 
-    @spec.action(
-        "rename_doc",
-        UpdateTitleParams,
+    spec.declare_action(
+        "bump_doc",
+        edit_function="bump_doc",
         allowed_roles=("admin", "ai_agent"),
         revert_roles=("admin",),
     )
+
+    @spec.edit_function("rename_doc", UpdateTitleParams)
     def rename_doc(ctx: Any, params: UpdateTitleParams) -> None:
         doc = ctx.require(WorkDoc, params.doc_id)
         ctx.modify(doc, title=params.title)
+
+    spec.declare_action(
+        "rename_doc",
+        edit_function="rename_doc",
+        allowed_roles=("admin", "ai_agent"),
+        revert_roles=("admin",),
+    )
 
     spec._test_work_doc = WorkDoc  # type: ignore[attr-defined]
     return spec, LedgerItem

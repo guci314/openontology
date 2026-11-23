@@ -624,13 +624,7 @@ def _status_subtitle(status_spec: _StatusSpec) -> str:
 # ---------------------------------------------------------------------------
 # 动作：建板 / 加成员
 # ---------------------------------------------------------------------------
-@spec.action(
-    "create_board",
-    CreateBoardParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
-    description="建板：创建使用固定 6 态流的任务看板。",
-)
+@spec.edit_function("create_board", CreateBoardParams, description="建板：创建使用固定 6 态流的任务看板。")
 def create_board(ctx: Any, params: CreateBoardParams) -> None:
     if ctx.get(Board, params.board_key) is not None:
         raise InvariantError(
@@ -649,14 +643,16 @@ def create_board(ctx: Any, params: CreateBoardParams) -> None:
         )
     )
 
-
-@spec.action(
-    "add_member",
-    AddMemberParams,
+spec.declare_action(
+    "create_board",
+    edit_function="create_board",
     allowed_roles=_ALLOWED_ROLES,
     affects_source=False,
-    description="新增看板成员（声明角色与在办 WIP 上限）。",
+    description="建板：创建使用固定 6 态流的任务看板。",
 )
+
+
+@spec.edit_function("add_member", AddMemberParams, description="新增看板成员（声明角色与在办 WIP 上限）。")
 def add_member(ctx: Any, params: AddMemberParams) -> None:
     if params.role not in MEMBER_ROLES:
         raise InvariantError(
@@ -677,6 +673,14 @@ def add_member(ctx: Any, params: AddMemberParams) -> None:
             wip_limit=params.wip_limit,
         )
     )
+
+spec.declare_action(
+    "add_member",
+    edit_function="add_member",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="新增看板成员（声明角色与在办 WIP 上限）。",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -699,11 +703,9 @@ def _next_card_id(ctx: Any) -> str:
         seq += 1
 
 
-@spec.action(
+@spec.edit_function(
     "create_card",
     CreateCardParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
     description="建卡：无前置落入 ready，有前置停在 todo 等待前置完成。",
 )
 def create_card(ctx: Any, params: CreateCardParams) -> None:
@@ -770,6 +772,14 @@ def create_card(ctx: Any, params: CreateCardParams) -> None:
     if member is not None and landing_status == "ready":
         _start_card_execution(ctx, card, member, allow_preassigned=True)
 
+spec.declare_action(
+    "create_card",
+    edit_function="create_card",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="建卡：无前置落入 ready，有前置停在 todo 等待前置完成。",
+)
+
 
 def _assert_no_dependency_cycle(ctx: Any, card: Card) -> None:
     seen: set[str] = set()
@@ -791,13 +801,7 @@ def _assert_no_dependency_cycle(ctx: Any, card: Card) -> None:
 # ---------------------------------------------------------------------------
 # 动作：人工移动 / 认领 / 指派 / 释放
 # ---------------------------------------------------------------------------
-@spec.action(
-    "move_card",
-    MoveCardParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
-    description="人工把未认领卡片移到允许的下一状态（禁止绕行进入 done）。",
-)
+@spec.edit_function("move_card", MoveCardParams, description="人工把未认领卡片移到允许的下一状态（禁止绕行进入 done）。")
 def move_card(ctx: Any, params: MoveCardParams) -> None:
     card = _require_card(ctx, params.card)
     source = _status_spec(card.status)
@@ -823,12 +827,18 @@ def move_card(ctx: Any, params: MoveCardParams) -> None:
         updates["block_kind"] = None
     ctx.modify(card, **updates)
 
+spec.declare_action(
+    "move_card",
+    edit_function="move_card",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="人工把未认领卡片移到允许的下一状态（禁止绕行进入 done）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "claim_card",
     ClaimCardParams,
-    allowed_roles=_WORKER_ROLES,
-    affects_source=False,
     description="认领卡片：校验前置完成、角色资格、WIP 上限与 Actor/Member 身份绑定。",
 )
 def claim_card(ctx: Any, params: ClaimCardParams) -> None:
@@ -842,12 +852,18 @@ def claim_card(ctx: Any, params: ClaimCardParams) -> None:
         allow_preassigned=_status_spec(card.status).claimable,
     )
 
+spec.declare_action(
+    "claim_card",
+    edit_function="claim_card",
+    allowed_roles=_WORKER_ROLES,
+    affects_source=False,
+    description="认领卡片：校验前置完成、角色资格、WIP 上限与 Actor/Member 身份绑定。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "assign_card",
     AssignCardParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
     description="指派承接人：将 ready 卡片指派给未超 WIP 上限的成员并推入 doing。",
 )
 def assign_card(ctx: Any, params: AssignCardParams) -> None:
@@ -861,12 +877,18 @@ def assign_card(ctx: Any, params: AssignCardParams) -> None:
         allow_reassign=(card.status != "doing"),
     )
 
-
-@spec.action(
-    "release_claim",
-    ReleaseClaimParams,
+spec.declare_action(
+    "assign_card",
+    edit_function="assign_card",
     allowed_roles=_ALLOWED_ROLES,
     affects_source=False,
+    description="指派承接人：将 ready 卡片指派给未超 WIP 上限的成员并推入 doing。",
+)
+
+
+@spec.edit_function(
+    "release_claim",
+    ReleaseClaimParams,
     description="释放认领：把 doing 卡片退回 ready 或 blocked 并计入一次失败重试。",
 )
 def release_claim(ctx: Any, params: ReleaseClaimParams) -> None:
@@ -885,15 +907,21 @@ def release_claim(ctx: Any, params: ReleaseClaimParams) -> None:
         consecutive_failures=failures,
     )
 
+spec.declare_action(
+    "release_claim",
+    edit_function="release_claim",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="释放认领：把 doing 卡片退回 ready 或 blocked 并计入一次失败重试。",
+)
+
 
 # ---------------------------------------------------------------------------
 # 动作：登记结果 / 解阻 / 提升子卡 / 评论
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "record_outcome",
     RecordOutcomeParams,
-    allowed_roles=_WORKER_ROLES,
-    affects_source=False,
     description="登记执行结果：completed / blocked / failed / abandoned。",
 )
 def record_outcome(ctx: Any, params: RecordOutcomeParams) -> None:
@@ -969,14 +997,16 @@ def record_outcome(ctx: Any, params: RecordOutcomeParams) -> None:
 
     ctx.modify(card, assignee=None, status="triage")
 
-
-@spec.action(
-    "unblock_card",
-    UnblockCardParams,
-    allowed_roles=_ALLOWED_ROLES,
+spec.declare_action(
+    "record_outcome",
+    edit_function="record_outcome",
+    allowed_roles=_WORKER_ROLES,
     affects_source=False,
-    description="解除阻塞；反复阻塞超过上限则升级至 triage。",
+    description="登记执行结果：completed / blocked / failed / abandoned。",
 )
+
+
+@spec.edit_function("unblock_card", UnblockCardParams, description="解除阻塞；反复阻塞超过上限则升级至 triage。")
 def unblock_card(ctx: Any, params: UnblockCardParams) -> None:
     card = _require_card(ctx, params.card)
     if card.block_kind is None and card.status != "blocked":
@@ -1003,26 +1033,34 @@ def unblock_card(ctx: Any, params: UnblockCardParams) -> None:
         consecutive_failures=0,
     )
 
-
-@spec.action(
-    "promote_children",
-    PromoteChildrenParams,
+spec.declare_action(
+    "unblock_card",
+    edit_function="unblock_card",
     allowed_roles=_ALLOWED_ROLES,
     affects_source=False,
+    description="解除阻塞；反复阻塞超过上限则升级至 triage。",
+)
+
+
+@spec.edit_function(
+    "promote_children",
+    PromoteChildrenParams,
     description="把前置已全部完成的子卡从 todo 提升到 ready。",
 )
 def promote_children(ctx: Any, params: PromoteChildrenParams) -> None:
     card = _require_card(ctx, params.card)
     _promote_ready_children(ctx, card)
 
-
-@spec.action(
-    "add_comment",
-    AddCommentParams,
-    allowed_roles=_WORKER_ROLES,
+spec.declare_action(
+    "promote_children",
+    edit_function="promote_children",
+    allowed_roles=_ALLOWED_ROLES,
     affects_source=False,
-    description="给卡片追加一条评论。",
+    description="把前置已全部完成的子卡从 todo 提升到 ready。",
 )
+
+
+@spec.edit_function("add_comment", AddCommentParams, description="给卡片追加一条评论。")
 def add_comment(ctx: Any, params: AddCommentParams) -> None:
     card = _require_card(ctx, params.card)
     if not params.body.strip():
@@ -1037,6 +1075,14 @@ def add_comment(ctx: Any, params: AddCommentParams) -> None:
             created_at=int(time.time()),
         )
     )
+
+spec.declare_action(
+    "add_comment",
+    edit_function="add_comment",
+    allowed_roles=_WORKER_ROLES,
+    affects_source=False,
+    description="给卡片追加一条评论。",
+)
 
 
 # ---------------------------------------------------------------------------

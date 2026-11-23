@@ -410,6 +410,7 @@ def test_pim_psm_separation():
         if path.name not in (
             "http_server.py",
             "mcp_server.py",
+            "console_server.py",
             "workshop.py",
             "meta_admin.py",
         ):

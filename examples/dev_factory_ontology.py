@@ -238,11 +238,9 @@ def _latest_deliverable(ctx: Any, ticket: WorkTicket) -> Deliverable | None:
 # ---------------------------------------------------------------------------
 # 动作：招募 / 立项
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "recruit_engineer",
     RecruitEngineerParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
     description="招募一名研发成员（架构师 / 程序员 / 测试员 / 审计官）。",
 )
 def recruit_engineer(ctx: Any, params: RecruitEngineerParams) -> None:
@@ -265,14 +263,16 @@ def recruit_engineer(ctx: Any, params: RecruitEngineerParams) -> None:
         )
     )
 
-
-@spec.action(
-    "open_ticket",
-    OpenTicketParams,
+spec.declare_action(
+    "recruit_engineer",
+    edit_function="recruit_engineer",
     allowed_roles=_ALLOWED_ROLES,
     affects_source=False,
-    description="立项：创建一张处于 OPEN 状态的研发工单。",
+    description="招募一名研发成员（架构师 / 程序员 / 测试员 / 审计官）。",
 )
+
+
+@spec.edit_function("open_ticket", OpenTicketParams, description="立项：创建一张处于 OPEN 状态的研发工单。")
 def open_ticket(ctx: Any, params: OpenTicketParams) -> None:
     if params.max_rework < 1:
         raise InvariantError(
@@ -302,15 +302,21 @@ def open_ticket(ctx: Any, params: OpenTicketParams) -> None:
         )
     )
 
+spec.declare_action(
+    "open_ticket",
+    edit_function="open_ticket",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="立项：创建一张处于 OPEN 状态的研发工单。",
+)
+
 
 # ---------------------------------------------------------------------------
 # 动作：派单（含并发目录隔离锁）
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "dispatch_ticket",
     DispatchTicketParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
     description="把 OPEN 工单派给空闲程序员；同一隔离目录不允许并发在途。",
 )
 def dispatch_ticket(ctx: Any, params: DispatchTicketParams) -> None:
@@ -360,15 +366,21 @@ def dispatch_ticket(ctx: Any, params: DispatchTicketParams) -> None:
         active_ticket=ticket.ticket_id,
     )
 
+spec.declare_action(
+    "dispatch_ticket",
+    edit_function="dispatch_ticket",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="把 OPEN 工单派给空闲程序员；同一隔离目录不允许并发在途。",
+)
+
 
 # ---------------------------------------------------------------------------
 # 动作：交卷
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "submit_work",
     SubmitWorkParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
     description="程序员交卷：生成交付物、释放程序员、推进到测试或架构评审。",
 )
 def submit_work(ctx: Any, params: SubmitWorkParams) -> None:
@@ -404,15 +416,21 @@ def submit_work(ctx: Any, params: SubmitWorkParams) -> None:
         verdict="PENDING",
     )
 
+spec.declare_action(
+    "submit_work",
+    edit_function="submit_work",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="程序员交卷：生成交付物、释放程序员、推进到测试或架构评审。",
+)
+
 
 # ---------------------------------------------------------------------------
 # 动作：评审（测试 / 架构终审 / 打回返工 / 熔断）
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "review_ticket",
     ReviewTicketParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
     description="测试员或架构师裁决；FAIL 自动返工，超过 max_rework 熔断。",
 )
 def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
@@ -503,15 +521,21 @@ def review_ticket(ctx: Any, params: ReviewTicketParams) -> None:
             assignee=None,
         )
 
+spec.declare_action(
+    "review_ticket",
+    edit_function="review_ticket",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="测试员或架构师裁决；FAIL 自动返工，超过 max_rework 熔断。",
+)
+
 
 # ---------------------------------------------------------------------------
 # 动作：无损换人
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "reassign_ticket",
     ReassignTicketParams,
-    allowed_roles=_ALLOWED_ROLES,
-    affects_source=False,
     description="原承接人失联时，把工单连同全部历史上下文原子交接给空闲程序员。",
 )
 def reassign_ticket(ctx: Any, params: ReassignTicketParams) -> None:
@@ -550,6 +574,14 @@ def reassign_ticket(ctx: Any, params: ReassignTicketParams) -> None:
         assignee=new_engineer.engineer_id,
         stage="CODING",
     )
+
+spec.declare_action(
+    "reassign_ticket",
+    edit_function="reassign_ticket",
+    allowed_roles=_ALLOWED_ROLES,
+    affects_source=False,
+    description="原承接人失联时，把工单连同全部历史上下文原子交接给空闲程序员。",
+)
 
 
 # ---------------------------------------------------------------------------

@@ -321,11 +321,9 @@ def portfolio_health_snapshot(
 # ---------------------------------------------------------------------------
 # Governed actions
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "ai_triage_crm_case",
     TriageCaseParams,
-    allowed_roles=("ai_agent", "support_agent", "ops_manager"),
-    affects_source=False,
     description="AI 分诊：把欺诈分、VIP 层级与处置方案写入 Ontology 自有字段。",
 )
 def ai_triage_crm_case(ctx: Any, params: TriageCaseParams) -> None:
@@ -354,12 +352,18 @@ def ai_triage_crm_case(ctx: Any, params: TriageCaseParams) -> None:
         )
     ctx.modify(case, **updates)
 
+spec.declare_action(
+    "ai_triage_crm_case",
+    edit_function="ai_triage_crm_case",
+    allowed_roles=("ai_agent", "support_agent", "ops_manager"),
+    affects_source=False,
+    description="AI 分诊：把欺诈分、VIP 层级与处置方案写入 Ontology 自有字段。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "win_opportunity_and_create_order",
     WinOpportunityParams,
-    allowed_roles=("sales_rep", "ai_agent", "ops_manager"),
-    affects_source=True,
     description="商机赢单并原生生成销售订单（不再依赖任何外部 CRM/ERP）。",
 )
 def win_opportunity_and_create_order(
@@ -405,14 +409,16 @@ def win_opportunity_and_create_order(
         ltv_cents=account.ltv_cents + opportunity.amount_cents,
     )
 
-
-@spec.action(
-    "open_customer_case",
-    OpenCaseParams,
-    allowed_roles=("support_agent", "sales_rep", "ai_agent", "ops_manager"),
+spec.declare_action(
+    "win_opportunity_and_create_order",
+    edit_function="win_opportunity_and_create_order",
+    allowed_roles=("sales_rep", "ai_agent", "ops_manager"),
     affects_source=True,
-    description="原生创建客服工单，并可挂到某张订单上。",
+    description="商机赢单并原生生成销售订单（不再依赖任何外部 CRM/ERP）。",
 )
+
+
+@spec.edit_function("open_customer_case", OpenCaseParams, description="原生创建客服工单，并可挂到某张订单上。")
 def open_customer_case(ctx: Any, params: OpenCaseParams) -> None:
     account = ctx.require(CustomerAccount, params.account_id)
     if params.priority not in ("Low", "Medium", "High", "Urgent"):
@@ -443,13 +449,18 @@ def open_customer_case(ctx: Any, params: OpenCaseParams) -> None:
         order = ctx.require(SalesOrder, params.order_id)
         ctx.link(case, CASE_ORDERS, order)
 
+spec.declare_action(
+    "open_customer_case",
+    edit_function="open_customer_case",
+    allowed_roles=("support_agent", "sales_rep", "ai_agent", "ops_manager"),
+    affects_source=True,
+    description="原生创建客服工单，并可挂到某张订单上。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "resolve_case_with_refund",
     ResolveRefundParams,
-    allowed_roles=("support_agent", "ai_agent", "ops_manager"),
-    revert_roles=("ops_manager",),
-    affects_source=True,
     description="工单退款结案：退货期/欺诈分硬护栏 + 大额前置门控签批。",
 )
 def resolve_case_with_refund(ctx: Any, params: ResolveRefundParams) -> None:
@@ -520,6 +531,15 @@ def resolve_case_with_refund(ctx: Any, params: ResolveRefundParams) -> None:
         account,
         ltv_cents=max(0, account.ltv_cents - order.total_cents),
     )
+
+spec.declare_action(
+    "resolve_case_with_refund",
+    edit_function="resolve_case_with_refund",
+    allowed_roles=("support_agent", "ai_agent", "ops_manager"),
+    revert_roles=("ops_manager",),
+    affects_source=True,
+    description="工单退款结案：退货期/欺诈分硬护栏 + 大额前置门控签批。",
+)
 
 
 # ---------------------------------------------------------------------------

@@ -197,10 +197,9 @@ class RecordP2pPaymentParams(BaseModel):
     payment_amount: float
 
 
-@spec.action(
+@spec.edit_function(
     "confirm_p2p_order",
     ConfirmP2pOrderParams,
-    allowed_roles=("buyer", "procurement_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
     description="校验供应商激活与正金额后确认标准采购订单。",
 )
 def confirm_p2p_order(ctx: Any, params: ConfirmP2pOrderParams) -> None:
@@ -223,11 +222,17 @@ def confirm_p2p_order(ctx: Any, params: ConfirmP2pOrderParams) -> None:
         )
     ctx.modify(po, status="confirmed")
 
+spec.declare_action(
+    "confirm_p2p_order",
+    edit_function="confirm_p2p_order",
+    allowed_roles=("buyer", "procurement_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
+    description="校验供应商激活与正金额后确认标准采购订单。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "record_p2p_receipt",
     RecordP2pReceiptParams,
-    allowed_roles=("warehouse", "buyer", "procurement_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
     description="登记采购收货实收数量与质检结论；短装/短磅或质检不合格即联动 PO 进入 disputed。",
 )
 def record_p2p_receipt(ctx: Any, params: RecordP2pReceiptParams) -> None:
@@ -259,11 +264,17 @@ def record_p2p_receipt(ctx: Any, params: RecordP2pReceiptParams) -> None:
     )
     ctx.modify(po, status="disputed" if is_disputed else "received")
 
+spec.declare_action(
+    "record_p2p_receipt",
+    edit_function="record_p2p_receipt",
+    allowed_roles=("warehouse", "buyer", "procurement_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
+    description="登记采购收货实收数量与质检结论；短装/短磅或质检不合格即联动 PO 进入 disputed。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "post_p2p_bill",
     PostP2pBillParams,
-    allowed_roles=("finance", "finance_director", "procurement_manager", "steward", "ai_agent", "admin"),
     description="正式过账供应商应付账单；若关联采购单处于 disputed 则以 PO_DISPUTED_BLOCKED 硬拦截。",
 )
 def post_p2p_bill(ctx: Any, params: PostP2pBillParams) -> None:
@@ -292,11 +303,17 @@ def post_p2p_bill(ctx: Any, params: PostP2pBillParams) -> None:
     ctx.modify(bill, status="posted")
     ctx.modify(po, status="billed")
 
+spec.declare_action(
+    "post_p2p_bill",
+    edit_function="post_p2p_bill",
+    allowed_roles=("finance", "finance_director", "procurement_manager", "steward", "ai_agent", "admin"),
+    description="正式过账供应商应付账单；若关联采购单处于 disputed 则以 PO_DISPUTED_BLOCKED 硬拦截。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "resolve_p2p_dispute",
     ResolveP2pDisputeParams,
-    allowed_roles=("procurement_manager", "finance_director", "steward", "admin"),
     description="凭已完成审批的 WorkCard 裁决采购争议，按核定结算金额解封 PO 与收货单。",
 )
 def resolve_p2p_dispute(ctx: Any, params: ResolveP2pDisputeParams) -> None:
@@ -334,11 +351,17 @@ def resolve_p2p_dispute(ctx: Any, params: ResolveP2pDisputeParams) -> None:
     if receipt.status != "completed":
         ctx.modify(receipt, status="completed")
 
+spec.declare_action(
+    "resolve_p2p_dispute",
+    edit_function="resolve_p2p_dispute",
+    allowed_roles=("procurement_manager", "finance_director", "steward", "admin"),
+    description="凭已完成审批的 WorkCard 裁决采购争议，按核定结算金额解封 PO 与收货单。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "reconcile_p2p_bill",
     ReconcileP2pBillParams,
-    allowed_roles=("buyer", "procurement_manager", "finance", "finance_director", "steward", "ai_agent", "admin"),
     description="将草稿应付账单金额与残值同步至已核定采购单金额。",
 )
 def reconcile_p2p_bill(ctx: Any, params: ReconcileP2pBillParams) -> None:
@@ -360,11 +383,17 @@ def reconcile_p2p_bill(ctx: Any, params: ReconcileP2pBillParams) -> None:
         amount_residual=po.amount_total,
     )
 
+spec.declare_action(
+    "reconcile_p2p_bill",
+    edit_function="reconcile_p2p_bill",
+    allowed_roles=("buyer", "procurement_manager", "finance", "finance_director", "steward", "ai_agent", "admin"),
+    description="将草稿应付账单金额与残值同步至已核定采购单金额。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "record_p2p_payment",
     RecordP2pPaymentParams,
-    allowed_roles=("finance", "finance_director", "steward", "admin"),
     description="登记已过账应付账单的付款核销，校验付款额位于 (0, amount_residual]。",
 )
 def record_p2p_payment(ctx: Any, params: RecordP2pPaymentParams) -> None:
@@ -384,6 +413,13 @@ def record_p2p_payment(ctx: Any, params: RecordP2pPaymentParams) -> None:
     remaining = max(0.0, bill.amount_residual - params.payment_amount)
     new_state = "paid" if remaining <= 1e-9 else "partial"
     ctx.modify(bill, amount_residual=remaining, payment_state=new_state)
+
+spec.declare_action(
+    "record_p2p_payment",
+    edit_function="record_p2p_payment",
+    allowed_roles=("finance", "finance_director", "steward", "admin"),
+    description="登记已过账应付账单的付款核销，校验付款额位于 (0, amount_residual]。",
+)
 
 
 spec.update_display(

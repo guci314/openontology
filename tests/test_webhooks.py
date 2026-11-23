@@ -161,16 +161,18 @@ def test_http_webhooks_crud_permission_and_approval_delivery():
     spec.role("worker")
     spec.object_type(_ApprovalItem)
 
-    @spec.action(
-        "create_item",
-        params=_ApproveItemParams,
-        allowed_roles=("worker", "admin"),
-        revert_roles=("manager",),
-    )
+    @spec.edit_function("create_item", _ApproveItemParams)
     def create_item(ctx: Any, params: _ApproveItemParams) -> None:
         if ctx.actor.role == "worker":
             raise InvariantError("worker requires manager override", code="APPROVAL_REQUIRED_MANAGER")
         ctx.create(_ApprovalItem(item_id=params.item_id, status="ready"))
+
+    spec.declare_action(
+        "create_item",
+        edit_function="create_item",
+        allowed_roles=("worker", "admin"),
+        revert_roles=("manager",),
+    )
 
     runtime = OntologyRuntime(spec)
     registry = CommandCenterRegistry()

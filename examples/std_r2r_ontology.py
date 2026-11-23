@@ -331,12 +331,11 @@ def _compute_entity_trial_balance_dict(
     }
 
 
-@spec.action(
+@spec.edit_function(
     "post_journal_entry",
     PostJournalEntryParams,
-    allowed_roles=("finance", "chief_accountant", "finance_director", "steward", "ai_agent", "admin"),
-    touched_object_types=("JournalEntry", "GlAccount"),
     description="复式总账凭证过账：校验正金额、借贷异目、同主体、科目激活、期间开放及大额手工调账 WorkCard 审批门禁。",
+    touched_object_types=("JournalEntry", "GlAccount"),
 )
 def post_journal_entry(ctx: Any, params: PostJournalEntryParams) -> None:
     entry = ctx.require(JournalEntry, params.entry_id)
@@ -411,13 +410,19 @@ def post_journal_entry(ctx: Any, params: PostJournalEntryParams) -> None:
     ctx.modify(credit_acc, credit_total_cents=credit_acc.credit_total_cents + entry.amount_cents)
     ctx.modify(entry, status="posted")
 
+spec.declare_action(
+    "post_journal_entry",
+    edit_function="post_journal_entry",
+    allowed_roles=("finance", "chief_accountant", "finance_director", "steward", "ai_agent", "admin"),
+    description="复式总账凭证过账：校验正金额、借贷异目、同主体、科目激活、期间开放及大额手工调账 WorkCard 审批门禁。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "reverse_journal_entry",
     ReverseJournalEntryParams,
-    allowed_roles=("chief_accountant", "finance_director", "finance", "steward", "admin"),
-    touched_object_types=("JournalEntry", "GlAccount"),
     description="对已过账凭证执行借贷互换红字冲正（禁直接删改已过账凭证、禁重复冲正、禁跨关账期间冲正）。",
+    touched_object_types=("JournalEntry", "GlAccount"),
 )
 def reverse_journal_entry(ctx: Any, params: ReverseJournalEntryParams) -> None:
     orig = ctx.require(JournalEntry, params.entry_id)
@@ -482,13 +487,19 @@ def reverse_journal_entry(ctx: Any, params: ReverseJournalEntryParams) -> None:
     ctx.modify(orig_debit, credit_total_cents=orig_debit.credit_total_cents + orig.amount_cents)
     ctx.modify(orig, status="reversed")
 
+spec.declare_action(
+    "reverse_journal_entry",
+    edit_function="reverse_journal_entry",
+    allowed_roles=("chief_accountant", "finance_director", "finance", "steward", "admin"),
+    description="对已过账凭证执行借贷互换红字冲正（禁直接删改已过账凭证、禁重复冲正、禁跨关账期间冲正）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "start_fiscal_period_closing",
     StartFiscalPeriodClosingParams,
-    allowed_roles=("chief_accountant", "finance_director", "admin"),
-    touched_object_types=("FiscalPeriod",),
     description="将开放中的会计期间切入结账中状态（open -> closing），冻结日常凭证过账。",
+    touched_object_types=("FiscalPeriod",),
 )
 def start_fiscal_period_closing(ctx: Any, params: StartFiscalPeriodClosingParams) -> None:
     period = ctx.require(FiscalPeriod, params.period_id)
@@ -499,13 +510,19 @@ def start_fiscal_period_closing(ctx: Any, params: StartFiscalPeriodClosingParams
         )
     ctx.modify(period, status="closing")
 
+spec.declare_action(
+    "start_fiscal_period_closing",
+    edit_function="start_fiscal_period_closing",
+    allowed_roles=("chief_accountant", "finance_director", "admin"),
+    description="将开放中的会计期间切入结账中状态（open -> closing），冻结日常凭证过账。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "close_fiscal_period",
     CloseFiscalPeriodParams,
-    allowed_roles=("chief_accountant", "finance_director", "admin"),
-    touched_object_types=("FiscalPeriod", "TrialBalanceSnapshot"),
     description="关账前强制复核全实体试算平衡并落库不可变试算快照，将期间闭环为 closed。",
+    touched_object_types=("FiscalPeriod", "TrialBalanceSnapshot"),
 )
 def close_fiscal_period(ctx: Any, params: CloseFiscalPeriodParams) -> None:
     period = ctx.require(FiscalPeriod, params.period_id)
@@ -543,6 +560,13 @@ def close_fiscal_period(ctx: Any, params: CloseFiscalPeriodParams) -> None:
         )
     )
     ctx.modify(period, status="closed")
+
+spec.declare_action(
+    "close_fiscal_period",
+    edit_function="close_fiscal_period",
+    allowed_roles=("chief_accountant", "finance_director", "admin"),
+    description="关账前强制复核全实体试算平衡并落库不可变试算快照，将期间闭环为 closed。",
+)
 
 
 @spec.function(

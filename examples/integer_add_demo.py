@@ -51,12 +51,7 @@ def build_integer_runtime() -> tuple[OntologyRuntime, Actor]:
     }
     spec.add_object_type(IntegerValue)
 
-    @spec.action(
-        name="add",
-        params=AddParams,
-        allowed_roles=["admin", "ops", "ai_agent"],
-        description="执行 整数 = 整数 + n",
-    )
+    @spec.edit_function("add", AddParams, description="执行 整数 = 整数 + n")
     def add_handler(ctx, params: AddParams) -> dict:
         objs = ctx.query(IntegerValue)
         if not objs:
@@ -66,16 +61,25 @@ def build_integer_runtime() -> tuple[OntologyRuntime, Actor]:
         ctx.modify(target, value=new_val)
         return {"id": target.id, "before": target.value, "after": new_val}
 
-    @spec.action(
-        name="create_integer",
-        params=CreateIntegerParams,
+    spec.declare_action(
+        "add",
+        edit_function="add",
         allowed_roles=["admin", "ops", "ai_agent"],
-        description="创建一个新的整数对象",
+        description="执行 整数 = 整数 + n",
     )
+
+    @spec.edit_function("create_integer", CreateIntegerParams, description="创建一个新的整数对象")
     def create_integer_handler(ctx, params: CreateIntegerParams) -> dict:
         created = IntegerValue(id=params.id, value=params.value)
         ctx.create(created)
         return {"id": created.id, "value": created.value}
+
+    spec.declare_action(
+        "create_integer",
+        edit_function="create_integer",
+        allowed_roles=["admin", "ops", "ai_agent"],
+        description="创建一个新的整数对象",
+    )
 
     runtime = OntologyRuntime(spec, db_path=":memory:")
     admin = Actor(actor_id="demo:admin", role="admin", clearance_tags={"*"})

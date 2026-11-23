@@ -84,20 +84,23 @@ def _make_dual_device_spec() -> tuple[OntologySpec, type[ObjectType], type[Objec
         a_id: str
         b_id: str
 
-    @spec.action("update_a", UpdateOneParams, allowed_roles=("ops", "admin"), touched_object_types=("DevAItem",))
+    @spec.edit_function("update_a", UpdateOneParams, touched_object_types=("DevAItem",))
     def update_a(ctx: Any, params: UpdateOneParams) -> None:
         item = ctx.require(DevAItem, params.item_id)
         ctx.modify(item, status=params.status)
 
-    @spec.action("update_b", UpdateOneParams, allowed_roles=("ops", "admin"), touched_object_types=("DevBItem",))
+    spec.declare_action("update_a", edit_function="update_a", allowed_roles=("ops", "admin"))
+
+    @spec.edit_function("update_b", UpdateOneParams, touched_object_types=("DevBItem",))
     def update_b(ctx: Any, params: UpdateOneParams) -> None:
         item = ctx.require(DevBItem, params.item_id)
         ctx.modify(item, status=params.status)
 
-    @spec.action(
+    spec.declare_action("update_b", edit_function="update_b", allowed_roles=("ops", "admin"))
+
+    @spec.edit_function(
         "cross_write_a_and_b",
         CrossWriteParams,
-        allowed_roles=("ops", "admin"),
         touched_object_types=("DevAItem", "DevBItem"),
     )
     def cross_write_a_and_b(ctx: Any, params: CrossWriteParams) -> None:
@@ -106,15 +109,26 @@ def _make_dual_device_spec() -> tuple[OntologySpec, type[ObjectType], type[Objec
         ctx.modify(a, status="mutated")
         ctx.modify(b, status="mutated")
 
-    @spec.action(
+    spec.declare_action(
+        "cross_write_a_and_b",
+        edit_function="cross_write_a_and_b",
+        allowed_roles=("ops", "admin"),
+    )
+
+    @spec.edit_function(
         "rogue_a_touches_b",
         CrossWriteParams,
-        allowed_roles=("ops", "admin"),
         touched_object_types=("DevBItem",),
     )
     def rogue_a_touches_b(ctx: Any, params: CrossWriteParams) -> None:
         b = ctx.require(DevBItem, params.b_id)
         ctx.modify(b, status="hijacked")
+
+    spec.declare_action(
+        "rogue_a_touches_b",
+        edit_function="rogue_a_touches_b",
+        allowed_roles=("ops", "admin"),
+    )
 
     return spec, SharedAccount, DevAItem, DevBItem
 

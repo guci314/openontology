@@ -1531,8 +1531,8 @@ class ConsoleService:
                 raise ValueError("sandbox submit requires 'action' or non-empty 'steps'")
 
             step_results: list[dict[str, Any]] = []
-            last_error_code: str | None = None
-            last_error_msg: str | None = None
+            final_error_code: str | None = None
+            final_error_msg: str | None = None
             last_hint_zh = ""
             all_ok = True
 
@@ -1564,9 +1564,9 @@ class ConsoleService:
                     step_results.append({"ok": True, **step_rec})
                 except ValidationError as exc:
                     all_ok = False
-                    last_error_code = "INVALID_PARAMETER"
+                    final_error_code = "INVALID_PARAMETER"
                     last_hint_zh = _format_validation_error_zh(exc, display)
-                    last_error_msg = last_hint_zh
+                    final_error_msg = last_hint_zh
                     step_results.append(
                         {
                             "ok": False,
@@ -1574,22 +1574,22 @@ class ConsoleService:
                             "params": dict(step.params),
                             "actor_id": step_actor.actor_id,
                             "status": "REJECTED",
-                            "error_code": last_error_code,
-                            "error": last_error_msg,
+                            "error_code": final_error_code,
+                            "error": final_error_msg,
                             "hint_zh": last_hint_zh,
                         }
                     )
                     break
                 except OpenOntologyError as exc:
                     all_ok = False
-                    last_error_code = (
+                    final_error_code = (
                         getattr(exc, "code", None)
                         or ("PERMISSION_DENIED" if isinstance(exc, PermissionDeniedError) else None)
                         or ("OBJECT_NOT_FOUND" if isinstance(exc, ObjectNotFoundError) else None)
                         or "SANDBOX_STEP_REJECTED"
                     )
-                    last_error_msg = str(exc)
-                    last_hint_zh = _translate_error_hint(last_error_code, last_error_msg)
+                    final_error_msg = str(exc)
+                    last_hint_zh = _translate_error_hint(final_error_code, final_error_msg)
                     step_results.append(
                         {
                             "ok": False,
@@ -1597,8 +1597,8 @@ class ConsoleService:
                             "params": dict(step.params),
                             "actor_id": step_actor.actor_id,
                             "status": "REJECTED",
-                            "error_code": last_error_code,
-                            "error": last_error_msg,
+                            "error_code": final_error_code,
+                            "error": final_error_msg,
                             "hint_zh": last_hint_zh,
                         }
                     )
@@ -1614,8 +1614,8 @@ class ConsoleService:
                 "base_fingerprint": session.base_fingerprint,
                 "current_primary_fingerprint": current_primary_fp,
                 "sandbox_fingerprint": session.fork_runtime.state_fingerprint(),
-                "error_code": last_error_code,
-                "error": last_error_msg,
+                "error_code": final_error_code,
+                "error": final_error_msg,
                 "hint_zh": last_hint_zh,
                 "zero_external_dirty_write": True,
             }

@@ -598,12 +598,9 @@ def reconcile_steel_three_view_ledger(
 # ---------------------------------------------------------------------------
 # Governed Actions
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "create_steel_material_spec",
     CreateSteelMaterialSpecParams,
-    allowed_roles=("steward", "mdm_steward", "admin"),
-    revert_roles=("steward", "mdm_steward", "admin"),
-    affects_source=False,
     description="核准创建挂接 TradeResource 的钢厂标准物理规格。",
 )
 def create_steel_material_spec(ctx: Any, params: CreateSteelMaterialSpecParams) -> None:
@@ -629,13 +626,19 @@ def create_steel_material_spec(ctx: Any, params: CreateSteelMaterialSpecParams) 
         )
     )
 
-
-@spec.action(
-    "create_steel_storage_bin",
-    CreateSteelStorageBinParams,
-    allowed_roles=("warehouse", "ops", "steward", "mdm_steward", "admin"),
+spec.declare_action(
+    "create_steel_material_spec",
+    edit_function="create_steel_material_spec",
+    allowed_roles=("steward", "mdm_steward", "admin"),
     revert_roles=("steward", "mdm_steward", "admin"),
     affects_source=False,
+    description="核准创建挂接 TradeResource 的钢厂标准物理规格。",
+)
+
+
+@spec.edit_function(
+    "create_steel_storage_bin",
+    CreateSteelStorageBinParams,
     description="登记钢厂料仓/料堆物理锚点。",
 )
 def create_steel_storage_bin(ctx: Any, params: CreateSteelStorageBinParams) -> None:
@@ -653,13 +656,19 @@ def create_steel_storage_bin(ctx: Any, params: CreateSteelStorageBinParams) -> N
         )
     )
 
-
-@spec.action(
-    "open_steel_cost_period",
-    OpenSteelCostPeriodParams,
-    allowed_roles=("cost_accountant", "finance", "steward", "mdm_steward", "admin"),
+spec.declare_action(
+    "create_steel_storage_bin",
+    edit_function="create_steel_storage_bin",
+    allowed_roles=("warehouse", "ops", "steward", "mdm_steward", "admin"),
     revert_roles=("steward", "mdm_steward", "admin"),
     affects_source=False,
+    description="登记钢厂料仓/料堆物理锚点。",
+)
+
+
+@spec.edit_function(
+    "open_steel_cost_period",
+    OpenSteelCostPeriodParams,
     description="开启月度成本核算关账期间。",
 )
 def open_steel_cost_period(ctx: Any, params: OpenSteelCostPeriodParams) -> None:
@@ -670,13 +679,19 @@ def open_steel_cost_period(ctx: Any, params: OpenSteelCostPeriodParams) -> None:
         )
     ctx.create(SteelCostPeriod(period_id=params.period_id, status="OPEN"))
 
-
-@spec.action(
-    "receive_steel_lot",
-    ReceiveSteelLotParams,
-    allowed_roles=("weighbridge", "warehouse", "buyer", "ops", "steward", "mdm_steward", "admin"),
+spec.declare_action(
+    "open_steel_cost_period",
+    edit_function="open_steel_cost_period",
+    allowed_roles=("cost_accountant", "finance", "steward", "mdm_steward", "admin"),
     revert_roles=("steward", "mdm_steward", "admin"),
     affects_source=False,
+    description="开启月度成本核算关账期间。",
+)
+
+
+@spec.edit_function(
+    "receive_steel_lot",
+    ReceiveSteelLotParams,
     description="过磅卸入料仓（前松后紧）：已归并建GOVERNED批次，旁路未归并散码先放行PROVISIONAL并挂协同工单。",
 )
 def receive_steel_lot(ctx: Any, params: ReceiveSteelLotParams) -> None:
@@ -780,13 +795,19 @@ def receive_steel_lot(ctx: Any, params: ReceiveSteelLotParams) -> None:
     ctx.link(lot, STEEL_LOT_PRODUCED_BY, manufacturer)
     ctx.link(lot, STEEL_LOT_BILLED_AS, sku)
 
-
-@spec.action(
-    "map_steel_sku_to_spec",
-    MapSteelSkuParams,
-    allowed_roles=("steward", "mdm_steward", "buyer", "admin"),
+spec.declare_action(
+    "receive_steel_lot",
+    edit_function="receive_steel_lot",
+    allowed_roles=("weighbridge", "warehouse", "buyer", "ops", "steward", "mdm_steward", "admin"),
     revert_roles=("steward", "mdm_steward", "admin"),
     affects_source=False,
+    description="过磅卸入料仓（前松后紧）：已归并建GOVERNED批次，旁路未归并散码先放行PROVISIONAL并挂协同工单。",
+)
+
+
+@spec.edit_function(
+    "map_steel_sku_to_spec",
+    MapSteelSkuParams,
     description="对存量/旁路散码只写 Ontology 自有归并字段与归并关系。",
 )
 def map_steel_sku_to_spec(ctx: Any, params: MapSteelSkuParams) -> None:
@@ -817,13 +838,19 @@ def map_steel_sku_to_spec(ctx: Any, params: MapSteelSkuParams) -> None:
     )
     ctx.link(sku, STEEL_SKU_MAPS_TO_SPEC, material_spec)
 
-
-@spec.action(
-    "reconcile_provisional_lot",
-    ReconcileProvisionalLotParams,
-    allowed_roles=("steward", "mdm_steward", "cost_accountant", "finance", "admin"),
+spec.declare_action(
+    "map_steel_sku_to_spec",
+    edit_function="map_steel_sku_to_spec",
+    allowed_roles=("steward", "mdm_steward", "buyer", "admin"),
     revert_roles=("steward", "mdm_steward", "admin"),
     affects_source=False,
+    description="对存量/旁路散码只写 Ontology 自有归并字段与归并关系。",
+)
+
+
+@spec.edit_function(
+    "reconcile_provisional_lot",
+    ReconcileProvisionalLotParams,
     description="依据已核准工单与散码归并结论，将 PROVISIONAL 批次升级为 GOVERNED 并回填消耗账目规格。",
 )
 def reconcile_provisional_lot(ctx: Any, params: ReconcileProvisionalLotParams) -> None:
@@ -863,13 +890,19 @@ def reconcile_provisional_lot(ctx: Any, params: ReconcileProvisionalLotParams) -
         if entry.lot_id == lot.lot_id and entry.spec_id != material_spec.spec_id:
             ctx.modify(entry, spec_id=material_spec.spec_id)
 
+spec.declare_action(
+    "reconcile_provisional_lot",
+    edit_function="reconcile_provisional_lot",
+    allowed_roles=("steward", "mdm_steward", "cost_accountant", "finance", "admin"),
+    revert_roles=("steward", "mdm_steward", "admin"),
+    affects_source=False,
+    description="依据已核准工单与散码归并结论，将 PROVISIONAL 批次升级为 GOVERNED 并回填消耗账目规格。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "authorize_steel_lot_settlement",
     AuthorizeSteelLotSettlementParams,
-    allowed_roles=("cost_accountant", "finance", "steward", "mdm_steward", "admin"),
-    revert_roles=("cost_accountant", "steward", "mdm_steward", "admin"),
-    affects_source=False,
     description="付款结算放行硬卡口：任何 PROVISIONAL 或未归并散码批次一律拦阻。",
 )
 def authorize_steel_lot_settlement(ctx: Any, params: AuthorizeSteelLotSettlementParams) -> None:
@@ -883,13 +916,19 @@ def authorize_steel_lot_settlement(ctx: Any, params: AuthorizeSteelLotSettlement
         )
     ctx.modify(lot, settlement_authorized=True)
 
-
-@spec.action(
-    "close_steel_cost_period",
-    CloseSteelCostPeriodParams,
+spec.declare_action(
+    "authorize_steel_lot_settlement",
+    edit_function="authorize_steel_lot_settlement",
     allowed_roles=("cost_accountant", "finance", "steward", "mdm_steward", "admin"),
     revert_roles=("cost_accountant", "steward", "mdm_steward", "admin"),
     affects_source=False,
+    description="付款结算放行硬卡口：任何 PROVISIONAL 或未归并散码批次一律拦阻。",
+)
+
+
+@spec.edit_function(
+    "close_steel_cost_period",
+    CloseSteelCostPeriodParams,
     description="成本月结硬卡口：期间内存在任意 PROVISIONAL 批次或未归并散码一律报错阻断。",
 )
 def close_steel_cost_period(ctx: Any, params: CloseSteelCostPeriodParams) -> None:
@@ -930,13 +969,19 @@ def close_steel_cost_period(ctx: Any, params: CloseSteelCostPeriodParams) -> Non
         closed_cost=closed_cost,
     )
 
+spec.declare_action(
+    "close_steel_cost_period",
+    edit_function="close_steel_cost_period",
+    allowed_roles=("cost_accountant", "finance", "steward", "mdm_steward", "admin"),
+    revert_roles=("cost_accountant", "steward", "mdm_steward", "admin"),
+    affects_source=False,
+    description="成本月结硬卡口：期间内存在任意 PROVISIONAL 批次或未归并散码一律报错阻断。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "consume_steel_from_bin",
     ConsumeSteelFromBinParams,
-    allowed_roles=("mes_operator", "ops", "warehouse", "steward", "mdm_steward", "admin"),
-    revert_roles=("steward", "mdm_steward", "cost_accountant", "admin"),
-    affects_source=False,
     description="MES 按物理料仓报工消耗：100% 精确溯源至该料仓批次与规格（BIN_EXACT）。",
 )
 def consume_steel_from_bin(ctx: Any, params: ConsumeSteelFromBinParams) -> None:
@@ -966,13 +1011,19 @@ def consume_steel_from_bin(ctx: Any, params: ConsumeSteelFromBinParams) -> None:
         insufficient_msg=f"bin {params.bin_id!r} has only {available} tons available, cannot consume {params.tons}",
     )
 
-
-@spec.action(
-    "consume_steel_by_brand_fifo",
-    ConsumeSteelByBrandFifoParams,
+spec.declare_action(
+    "consume_steel_from_bin",
+    edit_function="consume_steel_from_bin",
     allowed_roles=("mes_operator", "ops", "warehouse", "steward", "mdm_steward", "admin"),
     revert_roles=("steward", "mdm_steward", "cost_accountant", "admin"),
     affects_source=False,
+    description="MES 按物理料仓报工消耗：100% 精确溯源至该料仓批次与规格（BIN_EXACT）。",
+)
+
+
+@spec.edit_function(
+    "consume_steel_by_brand_fifo",
+    ConsumeSteelByBrandFifoParams,
     description="兼容无料仓计量工位按品牌 FIFO 扣减，强制打标 cost_allocation_rule='BRAND_FIFO'。",
 )
 def consume_steel_by_brand_fifo(ctx: Any, params: ConsumeSteelByBrandFifoParams) -> None:
@@ -996,6 +1047,15 @@ def consume_steel_by_brand_fifo(ctx: Any, params: ConsumeSteelByBrandFifoParams)
         insufficient_code="INSUFFICIENT_BRAND_STOCK",
         insufficient_msg=f"brand {params.brand_id!r} has only {available} tons available, cannot consume {params.tons}",
     )
+
+spec.declare_action(
+    "consume_steel_by_brand_fifo",
+    edit_function="consume_steel_by_brand_fifo",
+    allowed_roles=("mes_operator", "ops", "warehouse", "steward", "mdm_steward", "admin"),
+    revert_roles=("steward", "mdm_steward", "cost_accountant", "admin"),
+    affects_source=False,
+    description="兼容无料仓计量工位按品牌 FIFO 扣减，强制打标 cost_allocation_rule='BRAND_FIFO'。",
+)
 
 
 spec.update_display(

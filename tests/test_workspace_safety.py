@@ -472,15 +472,17 @@ def test_reopen_seven_table_world_with_leftover_ontology_expectations(
 
     spec.object_type(OrderRecord)
 
-    @spec.action(
-        "set_ops_note",
-        AnnotateParams,
-        allowed_roles=("ops",),
-        affects_source=False,
-    )
+    @spec.edit_function("set_ops_note", AnnotateParams)
     def set_ops_note(ctx, params: AnnotateParams) -> None:
         doc = ctx.require(OrderRecord, params.order_id)
         ctx.modify(doc, ops_note=params.ops_note)
+
+    spec.declare_action(
+        "set_ops_note",
+        edit_function="set_ops_note",
+        allowed_roles=("ops",),
+        affects_source=False,
+    )
 
     ops = Actor(actor_id="ops-1", role="ops")
     db_path = tmp_path / "legacy_seven_tables.sqlite3"

@@ -109,28 +109,32 @@ class AnnotateParams(BaseModel):
     note: str
 
 
-@spec.action(
-    "rename_account",
-    RenameParams,
-    allowed_roles=("admin", "ops"),
-    affects_source=True,
-    description="改账户名（source-backed 字段）",
-)
+@spec.edit_function("rename_account", RenameParams, description="改账户名（source-backed 字段）")
 def rename_account(ctx, params):
     obj = ctx.get(Account, params.account_id)
     ctx.modify(obj, name=params.name)
 
+spec.declare_action(
+    "rename_account",
+    edit_function="rename_account",
+    allowed_roles=("admin", "ops"),
+    affects_source=True,
+    description="改账户名（source-backed 字段）",
+)
 
-@spec.action(
+
+@spec.edit_function("annotate_account", AnnotateParams, description="写自有治理字段")
+def annotate_account(ctx, params):
+    obj = ctx.get(Account, params.account_id)
+    ctx.modify(obj, internal_note=params.note)
+
+spec.declare_action(
     "annotate_account",
-    AnnotateParams,
+    edit_function="annotate_account",
     allowed_roles=("admin", "ops"),
     affects_source=False,
     description="写自有治理字段",
 )
-def annotate_account(ctx, params):
-    obj = ctx.get(Account, params.account_id)
-    ctx.modify(obj, internal_note=params.note)
 
 
 @spec.function("noop", RenameParams, description="占位只读函数")
@@ -390,16 +394,18 @@ def test_revert_requires_revert_role_when_revert_roles_declared(runtime):
         note: str
 
     if "controlled_note" not in runtime.spec.actions:
-        @runtime.spec.action(
+        @runtime.spec.edit_function("controlled_note", ControlledNoteParams)
+        def _controlled_note(ctx, params: ControlledNoteParams) -> None:
+            acc = ctx.require(Account, params.account_id)
+            ctx.modify(acc, internal_note=params.note)
+
+        runtime.spec.declare_action(
             "controlled_note",
-            ControlledNoteParams,
+            edit_function="controlled_note",
             allowed_roles=("ops", "admin"),
             revert_roles=("admin",),
             affects_source=False,
         )
-        def _controlled_note(ctx, params: ControlledNoteParams) -> None:
-            acc = ctx.require(Account, params.account_id)
-            ctx.modify(acc, internal_note=params.note)
 
     run = runtime.submit_action(
         "RUN-CTRL-1", "controlled_note", {"account_id": "A1", "note": "由ops提交"}, OPS
@@ -425,15 +431,17 @@ def test_rejection_is_audited_and_objects_untouched(runtime):
     class Boom(BaseModel):
         account_id: str
 
-    @runtime.spec.action(
+    @runtime.spec.edit_function("boom_action", Boom, description="必定失败")
+    def boom_action(ctx, params):
+        raise InvariantError("故意失败", code="DELIBERATE")
+
+    runtime.spec.declare_action(
         "boom_action",
-        Boom,
+        edit_function="boom_action",
         allowed_roles=("admin",),
         affects_source=False,
         description="必定失败",
     )
-    def boom_action(ctx, params):
-        raise InvariantError("故意失败", code="DELIBERATE")
 
     with pytest.raises(InvariantError):
         runtime.submit_action(
@@ -896,17 +904,19 @@ class GuardedParams(BaseModel):
     name: str
 
 
-@spec.action(
-    "guarded_rename",
-    GuardedParams,
-    allowed_roles=("admin",),
-    affects_source=True,
-)
+@spec.edit_function("guarded_rename", GuardedParams)
 def guarded_rename(ctx, params):
     if not params.name:
         ctx.invalidate("name must not be empty", code="EMPTY_NAME")
     obj = ctx.get(Account, params.account_id)
     ctx.modify(obj, name=params.name)
+
+spec.declare_action(
+    "guarded_rename",
+    edit_function="guarded_rename",
+    allowed_roles=("admin",),
+    affects_source=True,
+)
 
 
 def test_commit_rejection_and_revert_writes_pass_through_the_gate(runtime):
@@ -976,15 +986,17 @@ class SetBalanceParams(BaseModel):
     balance: int
 
 
-@spec.action(
-    "set_balance",
-    SetBalanceParams,
-    allowed_roles=("admin", "guest"),
-    affects_source=True,
-)
+@spec.edit_function("set_balance", SetBalanceParams)
 def set_balance(ctx, params):
     obj = ctx.get(Account, params.account_id)
     ctx.modify(obj, balance=params.balance)
+
+spec.declare_action(
+    "set_balance",
+    edit_function="set_balance",
+    allowed_roles=("admin", "guest"),
+    affects_source=True,
+)
 
 
 def test_call_function_masks_columns_for_unauthorized_actor(runtime):
@@ -1091,32 +1103,36 @@ def test_read_only_source_spec_forbids_affects_source_true_at_registration():
     ro_spec = OntologySpec(read_only_source=True)
     ro_spec.object_type(_ExternalCustomer)
 
-    with pytest.raises(GovernanceViolationError, match="read_only_source"):
-
-        @ro_spec.action("default_affects_source", _CustomerEditParams, allowed_roles=("admin",))
-        def _bad_default(ctx, params):
-            return None
+    @ro_spec.edit_function("_noop_customer_edit", _CustomerEditParams)
+    def _noop_customer_edit(ctx, params):
+        return None
 
     with pytest.raises(GovernanceViolationError, match="read_only_source"):
+        ro_spec.declare_action(
+            "default_affects_source",
+            edit_function="_noop_customer_edit",
+            allowed_roles=("admin",),
+        )
 
-        @ro_spec.action(
+    with pytest.raises(GovernanceViolationError, match="read_only_source"):
+        ro_spec.declare_action(
             "explicit_affects_source",
-            _CustomerEditParams,
+            edit_function="_noop_customer_edit",
             allowed_roles=("admin",),
             affects_source=True,
         )
-        def _bad_explicit(ctx, params):
-            return None
 
-    @ro_spec.action(
-        "tag_customer",
-        _CustomerEditParams,
-        allowed_roles=("admin",),
-        affects_source=False,
-    )
+    @ro_spec.edit_function("tag_customer", _CustomerEditParams)
     def tag_customer(ctx, params):
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         ctx.modify(cust, ops_tag=params.ops_tag)
+
+    ro_spec.declare_action(
+        "tag_customer",
+        edit_function="tag_customer",
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
 
     assert "tag_customer" in ro_spec.actions
 
@@ -1173,61 +1189,72 @@ def test_read_only_source_spec_blocks_action_source_writes_but_allows_snapshots_
         owned=True,
     )
 
-    @ro_spec.action(
-        "annotate_customer",
-        _CustomerEditParams,
-        allowed_roles=("admin",),
-        affects_source=False,
-    )
+    @ro_spec.edit_function("annotate_customer", _CustomerEditParams)
     def annotate_customer(ctx, params):
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         ctx.modify(cust, ops_tag=params.ops_tag)
 
-    @ro_spec.action(
-        "link_customer_note",
-        _LinkEditParams,
+    ro_spec.declare_action(
+        "annotate_customer",
+        edit_function="annotate_customer",
         allowed_roles=("admin",),
         affects_source=False,
     )
+
+    @ro_spec.edit_function("link_customer_note", _LinkEditParams)
     def link_customer_note(ctx, params):
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         note = ctx.create(_OwnedNote(note_id=params.note_id, text="note"))
         ctx.link(cust, "customer_owned_notes", note)
 
-    @ro_spec.action(
-        "illegal_mutate_source",
-        _CustomerEditParams,
+    ro_spec.declare_action(
+        "link_customer_note",
+        edit_function="link_customer_note",
         allowed_roles=("admin",),
         affects_source=False,
     )
+
+    @ro_spec.edit_function("illegal_mutate_source", _CustomerEditParams)
     def illegal_mutate_source(ctx, params):
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         ctx.modify(cust, name=params.name)
 
-    @ro_spec.action(
-        "illegal_create_source",
-        _CustomerEditParams,
+    ro_spec.declare_action(
+        "illegal_mutate_source",
+        edit_function="illegal_mutate_source",
         allowed_roles=("admin",),
         affects_source=False,
     )
+
+    @ro_spec.edit_function("illegal_create_source", _CustomerEditParams)
     def illegal_create_source(ctx, params):
         ctx.create(_ExternalCustomer(customer_id=params.customer_id, name=params.name))
 
-    @ro_spec.action(
-        "illegal_src_link",
-        _LinkEditParams,
+    ro_spec.declare_action(
+        "illegal_create_source",
+        edit_function="illegal_create_source",
         allowed_roles=("admin",),
         affects_source=False,
     )
+
+    @ro_spec.edit_function("illegal_src_link", _LinkEditParams)
     def illegal_src_link(ctx, params):
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         ctx.link(cust, "customer_src_links", cust)
 
-    # Bypass decorator registration to test runtime guard defense-in-depth
+    ro_spec.declare_action(
+        "illegal_src_link",
+        edit_function="illegal_src_link",
+        allowed_roles=("admin",),
+        affects_source=False,
+    )
+
+    # Bypass registration guard to test runtime guard defense-in-depth
     ro_spec.actions["rogue_source_action"] = ActionDef(
         name="rogue_source_action",
         params=_CustomerEditParams,
         handler=lambda ctx, params: None,
+        implementation_kind="rule",
         allowed_roles=("admin",),
         affects_source=True,
     )
@@ -1295,46 +1322,54 @@ def test_object_level_read_only_source_protects_external_object_in_mixed_spec(tm
         owned=False,
     )
 
-    @mixed_spec.action(
-        "update_order_amount",
-        _OrderEditParams,
-        allowed_roles=("admin",),
-        affects_source=True,
-    )
+    @mixed_spec.edit_function("update_order_amount", _OrderEditParams)
     def update_order_amount(ctx, params):
         order = ctx.get(_MutableOrder, params.order_id)
         ctx.modify(order, amount=params.amount)
 
-    @mixed_spec.action(
-        "rename_customer_with_true",
-        _CustomerEditParams,
+    mixed_spec.declare_action(
+        "update_order_amount",
+        edit_function="update_order_amount",
         allowed_roles=("admin",),
         affects_source=True,
     )
+
+    @mixed_spec.edit_function("rename_customer_with_true", _CustomerEditParams)
     def rename_customer_with_true(ctx, params):
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         ctx.modify(cust, name=params.name)
 
-    @mixed_spec.action(
-        "tag_customer_only",
-        _CustomerEditParams,
+    mixed_spec.declare_action(
+        "rename_customer_with_true",
+        edit_function="rename_customer_with_true",
         allowed_roles=("admin",),
-        affects_source=False,
+        affects_source=True,
     )
+
+    @mixed_spec.edit_function("tag_customer_only", _CustomerEditParams)
     def tag_customer_only(ctx, params):
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         ctx.modify(cust, ops_tag=params.ops_tag)
 
-    @mixed_spec.action(
-        "link_customer_to_order",
-        _LinkEditParams,
+    mixed_spec.declare_action(
+        "tag_customer_only",
+        edit_function="tag_customer_only",
         allowed_roles=("admin",),
-        affects_source=True,
+        affects_source=False,
     )
+
+    @mixed_spec.edit_function("link_customer_to_order", _LinkEditParams)
     def link_customer_to_order(ctx, params):
         cust = ctx.get(_ExternalCustomer, params.customer_id)
         order = ctx.get(_MutableOrder, "O1")
         ctx.link(cust, "customer_orders", order)
+
+    mixed_spec.declare_action(
+        "link_customer_to_order",
+        edit_function="link_customer_to_order",
+        allowed_roles=("admin",),
+        affects_source=True,
+    )
 
     rt = OntologyRuntime(mixed_spec, tmp_path / "mixed.sqlite3")
     try:
@@ -1378,10 +1413,14 @@ def test_kanban_and_dev_factory_enforce_read_only_source():
     assert dev_factory.spec.read_only_source is True
 
     for target_spec in (kanban.spec, dev_factory.spec):
+        @target_spec.edit_function("_probe_forbidden_ef", _CustomerEditParams)
+        def _probe_forbidden_ef(ctx, params):
+            return None
+
         with pytest.raises(GovernanceViolationError):
-            target_spec.action(
+            target_spec.declare_action(
                 "_probe_forbidden_source_action",
-                _CustomerEditParams,
+                edit_function="_probe_forbidden_ef",
                 allowed_roles=("admin",),
                 affects_source=True,
             )

@@ -1779,7 +1779,7 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
     blind_spec.object_type(WarpCore)
     blind_spec.object_type(Starship)
 
-    @blind_spec.action("jump_sector", JumpSectorParams, allowed_roles=("navigator", "commander", "admin"))
+    @blind_spec.edit_function("jump_sector", JumpSectorParams)
     def jump_sector(ctx: Any, params: JumpSectorParams) -> None:
         ship = ctx.require(Starship, params.ship_id)
         if ship.fuel_cells < params.cost_cells:
@@ -1793,12 +1793,24 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
             fuel_cells=ship.fuel_cells - params.cost_cells,
         )
 
-    @blind_spec.action("refuel_ship", RefuelCoreParams, allowed_roles=("commander", "admin"))
+    blind_spec.declare_action(
+        "jump_sector",
+        edit_function="jump_sector",
+        allowed_roles=("navigator", "commander", "admin"),
+    )
+
+    @blind_spec.edit_function("refuel_ship", RefuelCoreParams)
     def refuel_ship(ctx: Any, params: RefuelCoreParams) -> None:
         ship = ctx.require(Starship, params.ship_id)
         if params.added_cells <= 0:
             raise InvariantError("added_cells must be positive", code="INVALID_FUEL_AMOUNT")
         ctx.modify(ship, fuel_cells=ship.fuel_cells + params.added_cells)
+
+    blind_spec.declare_action(
+        "refuel_ship",
+        edit_function="refuel_ship",
+        allowed_roles=("commander", "admin"),
+    )
 
     @blind_spec.function("fleet_fuel_total", FleetFuelParams, description="计算当前可见舰队燃料总量与跃迁能量值")
     def fleet_fuel_total(ctx: Any, params: FleetFuelParams) -> dict[str, Any]:

@@ -477,11 +477,9 @@ def evaluate_credit_exposure(
 # ---------------------------------------------------------------------------
 # Governed actions (OWL ObjectProperty auto-links triples)
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "create_sales_order",
     CreateOrderParams,
-    allowed_roles=("sales_rep", "buyer", "ai_agent", "finance_director", "ops_manager"),
-    affects_source=True,
     description="为客户新建草稿销售订单（报价单）；信用冻结客户严禁开单。",
 )
 def create_sales_order(ctx: Any, params: CreateOrderParams) -> None:
@@ -531,13 +529,18 @@ def create_sales_order(ctx: Any, params: CreateOrderParams) -> None:
         )
     )
 
+spec.declare_action(
+    "create_sales_order",
+    edit_function="create_sales_order",
+    allowed_roles=("sales_rep", "buyer", "ai_agent", "finance_director", "ops_manager"),
+    affects_source=True,
+    description="为客户新建草稿销售订单（报价单）；信用冻结客户严禁开单。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "confirm_sales_order",
     ConfirmOrderParams,
-    allowed_roles=("sales_rep", "buyer", "ai_agent", "finance_director", "ops_manager"),
-    revert_roles=("finance_director",),
-    affects_source=True,
     description="确认草稿销售订单，创建待发货交货单；超信用额度须由财务总监审批（WorkCard）后在最新状态重算执行。",
 )
 def confirm_sales_order(ctx: Any, params: ConfirmOrderParams) -> None:
@@ -576,12 +579,19 @@ def confirm_sales_order(ctx: Any, params: ConfirmOrderParams) -> None:
         )
     )
 
+spec.declare_action(
+    "confirm_sales_order",
+    edit_function="confirm_sales_order",
+    allowed_roles=("sales_rep", "buyer", "ai_agent", "finance_director", "ops_manager"),
+    revert_roles=("finance_director",),
+    affects_source=True,
+    description="确认草稿销售订单，创建待发货交货单；超信用额度须由财务总监审批（WorkCard）后在最新状态重算执行。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "ship_order_delivery",
     ShipOrderParams,
-    allowed_roles=("warehouse", "sales_rep", "ai_agent", "ops_manager"),
-    affects_source=True,
     description="仓库发货：支持全量出库或按指定数量分批出库（自动追踪补货进度）。",
 )
 def ship_order_delivery(ctx: Any, params: ShipOrderParams) -> None:
@@ -630,12 +640,18 @@ def ship_order_delivery(ctx: Any, params: ShipOrderParams) -> None:
         )
         ctx.modify(order, status="shipped")
 
+spec.declare_action(
+    "ship_order_delivery",
+    edit_function="ship_order_delivery",
+    allowed_roles=("warehouse", "sales_rep", "ai_agent", "ops_manager"),
+    affects_source=True,
+    description="仓库发货：支持全量出库或按指定数量分批出库（自动追踪补货进度）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "issue_and_post_invoice",
     InvoiceOrderParams,
-    allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
-    affects_source=True,
     description="对已发货订单开具并过账应收发票（含税总额一致）；未发货严禁开票。",
 )
 def issue_and_post_invoice(ctx: Any, params: InvoiceOrderParams) -> None:
@@ -675,12 +691,18 @@ def issue_and_post_invoice(ctx: Any, params: InvoiceOrderParams) -> None:
         )
     )
 
-
-@spec.action(
-    "record_customer_payment",
-    RecordPaymentParams,
+spec.declare_action(
+    "issue_and_post_invoice",
+    edit_function="issue_and_post_invoice",
     allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
     affects_source=True,
+    description="对已发货订单开具并过账应收发票（含税总额一致）；未发货严禁开票。",
+)
+
+
+@spec.edit_function(
+    "record_customer_payment",
+    RecordPaymentParams,
     description="登记客户收款并核销发票；默认需全额匹配，显式 allow_partial=True 时支持分期收款。",
 )
 def record_customer_payment(ctx: Any, params: RecordPaymentParams) -> None:
@@ -756,13 +778,18 @@ def record_customer_payment(ctx: Any, params: RecordPaymentParams) -> None:
         )
     )
 
+spec.declare_action(
+    "record_customer_payment",
+    edit_function="record_customer_payment",
+    allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
+    affects_source=True,
+    description="登记客户收款并核销发票；默认需全额匹配，显式 allow_partial=True 时支持分期收款。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "issue_credit_note_refund",
     IssueCreditNoteParams,
-    allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
-    revert_roles=("finance_director",),
-    affects_source=True,
     description="对已过账/部分收款/已收款发票开具红字退款贷项通知单；非财务总监须开立 WorkCard 审批。",
 )
 def issue_credit_note_refund(ctx: Any, params: IssueCreditNoteParams) -> None:
@@ -807,12 +834,19 @@ def issue_credit_note_refund(ctx: Any, params: IssueCreditNoteParams) -> None:
         )
     )
 
+spec.declare_action(
+    "issue_credit_note_refund",
+    edit_function="issue_credit_note_refund",
+    allowed_roles=("finance", "finance_director", "ai_agent", "ops_manager"),
+    revert_roles=("finance_director",),
+    affects_source=True,
+    description="对已过账/部分收款/已收款发票开具红字退款贷项通知单；非财务总监须开立 WorkCard 审批。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "annotate_o2c_governance",
     AnnotateO2CParams,
-    allowed_roles=("sales_rep", "buyer", "ai_agent", "finance_director", "ops_manager"),
-    affects_source=False,
     description="只修改客户风险层级/信用备注与订单责任人/履约备注（领域自有治理）。",
 )
 def annotate_o2c_governance(ctx: Any, params: AnnotateO2CParams) -> None:
@@ -845,6 +879,14 @@ def annotate_o2c_governance(ctx: Any, params: AnnotateO2CParams) -> None:
             "no governance target or field supplied",
             code="NO_GOVERNANCE_TARGET",
         )
+
+spec.declare_action(
+    "annotate_o2c_governance",
+    edit_function="annotate_o2c_governance",
+    allowed_roles=("sales_rep", "buyer", "ai_agent", "finance_director", "ops_manager"),
+    affects_source=False,
+    description="只修改客户风险层级/信用备注与订单责任人/履约备注（领域自有治理）。",
+)
 
 
 # ---------------------------------------------------------------------------

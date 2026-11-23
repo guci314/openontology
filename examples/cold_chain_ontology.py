@@ -208,11 +208,9 @@ def recommend_reroute(ctx: Any, params: RecommendParams) -> dict[str, Any]:
     }
 
 
-@spec.action(
+@spec.edit_function(
     "reroute_shipment",
     RerouteParams,
-    allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
-    revert_roles=("ops_manager",),
     description="把冷链运单从抛锚卡车重派到接替仓 + 接替车（受治理）。",
 )
 def reroute_shipment(ctx: Any, params: RerouteParams) -> None:
@@ -291,17 +289,31 @@ def reroute_shipment(ctx: Any, params: RerouteParams) -> None:
             ctx.unlink(shipment, SHIPS_FROM, old_warehouse)
     ctx.link(shipment, SHIPS_FROM, warehouse)
 
+spec.declare_action(
+    "reroute_shipment",
+    edit_function="reroute_shipment",
+    allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
+    revert_roles=("ops_manager",),
+    description="把冷链运单从抛锚卡车重派到接替仓 + 接替车（受治理）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "annotate_shipment",
     AnnotateParams,
-    allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
-    affects_source=False,
     description="只修改 Ontology 自有的调度备注，不触碰任何源支撑业务字段。",
 )
 def annotate_shipment(ctx: Any, params: AnnotateParams) -> None:
     shipment = ctx.require(Shipment, params.shipment_id)
     ctx.modify(shipment, dispatcher_note=params.note)
+
+spec.declare_action(
+    "annotate_shipment",
+    edit_function="annotate_shipment",
+    allowed_roles=("dispatcher", "ai_agent", "ops_manager"),
+    affects_source=False,
+    description="只修改 Ontology 自有的调度备注，不触碰任何源支撑业务字段。",
+)
 
 
 DISPATCHER = Actor(

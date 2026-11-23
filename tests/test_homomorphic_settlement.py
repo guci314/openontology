@@ -110,12 +110,7 @@ def _build_settlement_spec() -> (
         ops_note: str
         memo_id: str | None = None
 
-    @spec.action(
-        "confirm_order",
-        ConfirmParams,
-        allowed_roles=("ops", "director"),
-        affects_source=True,
-    )
+    @spec.edit_function("confirm_order", ConfirmParams)
     def confirm_order(ctx: Any, params: ConfirmParams) -> None:
         doc = ctx.require(SalesOrder, params.order_id)
         if doc.qty <= 0:
@@ -125,12 +120,14 @@ def _build_settlement_spec() -> (
             tag = ctx.require(ShippingTag, params.attach_tag_id)
             ctx.link(doc, "order_tags", tag)
 
-    @spec.action(
-        "create_order",
-        CreateOrderParams,
+    spec.declare_action(
+        "confirm_order",
+        edit_function="confirm_order",
         allowed_roles=("ops", "director"),
         affects_source=True,
     )
+
+    @spec.edit_function("create_order", CreateOrderParams)
     def create_order(ctx: Any, params: CreateOrderParams) -> None:
         if params.qty <= 0:
             raise InvariantError("qty must be positive", code="NON_POSITIVE_QTY")
@@ -142,27 +139,38 @@ def _build_settlement_spec() -> (
             )
         )
 
-    @spec.action(
-        "delete_order",
-        DeleteOrderParams,
+    spec.declare_action(
+        "create_order",
+        edit_function="create_order",
         allowed_roles=("ops", "director"),
         affects_source=True,
     )
+
+    @spec.edit_function("delete_order", DeleteOrderParams)
     def delete_order(ctx: Any, params: DeleteOrderParams) -> None:
         doc = ctx.require(SalesOrder, params.order_id)
         ctx.delete(doc)
 
-    @spec.action(
-        "annotate_order",
-        NoteParams,
+    spec.declare_action(
+        "delete_order",
+        edit_function="delete_order",
         allowed_roles=("ops", "director"),
-        affects_source=False,
+        affects_source=True,
     )
+
+    @spec.edit_function("annotate_order", NoteParams)
     def annotate_order(ctx: Any, params: NoteParams) -> None:
         doc = ctx.require(SalesOrder, params.order_id)
         ctx.modify(doc, ops_note=params.ops_note)
         if params.memo_id:
             ctx.create(DecisionMemo(memo_id=params.memo_id, text=params.ops_note))
+
+    spec.declare_action(
+        "annotate_order",
+        edit_function="annotate_order",
+        allowed_roles=("ops", "director"),
+        affects_source=False,
+    )
 
     @spec.invariant(
         "order_qty_positive",
@@ -433,11 +441,18 @@ def test_phase_a_validation_and_occ_abort_before_actuate(tmp_path):
         class _BumpParams(BaseModel):
             order_id: str
 
-        @spec.action("confirm_with_concurrent_snapshot", _BumpParams, allowed_roles=("ops",), affects_source=True)
+        @spec.edit_function("confirm_with_concurrent_snapshot", _BumpParams)
         def _confirm_race(ctx: Any, params: _BumpParams) -> None:
             doc = ctx.require(SalesOrder, params.order_id)
             rt.load_snapshot({"SalesOrder": [{"order_id": params.order_id, "status": "draft", "qty": 99}]})
             ctx.modify(doc, status="confirmed")
+
+        spec.declare_action(
+            "confirm_with_concurrent_snapshot",
+            edit_function="confirm_with_concurrent_snapshot",
+            allowed_roles=("ops",),
+            affects_source=True,
+        )
 
         with pytest.raises(ConcurrencyConflictError):
             rt.submit_action("OCC-RACE", "confirm_with_concurrent_snapshot", {"order_id": "O-1"}, OPS)

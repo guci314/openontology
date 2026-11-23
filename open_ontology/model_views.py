@@ -140,6 +140,8 @@ def describe_behavior(
             {
                 "name": action.name,
                 "description": action.description,
+                "implementation_kind": action.implementation_kind,
+                "edit_function": action.edit_function,
                 "allowed_roles": list(action.allowed_roles),
                 "revert_roles": list(action.revert_roles),
                 "affects_source": action.affects_source,

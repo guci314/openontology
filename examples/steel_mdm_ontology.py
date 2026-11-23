@@ -366,12 +366,9 @@ def reconcile_multi_view_ledger(
 # ---------------------------------------------------------------------------
 # Governed actions
 # ---------------------------------------------------------------------------
-@spec.action(
+@spec.edit_function(
     "map_legacy_sku_to_spec",
     MapSkuParams,
-    allowed_roles=("buyer", "ai_agent", "mdm_steward"),
-    revert_roles=("mdm_steward",),
-    affects_source=False,
     description="存量散码零侵入寄生归并：只写 Ontology 自有字段与归并边。",
 )
 def map_legacy_sku_to_spec(ctx: Any, params: MapSkuParams) -> None:
@@ -391,13 +388,19 @@ def map_legacy_sku_to_spec(ctx: Any, params: MapSkuParams) -> None:
     )
     ctx.link(sku, SKU_MAPS_TO_SPEC, material_spec)
 
-
-@spec.action(
-    "create_material_spec",
-    CreateMaterialSpecParams,
-    allowed_roles=("mdm_steward",),
+spec.declare_action(
+    "map_legacy_sku_to_spec",
+    edit_function="map_legacy_sku_to_spec",
+    allowed_roles=("buyer", "ai_agent", "mdm_steward"),
     revert_roles=("mdm_steward",),
     affects_source=False,
+    description="存量散码零侵入寄生归并：只写 Ontology 自有字段与归并边。",
+)
+
+
+@spec.edit_function(
+    "create_material_spec",
+    CreateMaterialSpecParams,
     description="主数据管理员核准后创建全新物理规格（仅写 Ontology 自有层）。",
 )
 def create_material_spec(ctx: Any, params: CreateMaterialSpecParams) -> None:
@@ -420,13 +423,19 @@ def create_material_spec(ctx: Any, params: CreateMaterialSpecParams) -> None:
         )
     )
 
+spec.declare_action(
+    "create_material_spec",
+    edit_function="create_material_spec",
+    allowed_roles=("mdm_steward",),
+    revert_roles=("mdm_steward",),
+    affects_source=False,
+    description="主数据管理员核准后创建全新物理规格（仅写 Ontology 自有层）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "register_contract_sku",
     RegisterSkuParams,
-    allowed_roles=("buyer", "ai_agent", "mdm_steward"),
-    revert_roles=("mdm_steward",),
-    affects_source=True,
     description="增量建码硬护栏：必须绑定规格；缺失新物理品种需经主数据管理员核准开卡后建码。",
 )
 def register_contract_sku(ctx: Any, params: RegisterSkuParams) -> None:
@@ -480,13 +489,19 @@ def register_contract_sku(ctx: Any, params: RegisterSkuParams) -> None:
     )
     ctx.create(sku)
 
+spec.declare_action(
+    "register_contract_sku",
+    edit_function="register_contract_sku",
+    allowed_roles=("buyer", "ai_agent", "mdm_steward"),
+    revert_roles=("mdm_steward",),
+    affects_source=True,
+    description="增量建码硬护栏：必须绑定规格；缺失新物理品种需经主数据管理员核准开卡后建码。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "receive_material_lot",
     ReceiveLotParams,
-    allowed_roles=("buyer", "mdm_steward", "warehouse", "ops_manager"),
-    revert_roles=("mdm_steward",),
-    affects_source=False,
     description="按已治理散码入库，建立规格/厂家/发票三边齐备的高维批次桶。",
 )
 def receive_material_lot(ctx: Any, params: ReceiveLotParams) -> None:
@@ -532,13 +547,19 @@ def receive_material_lot(ctx: Any, params: ReceiveLotParams) -> None:
     ctx.link(lot, LOT_PRODUCED_BY, manufacturer)
     ctx.link(lot, LOT_BILLED_AS, sku)
 
+spec.declare_action(
+    "receive_material_lot",
+    edit_function="receive_material_lot",
+    allowed_roles=("buyer", "mdm_steward", "warehouse", "ops_manager"),
+    revert_roles=("mdm_steward",),
+    affects_source=False,
+    description="按已治理散码入库，建立规格/厂家/发票三边齐备的高维批次桶。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "consume_by_brand_fifo",
     ConsumeBrandParams,
-    allowed_roles=("mes", "mes_operator", "production", "ops_manager"),
-    revert_roles=("mdm_steward", "mes", "mes_operator", "production", "ops_manager"),
-    affects_source=False,
     description="按厂家报工后自动按 FIFO 扣减高维批次桶。",
 )
 def consume_by_brand_fifo(ctx: Any, params: ConsumeBrandParams) -> None:
@@ -574,6 +595,15 @@ def consume_by_brand_fifo(ctx: Any, params: ConsumeBrandParams) -> None:
             consumed_tons=lot.consumed_tons + take,
         )
         remaining -= take
+
+spec.declare_action(
+    "consume_by_brand_fifo",
+    edit_function="consume_by_brand_fifo",
+    allowed_roles=("mes", "mes_operator", "production", "ops_manager"),
+    revert_roles=("mdm_steward", "mes", "mes_operator", "production", "ops_manager"),
+    affects_source=False,
+    description="按厂家报工后自动按 FIFO 扣减高维批次桶。",
+)
 
 
 spec.update_display(

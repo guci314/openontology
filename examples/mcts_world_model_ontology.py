@@ -152,10 +152,9 @@ def evaluate_world_value(ctx: Any, params: EvaluateValueParams) -> dict[str, Any
     }
 
 
-@spec.action(
+@spec.edit_function(
     "dispatch_order",
     DispatchParams,
-    allowed_roles=("dispatcher", "ops_manager", "ai_agent"),
     description="把一张急救运单派给一辆可用冷链车（受治理，硬护栏当场拒绝）。",
 )
 def dispatch_order(ctx: Any, params: DispatchParams) -> None:
@@ -193,6 +192,13 @@ def dispatch_order(ctx: Any, params: DispatchParams) -> None:
     )
     ctx.modify(truck, status="assigned")
     ctx.link(truck, SERVES, order)
+
+spec.declare_action(
+    "dispatch_order",
+    edit_function="dispatch_order",
+    allowed_roles=("dispatcher", "ops_manager", "ai_agent"),
+    description="把一张急救运单派给一辆可用冷链车（受治理，硬护栏当场拒绝）。",
+)
 
 
 spec.update_display(

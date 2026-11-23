@@ -159,12 +159,11 @@ class RecordO2cPaymentParams(BaseModel):
     payment_amount: float = Field(..., ge=0.0)
 
 
-@spec.action(
+@spec.edit_function(
     "confirm_o2c_order",
     ConfirmO2cOrderParams,
-    allowed_roles=("sales_rep", "sales_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
-    touched_object_types=("O2cOrder",),
     description="校验草稿状态与正金额后确认标准销售订单。",
+    touched_object_types=("O2cOrder",),
 )
 def confirm_o2c_order(ctx: Any, params: ConfirmO2cOrderParams) -> None:
     order = ctx.require(O2cOrder, params.order_id)
@@ -180,13 +179,19 @@ def confirm_o2c_order(ctx: Any, params: ConfirmO2cOrderParams) -> None:
         )
     ctx.modify(order, status="confirmed")
 
+spec.declare_action(
+    "confirm_o2c_order",
+    edit_function="confirm_o2c_order",
+    allowed_roles=("sales_rep", "sales_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
+    description="校验草稿状态与正金额后确认标准销售订单。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "complete_o2c_delivery",
     CompleteO2cDeliveryParams,
-    allowed_roles=("warehouse", "ops", "finance_director", "steward", "ai_agent", "admin"),
-    touched_object_types=("O2cDelivery", "O2cOrder"),
     description="完成待发货履约单并同步推进关联销售订单为已发货（delivered）。",
+    touched_object_types=("O2cDelivery", "O2cOrder"),
 )
 def complete_o2c_delivery(ctx: Any, params: CompleteO2cDeliveryParams) -> None:
     delivery = ctx.require(O2cDelivery, params.delivery_id)
@@ -204,13 +209,19 @@ def complete_o2c_delivery(ctx: Any, params: CompleteO2cDeliveryParams) -> None:
     ctx.modify(delivery, status="completed")
     ctx.modify(order, status="delivered")
 
+spec.declare_action(
+    "complete_o2c_delivery",
+    edit_function="complete_o2c_delivery",
+    allowed_roles=("warehouse", "ops", "finance_director", "steward", "ai_agent", "admin"),
+    description="完成待发货履约单并同步推进关联销售订单为已发货（delivered）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "post_o2c_invoice",
     PostO2cInvoiceParams,
-    allowed_roles=("finance", "finance_director", "steward", "ai_agent", "admin"),
-    touched_object_types=("O2cInvoice", "O2cOrder"),
     description="将草稿应收发票正式过账并将关联订单推进为已开票（invoiced）。",
+    touched_object_types=("O2cInvoice", "O2cOrder"),
 )
 def post_o2c_invoice(ctx: Any, params: PostO2cInvoiceParams) -> None:
     invoice = ctx.require(O2cInvoice, params.invoice_id)
@@ -228,13 +239,19 @@ def post_o2c_invoice(ctx: Any, params: PostO2cInvoiceParams) -> None:
     ctx.modify(invoice, status="posted")
     ctx.modify(order, status="invoiced")
 
+spec.declare_action(
+    "post_o2c_invoice",
+    edit_function="post_o2c_invoice",
+    allowed_roles=("finance", "finance_director", "steward", "ai_agent", "admin"),
+    description="将草稿应收发票正式过账并将关联订单推进为已开票（invoiced）。",
+)
 
-@spec.action(
+
+@spec.edit_function(
     "record_o2c_payment",
     RecordO2cPaymentParams,
-    allowed_roles=("finance", "finance_director", "steward", "ai_agent", "admin"),
-    touched_object_types=("O2cInvoice",),
     description="登记已过账发票的回款核销（支持分期部分核销与全额结清）。",
+    touched_object_types=("O2cInvoice",),
 )
 def record_o2c_payment(ctx: Any, params: RecordO2cPaymentParams) -> None:
     invoice = ctx.require(O2cInvoice, params.invoice_id)
@@ -256,6 +273,13 @@ def record_o2c_payment(ctx: Any, params: RecordO2cPaymentParams) -> None:
     new_residual = max(0.0, round(invoice.amount_residual - params.payment_amount, 6))
     new_payment_state = "paid" if new_residual <= 1e-9 else "partial"
     ctx.modify(invoice, amount_residual=new_residual, payment_state=new_payment_state)
+
+spec.declare_action(
+    "record_o2c_payment",
+    edit_function="record_o2c_payment",
+    allowed_roles=("finance", "finance_director", "steward", "ai_agent", "admin"),
+    description="登记已过账发票的回款核销（支持分期部分核销与全额结清）。",
+)
 
 
 spec.update_display(

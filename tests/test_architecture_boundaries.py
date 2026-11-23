@@ -1,4 +1,4 @@
-"""架构红线统一门禁测试（Track A · 7 道结构性自动门禁）。
+"""架构红线统一门禁测试（Track A · 8 道结构性自动门禁）。
 
 覆盖两类架构反污染、Pure Runtime 依赖收敛与标准域零互耦红线：
 1. 门禁 1（技术不污染业务 · 动态发现 + AST 导入白名单 + 禁动态导入）：动态发现仓库内全部
@@ -16,7 +16,9 @@
 6. 门禁 6（Pure Runtime 零例外铁笼）：锁定 ``open_ontology`` 10 模块纯同步闭环，严禁延迟加载/引用 Design-Time、
    Workshop、MCTS/MPC 或 ModelViews；
 7. 门禁 7（常识细腰零耦合域间隔离）：动态发现全部 ``examples/std_*_ontology.py``，强制非 ``std_core_ontology``
-   标准域模块零同级交叉导入、声明式蓝图 ``imports`` 与 ``relations.target_type`` 严格收束于本域对象与常识细腰核心。
+   标准域模块零同级交叉导入、声明式蓝图 ``imports`` 与 ``relations.target_type`` 严格收束于本域对象与常识细腰核心；
+8. 门禁 8（反 xtUML 与 ``@spec.action`` 退役铁笼）：确认 ``OntologySpec.action`` 彻底移除、全仓零 ``.action(`` AST 注册残留、
+   声明式 DSL 与动作突变原语严禁图灵完备循环、标准本体全部动作实现归属 ``rule | edit_function``。
 """
 
 from __future__ import annotations
@@ -384,6 +386,7 @@ def test_gate3_dynamic_m1_vocabulary_reverse_scan() -> None:
         structural_tokens.update(spec.object_properties.keys())
         structural_tokens.update(spec.interfaces.keys())
         structural_tokens.update(spec.actions.keys())
+        structural_tokens.update(spec.edit_functions.keys())
         structural_tokens.update(spec.functions.keys())
         structural_tokens.update(spec.automations.keys())
         structural_tokens.update(spec.invariants.keys())
@@ -497,7 +500,7 @@ def test_gate4_fictional_domain_blind_m2_contract() -> None:
     blind_spec.object_type(WarpCore)
     blind_spec.object_type(Starship)
 
-    @blind_spec.action("jump_sector", JumpParams, allowed_roles=("navigator",))
+    @blind_spec.edit_function("jump_sector", JumpParams)
     def jump_sector(ctx, params: JumpParams) -> None:
         ship = ctx.require(Starship, params.ship_id)
         if ship.fuel_cells < params.cost_cells:
@@ -507,6 +510,12 @@ def test_gate4_fictional_domain_blind_m2_contract() -> None:
             sector=params.target_sector,
             fuel_cells=ship.fuel_cells - params.cost_cells,
         )
+
+    blind_spec.declare_action(
+        "jump_sector",
+        edit_function="jump_sector",
+        allowed_roles=("navigator",),
+    )
 
     @blind_spec.function("fleet_fuel_total", ScoreParams)
     def fleet_fuel_total(ctx, params: ScoreParams) -> dict:
@@ -1188,3 +1197,107 @@ def test_gate7_standard_domain_modules_zero_cross_imports() -> None:
     assert any("CrmAccount" in msg for msg in bp_hits), (
         f"Gate 7 负向自测未拦截关系越界指向 CrmAccount: {bp_hits}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gate 8: 反 xtUML 与 @spec.action 退役铁笼
+# ---------------------------------------------------------------------------
+def _scan_source_for_action_calls(source: str, filename: str = "<memory>") -> list[tuple[str, int]]:
+    tree = ast.parse(source, filename=filename)
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "action"
+        ):
+            hits.append((filename, node.lineno))
+    return hits
+
+
+def test_gate8_anti_xtuml_and_spec_action_retired() -> None:
+    """Gate 8: 彻底退役 OntologySpec.action，锁定声明式 DSL 非图灵完备边界与三元实现一致性。"""
+    import subprocess
+    from typing import get_args as _get_args
+    from open_ontology.induction.dsl import ALLOWED_EXPR_OPS
+    from open_ontology.induction.governance import build_induction_governance_spec
+
+    # 8a. OntologySpec.action 彻底删除，不留向后兼容别名
+    assert not hasattr(OntologySpec, "action")
+    assert not hasattr(OntologySpec(), "action")
+
+    # 8b. 全仓 git 纳管源码零 .action(...) AST 调用残留（同步覆盖新增 Gate8/WO-27A 测试）
+    tracked_py = {
+        (REPO_ROOT / rel).resolve()
+        for rel in subprocess.check_output(
+            ["git", "ls-files", "--cached", "--", "open_ontology/*.py", "open_ontology/**/*.py", "examples/*.py", "tests/*.py"],
+            cwd=str(REPO_ROOT),
+            text=True,
+        ).splitlines()
+        if rel
+    }
+    tracked_py.update(p.resolve() for p in _iter_kernel_py_files())
+    new_suite = (REPO_ROOT / "tests" / "test_kinetic_split_and_overlay_on_spec.py").resolve()
+    if new_suite.is_file():
+        tracked_py.add(new_suite)
+
+    ast_action_hits: list[tuple[str, int]] = []
+    for py_path in sorted(tracked_py):
+        if not py_path.is_file():
+            continue
+        rel_str = str(py_path.relative_to(REPO_ROOT))
+        ast_action_hits.extend(_scan_source_for_action_calls(py_path.read_text(encoding="utf-8"), rel_str))
+    assert ast_action_hits == [], f"全仓仍残留已退役的 .action(...) 调用：{ast_action_hits}"
+
+    # 负向自测：恶意注入旧装饰器语法必被 Gate 8 AST 扫描准确捕获
+    neg_hits = _scan_source_for_action_calls(
+        "@spec.action('legacy_op', Params)\ndef _legacy(ctx, params):\n    pass\n",
+        "neg_probe.py",
+    )
+    assert len(neg_hits) == 1
+
+    # 8c. 反 xtUML 原语冻结：禁止循环/批量修改原语混入声明式 DSL
+    forbidden_dsl_ops = frozenset(
+        {
+            "while",
+            "loop",
+            "for",
+            "for_each",
+            "foreach",
+            "modify_where",
+            "delete_where",
+            "recurse",
+            "exec",
+            "eval",
+            "call_python",
+            "lambda",
+        }
+    )
+    assert set(ALLOWED_EXPR_OPS).isdisjoint(forbidden_dsl_ops), (
+        f"ALLOWED_EXPR_OPS 泄漏反 xtUML 违禁原语: {sorted(set(ALLOWED_EXPR_OPS) & forbidden_dsl_ops)}"
+    )
+    mut_ops = set(_get_args(ActionMutationSpec.model_fields["op"].annotation))
+    assert mut_ops == {"create", "modify", "delete"}
+    assert mut_ops.isdisjoint(forbidden_dsl_ops)
+
+    # 8d. 所有标准/内置本体动作必须明确标定 implementation_kind ∈ {'rule', 'edit_function'} 且绑定一致
+    specs_to_check: list[tuple[str, OntologySpec]] = []
+    for mod_name, attr in M1_ONTOLOGY_MODULES:
+        mod = importlib.import_module(mod_name)
+        target = getattr(mod, attr)
+        specs_to_check.append((mod_name, target() if callable(target) else target))
+    specs_to_check.append(("open_ontology.induction.governance", build_induction_governance_spec()))
+
+    for origin_name, loaded_spec in specs_to_check:
+        for act_name, act_def in loaded_spec.actions.items():
+            assert act_def.implementation_kind in ("rule", "edit_function"), (
+                f"{origin_name}.{act_name} has invalid implementation_kind={act_def.implementation_kind!r}"
+            )
+            if act_def.implementation_kind == "edit_function":
+                assert act_def.edit_function in loaded_spec.edit_functions, (
+                    f"{origin_name}.{act_name} references unregistered edit_function={act_def.edit_function!r}"
+                )
+            else:
+                assert act_def.edit_function is None, (
+                    f"{origin_name}.{act_name} rule action must have edit_function=None"
+                )

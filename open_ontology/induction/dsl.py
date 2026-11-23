@@ -1,4 +1,11 @@
-"""L1 零 eval/exec 声明式本体蓝图、补丁与安全谓词编译器（纯 M2，领域无关）。"""
+"""L1 零 eval/exec 声明式本体蓝图、补丁与安全谓词编译器（纯 M2，领域无关）。
+
+[反 xtUML 架构冻结声明]
+本声明式 DSL 严格限定为单向安全谓词、有限状态机与固定深度单次增删改声明原语，
+永久禁止引入 `while` / `loop` / `for_each` / `modify_where` / `recurse` / `exec` /
+`eval` / `call_python` 等图灵完备控制流原语；需要复杂迭代、图遍历或跨行算法时，
+一律显式下沉为 Python ``@spec.edit_function`` 并由 ``spec.declare_action`` 绑定治理壳。
+"""
 
 from __future__ import annotations
 
@@ -6,9 +13,10 @@ import copy
 import hashlib
 import json
 import re
+import types as _types
 import uuid
 from collections import defaultdict
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator, model_validator
 
@@ -16,16 +24,20 @@ from ..sandbox import EditBatch, InvariantView, ObjectDiff
 from ..spec import (
     Actor,
     AutoID,
+    EditFunctionDef,
     InvariantError,
     ObjectProperty,
     ObjectType,
     OntologySpec,
     ScopedViewSpec,
+    extract_auto_id_meta,
+    extract_object_property_meta,
 )
 from .phenomenon import ActionExecutionBinding, AdapterMappingSpec, EntityMappingSpec
 from .seed import SeedOntology
 
 __all__ = [
+    "ALLOWED_EXPR_OPS",
     "FieldSpec",
     "RelationSpec",
     "ObjectTypeBlueprint",
@@ -48,6 +60,7 @@ __all__ = [
     "eval_predicate",
     "compose_blueprints",
     "apply_overlay",
+    "apply_overlay_to_spec",
     "apply_evolution_patch",
     "apply_adapter_mapping_patch",
     "migrate_m0_snapshot",
@@ -66,6 +79,7 @@ _SCALAR_TYPES: dict[str, type[Any]] = {
     "boolean": bool,
 }
 
+# Anti-xtUML freeze: NEVER add loop/iteration/imperative control-flow operators here.
 COMPARISON_OPS = frozenset({"eq", "ne", "lt", "le", "gt", "ge", "in", "not_in"})
 LOGICAL_OPS = frozenset({"and", "or", "not"})
 QUANTIFIER_OPS = frozenset({"exists", "not_exists", "count_eq", "count_ge", "count_le"})
@@ -208,11 +222,23 @@ class ActionBlueprint(BaseModel):
     allowed_roles: list[str] = Field(default_factory=lambda: ["admin", "ai_agent"])
     revert_roles: list[str] = Field(default_factory=list)
     affects_source: bool = True
+    edit_function: str | None = None
     params: list[FieldSpec] = Field(default_factory=list)
     preconditions: list[InvariantRuleSpec] = Field(default_factory=list)
     mutations: list[ActionMutationSpec] = Field(default_factory=list)
     view_tags: list[str] = Field(default_factory=list)
     display_label: str = ""
+
+    @model_validator(mode="after")
+    def _validate_edit_function_exclusive(self) -> "ActionBlueprint":
+        if self.edit_function is not None:
+            _assert_safe_identifier(self.edit_function, "edit_function")
+            if self.mutations:
+                raise ValueError(
+                    f"ActionBlueprint {self.name!r} cannot specify both 'edit_function' "
+                    "and declarative 'mutations'"
+                )
+        return self
 
 
 class ScopedViewBlueprint(BaseModel):
@@ -2242,6 +2268,7 @@ def compile_blueprint(
     blueprint: DeclarativeBlueprint,
     *,
     seed_ontology: SeedOntology | None = None,
+    edit_functions: Mapping[str, EditFunctionDef] | None = None,
 ) -> OntologySpec:
     """Compile a L1 DeclarativeBlueprint into a real OntologySpec with ZERO eval/exec.
 
@@ -2407,7 +2434,13 @@ def compile_blueprint(
 
             validators = {"_coerce_null_optional_scalars": _make_null_coercer(dict(optional_scalar_defaults))}
 
-        cls = create_model(ot.name, __base__=base_cls, __validators__=validators, **field_defs)
+        cls = create_model(
+            ot.name,
+            __base__=base_cls,
+            __module__="open_ontology_declarative",
+            __validators__=validators,
+            **field_defs,
+        )
         cls.__primary_key__ = ot.primary_key
         cls.__title__ = ot.title_field or ot.primary_key
         cls.__aggregate_root__ = bool(agg_root)
@@ -2496,11 +2529,18 @@ def compile_blueprint(
             code="ILLEGAL_STATE_TRANSITION",
             description="Status transitions must follow declared FSM edges.",
         )
-        def _check_fsm(diff: ObjectDiff, _view: InvariantView) -> bool:
+        def _check_fsm(diff: ObjectDiff, view: InvariantView) -> bool:
             for change in diff.object_changes:
                 if change.object_type not in fallback_fsm_specs:
                     continue
-                status_field, initial_allowed, transitions = fallback_fsm_specs[change.object_type]
+                status_field, initial_allowed, base_transitions = fallback_fsm_specs[change.object_type]
+                cur_cls = view.spec.get_object_type(change.object_type)
+                live_trans = getattr(cur_cls, "__transitions__", None)
+                transitions = (
+                    {str(k): tuple(v) for k, v in live_trans.items()}
+                    if isinstance(live_trans, Mapping)
+                    else base_transitions
+                )
                 if change.kind == "create" and initial_allowed is not None and change.after:
                     after_s = change.after.get(status_field)
                     if after_s not in initial_allowed:
@@ -2610,278 +2650,29 @@ def compile_blueprint(
         validate_predicate_ast(inv.must_hold, allowed_roots=inv_roots, allow_view=True)
         _validate_expr_schema_refs(inv.must_hold, ot_by_name=ot_by_name, root_types=inv_ref_roots)
 
-        def _make_invariant(rule: InvariantRuleSpec) -> Callable[[InvariantView], bool]:
-            target_cls = created_classes[rule.target_type]
+        spec.invariant(inv.name, code=inv.code, description=inv.description)(
+            _make_rule_invariant_handler(inv)
+        )
 
-            def _check(view: InvariantView) -> bool:
-                for obj in view.query(target_cls):
-                    ctx = {"obj": obj}
-                    if rule.when is not None and not eval_predicate(rule.when, ctx, view):
-                        continue
-                    if not eval_predicate(rule.must_hold, ctx, view):
-                        msg = (
-                            f"[{rule.code}] {rule.description}"
-                            if rule.description
-                            else f"[{rule.code}] invariant {rule.name} violated on "
-                            f"{rule.target_type}:{obj.primary_key_value()}"
-                        )
-                        raise InvariantError(msg, code=rule.code)
-                return True
-
-            return _check
-
-        spec.invariant(inv.name, code=inv.code, description=inv.description)(_make_invariant(inv))
-
-    def _resolve_subject(
-        action_bp: ActionBlueprint,
-        pdefs: dict[str, Any],
-    ) -> tuple[type[ObjectType] | None, str | None]:
-        for m in action_bp.mutations:
-            if m.op != "create" and m.target_ref is None and m.id_param in pdefs:
-                return created_classes[m.object_type], m.id_param
-        for pre in action_bp.preconditions:
-            s_cls = created_classes[pre.target_type]
-            s_idp = pre.id_param or s_cls.__primary_key__
-            if s_idp in pdefs:
-                return s_cls, s_idp
-        return None, None
+    if edit_functions:
+        for ef_name, ef_def in edit_functions.items():
+            if not isinstance(ef_def, EditFunctionDef):
+                raise TypeError(
+                    f"edit_functions[{ef_name!r}] must be an EditFunctionDef, got {type(ef_def).__name__}"
+                )
+            spec.edit_functions[ef_name] = ef_def
 
     action_display: dict[str, str] = {}
     for act in blueprint.actions:
-        _assert_safe_identifier(act.name, "action name")
-        param_defs: dict[str, Any] = {}
-        for p in act.params:
-            _assert_safe_identifier(p.name, "action param")
-            py_type = _resolve_scalar_type(p.field_type)
-            if p.required:
-                default_val = ... if p.default is None else p.default
-            else:
-                default_val = _default_for_type(py_type) if p.default is None else p.default
-            param_defs[p.name] = (py_type, default_val)
-        params_cls = create_model(f"{act.name}_Params", **param_defs)
-
-        subject_cls, subject_id_param = _resolve_subject(act, param_defs)
-
-        pre_roots = frozenset({"obj", "param", "actor"})
-        act_param_names = set(param_defs.keys())
-        for pre in act.preconditions:
-            if pre.target_type not in created_classes:
-                raise InvariantError(
-                    f"precondition {pre.name!r} targets unknown object type {pre.target_type!r}",
-                    code="UNKNOWN_OBJECT_TYPE",
-                )
-            if compiled_valid_roles:
-                _validate_expr_closed_roles(
-                    pre.when,
-                    compiled_valid_roles,
-                    context=f"action {act.name}.preconditions.{pre.name}.when",
-                )
-                _validate_expr_closed_roles(
-                    pre.must_hold,
-                    compiled_valid_roles,
-                    context=f"action {act.name}.preconditions.{pre.name}.must_hold",
-                )
-            pre_ref_roots = {"obj": pre.target_type}
-            if pre.when is not None:
-                validate_predicate_ast(pre.when, allowed_roots=pre_roots, allow_view=True)
-                _validate_expr_schema_refs(
-                    pre.when, ot_by_name=ot_by_name, root_types=pre_ref_roots, param_names=act_param_names
-                )
-            validate_predicate_ast(pre.must_hold, allowed_roots=pre_roots, allow_view=True)
-            _validate_expr_schema_refs(
-                pre.must_hold, ot_by_name=ot_by_name, root_types=pre_ref_roots, param_names=act_param_names
-            )
-
-        for mut in act.mutations:
-            if mut.object_type not in created_classes:
-                raise InvariantError(
-                    f"action {act.name!r} mutates unknown object type {mut.object_type!r}",
-                    code="UNKNOWN_OBJECT_TYPE",
-                )
-            if mut.target_ref is not None:
-                if mut.op == "create":
-                    raise InvariantError(
-                        f"action {act.name!r} create mutation cannot use target_ref",
-                        code="INVALID_MUTATION_TARGET_REF",
-                    )
-                tref_parts = mut.target_ref.split(".")
-                if tref_parts[0] not in ("obj", "param") or len(tref_parts) < 2:
-                    raise InvariantError(
-                        f"action {act.name!r} target_ref {mut.target_ref!r} must start with 'obj.' or 'param.'",
-                        code="INVALID_MUTATION_TARGET_REF",
-                    )
-                for seg in tref_parts[1:]:
-                    _assert_safe_identifier(seg, "target_ref segment")
-                if tref_parts[0] == "obj" and subject_cls is None:
-                    raise InvariantError(
-                        f"action {act.name!r} mutation target_ref {mut.target_ref!r} requires a primary subject object",
-                        code="UNAVAILABLE_REF_IN_CONTEXT",
-                    )
-                mut_roots = frozenset({"obj", "source_obj", "param", "actor"})
-                mut_ref_roots: dict[str, str] = {"obj": mut.object_type}
-                if subject_cls is not None:
-                    mut_ref_roots["source_obj"] = subject_cls.__name__
-                if tref_parts[0] == "obj" and subject_cls is not None:
-                    _validate_expr_schema_refs(
-                        {"ref": mut.target_ref},
-                        ot_by_name=ot_by_name,
-                        root_types={"obj": subject_cls.__name__},
-                        param_names=act_param_names,
-                    )
-                elif tref_parts[0] == "param":
-                    _validate_expr_schema_refs(
-                        {"ref": mut.target_ref},
-                        ot_by_name=ot_by_name,
-                        root_types={},
-                        param_names=act_param_names,
-                    )
-            elif mut.op == "create":
-                mut_roots = frozenset({"param", "actor"})
-                mut_ref_roots = {}
-            else:
-                mut_roots = frozenset({"obj", "param", "actor"})
-                mut_ref_roots = {"obj": mut.object_type}
-            for fv in mut.set_fields.values():
-                if compiled_valid_roles:
-                    _validate_expr_closed_roles(
-                        fv,
-                        compiled_valid_roles,
-                        context=f"action {act.name}.mutations.{mut.object_type}",
-                    )
-                _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
-                _validate_expr_schema_refs(
-                    fv, ot_by_name=ot_by_name, root_types=mut_ref_roots, param_names=act_param_names
-                )
-
-        def _make_action_handler(
-            action_bp: ActionBlueprint,
-            anchor_cls: type[ObjectType] | None,
-            anchor_id_param: str | None,
-        ) -> Callable[[EditBatch, BaseModel], None]:
-            def _handler(ctx: EditBatch, params: BaseModel) -> None:
-                # 1. Preconditions (P1-1 fix: require exact target IDs instead of silent full-table scan)
-                for pre in action_bp.preconditions:
-                    target_cls = created_classes[pre.target_type]
-                    explicit_id_params: list[str] = []
-                    if pre.id_param:
-                        explicit_id_params.append(pre.id_param)
-                    else:
-                        for m in action_bp.mutations:
-                            if m.object_type == pre.target_type and m.op != "create" and m.target_ref is None:
-                                explicit_id_params.append(m.id_param)
-                        if not explicit_id_params and hasattr(params, target_cls.__primary_key__):
-                            explicit_id_params.append(target_cls.__primary_key__)
-
-                    checked_objs: list[ObjectType] = []
-                    if explicit_id_params:
-                        for idp in explicit_id_params:
-                            if not hasattr(params, idp):
-                                raise InvariantError(
-                                    f"precondition {pre.name!r} references missing param {idp!r}",
-                                    code="MISSING_ID_PARAM",
-                                )
-                            cid = getattr(params, idp)
-                            if cid is None:
-                                raise InvariantError(
-                                    f"precondition {pre.name!r} requires non-null {idp!r}",
-                                    code="MISSING_ID_PARAM",
-                                )
-                            checked_objs.append(ctx.require(target_cls, str(cid)))
-                    else:
-                        # Only scan when no target ID parameter exists on this action
-                        checked_objs = list(ctx.query(target_cls))
-
-                    for obj in checked_objs:
-                        eval_ctx = {"obj": obj, "param": params, "actor": ctx.actor}
-                        if pre.when is not None and not eval_predicate(pre.when, eval_ctx, ctx):
-                            continue
-                        if not eval_predicate(pre.must_hold, eval_ctx, ctx):
-                            msg = (
-                                f"[{pre.code}] {pre.description}"
-                                if pre.description
-                                else f"[{pre.code}] precondition {pre.name} failed on "
-                                f"{pre.target_type}:{obj.primary_key_value()}"
-                            )
-                            raise InvariantError(msg, code=pre.code)
-
-                anchor_obj: ObjectType | None = None
-                if anchor_cls is not None and anchor_id_param is not None and hasattr(params, anchor_id_param):
-                    raw_anchor_id = getattr(params, anchor_id_param, None)
-                    if raw_anchor_id is not None:
-                        anchor_obj = ctx.require(anchor_cls, str(raw_anchor_id))
-
-                # 2. Mutations
-                for mut in action_bp.mutations:
-                    target_cls = created_classes[mut.object_type]
-                    if mut.op == "create":
-                        eval_ctx = {"param": params, "actor": ctx.actor}
-                        payload: dict[str, Any] = {}
-                        for k, v_expr in mut.set_fields.items():
-                            payload[k] = _eval_value(v_expr, eval_ctx, ctx)
-                        if target_cls.__primary_key__ not in payload and hasattr(params, mut.id_param):
-                            payload[target_cls.__primary_key__] = getattr(params, mut.id_param)
-                        obj = target_cls(**payload)
-                        ctx.create(obj)
-                    elif mut.target_ref is not None:
-                        ref_ctx: dict[str, Any] = {"param": params, "actor": ctx.actor}
-                        if anchor_obj is not None:
-                            ref_ctx["obj"] = anchor_obj
-                        ref_val = _resolve_ref(mut.target_ref, ref_ctx, ctx)
-                        if ref_val is None:
-                            raise InvariantError(
-                                f"action {action_bp.name!r} mutation target_ref {mut.target_ref!r} resolved to None",
-                                code="MISSING_TARGET_REF",
-                            )
-                        target_id = (
-                            ref_val.primary_key_value()
-                            if isinstance(ref_val, ObjectType)
-                            else str(ref_val)
-                        )
-                        existing = ctx.require(target_cls, target_id)
-                        if mut.op == "delete":
-                            ctx.delete(existing)
-                        else:
-                            eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
-                            if anchor_obj is not None:
-                                eval_ctx["source_obj"] = anchor_obj
-                            updates: dict[str, Any] = {}
-                            for k, v_expr in mut.set_fields.items():
-                                updates[k] = _eval_value(v_expr, eval_ctx, ctx)
-                            ctx.modify(existing, **updates)
-                    else:
-                        if not hasattr(params, mut.id_param):
-                            raise InvariantError(
-                                f"action {action_bp.name!r} missing id_param {mut.id_param!r}",
-                                code="MISSING_ID_PARAM",
-                            )
-                        target_id = str(getattr(params, mut.id_param))
-                        existing = ctx.require(target_cls, target_id)
-                        if mut.op == "delete":
-                            ctx.delete(existing)
-                        else:
-                            eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
-                            updates = {}
-                            for k, v_expr in mut.set_fields.items():
-                                updates[k] = _eval_value(v_expr, eval_ctx, ctx)
-                            ctx.modify(existing, **updates)
-
-            return _handler
-
-        touched_types = {mut.object_type for mut in act.mutations} | {
-            pre.target_type for pre in act.preconditions
-        }
-        spec.action(
-            act.name,
-            params_cls,
-            allowed_roles=tuple(act.allowed_roles),
-            revert_roles=tuple(act.revert_roles),
-            affects_source=act.affects_source,
-            description=act.description,
-            view_tags=tuple(act.view_tags),
-            touched_object_types=tuple(sorted(touched_types)),
-        )(_make_action_handler(act, subject_cls, subject_id_param))
-        if act.display_label:
-            action_display[act.name] = act.display_label
+        lbl = _compile_and_register_action_blueprint(
+            spec,
+            act,
+            ot_by_name=ot_by_name,
+            valid_type_names=set(spec.object_types.keys()),
+            compiled_valid_roles=compiled_valid_roles,
+        )
+        if lbl:
+            action_display[act.name] = lbl
 
     valid_ot_names = set(spec.object_types.keys())
     valid_act_names = set(spec.actions.keys())
@@ -2913,6 +2704,1417 @@ def compile_blueprint(
         }
     )
     return spec
+
+
+def _compile_param_defs(params: Sequence[FieldSpec]) -> tuple[dict[str, Any], set[str]]:
+    param_defs: dict[str, Any] = {}
+    for p in params:
+        _assert_safe_identifier(p.name, "action param")
+        py_type = _resolve_scalar_type(p.field_type)
+        if p.required:
+            default_val = ... if p.default is None else p.default
+        else:
+            default_val = _default_for_type(py_type) if p.default is None else p.default
+        param_defs[p.name] = (py_type, default_val)
+    return param_defs, set(param_defs.keys())
+
+
+def _run_action_preconditions(
+    ctx: EditBatch,
+    params: BaseModel,
+    preconditions: Sequence[InvariantRuleSpec],
+    *,
+    mutations: Sequence[ActionMutationSpec] = (),
+) -> None:
+    params_cls = type(params)
+    param_fields = getattr(params_cls, "model_fields", {})
+    for pre in preconditions:
+        target_cls = ctx.spec.get_object_type(pre.target_type)
+        explicit_id_params: list[str] = []
+        if pre.id_param:
+            explicit_id_params.append(pre.id_param)
+        else:
+            for m in mutations:
+                if m.object_type == pre.target_type and m.op != "create" and m.target_ref is None:
+                    explicit_id_params.append(m.id_param)
+            if not explicit_id_params:
+                pk_name = target_cls.primary_key_name()
+                if pk_name in param_fields:
+                    explicit_id_params.append(pk_name)
+            if not explicit_id_params:
+                for pname, finfo in param_fields.items():
+                    meta = extract_object_property_meta(finfo)
+                    if meta is not None and meta[0] == pre.target_type and not meta[1]:
+                        explicit_id_params.append(pname)
+                        break
+
+        checked_objs: list[ObjectType | None] = []
+        if explicit_id_params:
+            for idp in explicit_id_params:
+                if not hasattr(params, idp):
+                    raise InvariantError(
+                        f"precondition {pre.name!r} references missing param {idp!r}",
+                        code="MISSING_ID_PARAM",
+                    )
+                cid = getattr(params, idp)
+                if cid is None:
+                    raise InvariantError(
+                        f"precondition {pre.name!r} requires non-null {idp!r}",
+                        code="MISSING_ID_PARAM",
+                    )
+                checked_objs.append(ctx.require(target_cls, str(cid)))
+        else:
+            checked_objs = list(ctx.query(target_cls))
+            if not checked_objs:
+                refs = [*_iter_ast_refs(pre.when or {}), *_iter_ast_refs(pre.must_hold)]
+                if not any(r.split(".")[0] == "obj" for r in refs):
+                    checked_objs = [None]
+
+        for obj in checked_objs:
+            eval_ctx = {"obj": obj, "param": params, "actor": ctx.actor}
+            if pre.when is not None and not eval_predicate(pre.when, eval_ctx, ctx):
+                continue
+            if not eval_predicate(pre.must_hold, eval_ctx, ctx):
+                obj_desc = (
+                    f"{pre.target_type}:{obj.primary_key_value()}"
+                    if obj is not None
+                    else pre.target_type
+                )
+                msg = (
+                    f"[{pre.code}] {pre.description}"
+                    if pre.description
+                    else f"[{pre.code}] precondition {pre.name} failed on {obj_desc}"
+                )
+                raise InvariantError(msg, code=pre.code)
+
+
+def _make_rule_invariant_handler(rule: InvariantRuleSpec) -> Callable[[InvariantView], bool]:
+    def _check(view: InvariantView) -> bool:
+        target_cls = view.spec.get_object_type(rule.target_type)
+        for obj in view.query(target_cls):
+            ctx = {"obj": obj}
+            if rule.when is not None and not eval_predicate(rule.when, ctx, view):
+                continue
+            if not eval_predicate(rule.must_hold, ctx, view):
+                msg = (
+                    f"[{rule.code}] {rule.description}"
+                    if rule.description
+                    else f"[{rule.code}] invariant {rule.name} violated on "
+                    f"{rule.target_type}:{obj.primary_key_value()}"
+                )
+                raise InvariantError(msg, code=rule.code)
+        return True
+
+    return _check
+
+
+def _make_rule_action_handler(
+    action_bp: ActionBlueprint,
+    anchor_type: str | None,
+    anchor_id_param: str | None,
+) -> Callable[[EditBatch, BaseModel], None]:
+    def _handler(ctx: EditBatch, params: BaseModel) -> None:
+        _run_action_preconditions(
+            ctx, params, action_bp.preconditions, mutations=action_bp.mutations
+        )
+
+        anchor_obj: ObjectType | None = None
+        if anchor_type is not None and anchor_id_param is not None and hasattr(params, anchor_id_param):
+            raw_anchor_id = getattr(params, anchor_id_param, None)
+            if raw_anchor_id is not None:
+                anchor_obj = ctx.require(ctx.spec.get_object_type(anchor_type), str(raw_anchor_id))
+
+        for mut in action_bp.mutations:
+            target_cls = ctx.spec.get_object_type(mut.object_type)
+            if mut.op == "create":
+                eval_ctx = {"param": params, "actor": ctx.actor}
+                payload: dict[str, Any] = {}
+                for k, v_expr in mut.set_fields.items():
+                    payload[k] = _eval_value(v_expr, eval_ctx, ctx)
+                if target_cls.__primary_key__ not in payload and hasattr(params, mut.id_param):
+                    payload[target_cls.__primary_key__] = getattr(params, mut.id_param)
+                obj = target_cls(**payload)
+                ctx.create(obj)
+            elif mut.target_ref is not None:
+                ref_ctx: dict[str, Any] = {"param": params, "actor": ctx.actor}
+                if anchor_obj is not None:
+                    ref_ctx["obj"] = anchor_obj
+                ref_val = _resolve_ref(mut.target_ref, ref_ctx, ctx)
+                if ref_val is None:
+                    raise InvariantError(
+                        f"action {action_bp.name!r} mutation target_ref {mut.target_ref!r} resolved to None",
+                        code="MISSING_TARGET_REF",
+                    )
+                target_id = (
+                    ref_val.primary_key_value()
+                    if isinstance(ref_val, ObjectType)
+                    else str(ref_val)
+                )
+                existing = ctx.require(target_cls, target_id)
+                if mut.op == "delete":
+                    ctx.delete(existing)
+                else:
+                    eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
+                    if anchor_obj is not None:
+                        eval_ctx["source_obj"] = anchor_obj
+                    updates: dict[str, Any] = {}
+                    for k, v_expr in mut.set_fields.items():
+                        updates[k] = _eval_value(v_expr, eval_ctx, ctx)
+                    ctx.modify(existing, **updates)
+            else:
+                if not hasattr(params, mut.id_param):
+                    raise InvariantError(
+                        f"action {action_bp.name!r} missing id_param {mut.id_param!r}",
+                        code="MISSING_ID_PARAM",
+                    )
+                target_id = str(getattr(params, mut.id_param))
+                existing = ctx.require(target_cls, target_id)
+                if mut.op == "delete":
+                    ctx.delete(existing)
+                else:
+                    eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
+                    updates = {}
+                    for k, v_expr in mut.set_fields.items():
+                        updates[k] = _eval_value(v_expr, eval_ctx, ctx)
+                    ctx.modify(existing, **updates)
+
+    return _handler
+
+
+def _compile_and_register_action_blueprint(
+    spec: OntologySpec,
+    act: ActionBlueprint,
+    *,
+    ot_by_name: Mapping[str, ObjectTypeBlueprint],
+    valid_type_names: set[str],
+    compiled_valid_roles: set[str],
+) -> str | None:
+    _assert_safe_identifier(act.name, "action name")
+    param_defs, act_param_names = _compile_param_defs(act.params)
+
+    if act.edit_function is not None:
+        ef = spec.get_edit_function(act.edit_function)
+        params_cls: type[BaseModel] | None = (
+            create_model(f"{act.name}_Params", __base__=ef.params, **param_defs)
+            if param_defs
+            else None
+        )
+        effective_param_names = set((params_cls or ef.params).model_fields.keys())
+        subject_type: str | None = None
+        subject_id_param: str | None = None
+        for pre in act.preconditions:
+            s_ot = ot_by_name.get(pre.target_type)
+            s_idp = pre.id_param or (s_ot.primary_key if s_ot is not None else "id")
+            if s_idp in effective_param_names:
+                subject_type, subject_id_param = pre.target_type, s_idp
+                break
+        _validate_preconditions_for_spec(
+            act.name,
+            act.preconditions,
+            ot_by_name=ot_by_name,
+            valid_type_names=valid_type_names,
+            valid_roles=compiled_valid_roles,
+            param_names=effective_param_names,
+        )
+        touched_types = set(ef.touched_object_types) | {pre.target_type for pre in act.preconditions}
+        action_def = spec.declare_action(
+            act.name,
+            edit_function=ef.name,
+            params=params_cls,
+            allowed_roles=tuple(act.allowed_roles),
+            revert_roles=tuple(act.revert_roles),
+            affects_source=act.affects_source,
+            description=act.description,
+            view_tags=tuple(act.view_tags),
+            touched_object_types=tuple(sorted(touched_types)),
+            submission_criteria=tuple(pre.model_dump(mode="json") for pre in act.preconditions),
+        )
+        if act.preconditions:
+            orig_handler = action_def.handler
+            pre_tuple = tuple(copy.deepcopy(p) for p in act.preconditions)
+
+            def _wrapped_ef(ctx: EditBatch, params: BaseModel) -> Any:
+                _run_action_preconditions(ctx, params, pre_tuple)
+                return orig_handler(ctx, params)
+
+            spec.actions[act.name] = action_def.model_copy(update={"handler": _wrapped_ef})
+        return act.display_label or None
+
+    params_cls_rule = create_model(f"{act.name}_Params", **param_defs)
+    subject_type = None
+    subject_id_param = None
+    for m in act.mutations:
+        if m.op != "create" and m.target_ref is None and m.id_param in param_defs:
+            subject_type, subject_id_param = m.object_type, m.id_param
+            break
+    if subject_type is None:
+        for pre in act.preconditions:
+            s_ot = ot_by_name.get(pre.target_type)
+            s_idp = pre.id_param or (s_ot.primary_key if s_ot is not None else "id")
+            if s_idp in param_defs:
+                subject_type, subject_id_param = pre.target_type, s_idp
+                break
+
+    _validate_preconditions_for_spec(
+        act.name,
+        act.preconditions,
+        ot_by_name=ot_by_name,
+        valid_type_names=valid_type_names,
+        valid_roles=compiled_valid_roles,
+        param_names=act_param_names,
+    )
+
+    for mut in act.mutations:
+        if mut.object_type not in valid_type_names:
+            raise InvariantError(
+                f"action {act.name!r} mutates unknown object type {mut.object_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if mut.target_ref is not None:
+            if mut.op == "create":
+                raise InvariantError(
+                    f"action {act.name!r} create mutation cannot use target_ref",
+                    code="INVALID_MUTATION_TARGET_REF",
+                )
+            tref_parts = mut.target_ref.split(".")
+            if tref_parts[0] not in ("obj", "param") or len(tref_parts) < 2:
+                raise InvariantError(
+                    f"action {act.name!r} target_ref {mut.target_ref!r} must start with 'obj.' or 'param.'",
+                    code="INVALID_MUTATION_TARGET_REF",
+                )
+            for seg in tref_parts[1:]:
+                _assert_safe_identifier(seg, "target_ref segment")
+            if tref_parts[0] == "obj" and subject_type is None:
+                raise InvariantError(
+                    f"action {act.name!r} mutation target_ref {mut.target_ref!r} requires a primary subject object",
+                    code="UNAVAILABLE_REF_IN_CONTEXT",
+                )
+            mut_roots = frozenset({"obj", "source_obj", "param", "actor"})
+            mut_ref_roots: dict[str, str] = {"obj": mut.object_type}
+            if subject_type is not None:
+                mut_ref_roots["source_obj"] = subject_type
+            if tref_parts[0] == "obj" and subject_type is not None:
+                _validate_expr_schema_refs(
+                    {"ref": mut.target_ref},
+                    ot_by_name=ot_by_name,
+                    root_types={"obj": subject_type},
+                    param_names=act_param_names,
+                )
+            elif tref_parts[0] == "param":
+                _validate_expr_schema_refs(
+                    {"ref": mut.target_ref},
+                    ot_by_name=ot_by_name,
+                    root_types={},
+                    param_names=act_param_names,
+                )
+        elif mut.op == "create":
+            mut_roots = frozenset({"param", "actor"})
+            mut_ref_roots = {}
+        else:
+            mut_roots = frozenset({"obj", "param", "actor"})
+            mut_ref_roots = {"obj": mut.object_type}
+        for fv in mut.set_fields.values():
+            if compiled_valid_roles:
+                _validate_expr_closed_roles(
+                    fv,
+                    compiled_valid_roles,
+                    context=f"action {act.name}.mutations.{mut.object_type}",
+                )
+            _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
+            _validate_expr_schema_refs(
+                fv, ot_by_name=ot_by_name, root_types=mut_ref_roots, param_names=act_param_names
+            )
+
+    touched_types = {mut.object_type for mut in act.mutations} | {
+        pre.target_type for pre in act.preconditions
+    }
+    spec.declare_rule_action(
+        act.name,
+        params=params_cls_rule,
+        handler=_make_rule_action_handler(act, subject_type, subject_id_param),
+        allowed_roles=tuple(act.allowed_roles),
+        revert_roles=tuple(act.revert_roles),
+        affects_source=act.affects_source,
+        description=act.description,
+        view_tags=tuple(act.view_tags),
+        touched_object_types=tuple(sorted(touched_types)),
+        submission_criteria=tuple(pre.model_dump(mode="json") for pre in act.preconditions),
+    )
+    return act.display_label or None
+
+
+def _validate_preconditions_for_spec(
+    act_name: str,
+    preconditions: Sequence[InvariantRuleSpec],
+    *,
+    ot_by_name: Mapping[str, ObjectTypeBlueprint],
+    valid_type_names: set[str],
+    valid_roles: set[str],
+    param_names: set[str],
+) -> None:
+    pre_roots = frozenset({"obj", "param", "actor"})
+    for pre in preconditions:
+        _assert_safe_identifier(pre.name, "precondition name")
+        if pre.target_type not in valid_type_names:
+            raise InvariantError(
+                f"precondition {pre.name!r} targets unknown object type {pre.target_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if valid_roles:
+            _validate_expr_closed_roles(
+                pre.when,
+                valid_roles,
+                context=f"action {act_name}.preconditions.{pre.name}.when",
+            )
+            _validate_expr_closed_roles(
+                pre.must_hold,
+                valid_roles,
+                context=f"action {act_name}.preconditions.{pre.name}.must_hold",
+            )
+        pre_ref_roots = {"obj": pre.target_type}
+        if pre.when is not None:
+            validate_predicate_ast(pre.when, allowed_roots=pre_roots, allow_view=True)
+            _validate_expr_schema_refs(
+                pre.when, ot_by_name=ot_by_name, root_types=pre_ref_roots, param_names=param_names
+            )
+        validate_predicate_ast(pre.must_hold, allowed_roots=pre_roots, allow_view=True)
+        _validate_expr_schema_refs(
+            pre.must_hold, ot_by_name=ot_by_name, root_types=pre_ref_roots, param_names=param_names
+        )
+
+
+def _infer_scalar_type_name(ann: Any) -> Literal["str", "int", "float", "bool"]:
+    if ann is None:
+        return "str"
+    origin = get_origin(ann)
+    if origin is not None:
+        args = [a for a in get_args(ann) if a is not type(None)]
+        if args and str(origin).endswith("Annotated"):
+            return _infer_scalar_type_name(args[0])
+        if origin in (Union, _types.UnionType):
+            for arg in args:
+                inferred = _infer_scalar_type_name(arg)
+                if inferred != "str":
+                    return inferred
+            return "str"
+    if isinstance(ann, type):
+        if issubclass(ann, bool):
+            return "bool"
+        if issubclass(ann, int):
+            return "int"
+        if issubclass(ann, float):
+            return "float"
+    return "str"
+
+
+def _spec_to_object_blueprints(spec: OntologySpec) -> dict[str, ObjectTypeBlueprint]:
+    out: dict[str, ObjectTypeBlueprint] = {}
+    for ot_name, cls in spec.object_types.items():
+        pk = cls.primary_key_name()
+        prop_map = getattr(cls, "__object_properties__", None) or {}
+        non_neg_set = set(getattr(cls, "__non_negative_fields__", ()) or ())
+        masked_map = getattr(cls, "__masked_fields__", None) or {}
+        owned_spec = cls.owned_spec()
+        fields: list[FieldSpec] = []
+        relations: list[RelationSpec] = []
+        for fname, info in cls.model_fields.items():
+            is_owned = bool(owned_spec is True or (isinstance(owned_spec, dict) and fname in owned_spec))
+            decl = prop_map.get(fname)
+            if decl is not None:
+                relations.append(
+                    RelationSpec(
+                        field=fname,
+                        target_type=decl.range,
+                        multiple=(decl.cardinality == "many-to-many"),
+                        owned=decl.owned,
+                        required=info.is_required(),
+                    )
+                )
+                continue
+            rel_meta = extract_object_property_meta(info)
+            if rel_meta is not None:
+                relations.append(
+                    RelationSpec(
+                        field=fname,
+                        target_type=rel_meta[0],
+                        multiple=rel_meta[1],
+                        owned=is_owned,
+                        required=info.is_required(),
+                    )
+                )
+                continue
+            fields.append(
+                FieldSpec(
+                    name=fname,
+                    field_type=_infer_scalar_type_name(info.annotation),
+                    required=info.is_required(),
+                    primary_key=(fname == pk),
+                    auto_id=extract_auto_id_meta(info),
+                    owned=is_owned,
+                    masked_roles=tuple(masked_map.get(fname, ())),
+                    non_negative=(fname in non_neg_set),
+                )
+            )
+        raw_trans = getattr(cls, "__transitions__", {}) or {}
+        raw_init = getattr(cls, "__initial_statuses__", None)
+        out[ot_name] = ObjectTypeBlueprint(
+            name=ot_name,
+            primary_key=pk,
+            title_field=getattr(cls, "__title__", None),
+            aggregate_root=cls.is_aggregate_root(),
+            append_only=cls.is_append_only(),
+            fields=fields,
+            relations=relations,
+            status_field=str(getattr(cls, "__status_field__", "status") or "status"),
+            initial_statuses=list(raw_init) if raw_init is not None else None,
+            transitions={str(k): list(v) for k, v in raw_trans.items()},
+            voucher_delta_rules={
+                k: tuple(v) for k, v in (getattr(cls, "__voucher_delta_rules__", {}) or {}).items()
+            },
+        )
+    return out
+
+
+def _build_overlay_object_type(
+    ot: ObjectTypeBlueprint,
+    *,
+    base_cls: type[ObjectType],
+    extra_security_field: str | None = None,
+) -> tuple[
+    type[ObjectType],
+    tuple[str, ...],
+    tuple[str, tuple[str, ...] | None, dict[str, tuple[str, ...]]] | None,
+]:
+    field_defs: dict[str, Any] = {}
+    owned_fields: dict[str, Any] = {}
+    masked_fields: dict[str, tuple[str, ...]] = {}
+    non_neg_fields: list[str] = []
+    optional_scalar_defaults: dict[str, Any] = {}
+
+    pk_declared = False
+    for fld in ot.fields:
+        _assert_safe_identifier(fld.name, "field name")
+        py_type = _resolve_scalar_type(fld.field_type)
+        ann: Any = AutoID if (fld.auto_id and py_type is str) else py_type
+        is_pk = fld.primary_key or fld.name == ot.primary_key
+        if is_pk:
+            pk_declared = True
+        if fld.required or is_pk:
+            default_val: Any = ... if fld.default is None else fld.default
+        else:
+            default_val = _default_for_type(py_type) if fld.default is None else fld.default
+            optional_scalar_defaults[fld.name] = default_val
+        field_defs[fld.name] = (ann, default_val)
+        if fld.owned:
+            owned_fields[fld.name] = None if default_val is ... else default_val
+        if fld.masked_roles:
+            masked_fields[fld.name] = tuple(fld.masked_roles)
+        if fld.non_negative:
+            non_neg_fields.append(fld.name)
+
+    if not pk_declared:
+        field_defs[ot.primary_key] = (str, ...)
+
+    if extra_security_field and extra_security_field not in field_defs:
+        field_defs[extra_security_field] = (str, "")
+        optional_scalar_defaults[extra_security_field] = ""
+        owned_fields[extra_security_field] = ""
+
+    for rel in ot.relations:
+        extra_schema = {
+            "property_kind": "object",
+            "range": rel.target_type,
+            "multiple": rel.multiple,
+        }
+        if rel.multiple:
+            field_defs[rel.field] = (
+                tuple[str, ...],
+                Field(default=(), json_schema_extra=extra_schema),
+            )
+        elif rel.required:
+            field_defs[rel.field] = (str, Field(..., json_schema_extra=extra_schema))
+        else:
+            field_defs[rel.field] = (str | None, Field(default=None, json_schema_extra=extra_schema))
+        if rel.owned:
+            owned_fields[rel.field] = () if rel.multiple else None
+
+    resolved_owned: bool | dict[str, Any]
+    if ot.owned is True:
+        resolved_owned = True
+    elif isinstance(ot.owned, dict):
+        merged_owned = dict(ot.owned)
+        merged_owned.update(owned_fields)
+        resolved_owned = merged_owned
+    elif owned_fields:
+        resolved_owned = owned_fields
+    else:
+        resolved_owned = False
+
+    validators: dict[str, Any] | None = None
+    if optional_scalar_defaults:
+
+        def _make_null_coercer(defaults_map: dict[str, Any]) -> Any:
+            @model_validator(mode="before")
+            @classmethod
+            def _coerce_null_optional_scalars(_cls_inner: Any, data: Any) -> Any:
+                if isinstance(data, dict):
+                    return {
+                        k: (defaults_map[k] if (v is None and k in defaults_map) else v)
+                        for k, v in data.items()
+                    }
+                return data
+
+            return _coerce_null_optional_scalars
+
+        validators = {"_coerce_null_optional_scalars": _make_null_coercer(dict(optional_scalar_defaults))}
+
+    cls = create_model(
+        ot.name,
+        __base__=base_cls,
+        __module__="open_ontology_overlay",
+        __validators__=validators,
+        **field_defs,
+    )
+    cls.__primary_key__ = ot.primary_key
+    cls.__title__ = ot.title_field or ot.primary_key
+    cls.__aggregate_root__ = bool(
+        ot.aggregate_root if ot.aggregate_root is not None else getattr(base_cls, "__aggregate_root__", False)
+    )
+    cls.__append_only__ = bool(
+        ot.append_only if ot.append_only is not None else getattr(base_cls, "__append_only__", False)
+    )
+    cls.__owned__ = resolved_owned
+    if extra_security_field:
+        sec_fields = list(getattr(base_cls, "__security_tag_fields__", ()) or ())
+        if extra_security_field not in sec_fields:
+            sec_fields.append(extra_security_field)
+        cls.__security_tag_fields__ = tuple(sec_fields)
+    if non_neg_fields:
+        cls.__non_negative_fields__ = tuple(non_neg_fields)
+    if ot.transitions or ot.initial_statuses is not None:
+        cls.__status_field__ = ot.status_field
+        cls.__initial_statuses__ = (
+            tuple(ot.initial_statuses) if ot.initial_statuses is not None else None
+        )
+        cls.__transitions__ = {k: tuple(v) for k, v in ot.transitions.items()}
+    if ot.voucher_delta_rules:
+        cls.__voucher_delta_rules__ = {k: tuple(v) for k, v in ot.voucher_delta_rules.items()}
+    if masked_fields:
+        cls.__masked_fields__ = masked_fields
+    if ot.view_tags:
+        cls.__view_tags__ = tuple(ot.view_tags)
+    fsm_spec = (
+        (
+            ot.status_field,
+            tuple(ot.initial_statuses) if ot.initial_statuses is not None else None,
+            {k: tuple(v) for k, v in ot.transitions.items()},
+        )
+        if (ot.transitions or ot.initial_statuses is not None)
+        else None
+    )
+    return cls, tuple(non_neg_fields), fsm_spec
+
+
+def apply_overlay_to_spec(
+    base_spec: OntologySpec,
+    overlay: CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any],
+    *,
+    seed_ontology: SeedOntology | None = None,
+    rls_object_types: Sequence[str] = (),
+    security_tag_field: str = "org",
+) -> OntologySpec:
+    """Immutably layer a CustomerOverlaySpec directly atop any Python OntologySpec.
+
+    Preserves all native Turing-complete ``@spec.edit_function``, ``@spec.function``,
+    ``@spec.invariant``, ``@spec.transition_invariant``, and ``@spec.automation``
+    handlers on ``base_spec`` without mutating ``base_spec`` or its classes.
+    """
+    spec_overlay = _coerce_overlay(overlay)
+
+    ont_map = base_spec.display.get("ontologies") or {}
+    if spec_overlay.base_model_id and ont_map and spec_overlay.base_model_id not in ont_map:
+        raise InvariantError(
+            f"overlay targets base_model_id={spec_overlay.base_model_id!r}, "
+            f"expected one of {sorted(ont_map)}",
+            code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+        )
+
+    destructive_checks = (
+        ("remove_object_types", bool(spec_overlay.remove_object_types)),
+        ("remove_fields", bool(spec_overlay.remove_fields)),
+        ("update_primary_keys", bool(spec_overlay.update_primary_keys)),
+        ("remove_invariants", bool(spec_overlay.remove_invariants)),
+        ("remove_action_preconditions", bool(spec_overlay.remove_action_preconditions)),
+    )
+    for label, hit in destructive_checks:
+        if hit:
+            raise InvariantError(
+                f"overlay violates standard contract via forbidden directive {label!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+
+    derived = OntologySpec(read_only_source=base_spec.read_only_source)
+    derived.parents = list(base_spec.parents)
+    derived.abstract_types = dict(base_spec.abstract_types)
+    derived.object_types = dict(base_spec.object_types)
+    derived.object_properties = dict(base_spec.object_properties)
+    derived.interfaces = dict(base_spec.interfaces)
+    derived.roles = dict(base_spec.roles)
+    derived.views = dict(base_spec.views)
+    derived.functions = dict(base_spec.functions)
+    derived.edit_functions = dict(base_spec.edit_functions)
+    derived.actions = {k: v.model_copy() for k, v in base_spec.actions.items()}
+    derived.automations = dict(base_spec.automations)
+    derived.invariants = dict(base_spec.invariants)
+    derived.transition_invariants = dict(base_spec.transition_invariants)
+    derived.display = copy.deepcopy(base_spec.display)
+
+    if derived.roles:
+        for role_name in _dedup_clean_roles(spec_overlay.add_roles):
+            if role_name not in derived.roles:
+                derived.role(role_name)
+        valid_roles: set[str] = set(derived.roles.keys())
+    else:
+        valid_roles = set()
+
+    # Check migrations against base standard fields
+    base_field_names = {
+        ot_name: set(cls.model_fields.keys())
+        for ot_name, cls in base_spec.object_types.items()
+    }
+    for mig in spec_overlay.migrations:
+        if (
+            mig.object_type in base_field_names
+            and mig.field in base_field_names[mig.object_type]
+            and mig.op in ("drop_field", "rename_field", "cast_type")
+        ):
+            raise InvariantError(
+                f"overlay migration {mig.op!r} cannot mutate standard field {mig.object_type}.{mig.field!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+
+    rls_set: set[str] = set()
+    if rls_object_types:
+        _assert_safe_identifier(security_tag_field, "security_tag_field")
+        for ot_name in rls_object_types:
+            if ot_name not in derived.object_types and all(
+                nt.name != ot_name for nt in spec_overlay.add_object_types
+            ):
+                raise InvariantError(
+                    f"rls_object_types references unknown object type {ot_name!r}",
+                    code="UNKNOWN_OBJECT_TYPE",
+                )
+            rls_set.add(ot_name)
+
+    # 1. Register new pure-declarative object types first (validation + classes)
+    object_display: dict[str, str] = {}
+    new_non_neg_map: dict[str, tuple[str, ...]] = {}
+    new_fsm_specs: dict[str, tuple[str, tuple[str, ...] | None, dict[str, tuple[str, ...]]]] = {}
+    new_ots: list[ObjectTypeBlueprint] = []
+    for raw_new_ot in spec_overlay.add_object_types:
+        _assert_safe_identifier(raw_new_ot.name, "object type")
+        _assert_safe_identifier(raw_new_ot.primary_key, "primary_key")
+        if raw_new_ot.name in derived.object_types or raw_new_ot.name in derived.abstract_types:
+            raise InvariantError(
+                f"overlay cannot overwrite existing object type {raw_new_ot.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        for fld in raw_new_ot.fields:
+            if fld.masked_roles:
+                _assert_known_roles(
+                    fld.masked_roles,
+                    valid_roles,
+                    context=f"overlay add_object_types {raw_new_ot.name}.{fld.name}.masked_roles",
+                )
+        if seed_ontology is not None:
+            arch_cls = seed_ontology.resolve_base_class(raw_new_ot.archetype)
+        elif raw_new_ot.archetype in derived.abstract_types:
+            arch_cls = derived.abstract_types[raw_new_ot.archetype]
+        elif raw_new_ot.archetype == "ObjectType":
+            arch_cls = ObjectType
+        else:
+            raise InvariantError(
+                f"unknown archetype {raw_new_ot.archetype!r} in overlay",
+                code="UNKNOWN_SEED_ARCHETYPE",
+            )
+        cls_new, nn_fields, fsm_spec = _build_overlay_object_type(
+            raw_new_ot,
+            base_cls=arch_cls,
+            extra_security_field=(security_tag_field if raw_new_ot.name in rls_set else None),
+        )
+        derived.object_type(cls_new)
+        new_ots.append(raw_new_ot)
+        if raw_new_ot.display_label:
+            object_display[raw_new_ot.name] = raw_new_ot.display_label
+        if nn_fields:
+            new_non_neg_map[raw_new_ot.name] = nn_fields
+        if fsm_spec is not None and not (
+            seed_ontology is not None and seed_ontology.covers_fsm_for(cls_new)
+        ):
+            new_fsm_specs[raw_new_ot.name] = fsm_spec
+
+    for new_ot in new_ots:
+        cls_new = derived.object_types[new_ot.name]
+        prop_map: dict[str, ObjectProperty] = dict(getattr(cls_new, "__object_properties__", None) or {})
+        for rel in new_ot.relations:
+            _assert_safe_identifier(rel.field, "relation field")
+            if rel.target_type not in derived.object_types:
+                raise InvariantError(
+                    f"relation {new_ot.name}.{rel.field} references unknown target {rel.target_type!r}",
+                    code="UNKNOWN_RELATION_TARGET",
+                )
+            decl = ObjectProperty(
+                name=f"{new_ot.name}.{rel.field}",
+                domain=new_ot.name,
+                range=rel.target_type,
+                cardinality="many-to-many" if rel.multiple else "many-to-one",
+                owned=bool(rel.owned or cls_new.is_fully_owned()),
+                field=rel.field,
+                description=rel.description,
+            )
+            derived.add_object_property(decl)
+            prop_map[rel.field] = decl
+        cls_new.__object_properties__ = prop_map
+
+    # 2. Validate alter_fields, add_fields, add_relations, transitions before subclassing
+    for ot_name, mod_fields in spec_overlay.alter_fields.items():
+        if ot_name not in base_spec.object_types:
+            raise InvariantError(
+                f"overlay alter_fields targets non-standard object type {ot_name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        std_cls = base_spec.object_types[ot_name]
+        std_pk = std_cls.primary_key_name()
+        std_non_neg = set(getattr(std_cls, "__non_negative_fields__", ()) or ())
+        for fld in mod_fields:
+            finfo = std_cls.model_fields.get(fld.name)
+            if finfo is None:
+                raise InvariantError(
+                    f"overlay alter_fields targets unknown standard field {ot_name}.{fld.name!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            std_scalar = _infer_scalar_type_name(finfo.annotation)
+            if (
+                fld.field_type != std_scalar
+                or fld.primary_key != (fld.name == std_pk)
+                or fld.name == std_pk
+                or (finfo.is_required() and not fld.required)
+                or (fld.name in std_non_neg and not fld.non_negative)
+            ):
+                raise InvariantError(
+                    f"overlay weakens or breaks standard field {ot_name}.{fld.name!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            if fld.masked_roles:
+                _assert_known_roles(
+                    fld.masked_roles,
+                    valid_roles,
+                    context=f"overlay alter_fields {ot_name}.{fld.name}.masked_roles",
+                )
+
+    for ot_name, new_fields in spec_overlay.add_fields.items():
+        if ot_name not in derived.object_types:
+            raise InvariantError(
+                f"overlay adds field to unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        cur_cls = derived.object_types[ot_name]
+        existing_names = set(cur_cls.model_fields.keys())
+        for nf in new_fields:
+            _assert_safe_identifier(nf.name, "field name")
+            if nf.primary_key or nf.name in existing_names:
+                raise InvariantError(
+                    f"overlay cannot overwrite or redefine field {ot_name}.{nf.name!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            if nf.masked_roles:
+                _assert_known_roles(
+                    nf.masked_roles,
+                    valid_roles,
+                    context=f"overlay add_fields {ot_name}.{nf.name}.masked_roles",
+                )
+            existing_names.add(nf.name)
+
+    for ot_name, new_rels in spec_overlay.add_relations.items():
+        if ot_name not in derived.object_types:
+            raise InvariantError(
+                f"overlay adds relation to unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        cur_cls = derived.object_types[ot_name]
+        existing_names = set(cur_cls.model_fields.keys()) | {
+            f.name for f in spec_overlay.add_fields.get(ot_name, ())
+        }
+        for nr in new_rels:
+            _assert_safe_identifier(nr.field, "relation field")
+            if nr.target_type not in derived.object_types:
+                raise InvariantError(
+                    f"relation {ot_name}.{nr.field} references unknown target {nr.target_type!r}",
+                    code="UNKNOWN_RELATION_TARGET",
+                )
+            if nr.field in existing_names:
+                raise InvariantError(
+                    f"overlay cannot overwrite relation or field {ot_name}.{nr.field!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+            existing_names.add(nr.field)
+
+    updated_transitions: dict[str, dict[str, list[str]]] = {}
+    for ot_name, new_map in spec_overlay.replace_transitions.items():
+        if ot_name not in derived.object_types:
+            raise InvariantError(
+                f"overlay replaces transitions on unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        std_cls = base_spec.object_types.get(ot_name) or derived.object_types[ot_name]
+        base_trans = {
+            str(k): list(v) for k, v in (getattr(std_cls, "__transitions__", {}) or {}).items()
+        }
+        updated_transitions[ot_name] = _validate_fsm_monotonic(
+            ot_name, base_trans, new_map, replace=True
+        )
+
+    for ot_name, trans_map in spec_overlay.update_transitions.items():
+        if ot_name not in derived.object_types:
+            raise InvariantError(
+                f"overlay updates transitions on unknown object type {ot_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        cur_trans = updated_transitions.get(ot_name)
+        if cur_trans is None:
+            cur_cls = derived.object_types[ot_name]
+            cur_trans = {
+                str(k): list(v) for k, v in (getattr(cur_cls, "__transitions__", {}) or {}).items()
+            }
+        updated_transitions[ot_name] = _validate_fsm_monotonic(
+            ot_name, cur_trans, trans_map, replace=False
+        )
+
+    # 3. Build dynamic subclasses on derived (NEVER mutating base_spec classes)
+    types_to_subclass = sorted(
+        (
+            set(spec_overlay.alter_fields)
+            | set(spec_overlay.add_fields)
+            | set(spec_overlay.add_relations)
+            | set(updated_transitions)
+            | rls_set
+        )
+        - {ot.name for ot in new_ots}
+    )
+
+    for ot_name in types_to_subclass:
+        cur_cls = derived.object_types[ot_name]
+        extra_fields: dict[str, Any] = {}
+        optional_scalar_defaults: dict[str, Any] = {}
+        prev_owned = cur_cls.owned_spec()
+        merged_owned: bool | dict[str, Any] = (
+            dict(prev_owned) if isinstance(prev_owned, dict) else prev_owned
+        )
+        merged_non_neg = list(getattr(cur_cls, "__non_negative_fields__", ()) or ())
+        merged_masked: dict[str, tuple[str, ...]] = {
+            k: tuple(v) for k, v in (getattr(cur_cls, "__masked_fields__", {}) or {}).items()
+        }
+        merged_sec_fields = list(getattr(cur_cls, "__security_tag_fields__", ()) or ())
+        prev_obj_props = dict(getattr(cur_cls, "__object_properties__", {}) or {})
+
+        for fld in spec_overlay.alter_fields.get(ot_name, ()):
+            if fld.masked_roles:
+                merged_masked[fld.name] = tuple(fld.masked_roles)
+            if fld.non_negative and fld.name not in merged_non_neg:
+                merged_non_neg.append(fld.name)
+            if fld.owned and merged_owned is not True:
+                base_info = cur_cls.model_fields[fld.name]
+                if not isinstance(merged_owned, dict):
+                    merged_owned = {}
+                merged_owned[fld.name] = fld.default if fld.default is not None else base_info.default
+
+        for nf in spec_overlay.add_fields.get(ot_name, ()):
+            py_type = _resolve_scalar_type(nf.field_type)
+            ann: Any = AutoID if (nf.auto_id and py_type is str) else py_type
+            if nf.required:
+                default_val: Any = ... if nf.default is None else nf.default
+            else:
+                default_val = _default_for_type(py_type) if nf.default is None else nf.default
+                optional_scalar_defaults[nf.name] = default_val
+            extra_fields[nf.name] = (ann, default_val)
+            if nf.owned and merged_owned is not True:
+                if not isinstance(merged_owned, dict):
+                    merged_owned = {}
+                merged_owned[nf.name] = None if default_val is ... else default_val
+            if nf.masked_roles:
+                merged_masked[nf.name] = tuple(nf.masked_roles)
+            if nf.non_negative and nf.name not in merged_non_neg:
+                merged_non_neg.append(nf.name)
+
+        added_rels = spec_overlay.add_relations.get(ot_name, ())
+        for nr in added_rels:
+            extra_schema = {
+                "property_kind": "object",
+                "range": nr.target_type,
+                "multiple": nr.multiple,
+            }
+            if nr.multiple:
+                extra_fields[nr.field] = (
+                    tuple[str, ...],
+                    Field(default=(), json_schema_extra=extra_schema),
+                )
+            elif nr.required:
+                extra_fields[nr.field] = (str, Field(..., json_schema_extra=extra_schema))
+            else:
+                extra_fields[nr.field] = (
+                    str | None,
+                    Field(default=None, json_schema_extra=extra_schema),
+                )
+            if nr.owned and merged_owned is not True:
+                if not isinstance(merged_owned, dict):
+                    merged_owned = {}
+                merged_owned[nr.field] = () if nr.multiple else None
+
+        if ot_name in rls_set:
+            if security_tag_field not in cur_cls.model_fields and security_tag_field not in extra_fields:
+                extra_fields[security_tag_field] = (str, "")
+                optional_scalar_defaults[security_tag_field] = ""
+                if merged_owned is not True:
+                    if not isinstance(merged_owned, dict):
+                        merged_owned = {}
+                    merged_owned[security_tag_field] = ""
+            if security_tag_field not in merged_sec_fields:
+                merged_sec_fields.append(security_tag_field)
+
+        validators: dict[str, Any] | None = None
+        if optional_scalar_defaults:
+
+            def _make_sub_null_coercer(defaults_map: dict[str, Any]) -> Any:
+                @model_validator(mode="before")
+                @classmethod
+                def _coerce_overlay_nulls(_cls_inner: Any, data: Any) -> Any:
+                    if isinstance(data, dict):
+                        return {
+                            k: (defaults_map[k] if (v is None and k in defaults_map) else v)
+                            for k, v in data.items()
+                        }
+                    return data
+
+                return _coerce_overlay_nulls
+
+            validators = {"_coerce_overlay_nulls": _make_sub_null_coercer(dict(optional_scalar_defaults))}
+
+        sub_cls = create_model(
+            ot_name,
+            __base__=cur_cls,
+            __module__="open_ontology_overlay",
+            __validators__=validators,
+            **extra_fields,
+        )
+        sub_cls.__primary_key__ = cur_cls.primary_key_name()
+        sub_cls.__title__ = getattr(cur_cls, "__title__", None)
+        sub_cls.__aggregate_root__ = cur_cls.is_aggregate_root()
+        sub_cls.__append_only__ = cur_cls.is_append_only()
+        sub_cls.__read_only_source__ = cur_cls.is_read_only_source()
+        sub_cls.__owned__ = merged_owned
+        sub_cls.__security_tag_fields__ = tuple(merged_sec_fields)
+        sub_cls.__non_negative_fields__ = tuple(merged_non_neg)
+        sub_cls.__masked_fields__ = merged_masked
+        sub_cls.__mask_defaults__ = dict(getattr(cur_cls, "__mask_defaults__", {}) or {})
+        sub_cls.__interfaces__ = tuple(getattr(cur_cls, "__interfaces__", ()) or ())
+        sub_cls.__view_tags__ = tuple(getattr(cur_cls, "__view_tags__", ()) or ())
+        sub_cls.__status_field__ = getattr(cur_cls, "__status_field__", "status")
+        sub_cls.__initial_statuses__ = getattr(cur_cls, "__initial_statuses__", None)
+        sub_cls.__deletable_statuses__ = getattr(cur_cls, "__deletable_statuses__", None)
+        if ot_name in updated_transitions:
+            sub_cls.__transitions__ = {k: tuple(v) for k, v in updated_transitions[ot_name].items()}
+        else:
+            sub_cls.__transitions__ = dict(getattr(cur_cls, "__transitions__", {}) or {})
+        sub_cls.__voucher_delta_rules__ = dict(
+            getattr(cur_cls, "__voucher_delta_rules__", {}) or {}
+        )
+
+        derived.object_type(sub_cls)
+        # Preserve any explicit spec.add_object_property bindings not encoded in annotations
+        sub_props = dict(getattr(sub_cls, "__object_properties__", None) or {})
+        for fname, decl in prev_obj_props.items():
+            sub_props.setdefault(fname, decl)
+            derived.object_properties[decl.name] = decl
+        for nr in added_rels:
+            decl = ObjectProperty(
+                name=f"{ot_name}.{nr.field}",
+                domain=ot_name,
+                range=nr.target_type,
+                cardinality="many-to-many" if nr.multiple else "many-to-one",
+                owned=bool(nr.owned or sub_cls.is_fully_owned()),
+                field=nr.field,
+                description=nr.description,
+            )
+            derived.add_object_property(decl)
+            sub_props[nr.field] = decl
+        sub_cls.__object_properties__ = sub_props
+
+        new_nn_for_ot = [f.name for f in spec_overlay.add_fields.get(ot_name, ()) if f.non_negative]
+        if new_nn_for_ot:
+            new_non_neg_map[ot_name] = tuple(merged_non_neg)
+        if ot_name in updated_transitions and not (
+            seed_ontology is not None and seed_ontology.covers_fsm_for(sub_cls)
+        ):
+            new_fsm_specs[ot_name] = (
+                str(getattr(sub_cls, "__status_field__", "status") or "status"),
+                getattr(sub_cls, "__initial_statuses__", None),
+                {str(k): tuple(v) for k, v in updated_transitions[ot_name].items()},
+            )
+
+    if new_non_neg_map:
+        nn_inv_name = f"overlay_{spec_overlay.overlay_id}_non_negative"
+        while nn_inv_name in derived.invariants:
+            nn_inv_name += "_ov"
+
+        @derived.invariant(
+            nn_inv_name,
+            code="NEGATIVE_VALUE",
+            description="Declared non-negative fields on overlay types must remain >= 0.",
+        )
+        def _check_overlay_non_negative(view: InvariantView, _map: dict[str, tuple[str, ...]] = dict(new_non_neg_map)) -> bool:
+            for type_name, field_names in _map.items():
+                cls_t = view.spec.get_object_type(type_name)
+                for obj in view.query(cls_t):
+                    for fn in field_names:
+                        val = getattr(obj, fn, 0)
+                        if val is not None and val < 0:
+                            raise InvariantError(
+                                f"{type_name}:{obj.primary_key_value()}.{fn}={val} < 0",
+                                code="NEGATIVE_VALUE",
+                            )
+            return True
+
+    if new_fsm_specs:
+        fsm_inv_name = f"overlay_{spec_overlay.overlay_id}_fsm"
+        while fsm_inv_name in derived.transition_invariants:
+            fsm_inv_name += "_ov"
+
+        @derived.transition_invariant(
+            fsm_inv_name,
+            code="ILLEGAL_STATE_TRANSITION",
+            description="Status transitions on overlay types must follow declared FSM edges.",
+        )
+        def _check_overlay_fsm(diff: ObjectDiff, view: InvariantView, _fsm: dict[str, tuple[str, tuple[str, ...] | None, dict[str, tuple[str, ...]]]] = dict(new_fsm_specs)) -> bool:
+            for change in diff.object_changes:
+                if change.object_type not in _fsm:
+                    continue
+                status_field, initial_allowed, base_transitions = _fsm[change.object_type]
+                cur_cls = view.spec.get_object_type(change.object_type)
+                live_trans = getattr(cur_cls, "__transitions__", None)
+                transitions = (
+                    {str(k): tuple(v) for k, v in live_trans.items()}
+                    if isinstance(live_trans, Mapping)
+                    else base_transitions
+                )
+                if change.kind == "create" and initial_allowed is not None and change.after:
+                    after_s = change.after.get(status_field)
+                    if after_s not in initial_allowed:
+                        raise InvariantError(
+                            f"{change.object_type}:{change.object_id} invalid initial "
+                            f"{status_field}={after_s!r}; allowed={initial_allowed}",
+                            code="ILLEGAL_INITIAL_STATUS",
+                        )
+                if change.kind == "update" and change.before and change.after:
+                    before_s = change.before.get(status_field)
+                    after_s = change.after.get(status_field)
+                    if before_s != after_s and transitions:
+                        allowed_next = transitions.get(str(before_s), ())
+                        if after_s not in allowed_next:
+                            raise InvariantError(
+                                f"{change.object_type}:{change.object_id} illegal transition "
+                                f"{before_s!r} -> {after_s!r}; allowed={allowed_next}",
+                                code="ILLEGAL_STATE_TRANSITION",
+                            )
+            return True
+
+    # Build full schema descriptors from derived.object_types for AST validation
+    ot_by_name = _spec_to_object_blueprints(derived)
+    valid_type_names = set(derived.object_types.keys())
+
+    # 4. Add declarative invariants
+    inv_roots = frozenset({"obj"})
+    for new_inv in spec_overlay.add_invariants:
+        _assert_safe_identifier(new_inv.name, "invariant name")
+        if new_inv.name in derived.invariants or new_inv.name in derived.transition_invariants:
+            raise InvariantError(
+                f"overlay cannot overwrite standard invariant {new_inv.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        if new_inv.target_type not in valid_type_names:
+            raise InvariantError(
+                f"invariant {new_inv.name!r} targets unknown object type {new_inv.target_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        inv_ref_roots = {"obj": new_inv.target_type}
+        if valid_roles:
+            _validate_expr_closed_roles(
+                new_inv.when,
+                valid_roles,
+                context=f"overlay add_invariants {new_inv.name}.when",
+            )
+            _validate_expr_closed_roles(
+                new_inv.must_hold,
+                valid_roles,
+                context=f"overlay add_invariants {new_inv.name}.must_hold",
+            )
+        if new_inv.when is not None:
+            validate_predicate_ast(new_inv.when, allowed_roots=inv_roots, allow_view=True)
+            _validate_expr_schema_refs(new_inv.when, ot_by_name=ot_by_name, root_types=inv_ref_roots)
+        validate_predicate_ast(new_inv.must_hold, allowed_roots=inv_roots, allow_view=True)
+        _validate_expr_schema_refs(new_inv.must_hold, ot_by_name=ot_by_name, root_types=inv_ref_roots)
+
+        derived.invariant(new_inv.name, code=new_inv.code, description=new_inv.description)(
+            _make_rule_invariant_handler(new_inv)
+        )
+
+    # 5. Add new actions / reject breaking update_actions
+    action_display: dict[str, str] = {}
+    for new_act in spec_overlay.add_actions:
+        _assert_safe_identifier(new_act.name, "action name")
+        if new_act.name in derived.actions:
+            raise InvariantError(
+                f"overlay cannot redefine existing action {new_act.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        if valid_roles:
+            _validate_action_closed_roles(new_act, valid_roles, context_prefix="overlay add_actions")
+        lbl = _compile_and_register_action_blueprint(
+            derived,
+            new_act,
+            ot_by_name=ot_by_name,
+            valid_type_names=valid_type_names,
+            compiled_valid_roles=valid_roles,
+        )
+        if lbl:
+            action_display[new_act.name] = lbl
+
+    for upd_act in spec_overlay.update_actions:
+        if upd_act.name not in derived.actions:
+            raise InvariantError(
+                f"overlay updates unknown action {upd_act.name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        cur_act = derived.actions[upd_act.name]
+        if cur_act.implementation_kind == "edit_function" and upd_act.mutations:
+            raise InvariantError(
+                f"overlay cannot replace native edit_function action {upd_act.name!r} with declarative mutations",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        if cur_act.affects_source != upd_act.affects_source:
+            raise InvariantError(
+                f"overlay alters affects_source on standard action {upd_act.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        if valid_roles:
+            _validate_action_closed_roles(upd_act, valid_roles, context_prefix="overlay update_actions")
+        if cur_act.name in base_spec.actions:
+            if not upd_act.allowed_roles or not set(upd_act.allowed_roles).issubset(
+                set(cur_act.allowed_roles)
+            ):
+                raise InvariantError(
+                    f"overlay expands or empties allowed_roles on standard action {upd_act.name!r}",
+                    code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                )
+        if cur_act.implementation_kind == "edit_function":
+            raise InvariantError(
+                f"overlay update_actions cannot redefine native action {upd_act.name!r}; use add_action_preconditions or restrict_allowed_roles",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        lbl = _compile_and_register_action_blueprint(
+            derived,
+            upd_act,
+            ot_by_name=ot_by_name,
+            valid_type_names=valid_type_names,
+            compiled_valid_roles=valid_roles,
+        )
+        if lbl:
+            action_display[upd_act.name] = lbl
+
+    # 6. Inject add_action_preconditions uniformly on both "rule" and "edit_function" actions
+    for act_name, extra_pres in spec_overlay.add_action_preconditions.items():
+        if act_name not in derived.actions:
+            raise InvariantError(
+                f"overlay adds preconditions to unknown action {act_name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        cur_act = derived.actions[act_name]
+        param_names = set(cur_act.params.model_fields.keys())
+        _validate_preconditions_for_spec(
+            act_name,
+            extra_pres,
+            ot_by_name=ot_by_name,
+            valid_type_names=valid_type_names,
+            valid_roles=valid_roles,
+            param_names=param_names,
+        )
+        existing_criteria = list(cur_act.submission_criteria or ())
+        existing_by_name = {
+            c["name"]: c for c in existing_criteria if isinstance(c, Mapping) and "name" in c
+        }
+        to_prepend: list[InvariantRuleSpec] = []
+        for pre in extra_pres:
+            dumped = pre.model_dump(mode="json")
+            if pre.name in existing_by_name:
+                if existing_by_name[pre.name] != dumped:
+                    raise InvariantError(
+                        f"overlay cannot overwrite precondition {pre.name!r} on action {act_name!r}",
+                        code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+                    )
+                continue
+            to_prepend.append(copy.deepcopy(pre))
+            existing_criteria.append(dumped)
+            existing_by_name[pre.name] = dumped
+
+        if to_prepend:
+            orig_handler = cur_act.handler
+            pre_tuple = tuple(to_prepend)
+
+            def _wrapped_action_handler(
+                ctx: EditBatch,
+                params: BaseModel,
+                _orig: Callable[..., Any] = orig_handler,
+                _pres: tuple[InvariantRuleSpec, ...] = pre_tuple,
+            ) -> Any:
+                _run_action_preconditions(ctx, params, _pres)
+                return _orig(ctx, params)
+
+            merged_touched = tuple(
+                dict.fromkeys([*cur_act.touched_object_types, *(p.target_type for p in to_prepend)])
+            )
+            derived.actions[act_name] = cur_act.model_copy(
+                update={
+                    "handler": _wrapped_action_handler,
+                    "submission_criteria": tuple(existing_criteria),
+                    "touched_object_types": merged_touched,
+                }
+            )
+
+    # 7. Monotonically restrict allowed_roles / update_revert_roles
+    for act_name, roles in spec_overlay.restrict_allowed_roles.items():
+        if act_name not in derived.actions:
+            raise InvariantError(
+                f"overlay restricts roles on unknown action {act_name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        dedup_roles = _dedup_clean_roles(roles) if roles else []
+        _assert_known_roles(
+            dedup_roles,
+            valid_roles,
+            context=f"overlay restrict_allowed_roles {act_name}",
+        )
+        cur_act = derived.actions[act_name]
+        if not dedup_roles or not set(dedup_roles).issubset(set(cur_act.allowed_roles)):
+            raise InvariantError(
+                f"overlay expands or empties allowed_roles on {act_name!r}: "
+                f"expected non-empty subset of {list(cur_act.allowed_roles)}, got {dedup_roles}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        derived.actions[act_name] = cur_act.model_copy(update={"allowed_roles": tuple(dedup_roles)})
+
+    for act_name, roles in spec_overlay.update_revert_roles.items():
+        if act_name not in derived.actions:
+            raise InvariantError(
+                f"overlay updates revert_roles on unknown action {act_name!r}",
+                code="UNKNOWN_ACTION",
+            )
+        dedup_roles = _dedup_clean_roles(roles) if roles else []
+        _assert_known_roles(
+            dedup_roles,
+            valid_roles,
+            context=f"overlay update_revert_roles {act_name}",
+        )
+        cur_act = derived.actions[act_name]
+        base_act = base_spec.actions.get(act_name)
+        if (
+            base_act is not None
+            and base_act.revert_roles
+            and not set(dedup_roles).issubset(set(base_act.revert_roles))
+        ):
+            raise InvariantError(
+                f"overlay expands revert_roles beyond standard action {act_name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        derived.actions[act_name] = cur_act.model_copy(update={"revert_roles": tuple(dedup_roles)})
+
+    # 8. Views & display
+    valid_act_names = set(derived.actions.keys())
+    valid_fn_names = set(derived.functions.keys())
+    for new_view in spec_overlay.add_views:
+        _assert_known_roles(
+            new_view.roles,
+            valid_roles,
+            context=f"overlay add_views {new_view.name}.roles",
+        )
+        _validate_scoped_view_bp(
+            new_view,
+            valid_ot_names=valid_type_names,
+            valid_act_names=valid_act_names,
+            valid_fn_names=valid_fn_names,
+        )
+        if new_view.name in derived.views:
+            raise InvariantError(
+                f"scoped view {new_view.name!r} already exists",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        derived.register_view(
+            ScopedViewSpec(
+                name=new_view.name,
+                description=new_view.description,
+                roles=tuple(new_view.roles),
+                view_tags=tuple(new_view.view_tags),
+                object_types=tuple(new_view.object_types),
+                actions=tuple(new_view.actions),
+                functions=tuple(new_view.functions),
+                include_reachable_objects=new_view.include_reachable_objects,
+            )
+        )
+    for upd_view in spec_overlay.update_views:
+        _assert_known_roles(
+            upd_view.roles,
+            valid_roles,
+            context=f"overlay update_views {upd_view.name}.roles",
+        )
+        _validate_scoped_view_bp(
+            upd_view,
+            valid_ot_names=valid_type_names,
+            valid_act_names=valid_act_names,
+            valid_fn_names=valid_fn_names,
+        )
+        if upd_view.name not in derived.views:
+            raise InvariantError(
+                f"overlay updates unknown scoped view {upd_view.name!r}",
+                code="INVALID_SCOPED_VIEW",
+            )
+        derived.register_view(
+            ScopedViewSpec(
+                name=upd_view.name,
+                description=upd_view.description,
+                roles=tuple(upd_view.roles),
+                view_tags=tuple(upd_view.view_tags),
+                object_types=tuple(upd_view.object_types),
+                actions=tuple(upd_view.actions),
+                functions=tuple(upd_view.functions),
+                include_reachable_objects=upd_view.include_reachable_objects,
+            )
+        )
+
+    display_updates: dict[str, dict[str, str]] = {}
+    if object_display:
+        display_updates["objects"] = object_display
+    if action_display:
+        display_updates["actions"] = action_display
+    if display_updates:
+        derived.update_display(display_updates)
+    if spec_overlay.display:
+        clean_disp = {
+            bucket: {k: lbl for k, lbl in entries.items() if lbl}
+            for bucket, entries in spec_overlay.display.items()
+            if entries
+        }
+        if clean_disp:
+            derived.update_display(clean_disp)
+
+    return derived
 
 
 def dsl_schema_prompt_guide(

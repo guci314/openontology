@@ -115,34 +115,36 @@ def portfolio_value(ctx: Any, params: Osv2EmptyParams) -> dict[str, Any]:
     return {"total_value": round(total, 2)}
 
 
-@osv2_spec.action(
-    "set_quality_grade",
-    Osv2SetGradeParams,
-    allowed_roles=("ops", "finance", "admin"),
-    affects_source=False,
-)
+@osv2_spec.edit_function("set_quality_grade", Osv2SetGradeParams)
 def set_quality_grade(ctx: Any, params: Osv2SetGradeParams) -> None:
     coil = ctx.require(SteelCoil, params.asset_id)
     ctx.modify(coil, quality_grade=params.quality_grade)
 
-
-@osv2_spec.action(
-    "adjust_price",
-    Osv2AdjustPriceParams,
+osv2_spec.declare_action(
+    "set_quality_grade",
+    edit_function="set_quality_grade",
     allowed_roles=("ops", "finance", "admin"),
+    affects_source=False,
 )
+
+
+@osv2_spec.edit_function("adjust_price", Osv2AdjustPriceParams)
 def adjust_price(ctx: Any, params: Osv2AdjustPriceParams) -> None:
     coil = ctx.require(SteelCoil, params.asset_id)
     if params.unit_price_ton <= 0:
         raise InvariantError("price must be positive", code="INVALID_PRICE")
     ctx.modify(coil, unit_price_ton=params.unit_price_ton)
 
+osv2_spec.declare_action(
+    "adjust_price",
+    edit_function="adjust_price",
+    allowed_roles=("ops", "finance", "admin"),
+)
 
-@osv2_spec.action(
+
+@osv2_spec.edit_function(
     "request_price_change",
     Osv2AdjustPriceParams,
-    allowed_roles=("ops", "finance", "finance_manager", "admin"),
-    revert_roles=("finance_manager",),
     description="超过 2 万元/吨的改价需要财务经理批准",
 )
 def request_price_change(ctx: Any, params: Osv2AdjustPriceParams) -> None:
@@ -153,6 +155,14 @@ def request_price_change(ctx: Any, params: Osv2AdjustPriceParams) -> None:
             code="APPROVAL_REQUIRED_PREMIUM_PRICE",
         )
     ctx.modify(coil, unit_price_ton=params.unit_price_ton)
+
+osv2_spec.declare_action(
+    "request_price_change",
+    edit_function="request_price_change",
+    allowed_roles=("ops", "finance", "finance_manager", "admin"),
+    revert_roles=("finance_manager",),
+    description="超过 2 万元/吨的改价需要财务经理批准",
+)
 
 
 _AUTO_IDS = iter(range(1, 10_000))
