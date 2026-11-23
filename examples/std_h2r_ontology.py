@@ -21,7 +21,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, compose_blueprints
+from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
 from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
 
 try:
@@ -31,7 +31,6 @@ try:
         AccountingEntity,
         BusinessParty,
         WorkCard,
-        build_std_core_blueprint,
         spec as std_core_spec,
     )
 except ImportError:  # pragma: no cover - script execution fallback
@@ -41,7 +40,6 @@ except ImportError:  # pragma: no cover - script execution fallback
         AccountingEntity,
         BusinessParty,
         WorkCard,
-        build_std_core_blueprint,
         spec as std_core_spec,
     )
 
@@ -555,11 +553,24 @@ def offboard_employee(ctx: Any, params: OffboardEmployeeParams) -> None:
             f"Employee:{emp.employee_id} status is {emp.status!r}; must be active/suspended to offboard",
             code="INVALID_EMPLOYEE_OFFBOARD_STATUS",
         )
-    for mandate in ctx.query(AuthorityMandate):
-        if (
-            mandate.grantee == emp.employee_id or mandate.grantor == emp.employee_id
-        ) and mandate.status == "active":
-            ctx.modify(mandate, status="revoked")
+    same_authority = (
+        ctx.spec.get_object_type(Employee).is_fully_owned()
+        == ctx.spec.get_object_type(AuthorityMandate).is_fully_owned()
+    )
+    active_mandates = [
+        mandate
+        for mandate in ctx.query(AuthorityMandate)
+        if (mandate.grantee == emp.employee_id or mandate.grantor == emp.employee_id)
+        and mandate.status == "active"
+    ]
+    if active_mandates and not same_authority:
+        raise InvariantError(
+            f"Employee:{emp.employee_id} has {len(active_mandates)} active AuthorityMandate(s) "
+            "across split ownership boundary; revoke them before offboarding",
+            code="OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN",
+        )
+    for mandate in active_mandates:
+        ctx.modify(mandate, status="revoked")
     ctx.modify(emp, status="offboarded")
 
 spec.declare_action(
@@ -650,7 +661,7 @@ spec.update_display(
             "scope_tag": "权限范围标签",
             "position_id": "岗位编码",
             "department": "所属部门",
-            "title": "岗位名称",
+            "title": "标题",
             "role_name": "标准系统角色",
             "approval_ceiling_cents": "审批金额上限（分）",
             "employee_id": "员工编码",
@@ -669,539 +680,12 @@ spec.update_display(
 
 
 def build_std_h2r_blueprint() -> DeclarativeBlueprint:
-    """构建与 ``std_h2r_ontology`` 对称的零 ``exec/eval`` 声明式领域蓝图（基于 std_core 组合）。"""
-    role_list = list(VALID_STD_ROLE_NAMES)
-
-    def _cycle_hop_check(prefix_ref: str) -> dict[str, Any]:
-        return {
-            "op": "ne",
-            "left": {"ref": prefix_ref},
-            "right": {"ref": "obj.department_id"},
-        }
-
-    h2r_fragment: dict[str, Any] = {
-        "model_id": "_std_h2r_domain_fragment",
-        "version": "1.0.0",
-        "seed_ontology_id": "business_ontology",
-        "object_types": [
-            {
-                "name": "Department",
-                "archetype": "MasterEntity",
-                "primary_key": "department_id",
-                "title_field": "name",
-                "aggregate_root": True,
-                "owned": False,
-                "display_label": "部门组织",
-                "fields": [
-                    {"name": "department_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "name", "field_type": "str", "required": True},
-                    {"name": "scope_tag", "field_type": "str", "default": ""},
-                    {"name": "status", "field_type": "str", "default": "active"},
-                ],
-                "relations": [
-                    {"field": "accounting_entity", "target_type": "AccountingEntity", "required": True},
-                    {"field": "parent_department", "target_type": "Department", "required": False},
-                ],
-            },
-            {
-                "name": "JobPosition",
-                "archetype": "MasterEntity",
-                "primary_key": "position_id",
-                "title_field": "title",
-                "aggregate_root": True,
-                "owned": False,
-                "display_label": "岗位定编",
-                "fields": [
-                    {"name": "position_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "title", "field_type": "str", "required": True},
-                    {"name": "role_name", "field_type": "str", "required": True},
-                    {"name": "approval_ceiling_cents", "field_type": "int", "default": 0, "non_negative": True},
-                    {"name": "status", "field_type": "str", "default": "active"},
-                ],
-                "relations": [
-                    {"field": "department", "target_type": "Department", "required": True},
-                ],
-            },
-            {
-                "name": "Employee",
-                "archetype": "MasterEntity",
-                "primary_key": "employee_id",
-                "title_field": "full_name",
-                "aggregate_root": True,
-                "owned": False,
-                "status_field": "status",
-                "initial_statuses": ["onboarding", "active"],
-                "transitions": {k: list(v) for k, v in _EMPLOYEE_TRANSITIONS.items()},
-                "display_label": "员工档案",
-                "fields": [
-                    {"name": "employee_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "full_name", "field_type": "str", "required": True},
-                    {"name": "actor_id", "field_type": "str", "required": True},
-                    {"name": "status", "field_type": "str", "default": "onboarding"},
-                ],
-                "relations": [
-                    {"field": "party", "target_type": "BusinessParty", "required": False},
-                    {"field": "department", "target_type": "Department", "required": True},
-                    {"field": "position", "target_type": "JobPosition", "required": True},
-                ],
-            },
-            {
-                "name": "AuthorityMandate",
-                "archetype": "ProcessDocument",
-                "primary_key": "mandate_id",
-                "title_field": "mandate_id",
-                "aggregate_root": True,
-                "owned": False,
-                "status_field": "status",
-                "initial_statuses": ["active"],
-                "transitions": {k: list(v) for k, v in _AUTHORITY_MANDATE_TRANSITIONS.items()},
-                "display_label": "动态授权委派凭证",
-                "fields": [
-                    {"name": "mandate_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "role_name", "field_type": "str", "required": True},
-                    {"name": "ceiling_cents", "field_type": "int", "required": True, "non_negative": True},
-                    {"name": "scope_tag", "field_type": "str", "default": ""},
-                    {"name": "status", "field_type": "str", "default": "active"},
-                ],
-                "relations": [
-                    {"field": "grantor", "target_type": "Employee", "required": True},
-                    {"field": "grantee", "target_type": "Employee", "required": True},
-                ],
-            },
-        ],
-        "invariants": [
-            {
-                "name": "h2r_department_dag_acyclic",
-                "code": "DEPARTMENT_CYCLE_DETECTED",
-                "target_type": "Department",
-                "must_hold": {
-                    "op": "and",
-                    "args": [
-                        _cycle_hop_check("obj.parent_department"),
-                        _cycle_hop_check("obj.parent_department.parent_department"),
-                        _cycle_hop_check("obj.parent_department.parent_department.parent_department"),
-                        _cycle_hop_check("obj.parent_department.parent_department.parent_department.parent_department"),
-                    ],
-                },
-                "description": "Department 组织层级必须为无环有向树（DAG），禁止指向自身或后代部门。",
-            },
-            {
-                "name": "h2r_job_position_closed_role",
-                "code": "UNKNOWN_ROLE",
-                "target_type": "JobPosition",
-                "must_hold": {
-                    "op": "in",
-                    "left": {"ref": "obj.role_name"},
-                    "right": {"lit": role_list},
-                },
-                "description": "JobPosition.role_name 必须命中闭集 STD_ROLES。",
-            },
-            {
-                "name": "h2r_mandate_closed_role",
-                "code": "UNKNOWN_ROLE",
-                "target_type": "AuthorityMandate",
-                "must_hold": {
-                    "op": "in",
-                    "left": {"ref": "obj.role_name"},
-                    "right": {"lit": role_list},
-                },
-                "description": "AuthorityMandate.role_name 必须命中闭集 STD_ROLES。",
-            },
-            {
-                "name": "h2r_mandate_no_self_grant",
-                "code": "MANDATE_SELF_GRANT_FORBIDDEN",
-                "target_type": "AuthorityMandate",
-                "must_hold": {
-                    "op": "and",
-                    "args": [
-                        {"op": "ne", "left": {"ref": "obj.grantor"}, "right": {"ref": "obj.grantee"}},
-                        {
-                            "op": "or",
-                            "args": [
-                                {"op": "eq", "left": {"ref": "obj.grantor.actor_id"}, "right": {"lit": ""}},
-                                {"op": "ne", "left": {"ref": "obj.grantor.actor_id"}, "right": {"ref": "obj.grantee.actor_id"}},
-                            ],
-                        },
-                    ],
-                },
-                "description": "职责分离（SoD）：AuthorityMandate 授权人与被授权人不得为同一员工或同一 actor_id。",
-            },
-            {
-                "name": "h2r_no_active_mandate_for_offboarded",
-                "code": "OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN",
-                "target_type": "AuthorityMandate",
-                "when": {"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "active"}},
-                "must_hold": {
-                    "op": "and",
-                    "args": [
-                        {"op": "ne", "left": {"ref": "obj.grantee.status"}, "right": {"lit": "offboarded"}},
-                        {"op": "ne", "left": {"ref": "obj.grantor.status"}, "right": {"lit": "offboarded"}},
-                    ],
-                },
-                "description": "已离职员工（无论作为被授权人还是原授权人）名下不得保留任何 active 状态的 AuthorityMandate。",
-            },
-        ],
-        "actions": [
-            {
-                "name": "reparent_department",
-                "display_label": "调整上级部门",
-                "description": "变更部门上级归属节点；强制校验 DAG 防环及同主体隔离。",
-                "allowed_roles": ["hr_admin", "hr_director", "steward", "admin"],
-                "params": [
-                    {"name": "department_id", "field_type": "str", "required": True},
-                    {"name": "new_parent_id", "field_type": "str", "default": ""},
-                ],
-                "preconditions": [
-                    {
-                        "name": "h2r_reparent_dept_active",
-                        "code": "DEPARTMENT_ARCHIVED",
-                        "target_type": "Department",
-                        "id_param": "department_id",
-                        "must_hold": {"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "active"}},
-                    },
-                    {
-                        "name": "h2r_reparent_parent_active",
-                        "code": "DEPARTMENT_ARCHIVED",
-                        "target_type": "Department",
-                        "id_param": "department_id",
-                        "when": {"op": "ne", "left": {"ref": "param.new_parent_id"}, "right": {"lit": ""}},
-                        "must_hold": {
-                            "op": "exists",
-                            "object_type": "Department",
-                            "where": {
-                                "op": "and",
-                                "args": [
-                                    {"op": "eq", "left": {"ref": "target.department_id"}, "right": {"ref": "param.new_parent_id"}},
-                                    {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "active"}},
-                                ],
-                            },
-                        },
-                    },
-                    {
-                        "name": "h2r_reparent_same_entity",
-                        "code": "CROSS_ENTITY_DEPARTMENT_FORBIDDEN",
-                        "target_type": "Department",
-                        "id_param": "department_id",
-                        "when": {"op": "ne", "left": {"ref": "param.new_parent_id"}, "right": {"lit": ""}},
-                        "must_hold": {
-                            "op": "exists",
-                            "object_type": "Department",
-                            "where": {
-                                "op": "and",
-                                "args": [
-                                    {"op": "eq", "left": {"ref": "target.department_id"}, "right": {"ref": "param.new_parent_id"}},
-                                    {"op": "eq", "left": {"ref": "target.accounting_entity"}, "right": {"ref": "obj.accounting_entity"}},
-                                ],
-                            },
-                        },
-                    },
-                ],
-                "mutations": [
-                    {
-                        "op": "modify",
-                        "object_type": "Department",
-                        "id_param": "department_id",
-                        "set_fields": {
-                            "parent_department": {
-                                "op": "if_else",
-                                "cond": {"op": "eq", "left": {"ref": "param.new_parent_id"}, "right": {"lit": ""}},
-                                "then": {"lit": None},
-                                "else": {"ref": "param.new_parent_id"},
-                            }
-                        },
-                    }
-                ],
-            },
-            {
-                "name": "assign_employee_position",
-                "display_label": "员工入职与调岗",
-                "description": "员工入职转正或调岗；禁止对已离职员工调岗，并校验目标部门/岗位激活且相互匹配。",
-                "allowed_roles": ["hr_admin", "hr_director", "steward", "admin"],
-                "params": [
-                    {"name": "employee_id", "field_type": "str", "required": True},
-                    {"name": "department_id", "field_type": "str", "required": True},
-                    {"name": "position_id", "field_type": "str", "required": True},
-                    {"name": "activate", "field_type": "bool", "default": True},
-                ],
-                "preconditions": [
-                    {
-                        "name": "h2r_assign_not_offboarded",
-                        "code": "EMPLOYEE_OFFBOARDED",
-                        "target_type": "Employee",
-                        "id_param": "employee_id",
-                        "must_hold": {"op": "ne", "left": {"ref": "obj.status"}, "right": {"lit": "offboarded"}},
-                    },
-                    {
-                        "name": "h2r_assign_dept_active",
-                        "code": "DEPARTMENT_NOT_ACTIVE",
-                        "target_type": "Department",
-                        "id_param": "department_id",
-                        "must_hold": {"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "active"}},
-                    },
-                    {
-                        "name": "h2r_assign_pos_active",
-                        "code": "POSITION_NOT_ACTIVE",
-                        "target_type": "JobPosition",
-                        "id_param": "position_id",
-                        "must_hold": {"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "active"}},
-                    },
-                    {
-                        "name": "h2r_assign_pos_matches_dept",
-                        "code": "POSITION_DEPARTMENT_MISMATCH",
-                        "target_type": "JobPosition",
-                        "id_param": "position_id",
-                        "must_hold": {"op": "eq", "left": {"ref": "obj.department"}, "right": {"ref": "param.department_id"}},
-                    },
-                    {
-                        "name": "h2r_assign_pos_closed_role",
-                        "code": "UNKNOWN_ROLE",
-                        "target_type": "JobPosition",
-                        "id_param": "position_id",
-                        "must_hold": {"op": "in", "left": {"ref": "obj.role_name"}, "right": {"lit": role_list}},
-                    },
-                ],
-                "mutations": [
-                    {
-                        "op": "modify",
-                        "object_type": "Employee",
-                        "id_param": "employee_id",
-                        "set_fields": {
-                            "department": {"ref": "param.department_id"},
-                            "position": {"ref": "param.position_id"},
-                            "status": {
-                                "op": "if_else",
-                                "cond": {"op": "eq", "left": {"ref": "param.activate"}, "right": {"lit": True}},
-                                "then": {"lit": "active"},
-                                "else": {"ref": "obj.status"},
-                            },
-                        },
-                    }
-                ],
-            },
-            {
-                "name": "grant_authority_mandate",
-                "display_label": "授予动态权限委派",
-                "description": "授予动态权限委派：强守闭集角色校验、双边在职校验、SoD 禁自授权及上限越权拦截/升级审批。",
-                "allowed_roles": [
-                    "hr_admin",
-                    "hr_director",
-                    "plant_manager",
-                    "procurement_manager",
-                    "sales_manager",
-                    "finance_director",
-                    "chief_accountant",
-                    "steward",
-                    "ai_agent",
-                    "admin",
-                ],
-                "params": [
-                    {"name": "mandate_id", "field_type": "str", "required": True},
-                    {"name": "grantor_id", "field_type": "str", "required": True},
-                    {"name": "grantee_id", "field_type": "str", "required": True},
-                    {"name": "role_name", "field_type": "str", "required": True},
-                    {"name": "ceiling_cents", "field_type": "int", "required": True, "non_negative": True},
-                    {"name": "scope_tag", "field_type": "str", "default": ""},
-                    {"name": "escalate_approval", "field_type": "bool", "default": False},
-                ],
-                "preconditions": [
-                    {
-                        "name": "h2r_grant_closed_role",
-                        "code": "UNKNOWN_ROLE",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "must_hold": {"op": "in", "left": {"ref": "param.role_name"}, "right": {"lit": role_list}},
-                    },
-                    {
-                        "name": "h2r_grant_positive_ceiling",
-                        "code": "NON_POSITIVE_MANDATE_CEILING",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "must_hold": {"op": "gt", "left": {"ref": "param.ceiling_cents"}, "right": {"lit": 0}},
-                    },
-                    {
-                        "name": "h2r_grant_grantor_active",
-                        "code": "EMPLOYEE_NOT_ACTIVE",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "must_hold": {"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "active"}},
-                    },
-                    {
-                        "name": "h2r_grant_grantee_active",
-                        "code": "EMPLOYEE_NOT_ACTIVE",
-                        "target_type": "Employee",
-                        "id_param": "grantee_id",
-                        "must_hold": {"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "active"}},
-                    },
-                    {
-                        "name": "h2r_grant_grantor_pos_active",
-                        "code": "POSITION_NOT_ACTIVE",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "must_hold": {"op": "eq", "left": {"ref": "obj.position.status"}, "right": {"lit": "active"}},
-                    },
-                    {
-                        "name": "h2r_grant_no_impersonation",
-                        "code": "MANDATE_GRANTOR_IMPERSONATION_FORBIDDEN",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "when": {"op": "not_in", "left": {"ref": "actor.role"}, "right": {"lit": ["hr_director", "admin"]}},
-                        "must_hold": {
-                            "op": "and",
-                            "args": [
-                                {"op": "ne", "left": {"ref": "obj.actor_id"}, "right": {"lit": ""}},
-                                {"op": "eq", "left": {"ref": "obj.actor_id"}, "right": {"ref": "actor.actor_id"}},
-                            ],
-                        },
-                    },
-                    {
-                        "name": "h2r_grant_forbid_admin_delegation",
-                        "code": "ADMIN_ROLE_DELEGATION_FORBIDDEN",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "when": {"op": "eq", "left": {"ref": "param.role_name"}, "right": {"lit": "admin"}},
-                        "must_hold": {"op": "eq", "left": {"ref": "actor.role"}, "right": {"lit": "admin"}},
-                    },
-                    {
-                        "name": "h2r_grant_no_role_escalation",
-                        "code": "MANDATE_ROLE_ESCALATION_FORBIDDEN",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "when": {"op": "ne", "left": {"ref": "param.role_name"}, "right": {"ref": "obj.position.role_name"}},
-                        "must_hold": {"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["hr_director", "admin"]}},
-                    },
-                    {
-                        "name": "h2r_grant_exceeds_ceiling_direct_block",
-                        "code": "MANDATE_EXCEEDS_GRANTOR_CEILING",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "when": {
-                            "op": "and",
-                            "args": [
-                                {"op": "gt", "left": {"ref": "param.ceiling_cents"}, "right": {"ref": "obj.position.approval_ceiling_cents"}},
-                                {"op": "eq", "left": {"ref": "param.escalate_approval"}, "right": {"lit": False}},
-                            ],
-                        },
-                        "must_hold": {
-                            "op": "in",
-                            "left": {"ref": "actor.role"},
-                            "right": {"lit": ["hr_director", "admin"]},
-                        },
-                    },
-                    {
-                        "name": "h2r_grant_escalation_approval_gate",
-                        "code": "APPROVAL_REQUIRED_AUTHORITY_ESCALATION",
-                        "target_type": "Employee",
-                        "id_param": "grantor_id",
-                        "when": {
-                            "op": "and",
-                            "args": [
-                                {"op": "gt", "left": {"ref": "param.ceiling_cents"}, "right": {"ref": "obj.position.approval_ceiling_cents"}},
-                                {"op": "eq", "left": {"ref": "param.escalate_approval"}, "right": {"lit": True}},
-                            ],
-                        },
-                        "must_hold": {
-                            "op": "or",
-                            "args": [
-                                {"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": ["hr_director", "admin"]}},
-                                {
-                                    "op": "exists",
-                                    "object_type": "WorkCard",
-                                    "where": {
-                                        "op": "and",
-                                        "args": [
-                                            {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "COMPLETED"}},
-                                            {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"lit": "APPROVAL"}},
-                                            {"op": "in", "left": {"ref": "target.assignee_role"}, "right": {"lit": ["hr_director", "admin"]}},
-                                            {"op": "eq", "left": {"ref": "target.target_object_type"}, "right": {"lit": "AuthorityMandate"}},
-                                            {"op": "eq", "left": {"ref": "target.target_object_id"}, "right": {"ref": "param.mandate_id"}},
-                                            {"op": "eq", "left": {"ref": "target.requested_action"}, "right": {"lit": "grant_authority_mandate"}},
-                                        ],
-                                    },
-                                },
-                            ],
-                        },
-                    },
-                ],
-                "mutations": [
-                    {
-                        "op": "create",
-                        "object_type": "AuthorityMandate",
-                        "id_param": "mandate_id",
-                        "set_fields": {
-                            "mandate_id": {"ref": "param.mandate_id"},
-                            "grantor": {"ref": "param.grantor_id"},
-                            "grantee": {"ref": "param.grantee_id"},
-                            "role_name": {"ref": "param.role_name"},
-                            "ceiling_cents": {"ref": "param.ceiling_cents"},
-                            "scope_tag": {"ref": "param.scope_tag"},
-                            "status": {"lit": "active"},
-                        },
-                    }
-                ],
-            },
-            {
-                "name": "offboard_employee",
-                "display_label": "员工离职与自动收权",
-                "description": "办理员工离职并阻断未吊销名下 active 权限的幽灵授权残留。",
-                "allowed_roles": ["hr_admin", "hr_director", "steward", "admin"],
-                "params": [
-                    {"name": "employee_id", "field_type": "str", "required": True},
-                    {"name": "reason", "field_type": "str", "default": ""},
-                ],
-                "preconditions": [
-                    {
-                        "name": "h2r_offboard_not_already",
-                        "code": "EMPLOYEE_ALREADY_OFFBOARDED",
-                        "target_type": "Employee",
-                        "id_param": "employee_id",
-                        "must_hold": {"op": "ne", "left": {"ref": "obj.status"}, "right": {"lit": "offboarded"}},
-                    },
-                    {
-                        "name": "h2r_offboard_valid_status",
-                        "code": "INVALID_EMPLOYEE_OFFBOARD_STATUS",
-                        "target_type": "Employee",
-                        "id_param": "employee_id",
-                        "must_hold": {
-                            "op": "in",
-                            "left": {"ref": "obj.status"},
-                            "right": {"lit": ["active", "suspended"]},
-                        },
-                    },
-                ],
-                "mutations": [
-                    {
-                        "op": "modify",
-                        "object_type": "Employee",
-                        "id_param": "employee_id",
-                        "set_fields": {"status": {"lit": "offboarded"}},
-                    }
-                ],
-            },
-        ],
-        "display": {
-            "ontologies": {
-                "std_h2r_ontology": "标准 H2R 领域本体（部门树·岗位定编·员工档案·动态授权委派）",
-            },
-            "objects": {
-                "Department": "部门组织",
-                "JobPosition": "岗位定编",
-                "Employee": "员工档案",
-                "AuthorityMandate": "动态授权委派凭证",
-            },
-            "actions": {
-                "reparent_department": "调整上级部门",
-                "assign_employee_position": "员工入职与调岗",
-                "grant_authority_mandate": "授予动态权限委派",
-                "offboard_employee": "员工离职与自动收权",
-            },
-        },
-    }
-    composed = compose_blueprints(
-        [build_std_core_blueprint(), h2r_fragment],
+    """将 ``std_h2r_ontology`` 唯一源码本体投影为标准 H2R 领域声明式蓝图。"""
+    return export_spec_blueprint(
+        spec,
         model_id="std_h2r_ontology",
         version="1.0.0",
         seed_ontology_id="business_ontology",
+        imports=("std_core_ontology",),
         description="标准 H2R 领域本体蓝图：在核心底座上组合部门组织、岗位定编、员工档案与动态授权委派。",
     )
-    composed.imports = ["std_core_ontology"]
-    return composed

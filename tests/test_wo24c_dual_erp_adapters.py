@@ -48,6 +48,7 @@ from examples.adapters import (  # noqa: E402
 from examples.business_ontology import BUSINESS_SEED_ONTOLOGY  # noqa: E402
 from examples.std_enterprise_world_model import (  # noqa: E402
     build_enterprise_standard_blueprint,
+    build_enterprise_standard_spec,
     evaluate_h2r_employee_authority,
     project_event_to_draft_journal,
     project_h2r_to_org_directory,
@@ -64,7 +65,7 @@ from examples.wo24c_dual_erp_fde_orchestrator import (  # noqa: E402
 )
 from open_ontology.design import _load_thin_driver_factory, audit_thin_driver_ast, run_design_check  # noqa: E402
 from open_ontology.drivers import DUPLICATE_ACTION_DRIVER, MountedDevice  # noqa: E402
-from open_ontology.induction import AdapterMappingSpec, blueprint_fingerprint  # noqa: E402
+from open_ontology.induction import AdapterMappingSpec, apply_overlay_to_spec, blueprint_fingerprint  # noqa: E402
 from open_ontology.settlement import UNBOUND_SOURCE_BRIDGE, SourceBridge  # noqa: E402
 from open_ontology.spec import Actor, GovernanceViolationError, InvariantError  # noqa: E402
 
@@ -224,10 +225,45 @@ def test_2_customer_overlay_api_cli_and_destructive_rejection(erp: str) -> None:
     assert exc_info.value.code == "OVERLAY_BREAKS_STANDARD_CONTRACT"
 
     weakened = copy.deepcopy(raw_overlay)
-    weakened["update_actions"][0]["preconditions"] = [weakened["update_actions"][0]["preconditions"][0]]
+    weakened["update_actions"] = [
+        {
+            "name": "post_p2p_bill",
+            "allowed_roles": ["finance"],
+            "affects_source": True,
+            "params": [{"name": "bill_id", "field_type": "str", "required": True}],
+            "preconditions": [
+                {
+                    "name": f"{erp}_receipt_required_before_bill",
+                    "code": "RECEIPT_REQUIRED_BEFORE_BILL",
+                    "target_type": "P2pVendorBill",
+                    "id_param": "bill_id",
+                    "must_hold": {
+                        "op": "eq",
+                        "left": {"ref": "obj.purchase_order.status"},
+                        "right": {"lit": "received"},
+                    },
+                }
+            ],
+            "mutations": [
+                {
+                    "op": "modify",
+                    "object_type": "P2pVendorBill",
+                    "id_param": "bill_id",
+                    "set_fields": {"status": {"lit": "posted"}},
+                }
+            ],
+        }
+    ]
     with pytest.raises(InvariantError) as weak_exc:
         build_enterprise_standard_blueprint(overlays=(weakened,))
     assert weak_exc.value.code == "OVERLAY_BREAKS_STANDARD_CONTRACT"
+    with pytest.raises(InvariantError) as weak_spec_exc:
+        apply_overlay_to_spec(
+            build_enterprise_standard_spec(),
+            weakened,
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
+        )
+    assert weak_spec_exc.value.code == "OVERLAY_BREAKS_STANDARD_CONTRACT"
 
 
 def test_3_hybrid_mount_contracts_and_registry_guards_offline() -> None:

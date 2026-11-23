@@ -44,10 +44,12 @@ from .induction import (
     SourceEntityBatch,
     SymbolicCrucible,
     apply_overlay,
+    apply_overlay_to_spec,
     apply_resolution_decisions,
     blueprint_fingerprint,
     compile_blueprint,
     compose_blueprints,
+    export_spec_blueprint,
     inject_crosswalk_into_mapping,
     merge_projected_phenomena,
     project_external_phenomenon,
@@ -258,13 +260,13 @@ def _load_json_file(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _load_blueprint_arg(arg: str) -> DeclarativeBlueprint:
+def _load_blueprint_with_specs(arg: str) -> tuple[DeclarativeBlueprint, tuple[OntologySpec, ...]]:
     p = Path(arg)
     if p.is_file() or arg.endswith(".json"):
         if not p.is_file():
             raise FileNotFoundError(f"blueprint file not found: {arg}")
         raw = _load_json_file(p)
-        return DeclarativeBlueprint.model_validate(raw)
+        return DeclarativeBlueprint.model_validate(raw), ()
     if ":" not in arg:
         raise ValueError(
             f"blueprint argument {arg!r} must be a .json path or 'module.path:symbol'"
@@ -273,9 +275,24 @@ def _load_blueprint_arg(arg: str) -> DeclarativeBlueprint:
     mod = importlib.import_module(mod_name)
     target = getattr(mod, attr_name)
     loaded = target() if callable(target) else target
+    if isinstance(loaded, OntologySpec):
+        ont_map = loaded.display.get("ontologies") or {}
+        mid = list(ont_map.keys())[-1] if ont_map else mod_name.rsplit(".", 1)[-1]
+        bp = export_spec_blueprint(loaded, model_id=mid)
+        return bp, (loaded,)
     if isinstance(loaded, DeclarativeBlueprint):
-        return loaded
-    return DeclarativeBlueprint.model_validate(loaded)
+        specs = tuple(getattr(loaded, "_base_specs", ()))
+        if not specs:
+            mod_spec = getattr(mod, "spec", None)
+            if isinstance(mod_spec, OntologySpec):
+                specs = (mod_spec,)
+                loaded._base_specs = specs
+        return loaded, specs
+    return DeclarativeBlueprint.model_validate(loaded), ()
+
+
+def _load_blueprint_arg(arg: str) -> DeclarativeBlueprint:
+    return _load_blueprint_with_specs(arg)[0]
 
 
 def _load_seed_arg(arg: str | None) -> SeedOntology | None:
@@ -1057,10 +1074,22 @@ def _prepare_design_context(
     resolution_summary: dict[str, Any] | None = None
 
     # 1. Blueprint composition + overlay + compilation
+    base_specs_tuple: tuple[OntologySpec, ...] = ()
     try:
-        loaded_bps = [_load_blueprint_arg(bp_arg) for bp_arg in blueprints]
+        seed_obj = _load_seed_arg(seed)
+        loaded_pairs = [_load_blueprint_with_specs(bp_arg) for bp_arg in blueprints]
+        loaded_bps = [bp for bp, _ in loaded_pairs]
         if not loaded_bps:
             raise InvariantError("at least one --blueprint is required", code="EMPTY_OBJECT_TYPES")
+        all_specs: list[OntologySpec] = []
+        seen_spec_ids: set[int] = set()
+        for _, specs in loaded_pairs:
+            for sp in specs:
+                if id(sp) not in seen_spec_ids:
+                    seen_spec_ids.add(id(sp))
+                    all_specs.append(sp)
+        base_specs_tuple = tuple(all_specs)
+
         if len(loaded_bps) == 1:
             base_bp = copy.deepcopy(loaded_bps[0])
             if model_id:
@@ -1069,6 +1098,7 @@ def _prepare_design_context(
             target_mid = model_id or f"{loaded_bps[0].model_id}_composed"
             base_bp = compose_blueprints(loaded_bps, model_id=target_mid, version=loaded_bps[0].version)
 
+        ov_spec: CustomerOverlaySpec | None = None
         if overlay:
             ov_path = Path(overlay)
             if not ov_path.is_file():
@@ -1078,8 +1108,28 @@ def _prepare_design_context(
         else:
             effective_bp = base_bp
 
-        seed_obj = _load_seed_arg(seed)
-        compiled_spec = compile_blueprint(effective_bp, seed_ontology=seed_obj)
+        if ov_spec is not None and all(len(specs) > 0 for _, specs in loaded_pairs) and base_specs_tuple:
+            unified_base = (
+                base_specs_tuple[0]
+                if len(base_specs_tuple) == 1
+                else OntologySpec(extends=list(base_specs_tuple))
+            )
+            if base_bp.model_id not in (unified_base.display.get("ontologies") or {}):
+                unified_base = apply_overlay_to_spec(unified_base, CustomerOverlaySpec())
+                unified_base.update_display(
+                    {"ontologies": {base_bp.model_id: base_bp.description or base_bp.model_id}}
+                )
+            compiled_spec = apply_overlay_to_spec(
+                unified_base,
+                ov_spec,
+                seed_ontology=seed_obj,
+            )
+        else:
+            compiled_spec = compile_blueprint(
+                effective_bp,
+                seed_ontology=seed_obj,
+                base_specs=base_specs_tuple,
+            )
         bp_fp = blueprint_fingerprint(effective_bp)
     except Exception as exc:
         code = getattr(exc, "code", None) or type(exc).__name__
@@ -1093,6 +1143,7 @@ def _prepare_design_context(
             "effective_bp": None,
             "compiled_spec": None,
             "seed_obj": None,
+            "base_specs": base_specs_tuple,
             "device_contexts": [],
             "device_reports": device_reports,
             "resolution_summary": resolution_summary,
@@ -1477,6 +1528,7 @@ def _prepare_design_context(
         "effective_bp": effective_bp,
         "compiled_spec": compiled_spec,
         "seed_obj": seed_obj,
+        "base_specs": base_specs_tuple,
         "device_contexts": loaded_devices,
         "device_reports": device_reports,
         "resolution_summary": resolution_summary,
@@ -1800,6 +1852,7 @@ def run_design_verify(
             m0_objects=merged_m0,
             seed_ontology=seed_obj,
             adapter_mapping=combined_mapping,
+            base_specs=prep.get("base_specs", ()),
         ),
     )
     crucible_passed = bool(crucible_report.passed)
@@ -1858,6 +1911,7 @@ def run_design_verify(
                 sandbox=sandbox,
                 seed_ontology=seed_obj,
                 target_actions=target_actions,
+                base_specs=prep.get("base_specs", ()),
             )
             fal_dict = fal_report.to_dict()
             for ce in fal_report.counterexamples:

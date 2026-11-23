@@ -161,13 +161,32 @@ def test_living_docs_synced_with_runtime_design_split_and_no_retired_symbols():
         "schema_pg.sql",
         "MDMSidecarPlugin",
         "Gate 7",
+        "Gate 8",
+        "EditFunctionDef",
+        "apply_overlay_to_spec",
     ):
         assert anchor in combined, f"活文档缺少现行关键架构锚点：{anchor}"
     assert "Gate 6" in combined or "Runtime 对 Design-Time" in combined
 
-    for anchor in ("mcp_server", "AutonomyRampController", "SagaReconciler", "schema_pg.sql", "MDMSidecarPlugin", "Gate 7"):
+    for anchor in (
+        "mcp_server",
+        "AutonomyRampController",
+        "SagaReconciler",
+        "schema_pg.sql",
+        "MDMSidecarPlugin",
+        "Gate 7",
+        "Gate 8",
+        "EditFunctionDef",
+        "apply_overlay_to_spec",
+    ):
         assert anchor in readme_doc, f"README.md 缺少生产运行壳或门禁锚点：{anchor}"
         assert anchor in arch_doc, f"docs/ARCHITECTURE.md 缺少生产运行壳或门禁锚点：{anchor}"
+
+    for relpath in (*living_paths, "_state.md"):
+        text = _doc(relpath)
+        assert "@spec.action" not in text and "spec.action(" not in text, (
+            f"活文档 {relpath} 仍残留已退役旧动作装饰器写法，应迁至 @spec.edit_function + spec.declare_action"
+        )
 
     for leak in ("jshERP", "Odoo", "BottleCRM", "SteelStorageBin", "螺纹钢"):
         assert leak not in arch_doc, f"M2 平台宪法 docs/ARCHITECTURE.md 夹带了具体厂商或行业实现词：{leak}"

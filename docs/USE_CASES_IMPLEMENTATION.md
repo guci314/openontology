@@ -103,9 +103,9 @@ OpenOntology 的建模原语只有两类，**但表达能力已经足够**：
 
 当年的可执行 UML 要发明专门的动作语言（Alf、OAL 等），表达能力受限、工具链封闭、没人会写。OpenOntology 选择 **Python 内生 DSL（internal DSL）**：
 
-- **结构是声明式的**：`ObjectType`（pydantic 模型）、`ObjectProperty`、`@spec.action(...)` 的元数据都是声明，可被运行时**静态分析和导出**——自动推导表单、生成 LLM 工具 Schema、绘制关系拓扑。
-- **行为是图灵完备的**：Action 体就是普通 Python 函数，循环、条件、递归、调用任意计算逻辑都可以，**任何业务规则都写得出来**。
-- **图灵完备但不失控**：Action 只能操作 `EditBatch` 沙箱，不能直接写库；无论逻辑多复杂，产出都是一个可审查、可模拟、可回滚的 `ObjectDiff`。**表达能力无上限，副作用有边界。**
+- **结构是声明式的**：`ObjectType`（pydantic 模型）、`ObjectProperty`、`spec.declare_action(...)` 的元数据都是声明，可被运行时**静态分析和导出**——自动推导表单、生成 LLM 工具 Schema、绘制关系拓扑，并支持由唯一 Python 模型单一源码投影（`export_spec_blueprint`）与单调叠加（`apply_overlay_to_spec`）。
+- **行为是图灵完备的**：`@spec.edit_function` 内核就是普通 Python 函数，循环、条件、递归、调用任意计算逻辑都可以，**任何业务规则都写得出来**；外层再由 `spec.declare_action` 声明 RBAC、`revert_roles`、`submission_criteria` 与 `affects_source` 治理壳。
+- **图灵完备但不失控**：`EditFunctionDef` 只能操作 `EditBatch` 沙箱，不能直接写库；无论逻辑多复杂，产出都是一个可审查、可模拟、可回滚的 `ObjectDiff`。**表达能力无上限，副作用有边界。**
 
 ```python
 # 示意：Domain（对象 + 关系）
@@ -119,12 +119,14 @@ class SalesOrder(ObjectType):
     amount: int
     status: str = "draft"
 
-# 示意：Service（Action：纯同步确定性门控 + M1 WorkCard 协同审批）
-@spec.action(
-    name="confirm_order",
-    params=ConfirmParams,
-    allowed_roles=["sales_rep", "sales_manager", "finance_director", "steward", "ai_agent"],
-    revert_roles=["finance_director", "admin"],
+class ConfirmParams(BaseModel):
+    order_id: str
+
+# 示意：Service（动力学三分法：@spec.edit_function 纯变更内核 + spec.declare_action 治理壳）
+@spec.edit_function(
+    "confirm_order",
+    ConfirmParams,
+    touched_object_types=("SalesOrder",),
 )
 def confirm_order(ctx, p: ConfirmParams):
     order = ctx.require(SalesOrder, p.order_id)
@@ -134,6 +136,13 @@ def confirm_order(ctx, p: ConfirmParams):
         if ctx.actor.role != "finance_director":              # 越额即阻断，建 M1 WorkCard 协同特批
             raise InvariantError("超出信用额度，须发起 WorkCard 特批", code="APPROVAL_REQUIRED_CREDIT_LIMIT_EXCEEDED")
     ctx.modify(order, status="confirmed")
+
+spec.declare_action(
+    "confirm_order",
+    edit_function="confirm_order",
+    allowed_roles=["sales_rep", "sales_manager", "finance_director", "steward", "ai_agent"],
+    revert_roles=["finance_director", "admin"],
+)
 ```
 
 这样带来的实施优势：

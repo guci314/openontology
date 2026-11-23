@@ -495,6 +495,7 @@ def test_workshop_live_driver_registry_connector_status_and_unplug() -> None:
 # 2. python -m open_ontology.design check | verify CLI Red & Green Tests
 # ---------------------------------------------------------------------------
 def test_design_cli_check_red_cases_fail_closed_with_error_codes(tmp_path: Path) -> None:
+    bp_arg = "examples.agy_fde_mudpit_decompile_benchmark:build_locked_enterprise_target_blueprint"
     abi_path = tmp_path / "target_abi.json"
     abi_path.write_text(
         json.dumps(build_locked_enterprise_target_blueprint().model_dump(mode="json"), indent=2),
@@ -514,7 +515,7 @@ def test_design_cli_check_red_cases_fail_closed_with_error_codes(tmp_path: Path)
         [
             "check",
             "--blueprint",
-            str(abi_path),
+            bp_arg,
             "--overlay",
             str(bad_role_ov),
             "--seed",
@@ -541,7 +542,7 @@ def test_design_cli_check_red_cases_fail_closed_with_error_codes(tmp_path: Path)
         [
             "check",
             "--blueprint",
-            str(abi_path),
+            bp_arg,
             "--overlay",
             str(bad_dest_ov),
             "--seed",
@@ -579,7 +580,7 @@ def test_design_cli_check_red_cases_fail_closed_with_error_codes(tmp_path: Path)
         [
             "check",
             "--blueprint",
-            str(abi_path),
+            bp_arg,
             "--seed",
             "examples.business_ontology:BUSINESS_SEED_ONTOLOGY",
             "--device",
@@ -613,7 +614,7 @@ def test_design_cli_check_red_cases_fail_closed_with_error_codes(tmp_path: Path)
         [
             "check",
             "--blueprint",
-            str(abi_path),
+            bp_arg,
             "--seed",
             "examples.business_ontology:BUSINESS_SEED_ONTOLOGY",
             "--device",

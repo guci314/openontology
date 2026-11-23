@@ -102,6 +102,7 @@ class CrucibleContext:
     max_patch_rules: int = 12
     max_total_invariants: int = 30
     max_total_ast_nodes: int = 250
+    base_specs: tuple[OntologySpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -758,8 +759,18 @@ class SymbolicCrucible:
         # --- Gate 1: Static & M2 Constitutional Safety (zero eval/exec + SeedOntology contract) ---
         compiled_spec: OntologySpec | None = None
         g1_errors: list[str] = []
+        eff_base_specs: list[OntologySpec] = []
+        seen_spec_ids: set[int] = set()
+        for sp in (*getattr(candidate, "_base_specs", ()), *context.base_specs):
+            if id(sp) not in seen_spec_ids:
+                seen_spec_ids.add(id(sp))
+                eff_base_specs.append(sp)
         try:
-            compiled_spec = compile_blueprint(candidate, seed_ontology=context.seed_ontology)
+            compiled_spec = compile_blueprint(
+                candidate,
+                seed_ontology=context.seed_ontology,
+                base_specs=tuple(eff_base_specs),
+            )
         except Exception as exc:
             g1_errors.append(f"{type(exc).__name__}: {exc}")
 

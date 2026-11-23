@@ -13,8 +13,10 @@
 
 > 交互式架构图（浏览器可交互查看视图、图例与源码行号定位）：[docs/assets/openontology-architecture.html](docs/assets/openontology-architecture.html) ｜ 源 JSON：[docs/assets/openontology-architecture.json](docs/assets/openontology-architecture.json)
 
-> **实施状态（`main` 基线 `ec29958` · `WO-01 ~ WO-21` + `WO-18` 全栈收官）**：系统已定型为 **“10 模块 Java 式 Pure Runtime 微内核 + 5 大零耦合适配/安全/持久化生产运行壳 + `javac` 式 Design-Time CLI + 外部 CLI AI-FDE”**，并已完成双异构开源 ERP 与国产模型全栈联调实证：
-> * **Pure Runtime 10 模块 JVM 核**：`import open_ontology` 严格仅加载 **10 个纯运行时模块 / 8,781 行**（较重构前缩减超 70%）；`open_ontology/runtime.py` **1,328 行**（硬预算 `<= 1,335`）；`open_ontology/__init__.py`（142 行）零 `__getattr__` 后门；`tests/test_architecture_boundaries.py` **Gate 1–7** 铁笼锁死（其中 **Gate 5** 双守卫 `schema.sql` + `schema_pg.sql` 6 表纯同步无 M2 挂起态，**Gate 6** 禁加载 `design/induction/workshop/mcts/mpc` 及外围扩展壳/`psycopg`，**Gate 7** 锁死 `std_*` 标准域常识细腰零横向交叉导入）。
+> **实施状态（`WO-01 ~ WO-27B` 持续演进）**：系统已定型为 **“10 模块 Java 式 Pure Runtime 微内核 + 零耦合适配/安全/持久化/指挥台生产运行壳 + `javac` 式 Design-Time CLI + 外部 CLI AI-FDE”**，并已完成双异构开源 ERP 与国产模型全栈联调实证：
+> * **Pure Runtime 10 模块 JVM 核**：`import open_ontology` 严格仅加载 **10 个纯运行时模块**；`open_ontology/runtime.py` **1,328 行**（硬预算 `<= 1,335`）；`open_ontology/__init__.py` 零 `__getattr__` 后门；`tests/test_architecture_boundaries.py` **Gate 1–8** 铁笼锁死（其中 **Gate 5** 双守卫 `schema.sql` + `schema_pg.sql` 6 表纯同步无 M2 挂起态，**Gate 6** 禁加载 `design/induction/workshop/console_server/mcts/mpc` 及外围扩展壳/`psycopg`，**Gate 7** 锁死 `std_*` 标准域常识细腰零横向交叉导入，**Gate 8** 永久锁定 `FunctionDef` / `EditFunctionDef` / `ActionDef` 动力学三分法正交隔离与声明式 DSL 反 xtUML 纯洁性）。
+> * **现代四视角交互指挥台（`open_ontology/console_server.py` · `WO-26`）**：服务化驱动 `web/` 提供 Model / Runtime / World / Device 四视角、沙盘预演与冲正、WorkCard 工单流转及 H2R/RLS 隔离演示。
+> * **单一源码标准本体与单调定制插件（`WO-27A` / `WO-27B`）**：7 大 `examples/std_*_ontology.py`（核心/CRM/O2C/P2P/P2M/R2R/H2R）以 Python `OntologySpec`（`@spec.edit_function` + `spec.declare_action`）为唯一源码，经 `export_spec_blueprint` 单向投影 JSON 蓝图，并经 `apply_overlay_to_spec` 无损叠加 `overlay.json + custom_edits.py` 客户定制 `EditFunctionDef` / `FunctionDef` / `InvariantDef` 插件。
 > * **标准 MCP Server 生产运行壳（`open_ontology/mcp_server.py`）**：纯 Python stdlib 实现 JSON-RPC 2.0，同时支持 **stdio** 与 **Streamable HTTP (`POST /mcp`)**，服务端钉死 `Actor` 与 `ScopedView` 身份权限契约，安全接入 Hermes / 各类 MCP 客户端。
 > * **生产安全双壳（`autonomy.py` & `reconciliation.py`）**：`AutonomyRampController` 提供 **`SHADOW` / `COPILOT_ESCALATE` / `AUTO_UNDER_CEILING`** 三级自治度影子爬坡与追加式账本；`SagaReconciler` 落地网络写后超时失联 **Observe-Before-Retry**（先只读回读物理终态再裁决提交/回滚/人工兜底），彻底杜绝盲重试重复下账。
 > * **真实 PostgreSQL 16 生产底座（`open_ontology/postgres_backend.py` + `open_ontology/schema_pg.sql` + `docker/postgres/`）**：PL/pgSQL 跨 schema 物理写门禁触发器、追加式审计防删、跨连接/跨进程并发 OCC，且保留 `fork()` 零锁纯 `:memory:` 反事实推演沙盘。
@@ -74,7 +76,7 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 |---|---|---|
 | Pure Runtime 入口 | `open_ontology/__init__.py` | 142 行纯运行时导出（零 `__getattr__`，默认仅加载 10 模块 / 8,781 行） |
 | Pure Runtime 存储 | `open_ontology/schema.sql` | 5 张纯业务核心表 + 1 张 `ontology_write_gate` 写门禁触发器（仅 `COMMITTED/REVERTED/REJECTED`） |
-| Pure Runtime 声明 | `open_ontology/spec.py` | `Actor` / `ObjectType` / `ObjectProperty` / `AutoID` / 函数 / 动作 / 不变量注册器 |
+| Pure Runtime 声明 | `open_ontology/spec.py` | `Actor` / `ObjectType` / `ObjectProperty` / `AutoID` / 动力学三分法（`FunctionDef` / `EditFunctionDef` / `ActionDef`）/ 不变量注册器 |
 | Pure Runtime 沙箱 | `open_ontology/sandbox.py` | `EditBatch` 内存推演、`ObjectDiff` 与逆向补丁 |
 | Pure Runtime 微内核 | `open_ontology/runtime.py` | **1,328 行**（`<= 1,335`）：`put_object` / `simulate` / `submit` / `fork` 管线；与 MCTS/Design/外围运行壳零耦合 |
 | Pure Runtime 切面 | `open_ontology/aspects.py` | 6 大系统调用切面：列脱敏 / 角色与主权门禁 / 幂等与 OCC / 被拒审计 / 自动化反射 / 忙闲回调 |
@@ -87,10 +89,10 @@ Python Ontology HTTP Server  +  Java quarkus-run.jar  +  erp_north / erp_south
 | 生产壳：PostgreSQL 16 底座 | `open_ontology/postgres_backend.py`、`schema_pg.sql` | 跨 schema 同构 6 表、PL/pgSQL 物理写门禁触发器与跨进程 OCC（`open_postgres_runtime`），容器配置见 `docker/postgres/` |
 | 生产壳：外挂 MDM Sidecar | `open_ontology/mdm_plugin.py` | `MDMSidecarPlugin`：零内核污染 L0–L4 `CrosswalkTable` 增量对账、热刷新与幂等 `WorkCard` 分派 |
 | Design-Time 裁判 CLI | `open_ontology/design.py` | `python -m open_ontology.design check \| verify`：`javac` 式静态编译对齐 + 只读 `?mode=ro` 探测 + `JUnit` 沙箱证伪 |
-| Design-Time 归纳与解析 | `open_ontology/induction/` | 零 `exec` 声明式 DSL 与单调 Overlay（`dsl.py`）、L0–L4 四级实体解析 `CrosswalkTable`（`resolution.py`）、五关熔炉（`crucible.py`）、覆盖率差分证伪（`falsifier.py`） |
+| Design-Time 归纳与解析 | `open_ontology/induction/` | `export_spec_blueprint` 单向投影、`apply_overlay_to_spec`（支持 `overlay.json + custom_edits.py`）、L0–L4 `CrosswalkTable`、`SymbolicCrucible`、`DifferentialFalsifier` |
 | 显式扩展：规划器 | `open_ontology/mcts.py`、`mpc.py` | 按需导入 `OntologyMCTSPlanner`（纯内存 `fork()` 树搜索）与无状态 `ClosedLoopMPCController` |
 | 显式扩展：目录与视图 | `open_ontology/workspaces.py`、`model_views.py` | `WorkspaceDescriptor` + `workspaces.json` 清单、`takeover_workspace`、`describe_behavior` / `describe_openapi` |
-| 显式扩展：指挥台与传输 | `open_ontology/workshop.py`、`workshop_ui.py`、`http_server.py` | 四视角指挥台（实时投影 `DeviceDriverRegistry` 状态）、拓扑大图与 HTTP 传输边界 |
+| 显式扩展：指挥台与传输 | `open_ontology/console_server.py`、`workshop.py`、`workshop_ui.py`、`http_server.py` | 现代四视角指挥台服务壳（`web/`）、实时投影 `DeviceDriverRegistry` 状态、拓扑大图与 HTTP 传输边界 |
 | 外部 AI-FDE 工作流 | `skills/openontology-fde/SKILL.md` | 领域无关 AI-FDE 隔离探库、产物撰写与自愈证伪规程（搭配 `agy` / `opencode` CLI） |
 | 标准薄本体与跨企常识细腰 | `examples/std_core_ontology.py`、`std_crm_ontology.py`、`std_o2c_ontology.py`、`std_p2p_ontology.py`、`commonsense_exchange.py` | 行业标准骨架、REA 5 原语（`AccountingEntity` / `BusinessParty` / `TradeResource` / `TradeCommitment` / `FulfillmentEvent`）+ M1 `WorkCard` + 跨企信封白名单；受 Gate 7 零交叉隔离保护 |
 | 内部执行边界 | `open_ontology/execution/` | 实例级能力绑定与透明可选观察 |
@@ -246,9 +248,10 @@ GET /camel/stats      -> ingest_count / north_writebacks / south_writebacks
 
 ## 测试覆盖
 
-下列分项为核心与特色回归套件说明；当前已提交基线 `ec29958` 下全量离线回归实测 **`650 passed, 6 skipped, 63 deselected`**（`/Users/guci/miniforge3/bin/python3 -m pytest --ignore=tests/test_agent_value_mcts.py -k "not odoo and not camel and not jsherp and not video_artifact_quality" -q`），且 Python 3.11.15 与 Python 3.13.12 双版本 7 文件核心/生产壳套件 **38/38 全绿**，详见 `_state.md`：
+下列分项为核心与特色回归套件说明；当前 `WO-27B` 工作区离线全量回归实测 **`697 passed, 6 skipped, 81 deselected`**（`/Users/guci/miniforge3/bin/python3 -m pytest --ignore=tests/test_agent_value_mcts.py -k "not odoo and not camel and not jsherp and not video_artifact_quality and not test_group_" -q`），详见 `_state.md`：
 
-- `tests/test_architecture_boundaries.py`：**Gate 1 – Gate 7** 零例外架构门禁（M1 AST 白名单、M2 零反向引用、动态词表/供应商词封杀、虚构 `Starship` 领域盲测、SQLite & PG16 纯同步 6 表无退役符号门禁、Runtime 严格收口 10 模块白名单且不加载任何外围扩展/生产壳及 `psycopg`，以及 `std_*` 标准域常识细腰零交叉导入门禁 **Gate 7**）。
+- `tests/test_architecture_boundaries.py`：**Gate 1 – Gate 8** 零例外架构门禁（M1 AST 白名单、M2 零反向引用、动态词表/供应商词封杀、虚构 `Starship` 领域盲测、SQLite & PG16 纯同步 6 表无退役符号门禁、Runtime 严格收口 10 模块白名单且不加载任何外围扩展/生产壳及 `psycopg`、`std_*` 标准域常识细腰零交叉导入门禁 **Gate 7**，以及动力学三分法正交隔离与声明式 DSL 纯洁门禁 **Gate 8**）。
+- `tests/test_kinetic_split_and_overlay_on_spec.py`：`FunctionDef` / `EditFunctionDef` / `ActionDef` 动力学三分法、`export_spec_blueprint` 单一源码投影及 `apply_overlay_to_spec` 客户自定义插件（`custom_edit_functions` / `custom_functions` / `custom_invariants`）单调验证。
 - `tests/test_postgres_backend.py`：PostgreSQL 16 跨 schema 同构 6 表、PL/pgSQL `BEFORE` 物理写门禁触发器、追加式防删审计、双连接并发 OCC 与 `fork()` 沙盘孤立测试。
 - `tests/test_autonomy_and_reconciliation.py`：`AutonomyRampController` 三级自治度爬坡（`SHADOW` / `COPILOT_ESCALATE` / `AUTO_UNDER_CEILING`）与 `SagaReconciler` 写后失联三分支注入实测。
 - `tests/test_commonsense_interop_and_mcp.py`：`OntologyMCPServer` stdio / Streamable HTTP 协议、身份防覆盖安全、5 原语 REA 常识信封跨企白名单防泄漏及钢铁贸易争议三幕回归。

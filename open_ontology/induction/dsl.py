@@ -18,18 +18,23 @@ import uuid
 from collections import defaultdict
 from typing import Any, Callable, Literal, Mapping, Sequence, Union, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, create_model, field_validator, model_validator
+from pydantic_core import PydanticUndefined
 
 from ..sandbox import EditBatch, InvariantView, ObjectDiff
 from ..spec import (
+    ActionDef,
     Actor,
     AutoID,
     EditFunctionDef,
+    FunctionDef,
+    InvariantDef,
     InvariantError,
     ObjectProperty,
     ObjectType,
     OntologySpec,
     ScopedViewSpec,
+    TransitionInvariantDef,
     extract_auto_id_meta,
     extract_object_property_meta,
 )
@@ -64,6 +69,7 @@ __all__ = [
     "apply_evolution_patch",
     "apply_adapter_mapping_patch",
     "migrate_m0_snapshot",
+    "export_spec_blueprint",
     "compile_blueprint",
     "dsl_schema_prompt_guide",
 ]
@@ -269,6 +275,21 @@ class DeclarativeBlueprint(BaseModel):
     migrations: list[FieldMigrationSpec] = Field(default_factory=list)
     views: list[ScopedViewBlueprint] = Field(default_factory=list)
     display: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    _base_specs: tuple[OntologySpec, ...] = PrivateAttr(default=())
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> "DeclarativeBlueprint":
+        if memo is None:
+            memo = {}
+        cls = type(self)
+        cloned_fields = {
+            fname: copy.deepcopy(getattr(self, fname), memo)
+            for fname in cls.model_fields
+        }
+        out = cls(**cloned_fields)
+        out._base_specs = self._base_specs
+        memo[id(self)] = out
+        return out
 
 
 class EvalActorSpec(BaseModel):
@@ -1045,6 +1066,17 @@ def _validate_expr_closed_roles(
         _assert_known_roles(role_literals, valid_roles, context=context)
 
 
+def _dedup_specs(specs: Sequence[OntologySpec]) -> tuple[OntologySpec, ...]:
+    out: list[OntologySpec] = []
+    seen_ids: set[int] = set()
+    for sp in specs:
+        sid = id(sp)
+        if sid not in seen_ids:
+            seen_ids.add(sid)
+            out.append(sp)
+    return tuple(out)
+
+
 def compose_blueprints(
     blueprints: Sequence[DeclarativeBlueprint | Mapping[str, Any]],
     *,
@@ -1157,7 +1189,7 @@ def compose_blueprints(
                 merged_roles.append(role_name)
 
     resolved_desc = description or " + ".join(bp.model_id for bp in coerced)
-    return DeclarativeBlueprint(
+    composed_bp = DeclarativeBlueprint(
         model_id=model_id,
         version=version,
         seed_ontology_id=resolved_seed,
@@ -1171,6 +1203,10 @@ def compose_blueprints(
         views=views,
         display=merged_display,
     )
+    composed_bp._base_specs = _dedup_specs(
+        [sp for bp in coerced for sp in getattr(bp, "_base_specs", ())]
+    )
+    return composed_bp
 
 
 def _coerce_overlay(
@@ -1437,6 +1473,11 @@ def _validate_action_update_monotonic(
     base_act: ActionBlueprint,
     upd_act: ActionBlueprint,
 ) -> None:
+    if upd_act.edit_function != base_act.edit_function:
+        raise InvariantError(
+            f"overlay alters or drops edit_function binding on standard action {base_act.name!r}",
+            code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+        )
     if upd_act.affects_source != base_act.affects_source:
         raise InvariantError(
             f"overlay alters affects_source on standard action {base_act.name!r}",
@@ -1704,6 +1745,11 @@ def apply_overlay(
 
     inv_roots = frozenset({"obj"})
     base_inv_by_name = {inv.name: inv for inv in base.invariants}
+    base_spec_inv_names = {
+        inv_name
+        for sp in getattr(base, "_base_specs", ())
+        for inv_name in (*sp.invariants.keys(), *sp.transition_invariants.keys())
+    }
     inv_names = {inv.name for inv in candidate.invariants}
     for new_inv in spec_overlay.add_invariants:
         _assert_safe_identifier(new_inv.name, "invariant name")
@@ -1735,9 +1781,9 @@ def apply_overlay(
                     code="OVERLAY_BREAKS_STANDARD_CONTRACT",
                 )
             continue
-        if new_inv.name in inv_names:
+        if new_inv.name in base_spec_inv_names or new_inv.name in inv_names:
             raise InvariantError(
-                f"duplicate invariant {new_inv.name!r} in overlay",
+                f"duplicate or standard invariant {new_inv.name!r} in overlay",
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
         candidate.invariants.append(copy.deepcopy(new_inv))
@@ -2269,6 +2315,7 @@ def compile_blueprint(
     *,
     seed_ontology: SeedOntology | None = None,
     edit_functions: Mapping[str, EditFunctionDef] | None = None,
+    base_specs: Sequence[OntologySpec] = (),
 ) -> OntologySpec:
     """Compile a L1 DeclarativeBlueprint into a real OntologySpec with ZERO eval/exec.
 
@@ -2276,7 +2323,10 @@ def compile_blueprint(
     ``seed_ontology.base_spec``, resolves every ``ot.archetype`` to its real
     abstract Python superclass, and automatically inherits all seed axioms
     (non-negativity, FSM transitions, voucher-backed balance conservation, or
-    any custom industry axioms).
+    any custom industry axioms). When ``base_specs`` (or embedded ``_base_specs``)
+    are available, native Python ``@spec.edit_function``, ``@spec.function``,
+    ``@spec.invariant``, ``@spec.transition_invariant``, and ``@spec.automation``
+    definitions are preserved alongside declarative actions.
     """
     if not blueprint.object_types:
         raise InvariantError(
@@ -2294,12 +2344,22 @@ def compile_blueprint(
             code="SEED_ONTOLOGY_MISMATCH",
         )
 
+    eff_base_specs = _dedup_specs([*getattr(blueprint, "_base_specs", ()), *(base_specs or ())])
     spec = OntologySpec(extends=(seed_ontology.base_spec,)) if seed_ontology is not None else OntologySpec()
+    for bs in eff_base_specs:
+        for abs_name, abs_cls in bs.abstract_types.items():
+            spec.abstract_types.setdefault(abs_name, abs_cls)
+        for if_name, if_def in bs.interfaces.items():
+            spec.interfaces.setdefault(if_name, if_def)
     seed_roles = set(seed_ontology.base_spec.roles) if seed_ontology is not None else set()
     if blueprint.roles:
         for role_name in _dedup_clean_roles(blueprint.roles):
             if role_name not in seed_roles and role_name not in spec.roles:
                 spec.role(role_name)
+    elif eff_base_specs:
+        for bs in eff_base_specs:
+            for role_name, role_def in bs.roles.items():
+                spec.roles.setdefault(role_name, role_def)
     compiled_valid_roles = set(spec.roles)
 
     created_classes: dict[str, type[ObjectType]] = {}
@@ -2333,14 +2393,16 @@ def compile_blueprint(
     for ot in blueprint.object_types:
         if seed_ontology is not None:
             base_cls = seed_ontology.resolve_base_class(ot.archetype)
-        else:
-            if ot.archetype not in _DEFAULT_STANDALONE_ARCHETYPES:
-                raise InvariantError(
-                    f"unknown archetype {ot.archetype!r} without seed_ontology; "
-                    f"allowed standalone archetypes: {sorted(_DEFAULT_STANDALONE_ARCHETYPES)}",
-                    code="UNKNOWN_SEED_ARCHETYPE",
-                )
+        elif ot.archetype == "ObjectType":
             base_cls = ObjectType
+        elif ot.archetype in spec.abstract_types:
+            base_cls = spec.abstract_types[ot.archetype]
+        else:
+            raise InvariantError(
+                f"unknown archetype {ot.archetype!r} without seed_ontology; "
+                f"allowed standalone archetypes: {sorted(_DEFAULT_STANDALONE_ARCHETYPES)}",
+                code="UNKNOWN_SEED_ARCHETYPE",
+            )
 
         field_defs: dict[str, Any] = {}
         owned_fields: dict[str, Any] = {}
@@ -2624,6 +2686,24 @@ def compile_blueprint(
             return True
 
     ot_by_name = {ot.name: ot for ot in blueprint.object_types}
+    bp_inv_names = {inv.name for inv in blueprint.invariants}
+    for bs in eff_base_specs:
+        for ef_name, ef_def in bs.edit_functions.items():
+            spec.edit_functions.setdefault(ef_name, ef_def)
+        for fn_name, fn_def in bs.functions.items():
+            spec.functions.setdefault(fn_name, fn_def)
+        for auto_name, auto_def in bs.automations.items():
+            spec.automations.setdefault(auto_name, auto_def)
+        for tinv_name, tinv_def in bs.transition_invariants.items():
+            spec.transition_invariants.setdefault(tinv_name, tinv_def)
+        for inv_name, inv_def in bs.invariants.items():
+            if (
+                inv_name in bp_inv_names
+                and getattr(inv_def.handler, "__declarative_rule__", None) is not None
+            ):
+                continue
+            spec.invariants.setdefault(inv_name, inv_def)
+
     for inv in blueprint.invariants:
         _assert_safe_identifier(inv.name, "invariant name")
         if inv.target_type not in created_classes:
@@ -2697,12 +2777,15 @@ def compile_blueprint(
             )
         )
 
-    spec.update_display(
-        {
-            "objects": {**object_display, **blueprint.display.get("objects", {})},
-            "actions": {**action_display, **blueprint.display.get("actions", {})},
-        }
-    )
+    display_updates: dict[str, dict[str, str]] = {}
+    for bucket, entries in blueprint.display.items():
+        if bucket in ("objects", "actions"):
+            continue
+        if entries:
+            display_updates[bucket] = {str(k): str(v) for k, v in entries.items() if v}
+    display_updates["objects"] = {**object_display, **blueprint.display.get("objects", {})}
+    display_updates["actions"] = {**action_display, **blueprint.display.get("actions", {})}
+    spec.update_display(display_updates)
     return spec
 
 
@@ -2805,6 +2888,7 @@ def _make_rule_invariant_handler(rule: InvariantRuleSpec) -> Callable[[Invariant
                 raise InvariantError(msg, code=rule.code)
         return True
 
+    _check.__declarative_rule__ = rule.model_dump(mode="json")  # type: ignore[attr-defined]
     return _check
 
 
@@ -2878,6 +2962,9 @@ def _make_rule_action_handler(
                         updates[k] = _eval_value(v_expr, eval_ctx, ctx)
                     ctx.modify(existing, **updates)
 
+    _handler.__declarative_mutations__ = [  # type: ignore[attr-defined]
+        m.model_dump(mode="json") for m in action_bp.mutations
+    ]
     return _handler
 
 
@@ -2894,9 +2981,15 @@ def _compile_and_register_action_blueprint(
 
     if act.edit_function is not None:
         ef = spec.get_edit_function(act.edit_function)
+        extra_param_defs = {k: v for k, v in param_defs.items() if k not in ef.params.model_fields}
         params_cls: type[BaseModel] | None = (
-            create_model(f"{act.name}_Params", __base__=ef.params, **param_defs)
-            if param_defs
+            create_model(
+                f"{act.name}_Params",
+                __base__=ef.params,
+                __module__="open_ontology_overlay",
+                **extra_param_defs,
+            )
+            if extra_param_defs
             else None
         )
         effective_param_names = set((params_cls or ef.params).model_fields.keys())
@@ -3107,8 +3200,31 @@ def _infer_scalar_type_name(ann: Any) -> Literal["str", "int", "float", "bool"]:
     return "str"
 
 
-def _spec_to_object_blueprints(spec: OntologySpec) -> dict[str, ObjectTypeBlueprint]:
+def _extract_field_default(info: Any) -> Any:
+    default_val = getattr(info, "default", PydanticUndefined)
+    if default_val is PydanticUndefined:
+        return None
+    if isinstance(default_val, (str, int, float, bool, type(None))):
+        return default_val
+    return None
+
+
+def _infer_archetype_name(cls: type[ObjectType], spec: OntologySpec) -> str:
+    for base in cls.__mro__[1:]:
+        if base is ObjectType or not (isinstance(base, type) and issubclass(base, ObjectType)):
+            continue
+        if base.__name__ in spec.abstract_types or base.is_abstract():
+            return base.__name__
+    return "ObjectType"
+
+
+def _spec_to_object_blueprints(
+    spec: OntologySpec,
+    *,
+    rich: bool = False,
+) -> dict[str, ObjectTypeBlueprint]:
     out: dict[str, ObjectTypeBlueprint] = {}
+    obj_display = spec.display.get("objects") or {}
     for ot_name, cls in spec.object_types.items():
         pk = cls.primary_key_name()
         prop_map = getattr(cls, "__object_properties__", None) or {}
@@ -3128,6 +3244,7 @@ def _spec_to_object_blueprints(spec: OntologySpec) -> dict[str, ObjectTypeBluepr
                         multiple=(decl.cardinality == "many-to-many"),
                         owned=decl.owned,
                         required=info.is_required(),
+                        description=str(decl.description or info.description or "") if rich else "",
                     )
                 )
                 continue
@@ -3140,6 +3257,7 @@ def _spec_to_object_blueprints(spec: OntologySpec) -> dict[str, ObjectTypeBluepr
                         multiple=rel_meta[1],
                         owned=is_owned,
                         required=info.is_required(),
+                        description=str(info.description or "") if rich else "",
                     )
                 )
                 continue
@@ -3147,22 +3265,26 @@ def _spec_to_object_blueprints(spec: OntologySpec) -> dict[str, ObjectTypeBluepr
                 FieldSpec(
                     name=fname,
                     field_type=_infer_scalar_type_name(info.annotation),
+                    default=None if (not rich or info.is_required()) else _extract_field_default(info),
                     required=info.is_required(),
                     primary_key=(fname == pk),
                     auto_id=extract_auto_id_meta(info),
                     owned=is_owned,
                     masked_roles=tuple(masked_map.get(fname, ())),
                     non_negative=(fname in non_neg_set),
+                    description=str(info.description or "") if rich else "",
                 )
             )
         raw_trans = getattr(cls, "__transitions__", {}) or {}
         raw_init = getattr(cls, "__initial_statuses__", None)
         out[ot_name] = ObjectTypeBlueprint(
             name=ot_name,
+            archetype=_infer_archetype_name(cls, spec) if rich else "ObjectType",
             primary_key=pk,
             title_field=getattr(cls, "__title__", None),
             aggregate_root=cls.is_aggregate_root(),
             append_only=cls.is_append_only(),
+            owned=copy.deepcopy(owned_spec) if rich else False,
             fields=fields,
             relations=relations,
             status_field=str(getattr(cls, "__status_field__", "status") or "status"),
@@ -3171,8 +3293,126 @@ def _spec_to_object_blueprints(spec: OntologySpec) -> dict[str, ObjectTypeBluepr
             voucher_delta_rules={
                 k: tuple(v) for k, v in (getattr(cls, "__voucher_delta_rules__", {}) or {}).items()
             },
+            view_tags=list(getattr(cls, "__view_tags__", ()) or ()) if rich else [],
+            display_label=str(obj_display.get(ot_name, "")) if rich else "",
         )
     return out
+
+
+def _action_def_to_blueprint(act_def: ActionDef, display_label: str = "") -> ActionBlueprint:
+    params_list: list[FieldSpec] = []
+    for pname, pinfo in act_def.params.model_fields.items():
+        is_nn = any(
+            getattr(m, "ge", None) == 0 or getattr(m, "gt", None) == 0
+            for m in getattr(pinfo, "metadata", ())
+        )
+        params_list.append(
+            FieldSpec(
+                name=pname,
+                field_type=_infer_scalar_type_name(pinfo.annotation),
+                default=None if pinfo.is_required() else _extract_field_default(pinfo),
+                required=bool(pinfo.is_required()),
+                non_negative=is_nn,
+                description=str(pinfo.description or ""),
+            )
+        )
+    pres = [
+        InvariantRuleSpec.model_validate(c)
+        for c in (act_def.submission_criteria or ())
+        if isinstance(c, (Mapping, InvariantRuleSpec))
+    ]
+    if act_def.implementation_kind == "edit_function":
+        ef_name: str | None = act_def.edit_function
+        muts: list[ActionMutationSpec] = []
+    else:
+        ef_name = None
+        raw_muts = getattr(act_def.handler, "__declarative_mutations__", ()) or ()
+        muts = [ActionMutationSpec.model_validate(m) for m in raw_muts]
+
+    return ActionBlueprint(
+        name=act_def.name,
+        description=act_def.description,
+        allowed_roles=list(act_def.allowed_roles),
+        revert_roles=list(act_def.revert_roles),
+        affects_source=act_def.affects_source,
+        edit_function=ef_name,
+        params=params_list,
+        preconditions=pres,
+        mutations=muts,
+        view_tags=list(act_def.view_tags),
+        display_label=display_label,
+    )
+
+
+def export_spec_blueprint(
+    spec: OntologySpec,
+    *,
+    model_id: str,
+    version: str = "1.0.0",
+    seed_ontology_id: str | None = None,
+    imports: Sequence[str] = (),
+    description: str = "",
+) -> DeclarativeBlueprint:
+    """Project a native Python ``OntologySpec`` into a JSON-serializable ``DeclarativeBlueprint``.
+
+    Uses ``spec`` as the single source of truth (zero dual-written JSON schemas)
+    and retains a private reference to ``spec`` so ``compile_blueprint``,
+    ``SymbolicCrucible``, ``DifferentialFalsifier``, and ``open_ontology.design``
+    preserve native Turing-complete ``@spec.edit_function`` / ``@spec.function`` /
+    ``@spec.invariant`` implementations.
+    """
+    _assert_safe_identifier(model_id, "model_id")
+    ot_map = _spec_to_object_blueprints(spec, rich=True)
+    act_display = spec.display.get("actions") or {}
+
+    exported_actions: list[ActionBlueprint] = [
+        _action_def_to_blueprint(act_def, display_label=str(act_display.get(act_name, "")))
+        for act_name, act_def in spec.actions.items()
+    ]
+
+    exported_invs: list[InvariantRuleSpec] = []
+    for inv in spec.invariants.values():
+        decl_rule = getattr(inv.handler, "__declarative_rule__", None)
+        if decl_rule is not None:
+            exported_invs.append(InvariantRuleSpec.model_validate(decl_rule))
+
+    exported_views = [
+        ScopedViewBlueprint(
+            name=v.name,
+            description=v.description,
+            roles=list(v.roles),
+            view_tags=list(v.view_tags),
+            object_types=list(v.object_types),
+            actions=list(v.actions),
+            functions=list(v.functions),
+            include_reachable_objects=v.include_reachable_objects,
+        )
+        for v in spec.views.values()
+    ]
+
+    clean_display: dict[str, dict[str, str]] = {}
+    for bucket, entries in spec.display.items():
+        if not entries:
+            continue
+        cleaned = {str(k): str(v) for k, v in entries.items() if v}
+        if cleaned:
+            clean_display[str(bucket)] = cleaned
+
+    bp = DeclarativeBlueprint(
+        model_id=model_id,
+        version=version,
+        seed_ontology_id=seed_ontology_id,
+        imports=[str(x) for x in imports],
+        roles=list(spec.roles.keys()),
+        description=description,
+        object_types=list(ot_map.values()),
+        actions=exported_actions,
+        invariants=exported_invs,
+        views=exported_views,
+        display=clean_display,
+    )
+    bp._base_specs = (spec,)
+    return bp
 
 
 def _build_overlay_object_type(
@@ -3315,6 +3555,38 @@ def _build_overlay_object_type(
     return cls, tuple(non_neg_fields), fsm_spec
 
 
+def _iter_custom_defs(
+    raw: Sequence[Any] | Mapping[str, Any],
+    *,
+    expected_types: type[Any] | tuple[type[Any], ...],
+    kind_label: str,
+) -> list[Any]:
+    items: list[tuple[str | None, Any]] = (
+        list(raw.items()) if isinstance(raw, Mapping) else [(None, item) for item in raw]
+    )
+    out: list[Any] = []
+    seen: set[str] = set()
+    for map_key, item in items:
+        if not isinstance(item, expected_types):
+            raise TypeError(
+                f"{kind_label} entries must be {expected_types}, got {type(item).__name__}"
+            )
+        _assert_safe_identifier(item.name, f"{kind_label} name")
+        if map_key is not None and map_key != item.name:
+            raise InvariantError(
+                f"{kind_label} key {map_key!r} does not match definition name {item.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        if item.name in seen:
+            raise InvariantError(
+                f"duplicate {kind_label} name {item.name!r} in overlay",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        seen.add(item.name)
+        out.append(item)
+    return out
+
+
 def apply_overlay_to_spec(
     base_spec: OntologySpec,
     overlay: CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any],
@@ -3322,6 +3594,10 @@ def apply_overlay_to_spec(
     seed_ontology: SeedOntology | None = None,
     rls_object_types: Sequence[str] = (),
     security_tag_field: str = "org",
+    custom_edit_functions: Sequence[EditFunctionDef] | Mapping[str, EditFunctionDef] = (),
+    custom_functions: Sequence[FunctionDef] | Mapping[str, FunctionDef] = (),
+    custom_invariants: Sequence[InvariantDef | TransitionInvariantDef]
+    | Mapping[str, InvariantDef | TransitionInvariantDef] = (),
 ) -> OntologySpec:
     """Immutably layer a CustomerOverlaySpec directly atop any Python OntologySpec.
 
@@ -3831,6 +4107,49 @@ def apply_overlay_to_spec(
     ot_by_name = _spec_to_object_blueprints(derived)
     valid_type_names = set(derived.object_types.keys())
 
+    # 3c. Register custom customer plugins (monotonically: never collide with base_spec)
+    for ef_def in _iter_custom_defs(
+        custom_edit_functions,
+        expected_types=EditFunctionDef,
+        kind_label="custom_edit_functions",
+    ):
+        if ef_def.name in base_spec.edit_functions:
+            raise InvariantError(
+                f"overlay custom edit_function {ef_def.name!r} collides with standard edit_function",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        derived.edit_functions[ef_def.name] = ef_def
+
+    for fn_def in _iter_custom_defs(
+        custom_functions,
+        expected_types=FunctionDef,
+        kind_label="custom_functions",
+    ):
+        if fn_def.name in base_spec.functions:
+            raise InvariantError(
+                f"overlay custom function {fn_def.name!r} collides with standard function",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        derived.functions[fn_def.name] = fn_def
+
+    for inv_def in _iter_custom_defs(
+        custom_invariants,
+        expected_types=(InvariantDef, TransitionInvariantDef),
+        kind_label="custom_invariants",
+    ):
+        if (
+            inv_def.name in base_spec.invariants
+            or inv_def.name in base_spec.transition_invariants
+        ):
+            raise InvariantError(
+                f"overlay custom invariant {inv_def.name!r} collides with standard invariant",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        if isinstance(inv_def, TransitionInvariantDef):
+            derived.transition_invariants[inv_def.name] = inv_def
+        else:
+            derived.invariants[inv_def.name] = inv_def
+
     # 4. Add declarative invariants
     inv_roots = frozenset({"obj"})
     for new_inv in spec_overlay.add_invariants:
@@ -3895,31 +4214,28 @@ def apply_overlay_to_spec(
                 code="UNKNOWN_ACTION",
             )
         cur_act = derived.actions[upd_act.name]
-        if cur_act.implementation_kind == "edit_function" and upd_act.mutations:
+        if cur_act.implementation_kind == "edit_function":
             raise InvariantError(
-                f"overlay cannot replace native edit_function action {upd_act.name!r} with declarative mutations",
+                f"overlay update_actions cannot redefine native action {upd_act.name!r}; "
+                "use add_action_preconditions or restrict_allowed_roles",
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
-        if cur_act.affects_source != upd_act.affects_source:
+        if upd_act.edit_function is not None:
             raise InvariantError(
-                f"overlay alters affects_source on standard action {upd_act.name!r}",
+                f"overlay cannot convert rule action {upd_act.name!r} to edit_function {upd_act.edit_function!r}",
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
         if valid_roles:
             _validate_action_closed_roles(upd_act, valid_roles, context_prefix="overlay update_actions")
         if cur_act.name in base_spec.actions:
-            if not upd_act.allowed_roles or not set(upd_act.allowed_roles).issubset(
-                set(cur_act.allowed_roles)
-            ):
+            base_act_def = base_spec.actions[cur_act.name]
+            if getattr(base_act_def.handler, "__declarative_mutations__", None) is None:
                 raise InvariantError(
-                    f"overlay expands or empties allowed_roles on standard action {upd_act.name!r}",
+                    f"overlay update_actions cannot redefine custom Python action {upd_act.name!r}; "
+                    "use add_action_preconditions or restrict_allowed_roles",
                     code="OVERLAY_BREAKS_STANDARD_CONTRACT",
                 )
-        if cur_act.implementation_kind == "edit_function":
-            raise InvariantError(
-                f"overlay update_actions cannot redefine native action {upd_act.name!r}; use add_action_preconditions or restrict_allowed_roles",
-                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
-            )
+            _validate_action_update_monotonic(_action_def_to_blueprint(base_act_def), upd_act)
         lbl = _compile_and_register_action_blueprint(
             derived,
             upd_act,

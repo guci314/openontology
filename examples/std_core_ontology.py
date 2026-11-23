@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from open_ontology.induction.dsl import DeclarativeBlueprint
+from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
 from open_ontology.spec import ObjectProperty, OntologySpec
 
 try:
@@ -22,9 +22,6 @@ try:
         MasterEntity,
         ProcessDocument,
         WorkCard,
-        build_work_card_action_blueprints,
-        build_work_card_invariant_blueprints,
-        build_work_card_object_blueprint,
         register_work_card_primitives,
         spec as business_spec,
     )
@@ -33,9 +30,6 @@ except ImportError:
         MasterEntity,
         ProcessDocument,
         WorkCard,
-        build_work_card_action_blueprints,
-        build_work_card_invariant_blueprints,
-        build_work_card_object_blueprint,
         register_work_card_primitives,
         spec as business_spec,
     )
@@ -248,6 +242,7 @@ spec.update_display(
             "TradeResource": "交易标的资源",
             "TradeCommitment": "交易承诺契约",
             "FulfillmentEvent": "履约事实凭证",
+            "WorkCard": "协同审批工单卡",
         },
         "fields": {
             "entity_id": "核算主体编码",
@@ -269,7 +264,7 @@ spec.update_display(
             "unit_price": "单价",
             "total_amount": "总金额",
             "event_id": "履约事实编码",
-            "commitment": "所属承诺",
+            "commitment": "承诺标的",
             "event_kind": "履约事件类型",
             "amount": "金额",
             "evidence_summary": "凭证摘要",
@@ -280,129 +275,12 @@ spec.update_display(
 
 
 def build_std_core_blueprint() -> DeclarativeBlueprint:
-    """构建与 ``std_core_ontology`` 等价的零 ``exec/eval`` 声明式核心标准蓝图。"""
-    payload: dict[str, Any] = {
-        "model_id": "std_core_ontology",
-        "version": "1.0.0",
-        "seed_ontology_id": "business_ontology",
-        "imports": [],
-        "roles": [r for r, _ in STD_ROLES],
-        "description": "企业标准核心底座蓝图：核算主体、往来伙伴、REA 交易资源/承诺/履约事实与 WorkCard。",
-        "object_types": [
-            {
-                "name": "AccountingEntity",
-                "archetype": "MasterEntity",
-                "primary_key": "entity_id",
-                "title_field": "name",
-                "aggregate_root": True,
-                "owned": False,
-                "display_label": "法人核算主体",
-                "fields": [
-                    {"name": "entity_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "name", "field_type": "str", "required": True},
-                    {"name": "base_currency", "field_type": "str", "default": "CNY"},
-                    {"name": "status", "field_type": "str", "default": "active"},
-                ],
-            },
-            {
-                "name": "BusinessParty",
-                "archetype": "MasterEntity",
-                "primary_key": "party_id",
-                "title_field": "legal_name",
-                "aggregate_root": True,
-                "owned": False,
-                "display_label": "往来业务伙伴",
-                "fields": [
-                    {"name": "party_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "legal_name", "field_type": "str", "required": True},
-                    {"name": "tax_id", "field_type": "str", "default": ""},
-                    {"name": "country_code", "field_type": "str", "default": "CN"},
-                    {"name": "status", "field_type": "str", "default": "active"},
-                ],
-            },
-            {
-                "name": "TradeResource",
-                "archetype": "MasterEntity",
-                "primary_key": "resource_id",
-                "title_field": "name",
-                "aggregate_root": True,
-                "owned": False,
-                "display_label": "交易标的资源",
-                "fields": [
-                    {"name": "resource_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "code", "field_type": "str", "default": ""},
-                    {"name": "name", "field_type": "str", "required": True},
-                    {"name": "unit", "field_type": "str", "default": "EA"},
-                    {"name": "spec_summary", "field_type": "str", "default": ""},
-                    {"name": "status", "field_type": "str", "default": "active"},
-                ],
-            },
-            {
-                "name": "TradeCommitment",
-                "archetype": "ProcessDocument",
-                "primary_key": "commitment_id",
-                "title_field": "commitment_id",
-                "aggregate_root": True,
-                "owned": False,
-                "status_field": "status",
-                "initial_statuses": ["proposed", "agreed"],
-                "transitions": {k: list(v) for k, v in _TRADE_COMMITMENT_TRANSITIONS.items()},
-                "display_label": "交易承诺契约",
-                "fields": [
-                    {"name": "commitment_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "quantity", "field_type": "float", "default": 0.0, "non_negative": True},
-                    {"name": "unit_price", "field_type": "float", "default": 0.0, "non_negative": True},
-                    {"name": "total_amount", "field_type": "float", "default": 0.0, "non_negative": True},
-                    {"name": "status", "field_type": "str", "default": "proposed"},
-                ],
-                "relations": [
-                    {"field": "buyer_party", "target_type": "BusinessParty", "required": True},
-                    {"field": "seller_party", "target_type": "BusinessParty", "required": True},
-                    {"field": "resource", "target_type": "TradeResource", "required": True},
-                ],
-            },
-            {
-                "name": "FulfillmentEvent",
-                "archetype": "ProcessDocument",
-                "primary_key": "event_id",
-                "title_field": "event_id",
-                "aggregate_root": True,
-                "owned": False,
-                "status_field": "status",
-                "initial_statuses": ["recorded", "confirmed", "disputed"],
-                "transitions": {k: list(v) for k, v in _FULFILLMENT_EVENT_TRANSITIONS.items()},
-                "display_label": "履约事实凭证",
-                "fields": [
-                    {"name": "event_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "event_kind", "field_type": "str", "default": "SHIPMENT"},
-                    {"name": "quantity", "field_type": "float", "default": 0.0, "non_negative": True},
-                    {"name": "amount", "field_type": "float", "default": 0.0, "non_negative": True},
-                    {"name": "evidence_summary", "field_type": "str", "default": ""},
-                    {"name": "status", "field_type": "str", "default": "recorded"},
-                ],
-                "relations": [
-                    {"field": "commitment", "target_type": "TradeCommitment", "required": True},
-                ],
-            },
-            build_work_card_object_blueprint(),
-        ],
-        "invariants": build_work_card_invariant_blueprints(),
-        "actions": build_work_card_action_blueprints(
-            opener_roles=STD_WORK_CARD_OPENERS,
-            resolver_roles=STD_WORK_CARD_RESOLVERS,
-        ),
-        "display": {
-            "ontologies": {
-                "std_core_ontology": "企业标准核心底座本体（REA五原语常识细腰）",
-            },
-            "objects": {
-                "AccountingEntity": "法人核算主体",
-                "BusinessParty": "往来业务伙伴",
-                "TradeResource": "交易标的资源",
-                "TradeCommitment": "交易承诺契约",
-                "FulfillmentEvent": "履约事实凭证",
-                "WorkCard": "协同审批工单卡",
-            },
-        },
-    }
-    return DeclarativeBlueprint.model_validate(payload)
+    """将 ``std_core_ontology`` 唯一源码本体投影为声明式标准底座蓝图。"""
+    return export_spec_blueprint(
+        spec,
+        model_id="std_core_ontology",
+        version="1.0.0",
+        seed_ontology_id="business_ontology",
+        imports=(),
+        description="企业标准核心底座蓝图：核算主体、往来伙伴、REA 交易资源/承诺/履约事实与 WorkCard。",
+    )

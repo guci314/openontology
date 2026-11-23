@@ -988,7 +988,7 @@ export no_proxy="$NO_PROXY"
 export PYTHONPATH="{ROOT}:${{PYTHONPATH:-}}"
 if [[ "$MODE" == "verify" ]]; then
   exec "{sys.executable}" -m open_ontology.design verify \\
-    --blueprint target_abi.json \\
+    --blueprint "{STD_P2P_BP_ARG}" \\
     --seed "{BUSINESS_SEED_ARG}" \\
     --device .judge/device_p2p.json \\
     {target_flags} \\
@@ -998,7 +998,7 @@ if [[ "$MODE" == "verify" ]]; then
 else
   "{sys.executable}" -c "import sys; sys.path.insert(0, '.judge'); import reset_hook; reset_hook.reset_sandbox({{}})"
   exec "{sys.executable}" -m open_ontology.design check \\
-    --blueprint target_abi.json \\
+    --blueprint "{STD_P2P_BP_ARG}" \\
     --seed "{BUSINESS_SEED_ARG}" \\
     --device .judge/device_p2p.json
 fi

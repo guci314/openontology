@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from pydantic import create_model
+
 from examples.business_ontology import BUSINESS_SEED_ONTOLOGY
 from examples.std_enterprise_world_model import (
     build_enterprise_standard_blueprint,
@@ -23,7 +25,12 @@ from examples.std_enterprise_world_model import (
 )
 from open_ontology.design import _load_thin_driver_factory
 from open_ontology.drivers import DeviceDriverRegistry, MountedDevice
-from open_ontology.induction import AdapterMappingSpec, CustomerOverlaySpec, DeclarativeBlueprint, compile_blueprint
+from open_ontology.induction import (
+    AdapterMappingSpec,
+    CustomerOverlaySpec,
+    DeclarativeBlueprint,
+    apply_overlay_to_spec,
+)
 from open_ontology.runtime import OntologyRuntime
 from open_ontology.settlement import SourceBridge, call_observe
 from open_ontology.spec import Actor, OntologySpec
@@ -119,76 +126,64 @@ def load_adapter_package(
     return mapping, bridge, driver_path, mapping_path
 
 
-class _CompiledTypeQueryCtx:
-    """Resolve base std module ObjectType classes onto the compiled overlay-aware OntologySpec."""
-
-    def __init__(self, inner: Any) -> None:
-        self._inner = inner
-
-    def _resolve_cls(self, cls: Any) -> Any:
-        if isinstance(cls, type):
-            try:
-                if not cls.is_abstract():
-                    return self._inner.spec.get_object_type(cls)
-            except Exception:
-                return cls
-        return cls
-
-    def get(self, cls: Any, object_id: str) -> Any:
-        return self._inner.get(self._resolve_cls(cls), object_id)
-
-    def require(self, cls: Any, object_id: str) -> Any:
-        return self._inner.require(self._resolve_cls(cls), object_id)
-
-    def query(self, cls: Any) -> list[Any]:
-        return self._inner.query(self._resolve_cls(cls))
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
-
-
-def _attach_standard_functions(spec: OntologySpec) -> None:
-    """Attach standard Python read-only ``@spec.function`` definitions onto compiled ``spec``."""
-    py_spec = build_enterprise_standard_spec()
-    for fn_name, fn_def in py_spec.functions.items():
-        if fn_name in spec.functions:
-            continue
-        raw_handler = fn_def.handler
-
-        def _wrapped(ctx: Any, params: Any, _fn: Any = raw_handler) -> Any:
-            return _fn(_CompiledTypeQueryCtx(ctx), params)
-
-        spec.function(
-            fn_name,
-            fn_def.params,
-            description=fn_def.description,
-            view_tags=getattr(fn_def, "view_tags", ()),
-        )(_wrapped)
-
-
 def _mark_hybrid_ownership(
     spec: OntologySpec,
     *,
     standalone_object_types: Sequence[str],
     standalone_actions: Sequence[str],
 ) -> None:
-    """Configure hybrid world ownership: ERP-backed types stay source-backed; missing domains become owned."""
+    """Configure hybrid world ownership without mutating module-level standard classes or ActionDefs."""
     for ot_name in standalone_object_types:
         if ot_name not in spec.object_types:
             continue
-        cls = spec.get_object_type(ot_name)
-        cls.__owned__ = True
-        prop_map = getattr(cls, "__object_properties__", None)
-        if isinstance(prop_map, dict):
-            for fname, decl in list(prop_map.items()):
-                owned_decl = decl.model_copy(update={"owned": True})
-                prop_map[fname] = owned_decl
-                if decl.name in spec.object_properties:
-                    spec.object_properties[decl.name] = owned_decl
+        base_cls = spec.get_object_type(ot_name)
+        cloned_cls = create_model(
+            ot_name,
+            __base__=base_cls,
+            __module__="open_ontology_hybrid_mount",
+        )
+        cloned_cls.__primary_key__ = base_cls.primary_key_name()
+        cloned_cls.__title__ = getattr(base_cls, "__title__", None)
+        cloned_cls.__aggregate_root__ = base_cls.is_aggregate_root()
+        cloned_cls.__append_only__ = base_cls.is_append_only()
+        cloned_cls.__read_only_source__ = base_cls.is_read_only_source()
+        cloned_cls.__owned__ = True
+        cloned_cls.__security_tag_fields__ = tuple(
+            getattr(base_cls, "__security_tag_fields__", ()) or ()
+        )
+        cloned_cls.__non_negative_fields__ = tuple(
+            getattr(base_cls, "__non_negative_fields__", ()) or ()
+        )
+        cloned_cls.__masked_fields__ = dict(
+            getattr(base_cls, "__masked_fields__", {}) or {}
+        )
+        cloned_cls.__mask_defaults__ = dict(
+            getattr(base_cls, "__mask_defaults__", {}) or {}
+        )
+        cloned_cls.__interfaces__ = tuple(getattr(base_cls, "__interfaces__", ()) or ())
+        cloned_cls.__view_tags__ = tuple(getattr(base_cls, "__view_tags__", ()) or ())
+        cloned_cls.__status_field__ = getattr(base_cls, "__status_field__", "status")
+        cloned_cls.__initial_statuses__ = getattr(base_cls, "__initial_statuses__", None)
+        cloned_cls.__deletable_statuses__ = getattr(base_cls, "__deletable_statuses__", None)
+        cloned_cls.__transitions__ = dict(getattr(base_cls, "__transitions__", {}) or {})
+        cloned_cls.__voucher_delta_rules__ = dict(
+            getattr(base_cls, "__voucher_delta_rules__", {}) or {}
+        )
+        prop_map = dict(getattr(base_cls, "__object_properties__", None) or {})
+        new_prop_map: dict[str, Any] = {}
+        for fname, decl in prop_map.items():
+            owned_decl = decl.model_copy(update={"owned": True})
+            new_prop_map[fname] = owned_decl
+            if decl.name in spec.object_properties:
+                spec.object_properties[decl.name] = owned_decl
+        cloned_cls.__object_properties__ = new_prop_map
+        spec.object_types[ot_name] = cloned_cls
 
     for act_name in standalone_actions:
         if act_name in spec.actions:
-            spec.actions[act_name].affects_source = False
+            spec.actions[act_name] = spec.actions[act_name].model_copy(
+                update={"affects_source": False}
+            )
 
 
 def _toposort_departments(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -350,6 +345,71 @@ def _build_canonical_entity_bridges(
     )
 
 
+def _wrap_odoo_r2r_bridge(
+    r2r_bridge: SourceBridge,
+    *,
+    spec: OntologySpec,
+) -> SourceBridge:
+    """Correlate Odoo server-assigned ``account.move.reversal`` IDs with M1's predicted ``reversal_of`` ID."""
+    rev_aliases: dict[str, dict[str, Any]] = {}
+    claimed_raw_ids: set[str] = set()
+
+    def _r2r_observe(move: dict[str, Any] | None = None) -> Any:
+        objs, links = call_observe(r2r_bridge, move, spec=spec)
+        je_rows = list(objs.get("JournalEntry") or ())
+        if isinstance(move, Mapping) and move.get("action_type") == "reverse_journal_entry":
+            changes = (move.get("object_diff") or {}).get("object_changes") or ()
+            for ch in changes:
+                if ch.get("kind") != "create" or ch.get("object_type") != "JournalEntry":
+                    continue
+                pred_id = str(ch.get("object_id") or "")
+                after = dict(ch.get("after") or {})
+                orig_id = str(after.get("reversal_of") or "")
+                if not pred_id or not orig_id:
+                    continue
+                for row in je_rows:
+                    raw_id = str(row.get("entry_id") or "")
+                    if not raw_id or raw_id in claimed_raw_ids:
+                        continue
+                    if str(row.get("reversal_of") or "") == orig_id:
+                        claimed_raw_ids.add(raw_id)
+                        rev_aliases[raw_id] = {
+                            "entry_id": pred_id,
+                            "memo": str(after.get("memo") or ""),
+                            "source_event": after.get("source_event"),
+                        }
+                        break
+
+        if rev_aliases:
+            for row in je_rows:
+                raw_id = str(row.get("entry_id") or "")
+                alias = rev_aliases.get(raw_id)
+                if alias is not None:
+                    row["entry_id"] = alias["entry_id"]
+                    row["memo"] = alias["memo"]
+                    if alias.get("source_event") is not None:
+                        row["source_event"] = alias["source_event"]
+                rev_of = str(row.get("reversal_of") or "")
+                if rev_of in rev_aliases:
+                    row["reversal_of"] = rev_aliases[rev_of]["entry_id"]
+            if links is not None:
+                id_map = {k: str(v["entry_id"]) for k, v in rev_aliases.items()}
+                rewritten_links: dict[str, list[tuple[str, str]]] = {}
+                for ltype, edges in links.items():
+                    rewritten_links[ltype] = [
+                        (id_map.get(str(s), str(s)), id_map.get(str(t), str(t)))
+                        for s, t in edges
+                    ]
+                links = rewritten_links
+        return (objs, links) if links is not None else objs
+
+    return SourceBridge(
+        actuate=r2r_bridge.actuate,
+        observe=_r2r_observe,
+        allow_source_revert=r2r_bridge.allow_source_revert,
+    )
+
+
 def mount_odoo19_enterprise_world(
     endpoint_config: Mapping[str, Any],
     *,
@@ -364,8 +424,9 @@ def mount_odoo19_enterprise_world(
         (load_customer_overlay("odoo19", overlay_path),) if (include_overlay or overlay_path is not None) else ()
     )
     blueprint = build_enterprise_standard_blueprint(overlays=overlays)
-    spec = compile_blueprint(blueprint, seed_ontology=BUSINESS_SEED_ONTOLOGY)
-    _attach_standard_functions(spec)
+    spec = build_enterprise_standard_spec()
+    for ov in overlays:
+        spec = apply_overlay_to_spec(spec, ov, seed_ontology=BUSINESS_SEED_ONTOLOGY)
 
     _mark_hybrid_ownership(
         spec,
@@ -375,7 +436,8 @@ def mount_odoo19_enterprise_world(
 
     _, o2c_bridge, _, _ = load_adapter_package("odoo19", "o2c", ep_copy)
     _, p2p_bridge, _, _ = load_adapter_package("odoo19", "p2p", ep_copy)
-    _, r2r_bridge, _, _ = load_adapter_package("odoo19", "r2r", ep_copy)
+    _, raw_r2r_bridge, _, _ = load_adapter_package("odoo19", "r2r", ep_copy)
+    r2r_bridge = _wrap_odoo_r2r_bridge(raw_r2r_bridge, spec=spec)
 
     ep_label = str(ep_copy.get("url") or "http://localhost:8069/jsonrpc")
     registry = DeviceDriverRegistry(spec=spec)
@@ -454,8 +516,9 @@ def mount_jsherp_enterprise_world(
         (load_customer_overlay("jsherp", overlay_path),) if (include_overlay or overlay_path is not None) else ()
     )
     blueprint = build_enterprise_standard_blueprint(overlays=overlays)
-    spec = compile_blueprint(blueprint, seed_ontology=BUSINESS_SEED_ONTOLOGY)
-    _attach_standard_functions(spec)
+    spec = build_enterprise_standard_spec()
+    for ov in overlays:
+        spec = apply_overlay_to_spec(spec, ov, seed_ontology=BUSINESS_SEED_ONTOLOGY)
 
     _mark_hybrid_ownership(
         spec,

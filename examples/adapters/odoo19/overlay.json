@@ -43,111 +43,27 @@
         },
         "description": "Odoo 19 overlay rule: O2C delivery must be completed before posting an O2C customer invoice."
       }
+    ],
+    "post_p2p_bill": [
+      {
+        "name": "odoo19_receipt_required_before_bill",
+        "code": "RECEIPT_REQUIRED_BEFORE_BILL",
+        "target_type": "P2pVendorBill",
+        "id_param": "bill_id",
+        "when": {
+          "op": "ne",
+          "left": {"ref": "obj.purchase_order.status"},
+          "right": {"lit": "disputed"}
+        },
+        "must_hold": {
+          "op": "eq",
+          "left": {"ref": "obj.purchase_order.status"},
+          "right": {"lit": "received"}
+        },
+        "description": "Odoo 19 overlay rule: goods receipt must be completed before posting vendor bill."
+      }
     ]
   },
-  "update_actions": [
-    {
-      "name": "post_p2p_bill",
-      "display_label": "应付账单过账",
-      "description": "正式过账供应商应付账单；若关联采购单处于 disputed 则以 PO_DISPUTED_BLOCKED 硬拦截。",
-      "allowed_roles": [
-        "finance",
-        "finance_director",
-        "procurement_manager",
-        "steward",
-        "ai_agent",
-        "admin"
-      ],
-      "affects_source": true,
-      "params": [
-        {
-          "name": "bill_id",
-          "field_type": "str",
-          "required": true
-        }
-      ],
-      "preconditions": [
-        {
-          "name": "odoo19_receipt_required_before_bill",
-          "code": "RECEIPT_REQUIRED_BEFORE_BILL",
-          "target_type": "P2pVendorBill",
-          "id_param": "bill_id",
-          "must_hold": {
-            "op": "eq",
-            "left": {"ref": "obj.purchase_order.status"},
-            "right": {"lit": "received"}
-          },
-          "description": "Odoo 19 overlay rule: goods receipt must be completed before posting vendor bill."
-        },
-        {
-          "name": "p2p_bill_po_not_disputed",
-          "code": "PO_DISPUTED_BLOCKED",
-          "target_type": "P2pVendorBill",
-          "id_param": "bill_id",
-          "must_hold": {
-            "op": "ne",
-            "left": {"ref": "obj.purchase_order.status"},
-            "right": {"lit": "disputed"}
-          },
-          "description": "Blocked while linked P2pPurchaseOrder is disputed."
-        },
-        {
-          "name": "p2p_bill_must_be_draft",
-          "code": "BILL_NOT_DRAFT",
-          "target_type": "P2pVendorBill",
-          "id_param": "bill_id",
-          "must_hold": {
-            "op": "eq",
-            "left": {"ref": "obj.status"},
-            "right": {"lit": "draft"}
-          },
-          "description": "P2pVendorBill must be draft."
-        },
-        {
-          "name": "p2p_bill_po_must_be_received",
-          "code": "PO_NOT_RECEIVED",
-          "target_type": "P2pVendorBill",
-          "id_param": "bill_id",
-          "must_hold": {
-            "op": "eq",
-            "left": {"ref": "obj.purchase_order.status"},
-            "right": {"lit": "received"}
-          },
-          "description": "Linked P2pPurchaseOrder must be received."
-        },
-        {
-          "name": "p2p_bill_within_po_amount",
-          "code": "BILL_EXCEEDS_PO_AMOUNT",
-          "target_type": "P2pVendorBill",
-          "id_param": "bill_id",
-          "must_hold": {
-            "op": "le",
-            "left": {"ref": "obj.amount_total"},
-            "right": {
-              "op": "add",
-              "left": {"ref": "obj.purchase_order.amount_total"},
-              "right": {"lit": 1e-9}
-            }
-          },
-          "description": "Vendor bill amount_total must not exceed PO amount_total."
-        }
-      ],
-      "mutations": [
-        {
-          "op": "modify",
-          "object_type": "P2pVendorBill",
-          "id_param": "bill_id",
-          "set_fields": {"status": {"lit": "posted"}}
-        },
-        {
-          "op": "modify",
-          "object_type": "P2pPurchaseOrder",
-          "target_ref": "obj.purchase_order",
-          "set_fields": {"status": {"lit": "billed"}}
-        }
-      ]
-    }
-  ],
   "add_actions": [
     {
       "name": "tag_odoo_order_sales_channel",

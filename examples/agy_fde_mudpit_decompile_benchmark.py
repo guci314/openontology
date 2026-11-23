@@ -781,7 +781,7 @@ if [ "$#" -gt 0 ]; then
 fi
 export PYTHONPATH="{ROOT}"
 exec "{py_exe}" -m open_ontology.design "$CMD" \\
-  --blueprint target_abi.json \\
+  --blueprint examples.agy_fde_mudpit_decompile_benchmark:build_locked_enterprise_target_blueprint \\
   --overlay out/customer_overlay.json \\
   --seed examples.business_ontology:BUSINESS_SEED_ONTOLOGY \\
   --device .judge/device_crm.json \\
@@ -914,7 +914,7 @@ def _independent_referee_audit(
 
         # Round 1 Verify: must be CORROBORATED, with L1 merges, Southstar conflict blocked, and Northwind in L4
         round1 = run_design_verify(
-            blueprints=[str(abi_file)],
+            blueprints=["examples.agy_fde_mudpit_decompile_benchmark:build_locked_enterprise_target_blueprint"],
             overlay=str(ov_file),
             seed="examples.business_ontology:BUSINESS_SEED_ONTOLOGY",
             devices=[str(dev_crm_file), str(dev_erp_file)],
@@ -1005,7 +1005,7 @@ def _independent_referee_audit(
 
         # Round 2 Verify with steward decisions -> 0 ambiguous candidates & CORROBORATED
         round2 = run_design_verify(
-            blueprints=[str(abi_file)],
+            blueprints=["examples.agy_fde_mudpit_decompile_benchmark:build_locked_enterprise_target_blueprint"],
             overlay=str(ov_file),
             seed="examples.business_ontology:BUSINESS_SEED_ONTOLOGY",
             devices=[str(dev_crm_file), str(dev_erp_file)],

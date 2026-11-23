@@ -115,6 +115,8 @@ def _summarize_target_abi(target_blueprint: DeclarativeBlueprint) -> dict[str, A
         "actions": [
             {
                 "name": act.name,
+                "description": act.description,
+                "edit_function": act.edit_function,
                 "allowed_roles": act.allowed_roles,
                 "params": [{"name": p.name, "field_type": p.field_type, "required": p.required} for p in act.params],
                 "preconditions": [pre.model_dump(mode="json") for pre in act.preconditions],

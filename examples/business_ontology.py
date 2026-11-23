@@ -516,6 +516,8 @@ def register_work_card_primitives(
     if "WorkCard" not in target_spec.object_types:
         target_spec.object_type(WorkCard)
 
+    wc_inv_rules = list(build_work_card_invariant_blueprints())
+
     if "work_card_unique_active_intent" not in target_spec.invariants:
 
         @target_spec.invariant(
@@ -543,6 +545,8 @@ def register_work_card_primitives(
                 seen[sig] = card.card_id
             return True
 
+        target_spec.invariants["work_card_unique_active_intent"].handler.__declarative_rule__ = wc_inv_rules[0]  # type: ignore[attr-defined]
+
     if "work_card_segregation_of_duties" not in target_spec.invariants:
 
         @target_spec.invariant(
@@ -563,6 +567,8 @@ def register_work_card_primitives(
                         code="SOD_SELF_APPROVAL_FORBIDDEN",
                     )
             return True
+
+        target_spec.invariants["work_card_segregation_of_duties"].handler.__declarative_rule__ = wc_inv_rules[1]  # type: ignore[attr-defined]
 
     all_card_roles = tuple(dict.fromkeys([*eff_openers, *eff_resolvers]))
     work_card_specs: tuple[

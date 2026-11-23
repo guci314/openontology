@@ -49,7 +49,6 @@ from open_ontology.induction import CustomerOverlaySpec, FieldSpec, InvariantRul
 from open_ontology.org_authority import OrgDirectory, hash_auth_token
 
 from examples.adapters.erp_world_mount import (
-    _attach_standard_functions,
     mount_jsherp_enterprise_world,
     mount_odoo19_enterprise_world,
 )
@@ -1594,7 +1593,6 @@ def build_standalone_enterprise_console(
         ),
         model_id="std_enterprise_world_model",
     )
-    _attach_standard_functions(spec)
     _merge_std_display(spec)
 
     rt = OntologyRuntime(spec, db_path=db_path, world_mode="standalone")

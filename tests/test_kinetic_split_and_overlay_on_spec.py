@@ -1,6 +1,10 @@
-"""WO-27A Verification Suite: Kinetic Trio Split, @spec.action Retirement & apply_overlay_to_spec."""
+"""WO-27A / WO-27B Verification Suite: Kinetic Trio Split, Single-Source Projector & Customer Plugins."""
 
 from __future__ import annotations
+
+import inspect
+import json
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
@@ -11,6 +15,8 @@ from open_ontology import (
     Actor,
     EditFunctionDef,
     EditFunctionNotFoundError,
+    FunctionDef,
+    InvariantDef,
     InvariantError,
     ObjectType,
     OntologyRuntime,
@@ -18,6 +24,7 @@ from open_ontology import (
     PermissionDeniedError,
 )
 from open_ontology.console_server import ConsoleService, create_console_app
+from open_ontology.design import run_design_check
 from open_ontology.induction import (
     ActionBlueprint,
     ActionMutationSpec,
@@ -26,23 +33,46 @@ from open_ontology.induction import (
     FieldSpec,
     InvariantRuleSpec,
     ObjectTypeBlueprint,
+    ScopedViewBlueprint,
     apply_overlay_to_spec,
     compile_blueprint,
+    compose_blueprints,
+    export_spec_blueprint,
 )
 from open_ontology.model_views import describe_behavior
+from examples.adapters import erp_world_mount
+from examples import enterprise_console_app
 from examples.business_ontology import BUSINESS_SEED_ONTOLOGY
+from examples.std_core_ontology import (
+    AccountingEntity,
+    BusinessParty,
+    build_std_core_blueprint,
+    spec as std_core_spec,
+)
+from examples.std_crm_ontology import build_std_crm_blueprint, spec as std_crm_spec
+from examples.std_enterprise_world_model import build_org_rls_enterprise_spec
 from examples.std_h2r_ontology import (
     AuthorityMandate,
     Department,
     Employee,
     JobPosition,
+    build_std_h2r_blueprint,
     spec as std_h2r_spec,
 )
-from examples.std_core_ontology import AccountingEntity
+from examples.std_o2c_ontology import (
+    O2cCustomerProfile,
+    O2cInvoice,
+    O2cOrder,
+    build_std_o2c_blueprint,
+    spec as std_o2c_spec,
+)
+from examples.std_p2m_ontology import build_std_p2m_blueprint, spec as std_p2m_spec
+from examples.std_p2p_ontology import build_std_p2p_blueprint, spec as std_p2p_spec
 from examples.std_r2r_ontology import (
     FiscalPeriod,
     GlAccount,
     JournalEntry,
+    build_std_r2r_blueprint,
     spec as std_r2r_spec,
 )
 
@@ -621,3 +651,562 @@ def test_6_describe_behavior_and_console_server_compatibility() -> None:
     finally:
         svc.close()
         rt.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. Customer Python EditFunction / Function / Invariant Plugins + Guardrails
+# ---------------------------------------------------------------------------
+def test_7_customer_custom_edit_function_plugin_red_black() -> None:
+    class BatchHoldParams(BaseModel):
+        party_id: str
+        hold_tag: str
+        poison_profile_id: str = ""
+
+    class ExposureQueryParams(BaseModel):
+        party_id: str
+
+    def batch_freeze_party_profiles(ctx, params: BatchHoldParams) -> None:
+        profiles = [
+            prof for prof in ctx.query(O2cCustomerProfile) if prof.party == params.party_id
+        ]
+        if not profiles:
+            raise InvariantError(f"no profiles for {params.party_id}", code="NO_PARTY_PROFILES")
+        for prof in profiles:
+            # Simulate customer-specific loop over multiple profiles, triggering a mid-batch violation on poison
+            new_terms = (
+                "ILLEGAL_POISON"
+                if params.poison_profile_id and prof.profile_id == params.poison_profile_id
+                else params.hold_tag
+            )
+            ctx.modify(prof, credit_limit=0.0, payment_terms=new_terms)
+
+    def summarize_party_o2c_exposure(ctx, params: ExposureQueryParams) -> dict[str, object]:
+        prof_ids = {
+            prof.profile_id
+            for prof in ctx.query(O2cCustomerProfile)
+            if prof.party == params.party_id
+        }
+        order_ids = {o.order_id for o in ctx.query(O2cOrder) if o.customer in prof_ids}
+        open_residual = sum(
+            inv.amount_residual
+            for inv in ctx.query(O2cInvoice)
+            if inv.order in order_ids and inv.status == "posted"
+        )
+        return {
+            "party_id": params.party_id,
+            "profile_count": len(prof_ids),
+            "open_residual": float(open_residual),
+        }
+
+    def forbid_illegal_poison_terms(view) -> bool:
+        for prof in view.query(O2cCustomerProfile):
+            if prof.payment_terms == "ILLEGAL_POISON":
+                raise InvariantError(
+                    f"profile {prof.profile_id} hit forbidden customer hold state",
+                    code="CUST_ILLEGAL_HOLD_TERMS",
+                )
+        return True
+
+    custom_ef = EditFunctionDef(
+        name="batch_freeze_party_profiles",
+        params=BatchHoldParams,
+        handler=batch_freeze_party_profiles,
+        touched_object_types=("O2cCustomerProfile",),
+    )
+    custom_fn = FunctionDef(
+        name="summarize_party_o2c_exposure",
+        params=ExposureQueryParams,
+        handler=summarize_party_o2c_exposure,
+    )
+    custom_inv = InvariantDef(
+        name="cust_forbid_illegal_poison_terms",
+        handler=forbid_illegal_poison_terms,
+        code="CUST_ILLEGAL_HOLD_TERMS",
+    )
+
+    overlay = CustomerOverlaySpec(
+        overlay_id="cust_o2c_batch_hold_v1",
+        base_model_id="std_o2c_ontology",
+        add_fields={
+            "O2cCustomerProfile": [
+                FieldSpec(name="hold_note", field_type="str", default=""),
+            ]
+        },
+        add_actions=[
+            ActionBlueprint(
+                name="freeze_party_credit_batch",
+                allowed_roles=["finance_director", "admin"],
+                edit_function="batch_freeze_party_profiles",
+                params=[
+                    FieldSpec(name="party_id", field_type="str", required=True),
+                    FieldSpec(name="hold_tag", field_type="str", required=True),
+                    FieldSpec(name="poison_profile_id", field_type="str", required=False, default=""),
+                ],
+            )
+        ],
+        add_views=[
+            ScopedViewBlueprint(
+                name="cust_credit_risk_view",
+                roles=["finance_director", "admin"],
+                object_types=["O2cCustomerProfile", "O2cInvoice"],
+                actions=["freeze_party_credit_batch"],
+                functions=["summarize_party_o2c_exposure"],
+            )
+        ],
+    )
+
+    overlaid = apply_overlay_to_spec(
+        std_o2c_spec,
+        overlay,
+        seed_ontology=BUSINESS_SEED_ONTOLOGY,
+        custom_edit_functions=[custom_ef],
+        custom_functions=[custom_fn],
+        custom_invariants=[custom_inv],
+    )
+    assert "hold_note" not in O2cCustomerProfile.model_fields
+    assert "batch_freeze_party_profiles" in overlaid.edit_functions
+    assert "freeze_party_credit_batch" in overlaid.actions
+    assert "summarize_party_o2c_exposure" in overlaid.functions
+    assert "cust_forbid_illegal_poison_terms" in overlaid.invariants
+
+    ProfCls = overlaid.get_object_type("O2cCustomerProfile")
+    fin_dir = Actor(actor_id="fin-1", role="finance_director", clearance_tags={"*"})
+    rt = OntologyRuntime(overlaid)
+    try:
+        rt.put_object(AccountingEntity(entity_id="ENT-O2C", name="HQ"))
+        rt.put_object(BusinessParty(party_id="PTY-1", legal_name="Steel Co"))
+        rt.put_object(
+            ProfCls(
+                profile_id="PROF-1",
+                party="PTY-1",
+                accounting_entity="ENT-O2C",
+                credit_limit=100_000.0,
+                payment_terms="NET30",
+            )
+        )
+        rt.put_object(
+            ProfCls(
+                profile_id="PROF-2",
+                party="PTY-1",
+                accounting_entity="ENT-O2C",
+                credit_limit=200_000.0,
+                payment_terms="NET60",
+            )
+        )
+        rt.put_object(
+            O2cOrder(
+                order_id="SO-1",
+                order_number="SO-001",
+                customer="PROF-1",
+                accounting_entity="ENT-O2C",
+                amount_total=50_000.0,
+                status="confirmed",
+            )
+        )
+        rt.put_object(
+            O2cInvoice(
+                invoice_id="INV-1",
+                order="SO-1",
+                amount_total=50_000.0,
+                amount_residual=30_000.0,
+                status="posted",
+            )
+        )
+
+        # RED: mid-loop illegal state aborts and atomically rolls back PROF-1 AND PROF-2!
+        with pytest.raises(InvariantError) as exc_bad:
+            rt.submit_action(
+                "ACT-FREEZE-BAD",
+                "freeze_party_credit_batch",
+                {"party_id": "PTY-1", "hold_tag": "HOLD_RISK", "poison_profile_id": "PROF-2"},
+                fin_dir,
+            )
+        assert exc_bad.value.code == "CUST_ILLEGAL_HOLD_TERMS"
+        assert rt.get_object(ProfCls, "PROF-1", fin_dir).credit_limit == 100_000.0
+        assert rt.get_object(ProfCls, "PROF-1", fin_dir).payment_terms == "NET30"
+        assert rt.get_object(ProfCls, "PROF-2", fin_dir).credit_limit == 200_000.0
+        assert rt.get_action_run("ACT-FREEZE-BAD")["status"] == "REJECTED"
+
+        # BLACK: valid loop commits both profiles atomically + read-only FunctionDef summarizes exposure
+        rt.submit_action(
+            "ACT-FREEZE-OK",
+            "freeze_party_credit_batch",
+            {"party_id": "PTY-1", "hold_tag": "HOLD_RISK"},
+            fin_dir,
+        )
+        assert rt.get_object(ProfCls, "PROF-1", fin_dir).credit_limit == 0.0
+        assert rt.get_object(ProfCls, "PROF-1", fin_dir).payment_terms == "HOLD_RISK"
+        assert rt.get_object(ProfCls, "PROF-2", fin_dir).credit_limit == 0.0
+        assert rt.get_object(ProfCls, "PROF-2", fin_dir).payment_terms == "HOLD_RISK"
+
+        summary = rt.call_function("summarize_party_o2c_exposure", {"party_id": "PTY-1"}, fin_dir)
+        assert summary == {"party_id": "PTY-1", "profile_count": 2, "open_residual": 30_000.0}
+    finally:
+        rt.close()
+
+    # RED: colliding names in custom_edit_functions / custom_functions / custom_invariants fail closed
+    with pytest.raises(InvariantError) as exc_ce:
+        apply_overlay_to_spec(
+            std_o2c_spec,
+            CustomerOverlaySpec(),
+            custom_edit_functions=[
+                EditFunctionDef(name="confirm_o2c_order", params=BatchHoldParams, handler=batch_freeze_party_profiles)
+            ],
+        )
+    assert exc_ce.value.code == "OVERLAY_BREAKS_STANDARD_CONTRACT"
+
+    with pytest.raises(InvariantError) as exc_cf:
+        apply_overlay_to_spec(
+            std_r2r_spec,
+            CustomerOverlaySpec(),
+            custom_functions=[
+                FunctionDef(name="compute_trial_balance", params=ExposureQueryParams, handler=summarize_party_o2c_exposure)
+            ],
+        )
+    assert exc_cf.value.code == "OVERLAY_BREAKS_STANDARD_CONTRACT"
+
+    with pytest.raises(InvariantError) as exc_ci:
+        apply_overlay_to_spec(
+            std_r2r_spec,
+            CustomerOverlaySpec(),
+            custom_invariants=[
+                InvariantDef(name="r2r_gl_account_valid_enums", handler=forbid_illegal_poison_terms)
+            ],
+        )
+    assert exc_ci.value.code == "OVERLAY_BREAKS_STANDARD_CONTRACT"
+
+    # RED: update_actions cannot drop/weaken preconditions on a rule standard action
+    rule_bp = DeclarativeBlueprint(
+        model_id="rule_base_test",
+        roles=["ops", "admin"],
+        object_types=[
+            ObjectTypeBlueprint(
+                name="Ticket",
+                primary_key="ticket_id",
+                fields=[
+                    FieldSpec(name="ticket_id", field_type="str", primary_key=True, required=True),
+                    FieldSpec(name="status", field_type="str", default="open"),
+                ],
+                transitions={"open": ["closed"], "closed": []},
+            )
+        ],
+        actions=[
+            ActionBlueprint(
+                name="close_ticket",
+                allowed_roles=["ops", "admin"],
+                params=[FieldSpec(name="ticket_id", field_type="str", required=True)],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="must_be_open",
+                        code="TICKET_NOT_OPEN",
+                        target_type="Ticket",
+                        id_param="ticket_id",
+                        must_hold={"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "open"}},
+                    )
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="Ticket",
+                        id_param="ticket_id",
+                        set_fields={"status": {"lit": "closed"}},
+                    )
+                ],
+            )
+        ],
+    )
+    rule_spec = compile_blueprint(rule_bp)
+    with pytest.raises(InvariantError) as exc_rule_upd:
+        apply_overlay_to_spec(
+            rule_spec,
+            CustomerOverlaySpec(
+                update_actions=[
+                    ActionBlueprint(
+                        name="close_ticket",
+                        allowed_roles=["ops"],
+                        params=[FieldSpec(name="ticket_id", field_type="str", required=True)],
+                        preconditions=[],
+                        mutations=[
+                            ActionMutationSpec(
+                                op="modify",
+                                object_type="Ticket",
+                                id_param="ticket_id",
+                                set_fields={"status": {"lit": "closed"}},
+                            )
+                        ],
+                    )
+                ]
+            ),
+        )
+    assert exc_rule_upd.value.code == "OVERLAY_BREAKS_STANDARD_CONTRACT"
+
+
+# ---------------------------------------------------------------------------
+# 8. Single-Source Enterprise World Model & Console Zero Runtime Patching
+# ---------------------------------------------------------------------------
+def test_8_single_source_enterprise_world_and_console_zero_patch() -> None:
+    mount_src = inspect.getsource(erp_world_mount)
+    console_src = inspect.getsource(enterprise_console_app)
+    assert "_attach_standard_functions" not in mount_src
+    assert "_CompiledTypeQueryCtx" not in mount_src
+    assert "_attach_standard_functions" not in console_src
+
+    spec = build_org_rls_enterprise_spec(
+        overlays=[enterprise_console_app.HUASHI_MFG_OVERLAY],
+        model_id="std_enterprise_world_model",
+    )
+    for fn_name in (
+        "compute_trial_balance",
+        "resolve_employee_effective_mandates",
+        "diagnose_work_order_conservation",
+    ):
+        assert fn_name in spec.functions
+
+    admin = Actor(actor_id="act-admin", role="admin", clearance_tags={"*"})
+    hr = Actor(actor_id="act-hr", role="hr_admin", clearance_tags={"*"})
+    director = Actor(actor_id="act-dir", role="finance_director", clearance_tags={"*"})
+    rt = OntologyRuntime(spec)
+    try:
+        rt.put_object(AccountingEntity(entity_id="ENT-1", name="Huashi HQ"))
+        DeptCls = spec.get_object_type("Department")
+        PosCls = spec.get_object_type("JobPosition")
+        EmpCls = spec.get_object_type("Employee")
+        MandateCls = spec.get_object_type("AuthorityMandate")
+        GlCls = spec.get_object_type("GlAccount")
+
+        # 8-hop DAG cycle detection (>6-hop declarative bound) via native @edit_function
+        prev_did: str | None = None
+        for idx in range(1, 9):
+            did = f"D-{idx}"
+            rt.put_object(
+                DeptCls(
+                    department_id=did,
+                    accounting_entity="ENT-1",
+                    name=f"Dept {idx}",
+                    parent_department=prev_did,
+                    scope_tag="hq",
+                ),
+                actor=admin,
+            )
+            prev_did = did
+
+        with pytest.raises(InvariantError) as exc_cycle:
+            rt.submit_action(
+                "CYC-8HOP",
+                "reparent_department",
+                {"department_id": "D-1", "new_parent_id": "D-8"},
+                hr,
+            )
+        assert exc_cycle.value.code == "DEPARTMENT_CYCLE_DETECTED"
+
+        rt.put_object(
+            PosCls(
+                position_id="POS-DIR",
+                department="D-1",
+                title="Finance Director",
+                role_name="finance_director",
+                approval_ceiling_cents=5_000_000,
+            ),
+            actor=admin,
+        )
+        rt.put_object(
+            PosCls(
+                position_id="POS-BUY",
+                department="D-2",
+                title="Buyer",
+                role_name="buyer",
+                approval_ceiling_cents=500_000,
+            ),
+            actor=admin,
+        )
+        rt.put_object(
+            EmpCls(
+                employee_id="EMP-DIR",
+                department="D-1",
+                position="POS-DIR",
+                full_name="Dir Zhang",
+                actor_id="act-dir",
+                status="active",
+            ),
+            actor=admin,
+        )
+        rt.put_object(
+            EmpCls(
+                employee_id="EMP-A",
+                department="D-2",
+                position="POS-BUY",
+                full_name="Buyer A",
+                actor_id="act-a",
+                status="active",
+            ),
+            actor=admin,
+        )
+        rt.put_object(
+            EmpCls(
+                employee_id="EMP-B",
+                department="D-2",
+                position="POS-BUY",
+                full_name="Buyer B",
+                actor_id="act-b",
+                status="active",
+            ),
+            actor=admin,
+        )
+        # Grant 2 mandates from EMP-DIR -> EMP-A and EMP-B
+        rt.submit_action(
+            "G-1",
+            "grant_authority_mandate",
+            {
+                "mandate_id": "MND-1",
+                "grantor_id": "EMP-DIR",
+                "grantee_id": "EMP-A",
+                "role_name": "finance_director",
+                "ceiling_cents": 1_000_000,
+            },
+            director,
+        )
+        rt.submit_action(
+            "G-2",
+            "grant_authority_mandate",
+            {
+                "mandate_id": "MND-2",
+                "grantor_id": "EMP-DIR",
+                "grantee_id": "EMP-B",
+                "role_name": "finance_director",
+                "ceiling_cents": 1_500_000,
+            },
+            director,
+        )
+        eff = rt.call_function("resolve_employee_effective_mandates", {"employee_id": "EMP-A"}, hr)
+        assert len(eff["active_mandates"]) == 1
+
+        # Atomic offboard revokes ALL mandates granted by EMP-DIR in one transaction
+        rt.submit_action("OFF-DIR", "offboard_employee", {"employee_id": "EMP-DIR"}, hr)
+        assert rt.get_object(EmpCls, "EMP-DIR", admin).status == "offboarded"
+        assert rt.get_object(MandateCls, "MND-1", admin).status == "revoked"
+        assert rt.get_object(MandateCls, "MND-2", admin).status == "revoked"
+
+        rt.put_object(
+            GlCls(
+                account_code="1001",
+                accounting_entity="ENT-1",
+                name="Cash",
+                category="ASSET",
+                normal_side="DEBIT",
+            ),
+            actor=admin,
+        )
+        tb = rt.call_function("compute_trial_balance", {"accounting_entity": "ENT-1"}, director)
+        assert tb["is_balanced"] is True
+    finally:
+        rt.close()
+
+
+# ---------------------------------------------------------------------------
+# 9. Single-Source export_spec_blueprint & design.py CLI Alignment
+# ---------------------------------------------------------------------------
+def test_9_export_spec_blueprint_and_design_check_single_source(tmp_path: Path) -> None:
+    pairs = (
+        (std_core_spec, build_std_core_blueprint),
+        (std_crm_spec, build_std_crm_blueprint),
+        (std_o2c_spec, build_std_o2c_blueprint),
+        (std_p2p_spec, build_std_p2p_blueprint),
+        (std_p2m_spec, build_std_p2m_blueprint),
+        (std_r2r_spec, build_std_r2r_blueprint),
+        (std_h2r_spec, build_std_h2r_blueprint),
+    )
+    exported_bps: list[DeclarativeBlueprint] = []
+    for py_spec, builder in pairs:
+        bp = builder()
+        exported_bps.append(bp)
+        assert {ot.name for ot in bp.object_types} == set(py_spec.object_types.keys())
+        assert {a.name for a in bp.actions} == set(py_spec.actions.keys())
+        assert set(bp.roles) == set(py_spec.roles.keys())
+
+        rtrip = DeclarativeBlueprint.model_validate_json(bp.model_dump_json())
+        assert rtrip.model_dump(mode="json") == bp.model_dump(mode="json")
+
+        from_export = export_spec_blueprint(
+            py_spec,
+            model_id=bp.model_id,
+            version=bp.version,
+            seed_ontology_id=bp.seed_ontology_id,
+            imports=bp.imports,
+            description=bp.description,
+        )
+        assert from_export.model_dump(mode="json") == bp.model_dump(mode="json")
+
+    composed = compose_blueprints(exported_bps, model_id="std_enterprise_world_model")
+    assert len(composed._base_specs) == 7
+    compiled = compile_blueprint(composed, seed_ontology=BUSINESS_SEED_ONTOLOGY)
+    assert "compute_trial_balance" in compiled.functions
+    assert "resolve_employee_effective_mandates" in compiled.functions
+    assert "diagnose_work_order_conservation" in compiled.functions
+
+    res_bp = run_design_check(
+        blueprints=["examples.std_crm_ontology:build_std_crm_blueprint"],
+        seed="examples.business_ontology:BUSINESS_SEED_ONTOLOGY",
+    )
+    assert res_bp["ok"] is True
+
+    ov_ok = tmp_path / "crm_ok_overlay.json"
+    ov_ok.write_text(
+        json.dumps(
+            {
+                "overlay_id": "crm_ok_v1",
+                "base_model_id": "std_crm_ontology",
+                "add_fields": {"CrmDeal": [{"name": "cust_region", "field_type": "str", "default": ""}]},
+                "add_action_preconditions": {
+                    "win_crm_deal": [
+                        {
+                            "name": "require_positive_deal",
+                            "code": "DEAL_AMOUNT_ZERO",
+                            "target_type": "CrmDeal",
+                            "id_param": "deal_id",
+                            "must_hold": {"op": "gt", "left": {"ref": "obj.amount"}, "right": {"lit": 0}},
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    res_spec_ok = run_design_check(
+        blueprints=["examples.std_crm_ontology:spec"],
+        overlay=str(ov_ok),
+        seed="examples.business_ontology:BUSINESS_SEED_ONTOLOGY",
+    )
+    assert res_spec_ok["ok"] is True
+
+    ov_bad = tmp_path / "crm_bad_overlay.json"
+    ov_bad.write_text(
+        json.dumps(
+            {
+                "overlay_id": "crm_bad_v1",
+                "base_model_id": "std_crm_ontology",
+                "update_actions": [
+                    {
+                        "name": "win_crm_deal",
+                        "allowed_roles": ["sales_rep"],
+                        "params": [{"name": "deal_id", "field_type": "str", "required": True}],
+                        "mutations": [
+                            {
+                                "op": "modify",
+                                "object_type": "CrmDeal",
+                                "id_param": "deal_id",
+                                "set_fields": {"stage": {"lit": "won"}},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    res_spec_bad = run_design_check(
+        blueprints=["examples.std_crm_ontology:spec"],
+        overlay=str(ov_bad),
+        seed="examples.business_ontology:BUSINESS_SEED_ONTOLOGY",
+    )
+    assert res_spec_bad["ok"] is False
+    assert "OVERLAY_BREAKS_STANDARD_CONTRACT" in res_spec_bad["error_codes"]

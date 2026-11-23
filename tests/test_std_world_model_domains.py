@@ -1848,29 +1848,16 @@ def test_11_p0_2_h2r_impersonation_role_escalation_admin_ban_and_grantor_offboar
             },
             actors["mgr_actor"],
         )
-        if use_blueprint:
-            # In declarative Blueprint, offboard_employee fails closed when an active mandate granted BY emp still exists
-            with pytest.raises(InvariantError) as e_bp_off:
-                rt.submit_action(
-                    "RED-OFF-GRANTOR-BP",
-                    "offboard_employee",
-                    {"employee_id": "EMP-MGR"},
-                    actors["hr_admin"],
-                )
-            assert e_bp_off.value.code == "OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN"
-            assert rt.get_action_run("RED-OFF-GRANTOR-BP")["status"] == "REJECTED"
-            assert rt.get_object("Employee", "EMP-MGR", actors["admin"]).status == "active"
-        else:
-            # In Python spec, offboard_employee atomically revokes both grantee and grantor active mandates
-            rt.submit_action(
-                "OFF-GRANTOR-MGR",
-                "offboard_employee",
-                {"employee_id": "EMP-MGR", "reason": "授权人离职"},
-                actors["hr_admin"],
-            )
-            assert rt.get_object("Employee", "EMP-MGR", actors["admin"]).status == "offboarded"
-            assert rt.get_object("AuthorityMandate", "MND-BY-MGR", actors["admin"]).status == "revoked"
-            assert rt.get_object("Employee", "EMP-WANG", actors["admin"]).status == "active"
+        # Single-source Python offboard_employee atomically revokes both grantee and grantor active mandates
+        rt.submit_action(
+            "OFF-GRANTOR-MGR",
+            "offboard_employee",
+            {"employee_id": "EMP-MGR", "reason": "授权人离职"},
+            actors["hr_admin"],
+        )
+        assert rt.get_object("Employee", "EMP-MGR", actors["admin"]).status == "offboarded"
+        assert rt.get_object("AuthorityMandate", "MND-BY-MGR", actors["admin"]).status == "revoked"
+        assert rt.get_object("Employee", "EMP-WANG", actors["admin"]).status == "active"
     finally:
         rt.close()
 
@@ -1995,53 +1982,25 @@ def test_12_p0_3_r2r_source_event_spoofing_and_nested_reversal_red_tests(
         assert rt.get_object("JournalEntry", "JE-ZERO-SPOOF", actors["admin"]).status == "draft"
 
         # 4. Reversing a reversal entry blocked -> CANNOT_REVERSE_REVERSAL_ENTRY
-        if use_blueprint:
-            # Seed a posted reversal entry directly on Blueprint runtime (Blueprint create cannot set swapped fields automatically)
-            rt.put_object(
-                JeCls(
-                    entry_id="JE-ORIG-P",
-                    accounting_entity="ENT-HQ",
-                    fiscal_period="2026-11",
-                    debit_account="1001",
-                    credit_account="4001",
-                    amount_cents=50_000,
-                    status="reversed",
-                ),
-                actor=actors["admin"],
-            )
-            rt.put_object(
-                JeCls(
-                    entry_id="JE-REV-1",
-                    accounting_entity="ENT-HQ",
-                    fiscal_period="2026-11",
-                    debit_account="4001",
-                    credit_account="1001",
-                    amount_cents=50_000,
-                    reversal_of="JE-ORIG-P",
-                    status="posted",
-                ),
-                actor=actors["admin"],
-            )
-        else:
-            rt.put_object(
-                JeCls(
-                    entry_id="JE-ORIG-P",
-                    accounting_entity="ENT-HQ",
-                    fiscal_period="2026-11",
-                    debit_account="1001",
-                    credit_account="4001",
-                    amount_cents=50_000,
-                    status="draft",
-                ),
-                actor=actors["admin"],
-            )
-            rt.submit_action("POST-ORIG-P", "post_journal_entry", {"entry_id": "JE-ORIG-P"}, actors["finance"])
-            rt.submit_action(
-                "REV-ORIG-P",
-                "reverse_journal_entry",
-                {"entry_id": "JE-ORIG-P", "reversal_entry_id": "JE-REV-1"},
-                actors["chief_acc"],
-            )
+        rt.put_object(
+            JeCls(
+                entry_id="JE-ORIG-P",
+                accounting_entity="ENT-HQ",
+                fiscal_period="2026-11",
+                debit_account="1001",
+                credit_account="4001",
+                amount_cents=50_000,
+                status="draft",
+            ),
+            actor=actors["admin"],
+        )
+        rt.submit_action("POST-ORIG-P", "post_journal_entry", {"entry_id": "JE-ORIG-P"}, actors["finance"])
+        rt.submit_action(
+            "REV-ORIG-P",
+            "reverse_journal_entry",
+            {"entry_id": "JE-ORIG-P", "reversal_entry_id": "JE-REV-1"},
+            actors["chief_acc"],
+        )
 
         debit_before = rt.get_object("GlAccount", "1001", actors["admin"]).debit_total_cents
         credit_before = rt.get_object("GlAccount", "4001", actors["admin"]).credit_total_cents

@@ -693,7 +693,7 @@ fi
 export PYTHONPATH="{ROOT}:${{PYTHONPATH:-}}"
 if [[ "$MODE" == "verify" ]]; then
   exec "{sys.executable}" -m open_ontology.design verify \\
-    --blueprint target_abi.json \\
+    --blueprint "{STD_O2C_BP_ARG}" \\
     --seed "{BUSINESS_SEED_ARG}" \\
     --device .judge/device_erp.json \\
     --min-action-coverage 1.0 \\
@@ -701,7 +701,7 @@ if [[ "$MODE" == "verify" ]]; then
     --max-waves 2
 else
   exec "{sys.executable}" -m open_ontology.design check \\
-    --blueprint target_abi.json \\
+    --blueprint "{STD_O2C_BP_ARG}" \\
     --seed "{BUSINESS_SEED_ARG}" \\
     --device .judge/device_erp.json
 fi

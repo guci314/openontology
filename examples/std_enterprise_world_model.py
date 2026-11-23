@@ -33,8 +33,15 @@ from open_ontology.induction import (
     DeclarativeBlueprint,
     FieldSpec,
     apply_overlay,
+    apply_overlay_to_spec,
     compile_blueprint,
     compose_blueprints,
+)
+from open_ontology.spec import (
+    EditFunctionDef,
+    FunctionDef,
+    InvariantDef,
+    TransitionInvariantDef,
 )
 from open_ontology.org_authority import (
     AUTHORITY_TIER_INSUFFICIENT,
@@ -241,52 +248,64 @@ def build_org_rls_enterprise_spec(
     overlays: Sequence[CustomerOverlaySpec | Mapping[str, Any]] = (),
     rls_object_types: Sequence[str] = ("P2pPurchaseOrder", "WorkOrder", "O2cOrder"),
     model_id: str = "std_enterprise_org_rls_world",
+    custom_edit_functions: Sequence[EditFunctionDef] | Mapping[str, EditFunctionDef] = (),
+    custom_functions: Sequence[FunctionDef] | Mapping[str, FunctionDef] = (),
+    custom_invariants: Sequence[InvariantDef | TransitionInvariantDef]
+    | Mapping[str, InvariantDef | TransitionInvariantDef] = (),
 ) -> OntologySpec:
-    """在标准总装蓝图上只增不破叠加 ``org`` 组织行级安全字段并绑定 ``__security_tag_fields__``。"""
-    base_bp = build_enterprise_standard_blueprint(
-        domains=domains,
-        overlays=overlays,
-        model_id=model_id,
-    )
-    by_name = {ot.name: ot for ot in base_bp.object_types}
-    add_fields: dict[str, list[FieldSpec]] = {}
-    targets_to_tag: list[str] = []
-    for ot_name in rls_object_types:
-        ot_bp = by_name.get(ot_name)
-        if ot_bp is None:
-            continue
-        targets_to_tag.append(ot_name)
-        if not any(fld.name == "org" for fld in ot_bp.fields):
-            add_fields[ot_name] = [
-                FieldSpec(
-                    name="org",
-                    field_type="str",
-                    default="",
-                    owned=True,
-                    description="所属部门/厂区 RLS 标签值（与 Department.scope_tag 对齐）",
+    """在标准总装 ``OntologySpec`` 上单一源码只增不破叠加插件、Overlay 与 ``org`` 行级安全标签。"""
+    keys = normalize_domain_keys(domains)
+    spec = build_enterprise_standard_spec(domains=keys)
+    spec.update_display(
+        {
+            "ontologies": {
+                model_id: (
+                    f"企业标准世界模型统一总装（核心底座 + {', '.join(k.upper() for k in keys)}）"
                 )
-            ]
+            }
+        }
+    )
 
-    eff_bp = (
-        apply_overlay(
-            base_bp,
+    normalized_overlays = [
+        ov if isinstance(ov, CustomerOverlaySpec) else CustomerOverlaySpec.model_validate(dict(ov))
+        for ov in overlays
+    ]
+    if normalized_overlays:
+        for idx, ov_spec in enumerate(normalized_overlays):
+            spec = apply_overlay_to_spec(
+                spec,
+                ov_spec,
+                seed_ontology=BUSINESS_SEED_ONTOLOGY,
+                custom_edit_functions=custom_edit_functions if idx == 0 else (),
+                custom_functions=custom_functions if idx == 0 else (),
+                custom_invariants=custom_invariants if idx == 0 else (),
+            )
+    elif custom_edit_functions or custom_functions or custom_invariants:
+        spec = apply_overlay_to_spec(
+            spec,
+            CustomerOverlaySpec(
+                overlay_id=f"{model_id}_custom_plugin_overlay",
+                base_model_id=model_id,
+            ),
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
+            custom_edit_functions=custom_edit_functions,
+            custom_functions=custom_functions,
+            custom_invariants=custom_invariants,
+        )
+
+    eff_rls = [ot_name for ot_name in rls_object_types if ot_name in spec.object_types]
+    if eff_rls:
+        spec = apply_overlay_to_spec(
+            spec,
             CustomerOverlaySpec(
                 overlay_id=f"{model_id}_org_rls_overlay",
-                base_model_id=base_bp.model_id,
-                target_version=base_bp.version,
-                add_fields=add_fields,
+                base_model_id=model_id,
             ),
+            seed_ontology=BUSINESS_SEED_ONTOLOGY,
+            rls_object_types=eff_rls,
+            security_tag_field="org",
         )
-        if add_fields
-        else base_bp
-    )
-    compiled = compile_blueprint(eff_bp, seed_ontology=BUSINESS_SEED_ONTOLOGY)
-    for ot_name in targets_to_tag:
-        cls = compiled.get_object_type(ot_name)
-        existing = tuple(getattr(cls, "__security_tag_fields__", ()) or ())
-        if "org" not in existing:
-            cls.__security_tag_fields__ = (*existing, "org")
-    return compiled
+    return spec
 
 
 def open_standalone_enterprise_world(

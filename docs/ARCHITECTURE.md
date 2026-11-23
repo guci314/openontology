@@ -84,7 +84,7 @@ World <world_id / workspace_id>（M0 隔离业务世界）
 * 当前 `OntologyRuntime(spec, db_path)` 绑定单个模型与单个存储。同一模型复用于多个业务世界（工作空间）是核心能力；单个引擎同时装载多个不同模型不属于现阶段承诺。
 * 模型随 Python 代码模块发布即可；现阶段不建设独立模型发布服务、不引入外部 RDF/OWL 存储，也不因逻辑分层拆分底层业务表。
 
-#### 1.1.1 Ontology 核心原语规范（ObjectType · ObjectProperty · AutoID · InterfaceType · FunctionDef · ActionDef · AutomationDef）
+#### 1.1.1 Ontology 核心原语规范（ObjectType · ObjectProperty · AutoID · InterfaceType · FunctionDef · EditFunctionDef · ActionDef · AutomationDef）
 
 在 OpenOntology（`open_ontology/spec.py`、`sandbox.py`、`query.py`）中，一个领域本体模型由以下 M2 核心原语共同构成：
 
@@ -95,7 +95,8 @@ World <world_id / workspace_id>（M0 隔离业务世界）
 | **TBox 结构** | **`InterfaceType`** | `spec.interface(name, required_fields=...)` | 跨对象类型的多态接口契约；实现该接口的 `ObjectType` 必须在 `__interfaces__` 中显式声明，并在注册时强校验 `required_fields` 齐全。 |
 | **TBox 结构** | **`ObjectProperty`** | 字段注解 `ObjectProperty[Target]` / `ObjectProperty[tuple[Target, ...]]` 或 `spec.object_property(...)` | OWL 对象属性：声明有向强类型关系 `domain` → `range`、基数 `cardinality`（`one-to-one` / `one-to-many` / `many-to-one` / `many-to-many`）及 `owned` 连边主权标记；动作提交时自动同步关系三元组并强制引用完整性（`TARGET_NOT_FOUND`）。 |
 | **Behavior 行为** | **`FunctionDef`** | `@spec.function(name, params=...)` | 严格只读计算（`read_only=True`）：接收强类型 Pydantic `params`，在注入列级脱敏的沙箱内执行查询/聚合，任何暂存写变更一律丢弃。 |
-| **Behavior 行为** | **`ActionDef`** | `@spec.action(name, params=..., allowed_roles=...)` | **唯一合法的状态变迁入口**：声明同步 RBAC 角色授权（`allowed_roles` / `revert_roles`）、`affects_source` 与可见性，并在处理器内以 `InvariantError` 强制业务不变量（协同审批由 M1 领域协同实体如 `WorkCard` 显式建模）。 |
+| **Behavior 行为** | **`EditFunctionDef`** | `@spec.edit_function(name, params=..., touched_object_types=...)` | **纯图灵完备变更内核**：只承载纯状态变更逻辑，在 `EditBatch` 沙箱内读写多个对象并校验业务规则抛 `InvariantError`；严禁耦合 RBAC、审批流或外部设备策略，可被多个治理外壳复用。 |
+| **Behavior 行为** | **`ActionDef`** | `spec.declare_action(..., edit_function=...)` 或 `spec.declare_rule_action(...)` | **唯一合法的写治理外壳与入口**：绑定既定 `EditFunctionDef` 或零 `eval/exec` 声明式单次变更加法规则（`submission_criteria`），统一承载同步 RBAC 授权（`allowed_roles` / `revert_roles`）、`affects_source` 主权声明与可见性（协同审批由 M1 领域实体如 `WorkCard` 显式建模）。 |
 | **Behavior 行为** | **`InvariantDef` / `TransitionInvariantDef`** | `@spec.invariant` / `@spec.transition_invariant` | 声明式公理门禁：前者校验后置快照终态，后者校验单次 `ObjectDiff` 状态跃迁合法性与守恒律；在模拟与同步提交时统一强制。 |
 | **Behavior 行为** | **`AutomationDef`** | `@spec.automation(name, watch_object_type=..., condition=...)` | 提交后事件驱动条件反射：监听目标 `ObjectType` 变更，满足 `condition(obj)` 时由 `AutomationReflexAspect` 按对象版本号去重触发 `handler(runtime, obj, actor)`。 |
 | **安全与沙箱** | **`Actor`** | `Actor(actor_id, role, clearance_tags)` | 显式零信任调用方身份：`role` 参与 RBAC 与列级脱敏判断，`clearance_tags`（或通配符 `"*"`）驱动 RLS 行级可见性过滤。 |
@@ -104,7 +105,7 @@ World <world_id / workspace_id>（M0 隔离业务世界）
 
 **各核心原语的关键契约约束**：
 1. **`ObjectType` 的类级元数据**：`__primary_key__`（主键字段，默认 `"id"`）、`__title__`（标题字段）、`__abstract__`（仅看当前类自身 `__dict__` 的抽象基类标记，不沿 MRO 自动传递）、`__append_only__`（只追加不可变事实标记，禁止 `Action` 对存量行执行改/删）、`__aggregate_root__`（显式聚合根标记，默认 `False`）、`__owned__`（字段主权标记：`bool | dict[str, Any]`）、`__interfaces__`（实现的接口名元组）、`__security_tag_fields__`（自动派生 `field:value` 行级安全标签的字段元组）与 `__masked_fields__` / `__mask_defaults__`（列级脱敏白名单 `{字段名: (明文角色, ...)}` 与自定义掩码值）；其中 `__interfaces__`、`__masked_fields__`、`__mask_defaults__` 与 `__owned__` 沿继承链自动合并。
-2. **`FunctionDef` 与 `ActionDef` 的严格隔离**：所有业务查询与计算封装在 `FunctionDef`（读出口脱敏开启、物理表零变更）；所有写入封装在 `ActionDef`（读出口脱敏关闭、先经 `EditBatch` 沙箱与 `InvariantError` 校验再编译 `ObjectDiff`，禁止跳过 `ActionDef` 直接执行裸 CRUD）。
+2. **动力学三分法与单一源码单调覆层（`FunctionDef` / `EditFunctionDef` / `ActionDef`）**：所有只读查询与计算封装在 `FunctionDef`（读出口脱敏开启、物理表零变更）；纯变更算法下沉至 `EditFunctionDef`；所有外部可调用写入封装在 `ActionDef`（读出口脱敏关闭、先经前置 `submission_criteria` 门控再进入 `EditBatch` 与 `InvariantError` 校验并编译 `ObjectDiff`，禁止跳过 `ActionDef` 直接执行裸 CRUD）。标准领域模型以 Python `OntologySpec` 为单一源码，通过 `export_spec_blueprint` 投影声明式 `DeclarativeBlueprint`，并通过 `apply_overlay_to_spec` 无损叠加 `overlay.json` 规则与客户自定义插件（`overlay.json + custom_edits.py`，即只增不破的 `EditFunctionDef` / `FunctionDef` / `InvariantDef`）。
 3. **同步提交与自动化闭环**：`ActionDef` 为纯同步确定性状态转移（不存在任何 M2 异步挂起态，协同审批或异常升级由 M1 实体状态机显式承载）；每次 `COMMITTED` 落库后，内核自动委托 `evaluate_automations` 评估匹配的 `AutomationDef`。
 
 ```mermaid
@@ -118,10 +119,12 @@ flowchart LR
             OT -.->|"__interfaces__ 强校验"| IT
             OT <-->|"domain / range 关联"| LT
         end
-        subgraph BEHAV_BOX["Behavior 行为原语"]
-            FN["FunctionDef｜read_only 只读计算 · 脱敏投影"]
-            ACT["ActionDef｜唯一合法写入口 · RBAC · 冲正 · InvariantError"]
+        subgraph BEHAV_BOX["Behavior 动力学三分法原语"]
+            FN["FunctionDef｜@spec.function 只读计算 · 脱敏投影"]
+            EF["EditFunctionDef｜@spec.edit_function 纯变更内核"]
+            ACT["ActionDef｜spec.declare_action 治理外壳 · RBAC · 冲正"]
             AUTO["AutomationDef｜提交后条件反射 · 版本去重触发"]
+            ACT -.->|"edit_function=..."| EF
         end
     end
 
@@ -135,6 +138,7 @@ flowchart LR
     FN -->|"只读执行（丢弃写入）"| BATCH
     BATCH -->|"集合检索与聚合"| OSET
     ACT -->|"沙箱暂存读写与不变量校验"| BATCH
+    EF -->|"EditBatch 纯变更执行"| BATCH
     BATCH -->|"编译生成"| DIFF
     DIFF -->|"COMMITTED 落库后触发"| AUTO
     AUTO -.->|"按需派生新调用"| FN
@@ -231,7 +235,9 @@ sequenceDiagram
 │ Tier 2 · Design-Time 编译与波普尔证伪工具链（对 Runtime 物理不可见） │
 │   open_ontology/design.py            python -m open_ontology.design   │
 │                                      check（静态编译） / verify（证伪） │
-│   open_ontology/induction/dsl.py     零 exec 声明式蓝图 / 单调 Overlay  │
+│   open_ontology/induction/dsl.py     零 exec 声明式蓝图/投影/单调覆层   │
+│                                      （export_spec_blueprint /           │
+│                                      apply_overlay_to_spec）             │
 │   open_ontology/induction/resolution.py  L0-L4 实体解析与 CrosswalkTable │
 │   open_ontology/induction/phenomenon.py · crucible.py · falsifier.py   │
 │   skills/openontology-fde/SKILL.md   外部独立 AI-FDE 只读隔离探索规程  │
@@ -243,6 +249,7 @@ sequenceDiagram
 │     open_ontology.reconciliation    SagaReconciler（写后失联先回读对账）│
 │     open_ontology.postgres_backend + schema_pg.sql（PG16 跨进程持久底座）│
 │     open_ontology.mdm_plugin        MDMSidecarPlugin（L0-L4 外挂协调插件）│
+│     open_ontology.console_server    四视角现代化交互指挥台服务端壳层   │
 │   规划、指挥台与目录扩展：                                            │
 │     open_ontology.mcts（OntologyMCTSPlanner）/ mpc（ClosedLoopMPCController）│
 │     open_ontology.workshop / workshop_ui / workspaces / model_views /    │
@@ -355,16 +362,17 @@ sequenceDiagram
 
 ## 5. M2 自动化架构红线门禁 (Architectural Fitness Functions)
 
-仓库在 [test_architecture_boundaries.py](file:///Users/guci/work/open-ontology/tests/test_architecture_boundaries.py) 与各专项测试中固化了 **7 道 M2 结构性自动化门禁（Gate 1 – Gate 7）** 与配套纯洁性约束，任何修改一旦违反即失败：
+仓库在 [test_architecture_boundaries.py](file:///Users/guci/work/open-ontology/tests/test_architecture_boundaries.py) 与各专项测试中固化了 **8 道 M2 结构性自动化门禁（Gate 1 – Gate 8）** 与配套纯洁性约束，任何修改一旦违反即失败：
 
 1. **Gate 1（M1 本体 AST 导入白名单）**：自动发现仓库全部纯 M1 本体声明模块，严禁直接/间接/动态导入 `OntologyRuntime`、传输库、OS/IO 或外部驱动库，也严禁从 `open_ontology` 顶层混入非规范模块（`test_gate1_m1_ontologies_strict_ast_import_whitelist`）。
 2. **Gate 2（M2 内核零反向引用 `examples` 与干净 IO / `ObjectType` 子类白名单）**：递归扫描 `open_ontology/**/*.py`，严禁静态或动态导入 `examples`（`design.py` 仅允许 `import_module` 加载命令行显式路径且禁止硬编码 `examples`），非传输适配器禁止网络/子进程 IO；运行时遍历 `ObjectType.__subclasses__()` 严禁内核夹带具体业务实体子类（自举元治理与平台元数据模块除外，`test_gate2_m2_zero_reverse_example_imports_no_business_objects_clean_io`）。
 3. **Gate 3（动态 M1 结构词表反向扫描与供应商词禁令）**：动态采集全部 M1 本体注册词表，按词边界正则反向扫描 `open_ontology/**`（含 `drivers.py`、`design.py`、`induction/*` 与可插拔运行壳）及 `ui_display.json`，并封杀具体外部产品厂商耦合标识（`test_gate3_dynamic_m1_vocabulary_reverse_scan`）。
 4. **Gate 4（M2 跨领域虚构盲测）**：使用完全虚构领域模型（`Starship / WarpCore / Sector`）端到端跑通 `OntologyRuntime`、`OntologyMCTSPlanner`、`describe_tbox` 与 `SymbolicCrucible`（`test_gate4_fictional_domain_blind_m2_contract`）。
 5. **Gate 5（SQLite & PG16 纯同步 6 表无 M2 挂起态铁笼）**：双守卫校验 `open_ontology/schema.sql` 与 `open_ontology/schema_pg.sql` 均保持同构 5 张业务治理表加 1 张 `ontology_write_gate` 写门禁表、`ontology_action_runs.status` 约束仅允许 `('COMMITTED', 'REVERTED', 'REJECTED')`，且全仓 `open_ontology/**` 对任何已退役 M2 挂起/两相审批符号零命中（`test_gate5_pure_synchronous_non_suspending_m2_kernel`）。
-6. **Gate 6（零例外 Runtime 对 Design-Time、可插拔运行壳与扩展层完全不可知）**：**0 例外** 校验全部核心 Runtime 模块（`spec.py`、`sandbox.py`、`runtime.py`、`aspects.py`、`settlement.py`、`drivers.py`、`ingestion.py`、`query.py`、`osdk.py`）与 `open_ontology/__init__.py`（严禁 `__getattr__`），断言其静态依赖闭包与干净子进程 `import open_ontology` 实测的 `sys.modules` **严格收口于 10 模块 Pure Runtime 白名单**，确保 `design`、`induction`、`mcp_server`、`autonomy`、`reconciliation`、`postgres_backend`、`mdm_plugin`、`psycopg`、`workshop`、`workshop_ui`、`meta_admin`、`workspaces`、`model_views`、`http_server`、`webhooks`、`mcts`、`mpc` 与 `subprocess` 完全未加载（`test_gate6_runtime_oblivious_to_design_time`）。
+6. **Gate 6（零例外 Runtime 对 Design-Time、可插拔运行壳与扩展层完全不可知）**：**0 例外** 校验全部核心 Runtime 模块（`spec.py`、`sandbox.py`、`runtime.py`、`aspects.py`、`settlement.py`、`drivers.py`、`ingestion.py`、`query.py`、`osdk.py`）与 `open_ontology/__init__.py`（严禁 `__getattr__`），断言其静态依赖闭包与干净子进程 `import open_ontology` 实测的 `sys.modules` **严格收口于 10 模块 Pure Runtime 白名单**，确保 `design`、`induction`、`mcp_server`、`autonomy`、`reconciliation`、`postgres_backend`、`mdm_plugin`、`psycopg`、`workshop`、`workshop_ui`、`console_server`、`meta_admin`、`workspaces`、`model_views`、`http_server`、`webhooks`、`mcts`、`mpc` 与 `subprocess` 完全未加载（`test_gate6_runtime_oblivious_to_design_time`）。
 7. **Gate 7（标准领域模块常识细腰隔离与零横向互耦门禁）**：自动发现全部标准领域模型模块，强制不同行业标准本体只能依赖共性核心常识原语，严禁各标准域之间产生任何静态或动态交叉导入，并通过负向自测验证跨领域泄漏可被静态拦截（`test_gate7_standard_domain_modules_zero_cross_imports`）。
-8. **配套微内核预算与展示/文档门禁**：`open_ontology/runtime.py <= 1,335` 行（现 `1,328` 行）；`aspects.py` 零反向导入 `runtime.py`；`ui_display.json` 零业务词膨胀、`workshop`/`workshop_ui` 零领域字段泄漏；`tests/test_docs_consistency.py` 锁定 Archify 架构图与活文档零退役符号漂移。
+8. **Gate 8（动力学三分法正交隔离、旧动作装饰器退役与反 xtUML 声明式 DSL 纯洁门禁）**：全仓静态 AST 扫描禁止混用旧版单一动作装饰器入口，强制 `FunctionDef`（`@spec.function`）/`EditFunctionDef`（`@spec.edit_function`）/`ActionDef`（`spec.declare_action` / `spec.declare_rule_action`）正交隔离，并永久封杀声明式 DSL（`dsl.py`）引入 `while` / `for_each` / `modify_where` / `recurse` / `exec` / `eval` / `call_python` 等图灵完备控制流原语（`test_gate8_kinetic_trio_and_no_xtuml_dsl`）。
+9. **配套微内核预算与展示/文档门禁**：`open_ontology/runtime.py <= 1,335` 行（现 `1,328` 行）；`aspects.py` 零反向导入 `runtime.py`；`ui_display.json` 零业务词膨胀、`workshop`/`workshop_ui` 零领域字段泄漏；`tests/test_docs_consistency.py` 锁定 Archify 架构图与活文档零退役符号漂移。
 
 ---
 

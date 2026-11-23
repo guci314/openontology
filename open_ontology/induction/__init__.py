@@ -92,6 +92,7 @@ from .dsl import (
     count_ast_nodes,
     dsl_schema_prompt_guide,
     eval_predicate,
+    export_spec_blueprint,
     expr_depth,
     migrate_m0_snapshot,
     validate_predicate_ast,
@@ -206,6 +207,7 @@ __all__ = [
     "apply_adapter_mapping_patch",
     "migrate_m0_snapshot",
     "compile_blueprint",
+    "export_spec_blueprint",
     "dsl_schema_prompt_guide",
     # External phenomenon & adapter mapping
     "ExternalFieldProfile",

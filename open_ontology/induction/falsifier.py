@@ -42,7 +42,7 @@ from .dsl import (
     compile_blueprint,
 )
 from .governance import BUILDER_ACTOR, InductionGovernanceService
-from .phenomenon import AdapterMappingSpec, ExternalPhenomenonProfile
+from .phenomenon import ActionExecutionBinding, AdapterMappingSpec, ExternalPhenomenonProfile
 from .seed import SeedOntology
 
 __all__ = [
@@ -216,10 +216,53 @@ def _resolve_target_actions(
     return source_actions if source_actions else list(blueprint.actions)
 
 
+def _dedup_ontology_specs(specs: Sequence[OntologySpec]) -> tuple[OntologySpec, ...]:
+    out: list[OntologySpec] = []
+    seen_ids: set[int] = set()
+    for sp in specs:
+        if id(sp) not in seen_ids:
+            seen_ids.add(id(sp))
+            out.append(sp)
+    return tuple(out)
+
+
+def _export_m0_from_rt(rt: OntologyRuntime, spec: OntologySpec) -> list[dict[str, Any]]:
+    admin = Actor(actor_id="falsifier:export", role="admin", clearance_tags=frozenset({"*"}))
+    out: list[dict[str, Any]] = []
+    for ot_name in spec.object_types:
+        for obj in rt.query_objects(ot_name, admin):
+            out.append(
+                {
+                    "object_type": ot_name,
+                    "object_id": obj.primary_key_value(),
+                    "data": obj.to_properties(),
+                }
+            )
+    return out
+
+
+def _m0_state_signature(
+    m0_objects: Sequence[dict[str, Any]],
+    ot_by_name: Mapping[str, ObjectTypeBlueprint],
+) -> tuple[tuple[str, str, str], ...]:
+    items: list[tuple[str, str, str]] = []
+    for entry in m0_objects:
+        tname = str(entry.get("object_type") or "")
+        oid = str(entry.get("object_id") or "")
+        ot = ot_by_name.get(tname)
+        sf = ot.status_field if ot is not None else "status"
+        st = str((entry.get("data") or {}).get(sf, ""))
+        items.append((tname, oid, st))
+    return tuple(sorted(items))
+
+
 def _infer_reachable_transitions(
     blueprint: DeclarativeBlueprint,
     target_acts: Sequence[ActionBlueprint],
     initial_m0: Sequence[dict[str, Any]],
+    *,
+    compiled_spec: OntologySpec | None = None,
+    action_bindings: Sequence[ActionExecutionBinding] = (),
 ) -> set[tuple[str, str, str]]:
     """Infer reachable FSM edges produced by ``target_acts`` from active M0/initial states."""
     ot_by_name = {ot.name: ot for ot in blueprint.object_types}
@@ -283,6 +326,96 @@ def _infer_reachable_transitions(
                     continue
                 if to_state in (ot.transitions.get(from_state) or ()):
                     edges.add((ot.name, from_state, to_state))
+
+    ef_acts = (
+        [a for a in target_acts if a.edit_function is not None and a.name in compiled_spec.actions]
+        if compiled_spec is not None
+        else []
+    )
+    if ef_acts and compiled_spec is not None and initial_m0:
+        frontier: list[list[dict[str, Any]]] = [list(initial_m0)]
+        seen_state_sigs: set[tuple[tuple[str, str, str], ...]] = {
+            _m0_state_signature(initial_m0, ot_by_name)
+        }
+        for _ in range(4):
+            if not frontier or len(seen_state_sigs) >= 16:
+                break
+            next_frontier: list[list[dict[str, Any]]] = []
+            for state_m0 in frontier:
+                state_by_type = _index_m0_by_type(state_m0)
+                sim_rt = OntologyRuntime(compiled_spec, db_path=":memory:")
+                try:
+                    _sync_rt_with_m0(sim_rt, compiled_spec, state_m0)
+                    for act in ef_acts:
+                        subj_type, id_param = _primary_subject_for_action(
+                            act,
+                            ot_by_name,
+                            action_bindings=action_bindings,
+                            compiled_spec=compiled_spec,
+                        )
+                        if subj_type is None:
+                            continue
+                        subj_rows = state_by_type.get(subj_type, {})
+                        if not subj_rows:
+                            continue
+                        actors = _candidate_actors_for_action(act)
+                        branched_effects: set[tuple[tuple[str, str, str], ...]] = set()
+                        for oid, odata in sorted(subj_rows.items()):
+                            for params in _candidate_param_dicts(act, oid, id_param, odata)[:6]:
+                                for actor in actors[:2]:
+                                    try:
+                                        sim = sim_rt.simulate_action(act.name, params, actor)
+                                    except Exception:
+                                        continue
+                                    if not sim.valid:
+                                        continue
+                                    for edge in DifferentialFalsifier._extract_transition_edges(
+                                        sim, ot_by_name
+                                    ):
+                                        edges.add(edge)
+                                    if not sim.diff.object_changes or len(seen_state_sigs) >= 16:
+                                        continue
+                                    effect_sig = tuple(
+                                        sorted(
+                                            (
+                                                ch.object_type,
+                                                ch.kind,
+                                                str(
+                                                    (ch.after or {}).get(
+                                                        ot_by_name[ch.object_type].status_field,
+                                                        "",
+                                                    )
+                                                )
+                                                if ch.object_type in ot_by_name
+                                                else "",
+                                            )
+                                            for ch in sim.diff.object_changes
+                                        )
+                                    )
+                                    if effect_sig in branched_effects:
+                                        continue
+                                    branched_effects.add(effect_sig)
+                                    branch_rt = OntologyRuntime(compiled_spec, db_path=":memory:")
+                                    try:
+                                        _sync_rt_with_m0(branch_rt, compiled_spec, state_m0)
+                                        branch_rt.submit_action(
+                                            f"INF-{act.name}-{len(seen_state_sigs)}",
+                                            act.name,
+                                            params,
+                                            actor,
+                                        )
+                                        next_m0 = _export_m0_from_rt(branch_rt, compiled_spec)
+                                        st_sig = _m0_state_signature(next_m0, ot_by_name)
+                                        if st_sig not in seen_state_sigs:
+                                            seen_state_sigs.add(st_sig)
+                                            next_frontier.append(next_m0)
+                                    except Exception:
+                                        pass
+                                    finally:
+                                        branch_rt.close()
+                finally:
+                    sim_rt.close()
+            frontier = next_frontier
     return edges
 
 
@@ -325,6 +458,9 @@ def _index_m0_by_type(
 def _primary_subject_for_action(
     act: ActionBlueprint,
     ot_by_name: dict[str, ObjectTypeBlueprint],
+    *,
+    action_bindings: Sequence[ActionExecutionBinding] = (),
+    compiled_spec: OntologySpec | None = None,
 ) -> tuple[str | None, str]:
     param_names = {p.name for p in act.params}
     for mut in act.mutations:
@@ -335,6 +471,30 @@ def _primary_subject_for_action(
         idp = pre.id_param or (ot.primary_key if ot else "id")
         if idp in param_names:
             return pre.target_type, idp
+    for b in action_bindings:
+        if getattr(b, "action_name", None) != act.name:
+            continue
+        ot_name = getattr(b, "target_object_type", None)
+        ot = ot_by_name.get(ot_name) if ot_name else None
+        if ot is None:
+            continue
+        b_idp = getattr(b, "id_param", None)
+        if b_idp and b_idp in param_names:
+            return ot.name, b_idp
+        if ot.primary_key in param_names:
+            return ot.name, ot.primary_key
+    if compiled_spec is not None and act.name in compiled_spec.actions:
+        for ot_name in compiled_spec.actions[act.name].touched_object_types:
+            ot = ot_by_name.get(ot_name)
+            if ot is not None and ot.primary_key in param_names:
+                return ot_name, ot.primary_key
+    pk_matches = [
+        ot
+        for ot in ot_by_name.values()
+        if ot.primary_key != "id" and ot.primary_key in param_names
+    ]
+    if len(pk_matches) == 1:
+        return pk_matches[0].name, pk_matches[0].primary_key
     return None, (act.params[0].name if act.params else "id")
 
 
@@ -412,8 +572,16 @@ class DifferentialFalsifier:
         target_actions: Sequence[str] | None = None,
         custom_cases: Sequence[FalsificationCase] | None = None,
         auto_generate: bool = True,
+        base_specs: Sequence[OntologySpec] = (),
     ) -> DifferentialFalsificationReport:
-        spec = compile_blueprint(blueprint, seed_ontology=seed_ontology)
+        eff_base_specs = _dedup_ontology_specs(
+            [*getattr(blueprint, "_base_specs", ()), *base_specs]
+        )
+        spec = compile_blueprint(
+            blueprint,
+            seed_ontology=seed_ontology,
+            base_specs=eff_base_specs,
+        )
         ot_by_name = {ot.name: ot for ot in blueprint.object_types}
         target_act_defs = _resolve_target_actions(blueprint, target_actions)
         target_act_names = [a.name for a in target_act_defs]
@@ -424,7 +592,13 @@ class DifferentialFalsifier:
             set_map(adapter_mapping)
         sandbox.reset()
         initial_m0 = list(sandbox.snapshot_m0())
-        reachable_edges = _infer_reachable_transitions(blueprint, target_act_defs, initial_m0)
+        reachable_edges = _infer_reachable_transitions(
+            blueprint,
+            target_act_defs,
+            initial_m0,
+            compiled_spec=spec,
+            action_bindings=adapter_mapping.action_bindings,
+        )
 
         covered_actions: set[str] = set()
         covered_edges: set[tuple[str, str, str]] = set()
@@ -479,6 +653,7 @@ class DifferentialFalsifier:
                 covered_actions=covered_actions,
                 covered_edges=covered_edges,
                 counterexamples=counterexamples,
+                reachable_edges=reachable_edges,
             )
             cov_count += cov_stats["cases_run"]
             mismatches += cov_stats["mismatches"]
@@ -515,6 +690,7 @@ class DifferentialFalsifier:
                 custom_adversarial=[
                     *(c for c in (custom_cases or ()) if c.track == "adversarial"),
                 ],
+                action_bindings=adapter_mapping.action_bindings,
             )
             res_adv = self._run_case_batch(
                 cases=adv_cases,
@@ -596,13 +772,21 @@ class DifferentialFalsifier:
         covered_actions: set[str],
         covered_edges: set[tuple[str, str, str]],
         counterexamples: list[FalsificationCounterexample],
+        reachable_edges: set[tuple[str, str, str]] | None = None,
     ) -> dict[str, int]:
         """Execute up to two stateful waves (primary workflow chain + alternate branch) in dual worlds."""
         mismatches = 0
         dirty_writes = 0
         cases_run = 0
         tried_pairs: set[tuple[str, str, str]] = set()
-        reachable_edges = _infer_reachable_transitions(blueprint, target_act_defs, list(sandbox.snapshot_m0()))
+        if reachable_edges is None:
+            reachable_edges = _infer_reachable_transitions(
+                blueprint,
+                target_act_defs,
+                list(sandbox.snapshot_m0()),
+                compiled_spec=spec,
+                action_bindings=adapter_mapping.action_bindings,
+            )
 
         for wave_idx in range(self.max_waves):
             if len(covered_actions) == len(target_act_defs) and covered_edges >= reachable_edges:
@@ -641,7 +825,12 @@ class DifferentialFalsifier:
                         for act in target_act_defs:
                             if pass_kind == "uncovered_action" and act.name in covered_actions:
                                 continue
-                            subj_type, id_param = _primary_subject_for_action(act, ot_by_name)
+                            subj_type, id_param = _primary_subject_for_action(
+                                act,
+                                ot_by_name,
+                                action_bindings=adapter_mapping.action_bindings,
+                                compiled_spec=spec,
+                            )
                             if subj_type is None:
                                 continue
                             actors = _candidate_actors_for_action(act)
@@ -771,6 +960,7 @@ class DifferentialFalsifier:
         target_act_defs: Sequence[ActionBlueprint],
         initial_m0: Sequence[dict[str, Any]],
         custom_adversarial: Sequence[FalsificationCase],
+        action_bindings: Sequence[ActionExecutionBinding] = (),
     ) -> list[FalsificationCase]:
         cases: list[FalsificationCase] = list(custom_adversarial)
         m0_by_type = _index_m0_by_type(initial_m0)
@@ -797,7 +987,12 @@ class DifferentialFalsifier:
 
             # Track 2.2: Unauthorized role RBAC probes
             for act in target_act_defs:
-                subj_type, id_param = _primary_subject_for_action(act, ot_by_name)
+                subj_type, id_param = _primary_subject_for_action(
+                    act,
+                    ot_by_name,
+                    action_bindings=action_bindings,
+                    compiled_spec=spec,
+                )
                 if subj_type is None or not m0_by_type.get(subj_type):
                     continue
                 oid, odata = next(iter(sorted(m0_by_type[subj_type].items())))
@@ -818,7 +1013,12 @@ class DifferentialFalsifier:
 
             # Track 2.3: Terminal & incompatible FSM state probes
             for act in target_act_defs:
-                subj_type, id_param = _primary_subject_for_action(act, ot_by_name)
+                subj_type, id_param = _primary_subject_for_action(
+                    act,
+                    ot_by_name,
+                    action_bindings=action_bindings,
+                    compiled_spec=spec,
+                )
                 if subj_type is None or subj_type not in ot_by_name:
                     continue
                 ot = ot_by_name[subj_type]
@@ -866,7 +1066,12 @@ class DifferentialFalsifier:
 
             # Track 2.4: Role-conditional precondition gates (APPROVAL_REQUIRED_*)
             for act in target_act_defs:
-                subj_type, id_param = _primary_subject_for_action(act, ot_by_name)
+                subj_type, id_param = _primary_subject_for_action(
+                    act,
+                    ot_by_name,
+                    action_bindings=action_bindings,
+                    compiled_spec=spec,
+                )
                 if subj_type is None or not m0_by_type.get(subj_type):
                     continue
                 for pre in act.preconditions:
@@ -1185,6 +1390,7 @@ def decompile_and_falsify_driver(
     approver_actor: Actor | None = None,
     max_decompile_rounds: int = 3,
     max_healing_rounds: int = 3,
+    base_specs: Sequence[OntologySpec] = (),
 ) -> DecompileAndFalsifyResult:
     """Closed self-healing loop: DriverDecompilerAgent -> SymbolicCrucible -> DifferentialFalsifier."""
     from .governance import STEWARD_ACTOR
@@ -1215,12 +1421,20 @@ def decompile_and_falsify_driver(
             extra_feedback = dec.final_report.diagnostic_feedback()
             continue
 
+        eff_base_specs = _dedup_ontology_specs(
+            [
+                *getattr(target_blueprint, "_base_specs", ()),
+                *(crucible_context.base_specs if crucible_context is not None else ()),
+                *base_specs,
+            ]
+        )
         report = active_falsifier.evaluate(
             blueprint=dec.effective_blueprint,
             adapter_mapping=dec.adapter_mapping,
             sandbox=sandbox,
             seed_ontology=seed_ontology,
             target_actions=required_actions or None,
+            base_specs=eff_base_specs,
         )
         last_report = report
         if report.verdict == "CORROBORATED":

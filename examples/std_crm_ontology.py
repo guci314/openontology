@@ -14,7 +14,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, compose_blueprints
+from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
 from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
 
 try:
@@ -22,7 +22,6 @@ try:
     from .std_core_ontology import (
         BusinessParty,
         WorkCard,
-        build_std_core_blueprint,
         spec as std_core_spec,
     )
 except ImportError:
@@ -30,7 +29,6 @@ except ImportError:
     from examples.std_core_ontology import (
         BusinessParty,
         WorkCard,
-        build_std_core_blueprint,
         spec as std_core_spec,
     )
 
@@ -218,8 +216,8 @@ spec.update_display(
         "fields": {
             "account_id": "客户账户编码",
             "deal_id": "商机编码",
-            "title": "商机标题",
-            "amount": "预计金额",
+            "title": "标题",
+            "amount": "金额",
             "stage": "商机阶段",
             "loss_reason": "输单原因",
             "ticket_id": "工单编码",
@@ -232,198 +230,12 @@ spec.update_display(
 
 
 def build_std_crm_blueprint() -> DeclarativeBlueprint:
-    """构建标准 CRM 领域声明式蓝图（内部通过 ``compose_blueprints`` 导入核心底座）。"""
-    crm_fragment: dict[str, Any] = {
-        "model_id": "_std_crm_domain_fragment",
-        "version": "1.0.0",
-        "seed_ontology_id": "business_ontology",
-        "object_types": [
-            {
-                "name": "CrmAccount",
-                "archetype": "MasterEntity",
-                "primary_key": "account_id",
-                "title_field": "name",
-                "aggregate_root": True,
-                "owned": False,
-                "display_label": "CRM客户账户",
-                "fields": [
-                    {"name": "account_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "name", "field_type": "str", "required": True},
-                    {"name": "industry", "field_type": "str", "default": ""},
-                    {"name": "status", "field_type": "str", "default": "active"},
-                ],
-                "relations": [
-                    {"field": "party", "target_type": "BusinessParty", "required": True},
-                ],
-            },
-            {
-                "name": "CrmDeal",
-                "archetype": "ProcessDocument",
-                "primary_key": "deal_id",
-                "title_field": "title",
-                "owned": False,
-                "status_field": "stage",
-                "initial_statuses": ["PROSPECTING"],
-                "transitions": {k: list(v) for k, v in _CRM_DEAL_TRANSITIONS.items()},
-                "display_label": "CRM销售商机",
-                "fields": [
-                    {"name": "deal_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "title", "field_type": "str", "required": True},
-                    {"name": "amount", "field_type": "float", "default": 0.0, "non_negative": True},
-                    {"name": "stage", "field_type": "str", "default": "PROSPECTING"},
-                    {"name": "loss_reason", "field_type": "str", "default": ""},
-                ],
-                "relations": [
-                    {"field": "account", "target_type": "CrmAccount", "required": True},
-                ],
-            },
-            {
-                "name": "CrmTicket",
-                "archetype": "ProcessDocument",
-                "primary_key": "ticket_id",
-                "title_field": "subject",
-                "owned": False,
-                "status_field": "status",
-                "initial_statuses": ["OPEN"],
-                "transitions": {k: list(v) for k, v in _CRM_TICKET_TRANSITIONS.items()},
-                "display_label": "CRM客户工单",
-                "fields": [
-                    {"name": "ticket_id", "field_type": "str", "primary_key": True, "required": True},
-                    {"name": "subject", "field_type": "str", "required": True},
-                    {"name": "priority", "field_type": "str", "default": "MEDIUM"},
-                    {"name": "status", "field_type": "str", "default": "OPEN"},
-                    {"name": "resolution_summary", "field_type": "str", "default": ""},
-                ],
-                "relations": [
-                    {"field": "account", "target_type": "CrmAccount", "required": True},
-                ],
-            },
-        ],
-        "actions": [
-            {
-                "name": "win_crm_deal",
-                "display_label": "商机赢单",
-                "description": "将处于报价/谈判阶段的 CRM 商机推进为赢单（CLOSED_WON）。",
-                "allowed_roles": ["sales_rep", "sales_manager", "finance_director", "steward", "ai_agent", "admin"],
-                "params": [
-                    {"name": "deal_id", "field_type": "str", "required": True},
-                ],
-                "preconditions": [
-                    {
-                        "name": "crm_deal_winnable_stage",
-                        "code": "INVALID_DEAL_STAGE",
-                        "target_type": "CrmDeal",
-                        "id_param": "deal_id",
-                        "must_hold": {
-                            "op": "in",
-                            "left": {"ref": "obj.stage"},
-                            "right": {"lit": ["PROPOSAL", "NEGOTIATION"]},
-                        },
-                        "description": "CrmDeal must be in PROPOSAL or NEGOTIATION to win.",
-                    }
-                ],
-                "mutations": [
-                    {
-                        "op": "modify",
-                        "object_type": "CrmDeal",
-                        "id_param": "deal_id",
-                        "set_fields": {"stage": {"lit": "CLOSED_WON"}},
-                    }
-                ],
-            },
-            {
-                "name": "lose_crm_deal",
-                "display_label": "商机输单",
-                "description": "将进行中的 CRM 商机标记为输单（CLOSED_LOST）并记录输单原因。",
-                "allowed_roles": ["sales_rep", "sales_manager", "steward", "ai_agent", "admin"],
-                "params": [
-                    {"name": "deal_id", "field_type": "str", "required": True},
-                    {"name": "loss_reason", "field_type": "str", "default": ""},
-                ],
-                "preconditions": [
-                    {
-                        "name": "crm_deal_losable_stage",
-                        "code": "INVALID_DEAL_STAGE",
-                        "target_type": "CrmDeal",
-                        "id_param": "deal_id",
-                        "must_hold": {
-                            "op": "in",
-                            "left": {"ref": "obj.stage"},
-                            "right": {"lit": ["PROSPECTING", "QUALIFICATION", "PROPOSAL", "NEGOTIATION"]},
-                        },
-                        "description": "CrmDeal must be open before marking CLOSED_LOST.",
-                    }
-                ],
-                "mutations": [
-                    {
-                        "op": "modify",
-                        "object_type": "CrmDeal",
-                        "id_param": "deal_id",
-                        "set_fields": {
-                            "stage": {"lit": "CLOSED_LOST"},
-                            "loss_reason": {"ref": "param.loss_reason"},
-                        },
-                    }
-                ],
-            },
-            {
-                "name": "resolve_crm_ticket",
-                "display_label": "解决客户工单",
-                "description": "将待处理/处理中的客户工单解决为 RESOLVED。",
-                "allowed_roles": ["support_agent", "ops", "steward", "ai_agent", "admin"],
-                "params": [
-                    {"name": "ticket_id", "field_type": "str", "required": True},
-                    {"name": "resolution_summary", "field_type": "str", "default": ""},
-                ],
-                "preconditions": [
-                    {
-                        "name": "crm_ticket_resolvable_status",
-                        "code": "INVALID_TICKET_STATUS",
-                        "target_type": "CrmTicket",
-                        "id_param": "ticket_id",
-                        "must_hold": {
-                            "op": "in",
-                            "left": {"ref": "obj.status"},
-                            "right": {"lit": ["OPEN", "IN_PROGRESS"]},
-                        },
-                        "description": "CrmTicket must be OPEN or IN_PROGRESS to resolve.",
-                    }
-                ],
-                "mutations": [
-                    {
-                        "op": "modify",
-                        "object_type": "CrmTicket",
-                        "id_param": "ticket_id",
-                        "set_fields": {
-                            "status": {"lit": "RESOLVED"},
-                            "resolution_summary": {"ref": "param.resolution_summary"},
-                        },
-                    }
-                ],
-            },
-        ],
-        "display": {
-            "ontologies": {
-                "std_crm_ontology": "标准 CRM 领域本体（账户·商机·工单）",
-            },
-            "objects": {
-                "CrmAccount": "CRM客户账户",
-                "CrmDeal": "CRM销售商机",
-                "CrmTicket": "CRM客户工单",
-            },
-            "actions": {
-                "win_crm_deal": "商机赢单",
-                "lose_crm_deal": "商机输单",
-                "resolve_crm_ticket": "解决客户工单",
-            },
-        },
-    }
-    composed = compose_blueprints(
-        [build_std_core_blueprint(), crm_fragment],
+    """将 ``std_crm_ontology`` 唯一源码本体投影为标准 CRM 领域声明式蓝图。"""
+    return export_spec_blueprint(
+        spec,
         model_id="std_crm_ontology",
         version="1.0.0",
         seed_ontology_id="business_ontology",
+        imports=("std_core_ontology",),
         description="标准 CRM 领域本体蓝图：在核心底座上组合客户账户、商机与客服工单骨架。",
     )
-    composed.imports = ["std_core_ontology"]
-    return composed

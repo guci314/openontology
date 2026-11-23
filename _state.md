@@ -4,7 +4,19 @@
 
 ---
 
-## 最新执行检查点（2026-11-22 · 里程碑 WO-13 ~ WO-21 + WO-18 全栈收官：`ec29958`）
+## 最新执行检查点（2026-11-23 · 里程碑 WO-26 + WO-27A + WO-27B 动力学三分法与单一源码重构）
+
+* **演进脉络**：在 `ec29958` 之上完成 `WO-26`（`console_server.py` + `web/` 现代四视角指挥台）、`WO-27A`（`4709857`：动力学三分法 `FunctionDef` / `EditFunctionDef` / `ActionDef`、彻底退役旧动作装饰器、`apply_overlay_to_spec` 与 **Gate 8**）与 **`WO-27B`**（单一源码标准领域蓝图投影 `export_spec_blueprint`、定制插件与零补丁世界模型）。
+* **WO-27A / WO-27B 核心交付**：
+  1. **动力学三分法与单一源码投影（`dsl.py` / `crucible.py` / `falsifier.py` / `design.py`）**：`export_spec_blueprint(spec, ...)` 直接由 Python `OntologySpec` 投影声明式蓝图；`compose_blueprints` / `compile_blueprint` / `SymbolicCrucible` / `DifferentialFalsifier` / `open_ontology.design` 全链路保留 `_base_specs` 底层图灵完备 `@spec.edit_function` / `@spec.function` / `@spec.invariant`。
+  2. **淘汰 7 大标准领域双写 JSON 蓝图**：`examples/std_{core,crm,o2c,p2p,p2m,r2r,h2r}_ontology.py` 全部改为 `export_spec_blueprint(spec, ...)` 薄封装（`open_ontology/runtime.py` 保持 **0 行 diff / 1,328 行**）；`examples/std_enterprise_world_model.py`（`build_org_rls_enterprise_spec`）与 `examples/adapters/erp_world_mount.py` 消除 `_attach_standard_functions` 运行期动态补丁；`apply_overlay_to_spec` 支持 `custom_edit_functions` / `custom_functions` / `custom_invariants` 单调插件与规则动作收紧守卫。
+* **全量离线回归与双 ERP 实证**：
+  - Python 3.13 离线全量回归 `/Users/guci/miniforge3/bin/python3 -m pytest --ignore=tests/test_agent_value_mcts.py -k "not odoo and not camel and not jsherp and not video_artifact_quality and not test_group_" -q` -> **`697 passed, 6 skipped, 81 deselected`**；
+  - `tests/test_kinetic_split_and_overlay_on_spec.py` + `tests/test_std_world_model_domains.py` + `tests/test_wo24c_dual_erp_adapters.py`（含真实 Odoo 19 & 华夏 ERP 联调）-> **`37 passed`**。
+
+---
+
+## 历史执行检查点（2026-11-22 · 里程碑 WO-13 ~ WO-21 + WO-18 全栈收官：`ec29958`）
 
 * **基线版本**：`main` 本地已收口提交至 `ec29958afd9b7fcfd8df92f1db641f95bd801751`（`WO-13` ～ `WO-21` + `WO-18` 全部独立验收 PASS，待本轮 `WO-22` 活文档对齐验收后统一 `git push origin main` 并启动 `WO-23`）。
 * **核心成果（Pure Runtime 10 模块 JVM 核 + 5 大零耦合生产运行壳 + 双异构真实 ERP × 国产模型全栈实证）**：
@@ -108,9 +120,10 @@
   * **`open_ontology/mdm_plugin.py`（353 行）**：`MDMSidecarPlugin` 零内核污染跨系统增量 L0–L4 主数据协调插件。
 * **Design-Time 编译与波普尔证伪工具链（对 Runtime 零例外物理不可见）**：
   * **`open_ontology/design.py`**：`python -m open_ontology.design check | verify` 确定性命令行裁判，含只读 `?mode=ro` SQLite 画像探测、`DeclarativeSQLiteDriverBridge` 及隔离沙箱复验；
-  * **`open_ontology/induction/`**（`dsl.py`、`resolution.py`、`phenomenon.py`、`crucible.py`、`falsifier.py`、`decompiler.py` 等）：零 `exec` 声明式蓝图/单调 `CustomerOverlay`/闭集角色、`L0–L4 CrosswalkTable` 四级实体解析、五关 `SymbolicCrucible`、覆盖率驱动 `DifferentialFalsifier`；
+  * **`open_ontology/induction/`**（`dsl.py`、`resolution.py`、`phenomenon.py`、`crucible.py`、`falsifier.py`、`decompiler.py` 等）：单一源码投影 `export_spec_blueprint`、直接面向 `OntologySpec` 的只增不破叠加 `apply_overlay_to_spec`（支持 `overlay.json + custom_edits.py` 客户 `EditFunctionDef` / `FunctionDef` / `InvariantDef` 插件）、`L0–L4 CrosswalkTable`、五关 `SymbolicCrucible`、覆盖率驱动 `DifferentialFalsifier`；
   * **`skills/openontology-fde/SKILL.md`**：隔离只读工作区 AI-FDE（`agy` / `opencode` CLI）反编译工程规程。
 * **显式按需导入扩展模块**：
+  * **`open_ontology/console_server.py`（`WO-26`）**：现代四视角指挥台 API/交互壳层，服务化驱动 `web/`（Model / Runtime / World / Device、沙盘预演冲正与 H2R/RLS 隔离演示）；
   * **`open_ontology/mcts.py` & `mpc.py`**：`OntologyMCTSPlanner`（反事实 `fork()` 前瞻树搜索）与 `ClosedLoopMPCController`（滚动时域闭环规划）；
   * **`open_ontology/workspaces.py`**：工作空间身份清单、`not_loaded` 目录呈现与通用 `takeover_workspace`；
   * **`open_ontology/model_views.py`**：从 `.osdk` 复用 `describe_tbox` / `resolve_scoped_names`，并提供 `describe_behavior` / `describe_openapi`；
@@ -142,17 +155,17 @@
   * 华夏 ERP（`docker/jsherp/`，`http://127.0.0.1:19999/jshERP-boot`）：国产开源 ERP 集成与 AI-FDE 盲考靶场；
   * Odoo 19（`http://localhost:8069`）：保留 `['erp_north', 'erp_south', 'odoo_demo']` 三库供 O2C / 双 ERP / 全栈双企联调回归使用；
   * 作战台服务可按需通过 `open_ontology.workshop.start_workshop_server` 拉起（`/topology?model=<id>`）。
-* **全量离线回归基线（`ec29958`）**：
+* **全量离线回归基准（`WO-27B`）**：
   ```bash
-  /Users/guci/miniforge3/bin/pytest --ignore=tests/test_agent_value_mcts.py -k "not odoo and not camel and not jsherp and not video_artifact_quality" -q
+  /Users/guci/miniforge3/bin/python3 -m pytest --ignore=tests/test_agent_value_mcts.py -k "not odoo and not camel and not jsherp and not video_artifact_quality and not test_group_" -q
   ```
-  当前收官验收通过 **`650 passed, 6 skipped, 63 deselected`**（`0 failures`），另有 Python 3.11.15 & 3.13.12 7 文件核心/生产壳/双企实验室套件 **38/38 passed**，覆盖 **Gate 1–7** 零例外边界门禁、`OntologyMCPServer`、`AutonomyRampController`、`SagaReconciler`、`open_postgres_runtime`、`MDMSidecarPlugin` & 钢厂插件、`live_b2b_steel_trade_lab` 4 场景、Odoo 19 & 华夏 ERP 集成以及文档防漂移门禁（`tests/test_docs_consistency.py`）。
+  离线回归实测 **`697 passed, 6 skipped, 81 deselected`**（`0 failures`），覆盖 **Gate 1–8** 零例外边界门禁、动力学三分法与单一源码插件（`tests/test_kinetic_split_and_overlay_on_spec.py`）、`OntologyMCPServer`、`AutonomyRampController`、`SagaReconciler`、`open_postgres_runtime`、`MDMSidecarPlugin` & 钢厂插件、`live_b2b_steel_trade_lab` 4 场景、Odoo 19 & 华夏 ERP 集成以及文档防漂移门禁（`tests/test_docs_consistency.py`）。
 
 ---
 
 ## 3. 架构与工程纪律红线（不可违背）
 
-1. **Pure Runtime 与 M2 纯洁性铁笼（Gate 1–7）**：`open_ontology/runtime.py <= 1,335` 行（现 `1,328` 行），`import open_ontology` 严格收口至 10 模块白名单，零 `__getattr__` 后门；Gate 6 禁止加载任何设计期/生产壳/`psycopg`/UI/规划扩展；Gate 7 禁止 `examples/std_*_ontology.py` 横向交叉导入；`ui_display.json`、`workshop.py`/`workshop_ui.py` 严禁业务词汇或私有字段泄漏。
+1. **Pure Runtime 与 M2 纯洁性铁笼（Gate 1–8）**：`open_ontology/runtime.py <= 1,335` 行（现 `1,328` 行），`import open_ontology` 严格收口至 10 模块白名单，零 `__getattr__` 后门；Gate 6 禁止加载任何设计期/生产壳/`psycopg`/UI/`console_server`/规划扩展；Gate 7 禁止 `examples/std_*_ontology.py` 横向交叉导入；Gate 8 锁死动力学三分法（`FunctionDef` / `EditFunctionDef` / `ActionDef`）正交隔离与声明式 DSL 反 xtUML 纯洁性；`ui_display.json`、`workshop.py`/`workshop_ui.py` 严禁业务词汇或私有字段泄漏。
 2. **Design-Time 选手/裁判物理隔离**：外部 AI-FDE（`agy` CLI）严禁修改只读输入、样本源文件（如 `vendor_crm/bottlecrm.sqlite3`）或裁判脚本，产物一律经过 `open_ontology.design check | verify` 证伪并满足覆盖率阈值后方可签发。
 3. **双模型协同与证据原则**：主控架构师只做顶层建模、计划设计与独立审计；执行侧遵循实证输出，文档与 `_state.md` 严禁遗留已退役架构符号与过期基线数字。
 

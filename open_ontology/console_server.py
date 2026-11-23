@@ -1361,18 +1361,26 @@ class ConsoleService:
             target_act = self.runtime.spec.actions.get(intent_action) if intent_action else None
             needs_followup = False
             if is_accept and item_kind == "APPROVAL" and target_act is not None and isinstance(intent_params, dict):
-                sim_accept = self.runtime.simulate_action(op_name, base_params, actor)
+                preflight_params = (
+                    {**base_params, wb.settled_run_param: "PREFLIGHT"}
+                    if (target_act.affects_source and wb.settled_run_param)
+                    else base_params
+                )
+                sim_accept = self.runtime.simulate_action(op_name, preflight_params, actor)
                 if not sim_accept.valid:
                     return self._rejected_resolution(op_name, run_id, sim_accept.error_code, sim_accept.error)
                 if target_act.affects_source:
                     # Source-coupled approvals settle the intent first, then finalize queue item with settled_run_id
                     act_rid = f"WQ-ACT-{uuid.uuid4().hex[:12]}"
-                    settled_run = self.runtime.submit_action(act_rid, intent_action, intent_params, actor)
-                    comp_params = {
-                        **base_params,
-                        wb.settled_run_param: str(settled_run.get("run_id", act_rid)),
-                    }
-                    comp_run = self.runtime.submit_action(run_id, op_name, comp_params, actor)
+                    try:
+                        settled_run = self.runtime.submit_action(act_rid, intent_action, intent_params, actor)
+                        comp_params = {
+                            **base_params,
+                            wb.settled_run_param: str(settled_run.get("run_id", act_rid)),
+                        }
+                        comp_run = self.runtime.submit_action(run_id, op_name, comp_params, actor)
+                    except InvariantError as exc:
+                        return self._rejected_resolution(intent_action, run_id, exc.code, str(exc))
                     return self._committed_resolution(op_name, comp_run, follow_up_run=settled_run)
 
                 touched_non_queue = any(
