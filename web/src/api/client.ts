@@ -448,6 +448,7 @@ export interface BlueprintEntityMeta {
   name: string;
   display_label: string;
   description: string;
+  extends?: string | null;
   primary_key: string;
   status_field: string | null;
   initial_statuses: string[];
@@ -468,6 +469,8 @@ export interface BlueprintLinkMeta {
   target: string;
   cardinality: string;
   cardinality_label: string;
+  min_cardinality?: number;
+  max_cardinality?: number | null;
   inverse_name?: string | null;
   description: string;
 }
@@ -544,6 +547,7 @@ export interface BlueprintResponse {
   blueprint_fingerprint: string;
   summary: BlueprintSummary;
   object_types: BlueprintEntityMeta[];
+  disjoint_types?: Array<[string, string]>;
   links: BlueprintLinkMeta[];
   actions: BlueprintActionMeta[];
   edit_functions: BlueprintEditFunctionMeta[];
@@ -601,7 +605,33 @@ export interface BlueprintRedundantRuleFinding {
   elapsed_ms: number;
 }
 
+export interface BlueprintClassProof {
+  object_type: string;
+  display_label?: string;
+  extends?: string | null;
+  extends_display_label?: string | null;
+  status:
+    | 'SATISFIABLE'
+    | 'UNSATISFIABLE_CLASS'
+    | 'DL_AXIOM_CONFLICT'
+    | 'LSP_VIOLATION'
+    | 'UNKNOWN';
+  logic_fragment: string;
+  inherited_invariants: string[];
+  own_invariants: string[];
+  unsat_core: string[];
+  unsat_core_labels?: string[];
+  detail: string;
+  witness?: Record<string, unknown> | null;
+  elapsed_ms: number;
+}
+
 export interface BlueprintProveSummary {
+  total_classes?: number;
+  satisfiable_classes?: number;
+  dead_class_count?: number;
+  dl_conflict_count?: number;
+  lsp_violation_count?: number;
   total_actions: number;
   reachable_actions: number;
   deadlocked_actions: number;
@@ -625,6 +655,7 @@ export interface BlueprintProveResponse {
   elapsed_ms?: number;
   blueprint_fingerprint?: string;
   summary?: BlueprintProveSummary;
+  class_proofs?: BlueprintClassProof[];
   action_proofs?: BlueprintActionProof[];
   invariant_proofs?: BlueprintInvariantProof[];
   redundant_rules?: BlueprintRedundantRuleFinding[];

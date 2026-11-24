@@ -1104,6 +1104,12 @@ class ConsoleService:
 
             bp, spec_name, spec_version, bp_fp = self._export_runtime_blueprint(display)
             bp_actions = {act_bp.name: act_bp for act_bp in bp.actions}
+            bp_ot_map = {ot_bp.name: ot_bp for ot_bp in bp.object_types}
+            bp_rel_map = {
+                (ot_bp.name, rel.field): rel
+                for ot_bp in bp.object_types
+                for rel in ot_bp.relations
+            }
 
             scoped_tbox = describe_tbox(self.runtime.spec, actor=actor)
             scoped_type_names = {ot["name"] for ot in scoped_tbox["object_types"]}
@@ -1314,6 +1320,7 @@ class ConsoleService:
                         "name": ot_name,
                         "display_label": str(obj_labels.get(ot_name) or ot_name),
                         "description": clean_doc,
+                        "extends": bp_ot_map[ot_name].extends if ot_name in bp_ot_map else None,
                         "primary_key": str(ot["primary_key"]),
                         "status_field": status_field,
                         "initial_statuses": initial_statuses,
@@ -1346,15 +1353,19 @@ class ConsoleService:
                     or fname
                     or pname
                 )
+                src_name = str(prop.get("domain", ""))
+                rel_meta = bp_rel_map.get((src_name, fname))
                 links_out.append(
                     {
                         "name": pname,
                         "field": fname,
                         "display_label": str(raw_label),
-                        "source": str(prop.get("domain", "")),
+                        "source": src_name,
                         "target": str(prop.get("range", "")),
                         "cardinality": card,
                         "cardinality_label": str(card_labels.get(card, card)),
+                        "min_cardinality": int(rel_meta.min_cardinality) if rel_meta is not None else 0,
+                        "max_cardinality": rel_meta.max_cardinality if rel_meta is not None else None,
                         "inverse_name": prop.get("inverse_name"),
                         "description": str(prop.get("description") or ""),
                     }
@@ -1388,6 +1399,7 @@ class ConsoleService:
                     "fsm_object_count": fsm_object_count,
                 },
                 "object_types": object_types_out,
+                "disjoint_types": [[a, b] for a, b in bp.disjoint_types],
                 "links": links_out,
                 "actions": actions_out,
                 "edit_functions": edit_functions_out,
@@ -1426,6 +1438,7 @@ class ConsoleService:
 
         with self._lock:
             display = self._merged_display()
+            obj_labels = display.get("objects") or {}
             act_labels = display.get("actions") or {}
             inv_labels = display.get("invariants") or {}
             declared_invs = self._collect_invariants(display)
@@ -1441,6 +1454,10 @@ class ConsoleService:
                 1 for p in report.invariant_preservation if p.status == "PROVED"
             )
             violated_invariants = report.invariant_violation_count
+            total_classes = len(report.class_proofs)
+            satisfiable_classes = sum(
+                1 for c in report.class_proofs if c.status == "SATISFIABLE"
+            )
 
             frag_counts = dict(report.logic_fragment_counts)
             total_frags = sum(frag_counts.values())
@@ -1453,6 +1470,21 @@ class ConsoleService:
                 round(exact_frags / total_frags, 4) if total_frags > 0 else 1.0
             )
 
+            class_proofs = [
+                {
+                    **item.model_dump(mode="json"),
+                    "display_label": str(obj_labels.get(item.object_type) or item.object_type),
+                    "extends_display_label": (
+                        str(obj_labels.get(item.extends) or item.extends)
+                        if item.extends
+                        else None
+                    ),
+                    "unsat_core_labels": [
+                        str(inv_labels.get(n) or n) for n in item.unsat_core
+                    ],
+                }
+                for item in report.class_proofs
+            ]
             action_proofs = [
                 {
                     **item.model_dump(mode="json"),
@@ -1496,6 +1528,9 @@ class ConsoleService:
                     report.ok
                     and deadlocked_actions == 0
                     and violated_invariants == 0
+                    and report.dead_class_count == 0
+                    and report.dl_conflict_count == 0
+                    and report.lsp_violation_count == 0
                 )
                 else "ISSUES_FOUND"
             )
@@ -1508,6 +1543,11 @@ class ConsoleService:
                 "elapsed_ms": report.elapsed_ms,
                 "blueprint_fingerprint": report.blueprint_fingerprint,
                 "summary": {
+                    "total_classes": total_classes,
+                    "satisfiable_classes": satisfiable_classes,
+                    "dead_class_count": report.dead_class_count,
+                    "dl_conflict_count": report.dl_conflict_count,
+                    "lsp_violation_count": report.lsp_violation_count,
                     "total_actions": report.total_actions_checked,
                     "reachable_actions": reachable_actions,
                     "deadlocked_actions": deadlocked_actions,
@@ -1519,6 +1559,7 @@ class ConsoleService:
                     "exact_linear_ratio": exact_linear_ratio,
                     "fragment_counts": frag_counts,
                 },
+                "class_proofs": class_proofs,
                 "action_proofs": action_proofs,
                 "invariant_proofs": invariant_proofs,
                 "redundant_rules": redundant_rules,

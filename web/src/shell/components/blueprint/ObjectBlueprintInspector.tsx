@@ -60,6 +60,14 @@ export const ObjectBlueprintInspector: React.FC<ObjectBlueprintInspectorProps> =
               <code className="rounded-md bg-slate-100 px-2 py-0.5 font-mono text-xs font-semibold text-slate-700">
                 {entity.name}
               </code>
+              {entity.extends && (
+                <span
+                  data-testid="blueprint-extends-badge"
+                  className="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-800"
+                >
+                  继承自 {display?.objects?.[entity.extends] || entity.extends}
+                </span>
+              )}
             </div>
             {entity.description && (
               <p className="mt-1 text-xs text-slate-500">{entity.description}</p>

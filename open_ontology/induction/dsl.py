@@ -156,7 +156,49 @@ class RelationSpec(BaseModel):
     multiple: bool = False
     owned: bool = False
     required: bool = False
+    min_cardinality: int = 0
+    max_cardinality: int | None = None
     description: str = ""
+
+    @field_validator("min_cardinality")
+    @classmethod
+    def _check_min_cardinality_non_neg(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"min_cardinality must be >= 0, got {v}")
+        return int(v)
+
+    @field_validator("max_cardinality")
+    @classmethod
+    def _check_max_cardinality_non_neg(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError(f"max_cardinality must be >= 0 or None, got {v}")
+        return int(v) if v is not None else None
+
+
+def _effective_relation_bounds(rel: RelationSpec) -> tuple[int, int | None]:
+    """Return effective closed-world (min_cardinality, max_cardinality) for a relation."""
+    eff_min = max(int(rel.min_cardinality), 1 if rel.required else 0)
+    if not rel.multiple:
+        eff_max: int | None = rel.max_cardinality if rel.max_cardinality is not None else 1
+    else:
+        eff_max = rel.max_cardinality
+    return eff_min, eff_max
+
+
+def _relation_cardinality_issue(ot_name: str, rel: RelationSpec) -> str | None:
+    """Return an error detail string if RelationSpec bounds are locally contradictory."""
+    eff_min, eff_max = _effective_relation_bounds(rel)
+    if not rel.multiple and rel.max_cardinality is not None and rel.max_cardinality > 1:
+        return (
+            f"single-valued relation {ot_name}.{rel.field} cannot declare "
+            f"max_cardinality={rel.max_cardinality} > 1"
+        )
+    if eff_max is not None and eff_min > eff_max:
+        return (
+            f"relation {ot_name}.{rel.field} has contradictory bounds "
+            f"min={eff_min} > max={eff_max}"
+        )
+    return None
 
 
 _DEFAULT_STANDALONE_ARCHETYPES: frozenset[str] = frozenset({"ObjectType"})
@@ -166,6 +208,7 @@ class ObjectTypeBlueprint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    extends: str | None = None
     archetype: str = "ObjectType"
     primary_key: str = "id"
     title_field: str | None = None
@@ -173,6 +216,7 @@ class ObjectTypeBlueprint(BaseModel):
     append_only: bool | None = None
     owned: bool | dict[str, Any] = False
     fields: list[FieldSpec] = Field(default_factory=list)
+    exclude_fields: list[str] = Field(default_factory=list)
     relations: list[RelationSpec] = Field(default_factory=list)
     status_field: str = "status"
     initial_statuses: list[str] | None = None
@@ -180,6 +224,17 @@ class ObjectTypeBlueprint(BaseModel):
     voucher_delta_rules: dict[str, tuple[str, str, str]] = Field(default_factory=dict)
     view_tags: list[str] = Field(default_factory=list)
     display_label: str = ""
+
+    @field_validator("extends")
+    @classmethod
+    def _check_extends_identifier(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v_clean = str(v).strip()
+        if not v_clean:
+            raise ValueError("extends must not be empty string")
+        _assert_safe_identifier(v_clean, "extends")
+        return v_clean
 
 
 class FieldMigrationSpec(BaseModel):
@@ -210,6 +265,21 @@ class InvariantRuleSpec(BaseModel):
         return None if v == {} else v
 
 
+def _normalize_disjoint_pairs(v: Any) -> list[tuple[str, str]]:
+    if v is None:
+        return []
+    if not isinstance(v, (list, tuple)):
+        raise ValueError("disjoint_types must be a list of 2-element type pairs")
+    out: list[tuple[str, str]] = []
+    for item in v:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f"each disjoint_types entry must be a 2-tuple, got {item!r}")
+        a = _assert_safe_identifier(str(item[0]), "disjoint_types[0]")
+        b = _assert_safe_identifier(str(item[1]), "disjoint_types[1]")
+        out.append((a, b))
+    return out
+
+
 class ActionMutationSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -217,7 +287,13 @@ class ActionMutationSpec(BaseModel):
     object_type: str
     id_param: str = "id"
     target_ref: str | None = None
+    when: dict[str, Any] | None = None
     set_fields: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("when", mode="before")
+    @classmethod
+    def _empty_when_to_none(cls, v: Any) -> Any:
+        return None if v == {} else v
 
 
 class ActionBlueprint(BaseModel):
@@ -270,11 +346,14 @@ class DeclarativeBlueprint(BaseModel):
     roles: list[str] = Field(default_factory=list)
     description: str = ""
     object_types: list[ObjectTypeBlueprint] = Field(default_factory=list)
+    disjoint_types: list[tuple[str, str]] = Field(default_factory=list)
     actions: list[ActionBlueprint] = Field(default_factory=list)
     invariants: list[InvariantRuleSpec] = Field(default_factory=list)
     migrations: list[FieldMigrationSpec] = Field(default_factory=list)
     views: list[ScopedViewBlueprint] = Field(default_factory=list)
     display: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    _normalize_disjoint = field_validator("disjoint_types", mode="before")(_normalize_disjoint_pairs)
 
     _base_specs: tuple[OntologySpec, ...] = PrivateAttr(default=())
 
@@ -385,7 +464,11 @@ class CustomerOverlaySpec(BaseModel):
     description: str = ""
     add_roles: list[str] = Field(default_factory=list)
     add_object_types: list[ObjectTypeBlueprint] = Field(default_factory=list)
+    derive_object_types: list[ObjectTypeBlueprint] = Field(default_factory=list)
+    add_disjoint_types: list[tuple[str, str]] = Field(default_factory=list)
     add_fields: dict[str, list[FieldSpec]] = Field(default_factory=dict)
+
+    _normalize_add_disjoint = field_validator("add_disjoint_types", mode="before")(_normalize_disjoint_pairs)
     add_relations: dict[str, list[RelationSpec]] = Field(default_factory=dict)
     update_transitions: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
     add_actions: list[ActionBlueprint] = Field(default_factory=list)
@@ -1077,6 +1160,507 @@ def _dedup_specs(specs: Sequence[OntologySpec]) -> tuple[OntologySpec, ...]:
     return tuple(out)
 
 
+def _merge_disjoint_pairs(*groups: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for grp in groups:
+        for raw_pair in grp:
+            a, b = str(raw_pair[0]), str(raw_pair[1])
+            pair = (a, b)
+            if pair not in seen:
+                seen.add(pair)
+                out.append(pair)
+    return out
+
+
+def _toposort_and_resolve_inheritance(
+    object_types: Sequence[ObjectTypeBlueprint],
+    *,
+    extra_known_parents: Mapping[str, ObjectTypeBlueprint] | None = None,
+) -> tuple[list[ObjectTypeBlueprint], dict[str, tuple[str, ...]]]:
+    """Topologically sort object types and validate/resolve monotonic ``extends`` subtyping."""
+    local_by_name: dict[str, ObjectTypeBlueprint] = {}
+    for ot in object_types:
+        _assert_safe_identifier(ot.name, "object type")
+        if ot.name in local_by_name:
+            raise InvariantError(
+                f"duplicate object type {ot.name!r}",
+                code="DUPLICATE_OBJECT_TYPE",
+            )
+        local_by_name[ot.name] = ot
+
+    known_parents: dict[str, ObjectTypeBlueprint] = dict(extra_known_parents or {})
+
+    # 1. Cycle detection & unknown-parent check
+    state: dict[str, int] = {}  # 0=unvisited, 1=visiting, 2=done
+    topo_names: list[str] = []
+
+    def _visit(name: str, trail: list[str]) -> None:
+        st = state.get(name, 0)
+        if st == 2:
+            return
+        if st == 1:
+            cycle_str = " -> ".join([*trail, name])
+            raise InvariantError(
+                f"inheritance cycle detected: {cycle_str} [INHERITANCE_CYCLE]",
+                code="INHERITANCE_CYCLE",
+            )
+        state[name] = 1
+        ot_obj = local_by_name[name]
+        parent_name = ot_obj.extends
+        if parent_name is not None:
+            if parent_name == name:
+                raise InvariantError(
+                    f"self-inheritance cycle detected on {name!r} [INHERITANCE_CYCLE]",
+                    code="INHERITANCE_CYCLE",
+                )
+            if parent_name in local_by_name:
+                _visit(parent_name, [*trail, name])
+            elif parent_name not in known_parents:
+                raise InvariantError(
+                    f"object type {name!r} extends unknown object type {parent_name!r}",
+                    code="UNKNOWN_OBJECT_TYPE",
+                )
+        state[name] = 2
+        topo_names.append(name)
+
+    for ot in object_types:
+        _visit(ot.name, [])
+
+    # 2. Compute strict ancestor chains
+    ancestors_map: dict[str, tuple[str, ...]] = {}
+    for pname, pot in known_parents.items():
+        chain: list[str] = []
+        cur = pot.extends
+        seen_anc: set[str] = {pname}
+        while cur is not None and cur not in seen_anc:
+            seen_anc.add(cur)
+            chain.append(cur)
+            nxt = known_parents.get(cur)
+            cur = nxt.extends if nxt is not None else None
+        ancestors_map[pname] = tuple(chain)
+
+    for name in topo_names:
+        parent_name = local_by_name[name].extends
+        if parent_name is None:
+            ancestors_map[name] = ()
+        else:
+            ancestors_map[name] = (parent_name, *ancestors_map.get(parent_name, ()))
+
+    # 3. Resolve monotonic inheritance in topological order
+    resolved_by_name: dict[str, ObjectTypeBlueprint] = {
+        k: copy.deepcopy(v) for k, v in known_parents.items()
+    }
+    resolved_list: list[ObjectTypeBlueprint] = []
+
+    for name in topo_names:
+        raw_ot = local_by_name[name]
+        if raw_ot.exclude_fields:
+            raise InvariantError(
+                f"object type {name!r} cannot exclude fields {raw_ot.exclude_fields} [LSP_VIOLATION]",
+                code="LSP_VIOLATION",
+            )
+        for rel in raw_ot.relations:
+            issue = _relation_cardinality_issue(name, rel)
+            if issue is not None:
+                raise InvariantError(f"{issue} [DL_CARDINALITY_CONFLICT]", code="DL_CARDINALITY_CONFLICT")
+
+        if raw_ot.extends is None:
+            cloned = copy.deepcopy(raw_ot)
+            resolved_by_name[name] = cloned
+            resolved_list.append(cloned)
+            continue
+
+        parent = resolved_by_name[raw_ot.extends]
+        sub_field_names = {sf.name for sf in raw_ot.fields}
+        pk_explicit = (
+            "primary_key" in raw_ot.model_fields_set
+            and raw_ot.primary_key != parent.primary_key
+            and (raw_ot.primary_key != "id" or "id" in sub_field_names)
+        )
+        if pk_explicit:
+            raise InvariantError(
+                f"subtype {name!r} cannot override parent {parent.name!r} primary_key "
+                f"{parent.primary_key!r} with {raw_ot.primary_key!r} [LSP_VIOLATION]",
+                code="LSP_VIOLATION",
+            )
+        for sf in raw_ot.fields:
+            if sf.primary_key and sf.name != parent.primary_key:
+                raise InvariantError(
+                    f"subtype {name!r} cannot declare different primary_key field {sf.name!r} "
+                    f"(parent {parent.name!r} uses {parent.primary_key!r}) [LSP_VIOLATION]",
+                    code="LSP_VIOLATION",
+                )
+        resolved_pk = parent.primary_key
+
+        status_explicit = (
+            "status_field" in raw_ot.model_fields_set
+            and raw_ot.status_field != parent.status_field
+            and (raw_ot.status_field != "status" or "status" in sub_field_names)
+        )
+        if status_explicit:
+            raise InvariantError(
+                f"subtype {name!r} cannot override parent {parent.name!r} status_field "
+                f"{parent.status_field!r} with {raw_ot.status_field!r} [LSP_VIOLATION]",
+                code="LSP_VIOLATION",
+            )
+        resolved_status_field = parent.status_field
+
+        if parent.append_only is True and raw_ot.append_only is False:
+            raise InvariantError(
+                f"subtype {name!r} cannot drop append_only=True from parent {parent.name!r} [LSP_VIOLATION]",
+                code="LSP_VIOLATION",
+            )
+        resolved_append_only = (
+            raw_ot.append_only if raw_ot.append_only is not None else parent.append_only
+        )
+        resolved_agg = (
+            raw_ot.aggregate_root if raw_ot.aggregate_root is not None else parent.aggregate_root
+        )
+        resolved_arch = (
+            raw_ot.archetype
+            if ("archetype" in raw_ot.model_fields_set and raw_ot.archetype != "ObjectType")
+            else parent.archetype
+        )
+        resolved_title = raw_ot.title_field if raw_ot.title_field is not None else parent.title_field
+
+        # Fields LSP merge
+        parent_fields = {f.name: f for f in parent.fields}
+        merged_fields: list[FieldSpec] = [copy.deepcopy(f) for f in parent.fields]
+        merged_idx = {f.name: idx for idx, f in enumerate(merged_fields)}
+        for sf in raw_ot.fields:
+            _assert_safe_identifier(sf.name, "field name")
+            if sf.name in parent_fields:
+                pf = parent_fields[sf.name]
+                if sf.field_type != pf.field_type:
+                    raise InvariantError(
+                        f"subtype {name!r} re-types parent field {sf.name!r} from "
+                        f"{pf.field_type!r} to {sf.field_type!r} [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                if pf.required and not sf.required and "required" in sf.model_fields_set:
+                    raise InvariantError(
+                        f"subtype {name!r} weakens required constraint on {sf.name!r} [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                if pf.non_negative and not sf.non_negative and "non_negative" in sf.model_fields_set:
+                    raise InvariantError(
+                        f"subtype {name!r} weakens non_negative constraint on {sf.name!r} [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                if pf.primary_key and not sf.primary_key and "primary_key" in sf.model_fields_set:
+                    raise InvariantError(
+                        f"subtype {name!r} drops primary_key flag on {sf.name!r} [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                tightened = FieldSpec(
+                    name=pf.name,
+                    field_type=pf.field_type,
+                    default=sf.default if "default" in sf.model_fields_set else pf.default,
+                    required=bool(pf.required or sf.required),
+                    primary_key=bool(pf.primary_key),
+                    auto_id=bool(pf.auto_id or sf.auto_id),
+                    owned=bool(pf.owned or sf.owned),
+                    masked_roles=tuple(dict.fromkeys([*pf.masked_roles, *sf.masked_roles])),
+                    non_negative=bool(pf.non_negative or sf.non_negative),
+                    description=sf.description or pf.description,
+                )
+                merged_fields[merged_idx[sf.name]] = tightened
+            else:
+                merged_idx[sf.name] = len(merged_fields)
+                merged_fields.append(copy.deepcopy(sf))
+
+        # Relations LSP merge
+        parent_rels = {r.field: r for r in parent.relations}
+        merged_rels: list[RelationSpec] = [copy.deepcopy(r) for r in parent.relations]
+        merged_rel_idx = {r.field: idx for idx, r in enumerate(merged_rels)}
+        for sr in raw_ot.relations:
+            _assert_safe_identifier(sr.field, "relation field")
+            if sr.field in parent_rels:
+                pr = parent_rels[sr.field]
+                if not pr.multiple and sr.multiple:
+                    raise InvariantError(
+                        f"subtype {name!r} relaxes single-valued relation {sr.field!r} to multiple=True [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                target_ok = (
+                    sr.target_type == pr.target_type
+                    or pr.target_type in ancestors_map.get(sr.target_type, ())
+                )
+                if not target_ok:
+                    raise InvariantError(
+                        f"subtype {name!r} widens relation {sr.field!r} target from "
+                        f"{pr.target_type!r} to unrelated {sr.target_type!r} [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                p_min, p_max = _effective_relation_bounds(pr)
+                req_set = "required" in sr.model_fields_set
+                min_set = "min_cardinality" in sr.model_fields_set
+                max_set = "max_cardinality" in sr.model_fields_set
+                if pr.required and req_set and not sr.required:
+                    raise InvariantError(
+                        f"subtype {name!r} drops required=True on relation {sr.field!r} [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                eff_sub_req = bool(pr.required or sr.required)
+                eff_sub_min_raw = int(sr.min_cardinality) if min_set else int(pr.min_cardinality)
+                eff_sub_min = max(eff_sub_min_raw, 1 if eff_sub_req else 0)
+                if eff_sub_min < p_min:
+                    raise InvariantError(
+                        f"subtype {name!r} weakens min_cardinality on relation {sr.field!r} "
+                        f"from {p_min} to {eff_sub_min} [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                if max_set:
+                    eff_sub_max_raw = sr.max_cardinality
+                    eff_sub_max = eff_sub_max_raw if sr.multiple else (
+                        eff_sub_max_raw if eff_sub_max_raw is not None else 1
+                    )
+                else:
+                    eff_sub_max_raw = pr.max_cardinality
+                    eff_sub_max = eff_sub_max_raw if sr.multiple else (
+                        min(eff_sub_max_raw, 1) if eff_sub_max_raw is not None else 1
+                    )
+                if p_max is not None and (eff_sub_max is None or eff_sub_max > p_max):
+                    raise InvariantError(
+                        f"subtype {name!r} relaxes max_cardinality on relation {sr.field!r} "
+                        f"from {p_max} to {eff_sub_max} [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                merged_rel = RelationSpec(
+                    field=sr.field,
+                    target_type=sr.target_type,
+                    multiple=sr.multiple if "multiple" in sr.model_fields_set else pr.multiple,
+                    owned=bool(pr.owned or sr.owned),
+                    required=eff_sub_req,
+                    min_cardinality=max(eff_sub_min_raw, pr.min_cardinality),
+                    max_cardinality=eff_sub_max_raw,
+                    description=sr.description or pr.description,
+                )
+                issue = _relation_cardinality_issue(name, merged_rel)
+                if issue is not None:
+                    raise InvariantError(
+                        f"{issue} [DL_CARDINALITY_CONFLICT]",
+                        code="DL_CARDINALITY_CONFLICT",
+                    )
+                merged_rels[merged_rel_idx[sr.field]] = merged_rel
+            else:
+                merged_rel_idx[sr.field] = len(merged_rels)
+                merged_rels.append(copy.deepcopy(sr))
+
+        # FSM Monotonic Subtyping
+        if parent.initial_statuses is not None:
+            if raw_ot.initial_statuses is None:
+                resolved_init: list[str] | None = list(parent.initial_statuses)
+            else:
+                if not raw_ot.initial_statuses or not set(raw_ot.initial_statuses).issubset(
+                    set(parent.initial_statuses)
+                ):
+                    raise InvariantError(
+                        f"subtype {name!r} widens or empties initial_statuses {raw_ot.initial_statuses} "
+                        f"relative to parent {parent.name!r} ({parent.initial_statuses}) [LSP_VIOLATION]",
+                        code="LSP_VIOLATION",
+                    )
+                resolved_init = list(raw_ot.initial_statuses)
+        else:
+            resolved_init = copy.deepcopy(raw_ot.initial_statuses)
+
+        if parent.transitions:
+            if not raw_ot.transitions:
+                resolved_trans = copy.deepcopy(parent.transitions)
+            else:
+                for src_s, dst_list in raw_ot.transitions.items():
+                    if src_s not in parent.transitions:
+                        raise InvariantError(
+                            f"subtype {name!r} introduces undeclared FSM state {src_s!r} "
+                            f"absent from parent {parent.name!r} [LSP_VIOLATION]",
+                            code="LSP_VIOLATION",
+                        )
+                    allowed_dsts = set(parent.transitions[src_s])
+                    extra_dsts = [d for d in dst_list if d not in allowed_dsts]
+                    if extra_dsts:
+                        raise InvariantError(
+                            f"subtype {name!r} widens FSM transition {src_s!r} -> {extra_dsts} "
+                            f"beyond parent {parent.name!r} ({parent.transitions[src_s]}) [LSP_VIOLATION]",
+                            code="LSP_VIOLATION",
+                        )
+                resolved_trans = copy.deepcopy(raw_ot.transitions)
+        else:
+            resolved_trans = copy.deepcopy(raw_ot.transitions)
+
+        # Voucher delta rules merge (forbid altering parent's rule)
+        merged_vrules = dict(parent.voucher_delta_rules)
+        for bk, bv in raw_ot.voucher_delta_rules.items():
+            if bk in merged_vrules and tuple(merged_vrules[bk]) != tuple(bv):
+                raise InvariantError(
+                    f"subtype {name!r} alters parent voucher_delta_rules[{bk!r}] [LSP_VIOLATION]",
+                    code="LSP_VIOLATION",
+                )
+            merged_vrules[bk] = tuple(bv)
+
+        # Owned spec merge
+        if parent.owned is True or raw_ot.owned is True:
+            resolved_owned_bp: bool | dict[str, Any] = True
+        elif isinstance(parent.owned, dict) or isinstance(raw_ot.owned, dict):
+            d_own = dict(parent.owned) if isinstance(parent.owned, dict) else {}
+            if isinstance(raw_ot.owned, dict):
+                d_own.update(raw_ot.owned)
+            resolved_owned_bp = d_own
+        else:
+            resolved_owned_bp = False
+
+        merged_view_tags = list(dict.fromkeys([*parent.view_tags, *raw_ot.view_tags]))
+        resolved_ot = ObjectTypeBlueprint(
+            name=name,
+            extends=raw_ot.extends,
+            archetype=resolved_arch,
+            primary_key=resolved_pk,
+            title_field=resolved_title,
+            aggregate_root=resolved_agg,
+            append_only=resolved_append_only,
+            owned=resolved_owned_bp,
+            fields=merged_fields,
+            exclude_fields=[],
+            relations=merged_rels,
+            status_field=resolved_status_field,
+            initial_statuses=resolved_init,
+            transitions=resolved_trans,
+            voucher_delta_rules=merged_vrules,
+            view_tags=merged_view_tags,
+            display_label=raw_ot.display_label or parent.display_label,
+        )
+        resolved_by_name[name] = resolved_ot
+        resolved_list.append(resolved_ot)
+
+    return resolved_list, ancestors_map
+
+
+def _validate_disjoint_types(
+    disjoint_types: Sequence[tuple[str, str]],
+    known_types: set[str],
+    ancestors_map: Mapping[str, Sequence[str]],
+) -> list[tuple[str, str]]:
+    deduped = _merge_disjoint_pairs(disjoint_types)
+    for a, b in deduped:
+        if a not in known_types:
+            raise InvariantError(
+                f"disjoint_types references unknown object type {a!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if b not in known_types:
+            raise InvariantError(
+                f"disjoint_types references unknown object type {b!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if a == b:
+            raise InvariantError(
+                f"self-disjoint axiom ({a!r}, {b!r}) makes {a!r} unsatisfiable [DL_DISJOINT_VIOLATION]",
+                code="DL_DISJOINT_VIOLATION",
+            )
+        for ot_name in sorted(known_types):
+            lineage = {ot_name, *ancestors_map.get(ot_name, ())}
+            if a in lineage and b in lineage:
+                raise InvariantError(
+                    f"object type {ot_name!r} inherits from disjoint types ({a!r}, {b!r}) [DL_DISJOINT_VIOLATION]",
+                    code="DL_DISJOINT_VIOLATION",
+                )
+    return deduped
+
+
+class _PolymorphicInvariantView:
+    """InvariantView proxy whose query(ParentCls) includes all concrete subtype rows."""
+
+    def __init__(self, inner: InvariantView) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def query(self, cls: type[ObjectType] | str) -> list[Any]:
+        target_cls = self._inner.spec.get_object_type(cls) if isinstance(cls, str) else cls
+        subtypes = self._inner.spec.subtypes_of(target_cls)
+        if len(subtypes) <= 1:
+            return self._inner.query(target_cls)
+        merged: list[Any] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for sub_c in subtypes:
+            pk_name = sub_c.primary_key_name()
+            for item in self._inner.query(sub_c):
+                k = (sub_c.__name__, str(getattr(item, pk_name)))
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    merged.append(item)
+        return merged
+
+
+def _wrap_spec_invariants_polymorphic(spec: OntologySpec) -> None:
+    """Wrap Python @spec.invariant / @spec.transition_invariant handlers for subtype visibility."""
+    has_subtypes = any(
+        any(b.__name__ != name and b.__name__ in spec.object_types for b in cls.__mro__[1:])
+        for name, cls in spec.object_types.items()
+    )
+    if not has_subtypes:
+        return
+    for inv_name, inv_def in list(spec.invariants.items()):
+        fn = inv_def.handler
+        if getattr(fn, "__declarative_rule__", None) is not None:
+            continue
+        if getattr(fn, "__polymorphic_wrapped__", False):
+            continue
+
+        def _wrapped_inv(view: InvariantView, _orig: Callable[[InvariantView], Any] = fn) -> Any:
+            return _orig(_PolymorphicInvariantView(view))
+
+        _wrapped_inv.__polymorphic_wrapped__ = True  # type: ignore[attr-defined]
+        spec.invariants[inv_name] = inv_def.model_copy(update={"handler": _wrapped_inv})
+
+    for tinv_name, tinv_def in list(spec.transition_invariants.items()):
+        fn = tinv_def.handler
+        if getattr(fn, "__polymorphic_wrapped__", False):
+            continue
+
+        def _wrapped_tinv(
+            diff: ObjectDiff,
+            view: InvariantView,
+            _orig: Callable[[ObjectDiff, InvariantView], Any] = fn,
+        ) -> Any:
+            return _orig(diff, _PolymorphicInvariantView(view))
+
+        _wrapped_tinv.__polymorphic_wrapped__ = True  # type: ignore[attr-defined]
+        spec.transition_invariants[tinv_name] = tinv_def.model_copy(update={"handler": _wrapped_tinv})
+
+
+def _make_cardinality_invariant_handler(
+    card_map: Mapping[str, dict[str, tuple[int, int | None]]],
+) -> Callable[[InvariantView], bool]:
+    frozen_map = {k: dict(v) for k, v in card_map.items()}
+
+    def _check_cardinalities(view: InvariantView) -> bool:
+        for type_name, rel_bounds in frozen_map.items():
+            if type_name not in view.spec.object_types:
+                continue
+            cls = view.spec.get_object_type(type_name)
+            for sub_cls in view.spec.subtypes_of(cls):
+                for obj in view.query(sub_cls):
+                    for rel_field, (min_c, max_c) in rel_bounds.items():
+                        raw_val = getattr(obj, rel_field, None)
+                        if isinstance(raw_val, (list, tuple, set)):
+                            cnt = len(raw_val)
+                        elif raw_val is None or raw_val == "":
+                            cnt = 0
+                        else:
+                            cnt = 1
+                        if cnt < min_c or (max_c is not None and cnt > max_c):
+                            raise InvariantError(
+                                f"{sub_cls.__name__}:{obj.primary_key_value()}.{rel_field} "
+                                f"cardinality {cnt} violates declared bounds [{min_c}, {max_c}]",
+                                code="CARDINALITY_VIOLATION",
+                            )
+        return True
+
+    return _check_cardinalities
+
+
 def compose_blueprints(
     blueprints: Sequence[DeclarativeBlueprint | Mapping[str, Any]],
     *,
@@ -1166,6 +1750,11 @@ def compose_blueprints(
                 else:
                     dest[key] = label
 
+    merged_disjoint = _merge_disjoint_pairs(*(bp.disjoint_types for bp in coerced))
+    object_types, ancestors_map = _toposort_and_resolve_inheritance(object_types)
+    ot_by_name = {ot.name: ot for ot in object_types}
+    _validate_disjoint_types(merged_disjoint, set(ot_by_name.keys()), ancestors_map)
+
     for ot in object_types:
         for rel in ot.relations:
             if rel.target_type not in ot_by_name:
@@ -1197,6 +1786,7 @@ def compose_blueprints(
         roles=merged_roles,
         description=resolved_desc,
         object_types=object_types,
+        disjoint_types=merged_disjoint,
         actions=actions,
         invariants=invariants,
         migrations=merged_migrations,
@@ -1462,6 +2052,11 @@ def _validate_action_mutations_ast(
         else:
             mut_roots = frozenset({"obj", "param", "actor"})
             ref_roots = {"obj": mut.object_type}
+        if mut.when is not None:
+            validate_predicate_ast(mut.when, allowed_roots=mut_roots, allow_view=True)
+            _validate_expr_schema_refs(
+                mut.when, ot_by_name=ot_by_name, root_types=ref_roots, param_names=param_names
+            )
         for fv in mut.set_fields.values():
             _validate_value_node(fv, allowed_roots=mut_roots, allow_view=True)
             _validate_expr_schema_refs(
@@ -1555,6 +2150,12 @@ def _validate_action_closed_roles(
             context=f"{context_prefix} {act.name}.preconditions.{pre.name}.must_hold",
         )
     for mut in act.mutations:
+        if mut.when is not None:
+            _validate_expr_closed_roles(
+                mut.when,
+                valid_roles,
+                context=f"{context_prefix} {act.name}.mutations.{mut.object_type}.when",
+            )
         for fv in mut.set_fields.values():
             _validate_expr_closed_roles(
                 fv,
@@ -1658,6 +2259,38 @@ def apply_overlay(
         candidate.object_types.append(copy.deepcopy(new_ot))
         ot_by_name[new_ot.name] = candidate.object_types[-1]
 
+    for drv_ot in spec_overlay.derive_object_types:
+        _assert_safe_identifier(drv_ot.name, "object type")
+        if drv_ot.extends is None:
+            raise InvariantError(
+                f"overlay derive_object_types entry {drv_ot.name!r} must specify 'extends' [LSP_VIOLATION]",
+                code="LSP_VIOLATION",
+            )
+        if drv_ot.name in ot_by_name:
+            raise InvariantError(
+                f"overlay cannot overwrite existing object type {drv_ot.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        for fld in drv_ot.fields:
+            if fld.masked_roles:
+                _assert_known_roles(
+                    fld.masked_roles,
+                    valid_roles,
+                    context=f"overlay derive_object_types {drv_ot.name}.{fld.name}.masked_roles",
+                )
+        candidate.object_types.append(copy.deepcopy(drv_ot))
+        ot_by_name[drv_ot.name] = candidate.object_types[-1]
+
+    candidate.disjoint_types = _merge_disjoint_pairs(
+        candidate.disjoint_types,
+        spec_overlay.add_disjoint_types,
+    )
+    candidate.object_types, _ov_ancestors = _toposort_and_resolve_inheritance(
+        candidate.object_types
+    )
+    ot_by_name = {ot.name: ot for ot in candidate.object_types}
+    _validate_disjoint_types(candidate.disjoint_types, set(ot_by_name.keys()), _ov_ancestors)
+
     for ot_name, new_fields in spec_overlay.add_fields.items():
         if ot_name not in ot_by_name:
             raise InvariantError(
@@ -1702,6 +2335,9 @@ def apply_overlay(
                     f"overlay cannot overwrite relation or field {ot_name}.{nr.field!r}",
                     code="OVERLAY_BREAKS_STANDARD_CONTRACT",
                 )
+            rel_issue = _relation_cardinality_issue(ot_name, nr)
+            if rel_issue is not None:
+                raise InvariantError(f"{rel_issue} [DL_CARDINALITY_CONFLICT]", code="DL_CARDINALITY_CONFLICT")
             ot.relations.append(copy.deepcopy(nr))
             existing_names.add(nr.field)
 
@@ -2149,6 +2785,18 @@ def apply_evolution_patch(
                 mut_roots = {"obj": mut.object_type}
                 if mut.target_ref and anchor_type is not None:
                     mut_roots["source_obj"] = anchor_type
+                if mut.when is not None:
+                    hit = _expr_removed_field_hit(
+                        mut.when,
+                        removed_by_type=removed_by_type,
+                        ot_by_name=ot_by_name,
+                        root_types=mut_roots,
+                    )
+                    if hit is not None:
+                        raise InvariantError(
+                            f"cannot remove {hit[0]}.{hit[1]} referenced by mutation when guard on {act.name!r}",
+                            code="FIELD_IN_USE",
+                        )
                 for k, v_expr in mut.set_fields.items():
                     if k in removed_by_type.get(mut.object_type, ()):
                         raise InvariantError(
@@ -2362,10 +3010,16 @@ def compile_blueprint(
                 spec.roles.setdefault(role_name, role_def)
     compiled_valid_roles = set(spec.roles)
 
+    raw_ot_by_name = {ot.name: ot for ot in blueprint.object_types}
+    resolved_ots, ancestors_map = _toposort_and_resolve_inheritance(blueprint.object_types)
     created_classes: dict[str, type[ObjectType]] = {}
-    type_names = {_assert_safe_identifier(ot.name, "object type") for ot in blueprint.object_types}
+    type_names = {ot.name for ot in resolved_ots}
+    validated_disjoint = _validate_disjoint_types(
+        blueprint.disjoint_types, type_names, ancestors_map
+    )
+    setattr(spec, "__disjoint_types__", tuple(validated_disjoint))
 
-    for ot in blueprint.object_types:
+    for ot in resolved_ots:
         _assert_safe_identifier(ot.primary_key, "primary_key")
         for rel in ot.relations:
             _assert_safe_identifier(rel.field, "relation field")
@@ -2389,9 +3043,16 @@ def compile_blueprint(
     non_neg_map: dict[str, tuple[str, ...]] = {}
     fsm_specs: dict[str, tuple[str, tuple[str, ...] | None, dict[str, tuple[str, ...]]]] = {}
     voucher_rules_map: dict[str, dict[str, tuple[str, str, str]]] = {}
+    card_map: dict[str, dict[str, tuple[int, int | None]]] = {}
 
-    for ot in blueprint.object_types:
-        if seed_ontology is not None:
+    for ot in resolved_ots:
+        raw_ot = raw_ot_by_name[ot.name]
+        raw_field_names = {f.name for f in raw_ot.fields}
+        raw_rel_names = {r.field for r in raw_ot.relations}
+
+        if ot.extends is not None:
+            base_cls = created_classes[ot.extends]
+        elif seed_ontology is not None:
             base_cls = seed_ontology.resolve_base_class(ot.archetype)
         elif ot.archetype == "ObjectType":
             base_cls = ObjectType
@@ -2423,7 +3084,12 @@ def compile_blueprint(
             else:
                 default_val = _default_for_type(py_type) if fld.default is None else fld.default
                 optional_scalar_defaults[fld.name] = default_val
-            field_defs[fld.name] = (ann, default_val)
+            if (
+                ot.extends is None
+                or fld.name not in base_cls.model_fields
+                or fld.name in raw_field_names
+            ):
+                field_defs[fld.name] = (ann, default_val)
             if fld.owned:
                 owned_fields[fld.name] = None if default_val is ... else default_val
             if fld.masked_roles:
@@ -2431,25 +3097,35 @@ def compile_blueprint(
             if fld.non_negative:
                 non_neg_fields.append(fld.name)
 
-        if not pk_declared:
+        if not pk_declared and ot.primary_key not in base_cls.model_fields:
             field_defs[ot.primary_key] = (str, ...)
 
         for rel in ot.relations:
-            extra_schema = {
-                "property_kind": "object",
-                "range": rel.target_type,
-                "multiple": rel.multiple,
-            }
-            if rel.multiple:
-                field_defs[rel.field] = (
-                    tuple[str, ...],
-                    Field(default=(), json_schema_extra=extra_schema),
-                )
-            else:
-                if rel.required:
-                    field_defs[rel.field] = (str, Field(..., json_schema_extra=extra_schema))
+            if rel.min_cardinality > 0 or rel.max_cardinality is not None:
+                card_map.setdefault(ot.name, {})[rel.field] = _effective_relation_bounds(rel)
+            if (
+                ot.extends is None
+                or rel.field not in base_cls.model_fields
+                or rel.field in raw_rel_names
+            ):
+                extra_schema = {
+                    "property_kind": "object",
+                    "range": rel.target_type,
+                    "multiple": rel.multiple,
+                }
+                if rel.multiple:
+                    field_defs[rel.field] = (
+                        tuple[str, ...],
+                        Field(default=(), json_schema_extra=extra_schema),
+                    )
                 else:
-                    field_defs[rel.field] = (str | None, Field(default=None, json_schema_extra=extra_schema))
+                    if rel.required:
+                        field_defs[rel.field] = (str, Field(..., json_schema_extra=extra_schema))
+                    else:
+                        field_defs[rel.field] = (
+                            str | None,
+                            Field(default=None, json_schema_extra=extra_schema),
+                        )
             if rel.owned:
                 owned_fields[rel.field] = () if rel.multiple else None
 
@@ -2508,6 +3184,10 @@ def compile_blueprint(
         cls.__aggregate_root__ = bool(agg_root)
         cls.__append_only__ = bool(append_only)
         cls.__owned__ = resolved_owned
+        cls.__extends_type__ = ot.extends  # type: ignore[attr-defined]
+        cls.__relation_cardinalities__ = {  # type: ignore[attr-defined]
+            r.field: (r.min_cardinality, r.max_cardinality) for r in ot.relations
+        }
         if non_neg_fields:
             cls.__non_negative_fields__ = tuple(non_neg_fields)
         if ot.transitions or ot.initial_statuses is not None:
@@ -2538,7 +3218,7 @@ def compile_blueprint(
         if ot.voucher_delta_rules:
             voucher_rules_map[ot.name] = {k: tuple(v) for k, v in ot.voucher_delta_rules.items()}
 
-    for ot in blueprint.object_types:
+    for ot in resolved_ots:
         cls = created_classes[ot.name]
         prop_map: dict[str, ObjectProperty] = dict(getattr(cls, "__object_properties__", None) or {})
         for rel in ot.relations:
@@ -2567,15 +3247,23 @@ def compile_blueprint(
         def _check_non_negative(view: InvariantView) -> bool:
             for type_name, field_names in non_neg_map.items():
                 cls = view.spec.get_object_type(type_name)
-                for obj in view.query(cls):
-                    for fn in field_names:
-                        val = getattr(obj, fn, 0)
-                        if val is not None and val < 0:
-                            raise InvariantError(
-                                f"{type_name}:{obj.primary_key_value()}.{fn}={val} < 0",
-                                code="NEGATIVE_VALUE",
-                            )
+                for sub_cls in view.spec.subtypes_of(cls):
+                    for obj in view.query(sub_cls):
+                        for fn in field_names:
+                            val = getattr(obj, fn, 0)
+                            if val is not None and val < 0:
+                                raise InvariantError(
+                                    f"{sub_cls.__name__}:{obj.primary_key_value()}.{fn}={val} < 0",
+                                    code="NEGATIVE_VALUE",
+                                )
             return True
+
+    if card_map:
+        spec.invariant(
+            "declarative_relation_cardinalities",
+            code="CARDINALITY_VIOLATION",
+            description="Declared closed-world relation cardinalities must hold.",
+        )(_make_cardinality_invariant_handler(card_map))
 
     # Only run fallback declarative FSM check on types not already covered by an inherited seed archetype axiom
     fallback_fsm_specs = {
@@ -2685,7 +3373,7 @@ def compile_blueprint(
                             )
             return True
 
-    ot_by_name = {ot.name: ot for ot in blueprint.object_types}
+    ot_by_name = {ot.name: ot for ot in resolved_ots}
     bp_inv_names = {inv.name for inv in blueprint.invariants}
     for bs in eff_base_specs:
         for ef_name, ef_def in bs.edit_functions.items():
@@ -2786,6 +3474,7 @@ def compile_blueprint(
     display_updates["objects"] = {**object_display, **blueprint.display.get("objects", {})}
     display_updates["actions"] = {**action_display, **blueprint.display.get("actions", {})}
     spec.update_display(display_updates)
+    _wrap_spec_invariants_polymorphic(spec)
     return spec
 
 
@@ -2874,18 +3563,19 @@ def _run_action_preconditions(
 def _make_rule_invariant_handler(rule: InvariantRuleSpec) -> Callable[[InvariantView], bool]:
     def _check(view: InvariantView) -> bool:
         target_cls = view.spec.get_object_type(rule.target_type)
-        for obj in view.query(target_cls):
-            ctx = {"obj": obj}
-            if rule.when is not None and not eval_predicate(rule.when, ctx, view):
-                continue
-            if not eval_predicate(rule.must_hold, ctx, view):
-                msg = (
-                    f"[{rule.code}] {rule.description}"
-                    if rule.description
-                    else f"[{rule.code}] invariant {rule.name} violated on "
-                    f"{rule.target_type}:{obj.primary_key_value()}"
-                )
-                raise InvariantError(msg, code=rule.code)
+        for sub_cls in view.spec.subtypes_of(target_cls):
+            for obj in view.query(sub_cls):
+                ctx = {"obj": obj}
+                if rule.when is not None and not eval_predicate(rule.when, ctx, view):
+                    continue
+                if not eval_predicate(rule.must_hold, ctx, view):
+                    msg = (
+                        f"[{rule.code}] {rule.description}"
+                        if rule.description
+                        else f"[{rule.code}] invariant {rule.name} violated on "
+                        f"{sub_cls.__name__}:{obj.primary_key_value()}"
+                    )
+                    raise InvariantError(msg, code=rule.code)
         return True
 
     _check.__declarative_rule__ = rule.model_dump(mode="json")  # type: ignore[attr-defined]
@@ -2897,6 +3587,11 @@ def _make_rule_action_handler(
     anchor_type: str | None,
     anchor_id_param: str | None,
 ) -> Callable[[EditBatch, BaseModel], None]:
+    def _when_needs_target_obj(when_ast: Mapping[str, Any] | None) -> bool:
+        if when_ast is None:
+            return False
+        return any(r.split(".")[0] in ("obj", "source_obj") for r in _iter_ast_refs(when_ast))
+
     def _handler(ctx: EditBatch, params: BaseModel) -> None:
         _run_action_preconditions(
             ctx, params, action_bp.preconditions, mutations=action_bp.mutations
@@ -2912,6 +3607,8 @@ def _make_rule_action_handler(
             target_cls = ctx.spec.get_object_type(mut.object_type)
             if mut.op == "create":
                 eval_ctx = {"param": params, "actor": ctx.actor}
+                if mut.when is not None and not eval_predicate(mut.when, eval_ctx, ctx):
+                    continue
                 payload: dict[str, Any] = {}
                 for k, v_expr in mut.set_fields.items():
                     payload[k] = _eval_value(v_expr, eval_ctx, ctx)
@@ -2920,6 +3617,10 @@ def _make_rule_action_handler(
                 obj = target_cls(**payload)
                 ctx.create(obj)
             elif mut.target_ref is not None:
+                if mut.when is not None and not _when_needs_target_obj(mut.when):
+                    pre_guard_ctx = {"param": params, "actor": ctx.actor}
+                    if not eval_predicate(mut.when, pre_guard_ctx, ctx):
+                        continue
                 ref_ctx: dict[str, Any] = {"param": params, "actor": ctx.actor}
                 if anchor_obj is not None:
                     ref_ctx["obj"] = anchor_obj
@@ -2935,17 +3636,23 @@ def _make_rule_action_handler(
                     else str(ref_val)
                 )
                 existing = ctx.require(target_cls, target_id)
+                eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
+                if anchor_obj is not None:
+                    eval_ctx["source_obj"] = anchor_obj
+                if mut.when is not None and not eval_predicate(mut.when, eval_ctx, ctx):
+                    continue
                 if mut.op == "delete":
                     ctx.delete(existing)
                 else:
-                    eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
-                    if anchor_obj is not None:
-                        eval_ctx["source_obj"] = anchor_obj
                     updates: dict[str, Any] = {}
                     for k, v_expr in mut.set_fields.items():
                         updates[k] = _eval_value(v_expr, eval_ctx, ctx)
                     ctx.modify(existing, **updates)
             else:
+                if mut.when is not None and not _when_needs_target_obj(mut.when):
+                    pre_guard_ctx = {"param": params, "actor": ctx.actor}
+                    if not eval_predicate(mut.when, pre_guard_ctx, ctx):
+                        continue
                 if not hasattr(params, mut.id_param):
                     raise InvariantError(
                         f"action {action_bp.name!r} missing id_param {mut.id_param!r}",
@@ -2953,10 +3660,12 @@ def _make_rule_action_handler(
                     )
                 target_id = str(getattr(params, mut.id_param))
                 existing = ctx.require(target_cls, target_id)
+                eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
+                if mut.when is not None and not eval_predicate(mut.when, eval_ctx, ctx):
+                    continue
                 if mut.op == "delete":
                     ctx.delete(existing)
                 else:
-                    eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
                     updates = {}
                     for k, v_expr in mut.set_fields.items():
                         updates[k] = _eval_value(v_expr, eval_ctx, ctx)
@@ -3106,6 +3815,17 @@ def _compile_and_register_action_blueprint(
         else:
             mut_roots = frozenset({"obj", "param", "actor"})
             mut_ref_roots = {"obj": mut.object_type}
+        if mut.when is not None:
+            if compiled_valid_roles:
+                _validate_expr_closed_roles(
+                    mut.when,
+                    compiled_valid_roles,
+                    context=f"action {act.name}.mutations.{mut.object_type}.when",
+                )
+            validate_predicate_ast(mut.when, allowed_roots=mut_roots, allow_view=True)
+            _validate_expr_schema_refs(
+                mut.when, ot_by_name=ot_by_name, root_types=mut_ref_roots, param_names=act_param_names
+            )
         for fv in mut.set_fields.values():
             if compiled_valid_roles:
                 _validate_expr_closed_roles(
@@ -3228,14 +3948,22 @@ def _spec_to_object_blueprints(
     for ot_name, cls in spec.object_types.items():
         pk = cls.primary_key_name()
         prop_map = getattr(cls, "__object_properties__", None) or {}
+        rel_cards = getattr(cls, "__relation_cardinalities__", None) or {}
         non_neg_set = set(getattr(cls, "__non_negative_fields__", ()) or ())
         masked_map = getattr(cls, "__masked_fields__", None) or {}
         owned_spec = cls.owned_spec()
+        extends_name = getattr(cls, "__extends_type__", None)
+        if extends_name is None:
+            for base in cls.__mro__[1:]:
+                if base.__name__ != ot_name and base.__name__ in spec.object_types:
+                    extends_name = base.__name__
+                    break
         fields: list[FieldSpec] = []
         relations: list[RelationSpec] = []
         for fname, info in cls.model_fields.items():
             is_owned = bool(owned_spec is True or (isinstance(owned_spec, dict) and fname in owned_spec))
             decl = prop_map.get(fname)
+            min_c, max_c = rel_cards.get(fname, (0, None))
             if decl is not None:
                 relations.append(
                     RelationSpec(
@@ -3244,6 +3972,8 @@ def _spec_to_object_blueprints(
                         multiple=(decl.cardinality == "many-to-many"),
                         owned=decl.owned,
                         required=info.is_required(),
+                        min_cardinality=int(min_c),
+                        max_cardinality=max_c,
                         description=str(decl.description or info.description or "") if rich else "",
                     )
                 )
@@ -3257,6 +3987,8 @@ def _spec_to_object_blueprints(
                         multiple=rel_meta[1],
                         owned=is_owned,
                         required=info.is_required(),
+                        min_cardinality=int(min_c),
+                        max_cardinality=max_c,
                         description=str(info.description or "") if rich else "",
                     )
                 )
@@ -3279,6 +4011,7 @@ def _spec_to_object_blueprints(
         raw_init = getattr(cls, "__initial_statuses__", None)
         out[ot_name] = ObjectTypeBlueprint(
             name=ot_name,
+            extends=extends_name,
             archetype=_infer_archetype_name(cls, spec) if rich else "ObjectType",
             primary_key=pk,
             title_field=getattr(cls, "__title__", None),
@@ -3406,6 +4139,7 @@ def export_spec_blueprint(
         roles=list(spec.roles.keys()),
         description=description,
         object_types=list(ot_map.values()),
+        disjoint_types=[list(p) for p in (getattr(spec, "__disjoint_types__", ()) or ())],
         actions=exported_actions,
         invariants=exported_invs,
         views=exported_views,
@@ -3420,6 +4154,8 @@ def _build_overlay_object_type(
     *,
     base_cls: type[ObjectType],
     extra_security_field: str | None = None,
+    raw_field_names: set[str] | None = None,
+    raw_rel_names: set[str] | None = None,
 ) -> tuple[
     type[ObjectType],
     tuple[str, ...],
@@ -3444,7 +4180,12 @@ def _build_overlay_object_type(
         else:
             default_val = _default_for_type(py_type) if fld.default is None else fld.default
             optional_scalar_defaults[fld.name] = default_val
-        field_defs[fld.name] = (ann, default_val)
+        if (
+            ot.extends is None
+            or fld.name not in base_cls.model_fields
+            or (raw_field_names is not None and fld.name in raw_field_names)
+        ):
+            field_defs[fld.name] = (ann, default_val)
         if fld.owned:
             owned_fields[fld.name] = None if default_val is ... else default_val
         if fld.masked_roles:
@@ -3452,29 +4193,34 @@ def _build_overlay_object_type(
         if fld.non_negative:
             non_neg_fields.append(fld.name)
 
-    if not pk_declared:
+    if not pk_declared and ot.primary_key not in base_cls.model_fields:
         field_defs[ot.primary_key] = (str, ...)
 
-    if extra_security_field and extra_security_field not in field_defs:
+    if extra_security_field and extra_security_field not in field_defs and extra_security_field not in base_cls.model_fields:
         field_defs[extra_security_field] = (str, "")
         optional_scalar_defaults[extra_security_field] = ""
         owned_fields[extra_security_field] = ""
 
     for rel in ot.relations:
-        extra_schema = {
-            "property_kind": "object",
-            "range": rel.target_type,
-            "multiple": rel.multiple,
-        }
-        if rel.multiple:
-            field_defs[rel.field] = (
-                tuple[str, ...],
-                Field(default=(), json_schema_extra=extra_schema),
-            )
-        elif rel.required:
-            field_defs[rel.field] = (str, Field(..., json_schema_extra=extra_schema))
-        else:
-            field_defs[rel.field] = (str | None, Field(default=None, json_schema_extra=extra_schema))
+        if (
+            ot.extends is None
+            or rel.field not in base_cls.model_fields
+            or (raw_rel_names is not None and rel.field in raw_rel_names)
+        ):
+            extra_schema = {
+                "property_kind": "object",
+                "range": rel.target_type,
+                "multiple": rel.multiple,
+            }
+            if rel.multiple:
+                field_defs[rel.field] = (
+                    tuple[str, ...],
+                    Field(default=(), json_schema_extra=extra_schema),
+                )
+            elif rel.required:
+                field_defs[rel.field] = (str, Field(..., json_schema_extra=extra_schema))
+            else:
+                field_defs[rel.field] = (str | None, Field(default=None, json_schema_extra=extra_schema))
         if rel.owned:
             owned_fields[rel.field] = () if rel.multiple else None
 
@@ -3524,6 +4270,10 @@ def _build_overlay_object_type(
         ot.append_only if ot.append_only is not None else getattr(base_cls, "__append_only__", False)
     )
     cls.__owned__ = resolved_owned
+    cls.__extends_type__ = ot.extends  # type: ignore[attr-defined]
+    cls.__relation_cardinalities__ = {  # type: ignore[attr-defined]
+        r.field: (r.min_cardinality, r.max_cardinality) for r in ot.relations
+    }
     if extra_security_field:
         sec_fields = list(getattr(base_cls, "__security_tag_fields__", ()) or ())
         if extra_security_field not in sec_fields:
@@ -3674,7 +4424,8 @@ def apply_overlay_to_spec(
         _assert_safe_identifier(security_tag_field, "security_tag_field")
         for ot_name in rls_object_types:
             if ot_name not in derived.object_types and all(
-                nt.name != ot_name for nt in spec_overlay.add_object_types
+                nt.name != ot_name
+                for nt in (*spec_overlay.add_object_types, *spec_overlay.derive_object_types)
             ):
                 raise InvariantError(
                     f"rls_object_types references unknown object type {ot_name!r}",
@@ -3682,52 +4433,113 @@ def apply_overlay_to_spec(
                 )
             rls_set.add(ot_name)
 
-    # 1. Register new pure-declarative object types first (validation + classes)
+    # 1. Register new & derived declarative object types (inheritance & LSP checked topologically)
     object_display: dict[str, str] = {}
     new_non_neg_map: dict[str, tuple[str, ...]] = {}
     new_fsm_specs: dict[str, tuple[str, tuple[str, ...] | None, dict[str, tuple[str, ...]]]] = {}
+    overlay_card_map: dict[str, dict[str, tuple[int, int | None]]] = {}
     new_ots: list[ObjectTypeBlueprint] = []
+
+    raw_pending_ots: list[ObjectTypeBlueprint] = []
     for raw_new_ot in spec_overlay.add_object_types:
         _assert_safe_identifier(raw_new_ot.name, "object type")
-        _assert_safe_identifier(raw_new_ot.primary_key, "primary_key")
         if raw_new_ot.name in derived.object_types or raw_new_ot.name in derived.abstract_types:
             raise InvariantError(
                 f"overlay cannot overwrite existing object type {raw_new_ot.name!r}",
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
-        for fld in raw_new_ot.fields:
+        raw_pending_ots.append(raw_new_ot)
+
+    for raw_drv_ot in spec_overlay.derive_object_types:
+        _assert_safe_identifier(raw_drv_ot.name, "object type")
+        if raw_drv_ot.extends is None:
+            raise InvariantError(
+                f"overlay derive_object_types entry {raw_drv_ot.name!r} must specify 'extends' [LSP_VIOLATION]",
+                code="LSP_VIOLATION",
+            )
+        if raw_drv_ot.name in derived.object_types or raw_drv_ot.name in derived.abstract_types:
+            raise InvariantError(
+                f"overlay cannot overwrite existing object type {raw_drv_ot.name!r}",
+                code="OVERLAY_BREAKS_STANDARD_CONTRACT",
+            )
+        raw_pending_ots.append(raw_drv_ot)
+
+    existing_bps = _spec_to_object_blueprints(derived, rich=True)
+    raw_pending_by_name = {o.name: o for o in raw_pending_ots}
+    resolved_new_ots, _new_ancestors = _toposort_and_resolve_inheritance(
+        raw_pending_ots,
+        extra_known_parents=existing_bps,
+    )
+
+    combined_ancestors: dict[str, tuple[str, ...]] = {}
+    for ename, ebp in existing_bps.items():
+        echain: list[str] = []
+        cur = ebp.extends
+        seen_e = {ename}
+        while cur is not None and cur not in seen_e:
+            seen_e.add(cur)
+            echain.append(cur)
+            nxt = existing_bps.get(cur)
+            cur = nxt.extends if nxt is not None else None
+        combined_ancestors[ename] = tuple(echain)
+    for k_name, k_anc in _new_ancestors.items():
+        if k_name in raw_pending_by_name:
+            combined_ancestors[k_name] = k_anc
+
+    merged_disjoint = _merge_disjoint_pairs(
+        getattr(base_spec, "__disjoint_types__", ()) or (),
+        spec_overlay.add_disjoint_types,
+    )
+    all_type_names_after_new = set(existing_bps.keys()) | {o.name for o in resolved_new_ots}
+    validated_disjoint = _validate_disjoint_types(
+        merged_disjoint, all_type_names_after_new, combined_ancestors
+    )
+    setattr(derived, "__disjoint_types__", tuple(validated_disjoint))
+
+    for resolved_ot in resolved_new_ots:
+        raw_ot = raw_pending_by_name[resolved_ot.name]
+        _assert_safe_identifier(resolved_ot.primary_key, "primary_key")
+        for fld in resolved_ot.fields:
             if fld.masked_roles:
                 _assert_known_roles(
                     fld.masked_roles,
                     valid_roles,
-                    context=f"overlay add_object_types {raw_new_ot.name}.{fld.name}.masked_roles",
+                    context=f"overlay add_object_types {resolved_ot.name}.{fld.name}.masked_roles",
                 )
-        if seed_ontology is not None:
-            arch_cls = seed_ontology.resolve_base_class(raw_new_ot.archetype)
-        elif raw_new_ot.archetype in derived.abstract_types:
-            arch_cls = derived.abstract_types[raw_new_ot.archetype]
-        elif raw_new_ot.archetype == "ObjectType":
+        if resolved_ot.extends is not None:
+            arch_cls = derived.object_types[resolved_ot.extends]
+        elif seed_ontology is not None:
+            arch_cls = seed_ontology.resolve_base_class(resolved_ot.archetype)
+        elif resolved_ot.archetype in derived.abstract_types:
+            arch_cls = derived.abstract_types[resolved_ot.archetype]
+        elif resolved_ot.archetype == "ObjectType":
             arch_cls = ObjectType
         else:
             raise InvariantError(
-                f"unknown archetype {raw_new_ot.archetype!r} in overlay",
+                f"unknown archetype {resolved_ot.archetype!r} in overlay",
                 code="UNKNOWN_SEED_ARCHETYPE",
             )
         cls_new, nn_fields, fsm_spec = _build_overlay_object_type(
-            raw_new_ot,
+            resolved_ot,
             base_cls=arch_cls,
-            extra_security_field=(security_tag_field if raw_new_ot.name in rls_set else None),
+            extra_security_field=(security_tag_field if resolved_ot.name in rls_set else None),
+            raw_field_names={f.name for f in raw_ot.fields},
+            raw_rel_names={r.field for r in raw_ot.relations},
         )
         derived.object_type(cls_new)
-        new_ots.append(raw_new_ot)
-        if raw_new_ot.display_label:
-            object_display[raw_new_ot.name] = raw_new_ot.display_label
+        new_ots.append(resolved_ot)
+        for rel in resolved_ot.relations:
+            if rel.min_cardinality > 0 or rel.max_cardinality is not None:
+                overlay_card_map.setdefault(resolved_ot.name, {})[rel.field] = _effective_relation_bounds(rel)
+        if resolved_ot.display_label:
+            object_display[resolved_ot.name] = resolved_ot.display_label
         if nn_fields:
-            new_non_neg_map[raw_new_ot.name] = nn_fields
-        if fsm_spec is not None and not (
-            seed_ontology is not None and seed_ontology.covers_fsm_for(cls_new)
+            new_non_neg_map[resolved_ot.name] = nn_fields
+        if fsm_spec is not None and (
+            resolved_ot.extends is not None
+            or not (seed_ontology is not None and seed_ontology.covers_fsm_for(cls_new))
         ):
-            new_fsm_specs[raw_new_ot.name] = fsm_spec
+            new_fsm_specs[resolved_ot.name] = fsm_spec
 
     for new_ot in new_ots:
         cls_new = derived.object_types[new_ot.name]
@@ -3833,6 +4645,9 @@ def apply_overlay_to_spec(
                     f"overlay cannot overwrite relation or field {ot_name}.{nr.field!r}",
                     code="OVERLAY_BREAKS_STANDARD_CONTRACT",
                 )
+            rel_issue = _relation_cardinality_issue(ot_name, nr)
+            if rel_issue is not None:
+                raise InvariantError(f"{rel_issue} [DL_CARDINALITY_CONFLICT]", code="DL_CARDINALITY_CONFLICT")
             existing_names.add(nr.field)
 
     updated_transitions: dict[str, dict[str, list[str]]] = {}
@@ -4004,6 +4819,13 @@ def apply_overlay_to_spec(
         sub_cls.__voucher_delta_rules__ = dict(
             getattr(cur_cls, "__voucher_delta_rules__", {}) or {}
         )
+        sub_cls.__extends_type__ = getattr(cur_cls, "__extends_type__", None)  # type: ignore[attr-defined]
+        merged_cards = dict(getattr(cur_cls, "__relation_cardinalities__", {}) or {})
+        for nr in added_rels:
+            if nr.min_cardinality > 0 or nr.max_cardinality is not None:
+                merged_cards[nr.field] = (nr.min_cardinality, nr.max_cardinality)
+                overlay_card_map.setdefault(ot_name, {})[nr.field] = _effective_relation_bounds(nr)
+        sub_cls.__relation_cardinalities__ = merged_cards  # type: ignore[attr-defined]
 
         derived.object_type(sub_cls)
         # Preserve any explicit spec.add_object_property bindings not encoded in annotations
@@ -4050,15 +4872,26 @@ def apply_overlay_to_spec(
         def _check_overlay_non_negative(view: InvariantView, _map: dict[str, tuple[str, ...]] = dict(new_non_neg_map)) -> bool:
             for type_name, field_names in _map.items():
                 cls_t = view.spec.get_object_type(type_name)
-                for obj in view.query(cls_t):
-                    for fn in field_names:
-                        val = getattr(obj, fn, 0)
-                        if val is not None and val < 0:
-                            raise InvariantError(
-                                f"{type_name}:{obj.primary_key_value()}.{fn}={val} < 0",
-                                code="NEGATIVE_VALUE",
-                            )
+                for sub_cls in view.spec.subtypes_of(cls_t):
+                    for obj in view.query(sub_cls):
+                        for fn in field_names:
+                            val = getattr(obj, fn, 0)
+                            if val is not None and val < 0:
+                                raise InvariantError(
+                                    f"{sub_cls.__name__}:{obj.primary_key_value()}.{fn}={val} < 0",
+                                    code="NEGATIVE_VALUE",
+                                )
             return True
+
+    if overlay_card_map:
+        card_inv_name = f"overlay_{spec_overlay.overlay_id}_cardinalities"
+        while card_inv_name in derived.invariants:
+            card_inv_name += "_ov"
+        derived.invariant(
+            card_inv_name,
+            code="CARDINALITY_VIOLATION",
+            description="Declared closed-world relation cardinalities on overlay types must hold.",
+        )(_make_cardinality_invariant_handler(overlay_card_map))
 
     if new_fsm_specs:
         fsm_inv_name = f"overlay_{spec_overlay.overlay_id}_fsm"
@@ -4430,6 +5263,7 @@ def apply_overlay_to_spec(
         if clean_disp:
             derived.update_display(clean_disp)
 
+    _wrap_spec_invariants_polymorphic(derived)
     return derived
 
 

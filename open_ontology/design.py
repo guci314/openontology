@@ -2332,6 +2332,14 @@ def run_design_prove(
             "report": None,
         }
 
+    for cp in report.class_proofs:
+        if cp.status != "SATISFIABLE":
+            _add_error(
+                errors,
+                error_codes,
+                f"{cp.status}: class {cp.object_type!r} ({cp.detail}) core={cp.unsat_core}",
+                code=cp.status,
+            )
     for r in report.reachability:
         if r.status == "TOTAL_DEADLOCK":
             _add_error(
@@ -2394,9 +2402,18 @@ def _format_prove_human_report(res: Mapping[str, Any]) -> str:
         f"  total_deadlocks={rep.get('total_deadlock_count')}, "
         f"conditional_deadlocks={rep.get('conditional_deadlock_count')}, "
         f"invariant_violations={rep.get('invariant_violation_count')}, "
+        f"dead_classes={rep.get('dead_class_count', 0)}, "
+        f"dl_conflicts={rep.get('dl_conflict_count', 0)}, "
+        f"lsp_violations={rep.get('lsp_violation_count', 0)}, "
         f"redundant_rules={rep.get('redundant_rule_count')}",
         f"  logic_fragments={rep.get('logic_fragment_counts')}",
     ]
+    for cp in rep.get("class_proofs") or ():
+        if cp.get("status") != "SATISFIABLE":
+            lines.append(
+                f"  [{cp.get('status')}] {cp.get('object_type')}: "
+                f"unsat_core={cp.get('unsat_core')} {cp.get('detail', '')}"
+            )
     for r in rep.get("reachability") or ():
         if r.get("status") == "TOTAL_DEADLOCK":
             lines.append(f"  [TOTAL_DEADLOCK] {r['action_name']}: unsat_core={r.get('unsat_core')}")

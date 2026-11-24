@@ -100,6 +100,7 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
   const isClean = result.verdict === 'PROVEN_CLEAN';
   const summary = result.summary;
   const fragmentEntries = Object.entries(summary?.fragment_counts || {});
+  const brokenClasses = (result.class_proofs || []).filter((c) => c.status !== 'SATISFIABLE');
   const deadlocked = (result.action_proofs || []).filter((p) => p.status !== 'REACHABLE');
   const violatedInvs = (result.invariant_proofs || []).filter((p) => p.status === 'VIOLATED');
   const redundantRules = result.redundant_rules || [];
@@ -149,6 +150,17 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
               )}
             </div>
             <div className="mt-1.5 flex flex-wrap items-center gap-3 text-xs text-slate-700">
+              {summary?.total_classes !== undefined && (
+                <span>
+                  类可满足性：<strong>{summary.satisfiable_classes ?? 0}</strong> /{' '}
+                  {summary.total_classes}（{summary.dead_class_count ?? 0} 死类 /{' '}
+                  {summary.lsp_violation_count ?? 0} LSP 违例
+                  {(summary.dl_conflict_count ?? 0) > 0
+                    ? ` / ${summary.dl_conflict_count} 公理冲突`
+                    : ''}
+                  ）
+                </span>
+              )}
               <span>
                 动作可达：<strong>{summary?.reachable_actions ?? 0}</strong> /{' '}
                 {summary?.total_actions ?? 0}
@@ -228,6 +240,41 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
 
       {!collapsed && (
         <div className="mt-4 space-y-3 border-t border-slate-200/70 pt-3 text-xs">
+          {brokenClasses.length > 0 && (
+            <div
+              data-testid="z3-class-conflict-list"
+              className="rounded-lg border border-rose-200 bg-white p-3"
+            >
+              <div className="font-semibold text-rose-800">不可满足类 / 结构契约违例诊断</div>
+              <ul className="mt-2 space-y-1.5">
+                {brokenClasses.map((clsItem) => (
+                  <li key={clsItem.object_type} className="text-slate-700">
+                    <span className="font-semibold text-slate-900">
+                      {clsItem.display_label || clsItem.object_type}
+                    </span>{' '}
+                    <code className="font-mono text-[11px] text-slate-500">
+                      ({clsItem.object_type}
+                      {clsItem.extends ? ` <- ${clsItem.extends_display_label || clsItem.extends}` : ''})
+                    </code>{' '}
+                    · <span className="font-semibold text-rose-700">{clsItem.status}</span>
+                    {clsItem.detail && (
+                      <div className="mt-0.5 text-[11px] text-slate-600">{clsItem.detail}</div>
+                    )}
+                    {clsItem.unsat_core.length > 0 && (
+                      <div className="mt-1 font-mono text-[11px] text-rose-700">
+                        UNSAT 冲突核：
+                        {(clsItem.unsat_core_labels?.length
+                          ? clsItem.unsat_core_labels
+                          : clsItem.unsat_core
+                        ).join(' , ')}
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {deadlocked.length > 0 && (
             <div className="rounded-lg border border-rose-200 bg-white p-3">
               <div className="font-semibold text-rose-800">不可达 / 死锁动作诊断</div>

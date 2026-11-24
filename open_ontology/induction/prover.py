@@ -32,6 +32,8 @@ from .dsl import (
     FieldSpec,
     InvariantRuleSpec,
     ObjectTypeBlueprint,
+    _effective_relation_bounds,
+    _relation_cardinality_issue,
     apply_overlay,
     blueprint_fingerprint,
     export_spec_blueprint,
@@ -43,6 +45,7 @@ __all__ = [
     "PROVER_UNAVAILABLE",
     "ProverUnavailableError",
     "LogicFragment",
+    "ClassSatisfiabilityProof",
     "ConditionalSliceResult",
     "ActionReachabilityProof",
     "RedundantRuleFinding",
@@ -51,6 +54,7 @@ __all__ = [
     "UpgradeRegressionItem",
     "UpgradeCompatibilityReport",
     "ProofReport",
+    "prove_class_satisfiability",
     "prove_action_reachability",
     "prove_redundant_rules",
     "prove_invariant_preservation",
@@ -192,6 +196,27 @@ class UpgradeCompatibilityReport(BaseModel):
     elapsed_ms: float = 0.0
 
 
+class ClassSatisfiabilityProof(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    object_type: str
+    extends: str | None = None
+    status: Literal[
+        "SATISFIABLE",
+        "UNSATISFIABLE_CLASS",
+        "DL_AXIOM_CONFLICT",
+        "LSP_VIOLATION",
+        "UNKNOWN",
+    ]
+    logic_fragment: str = "EXACT_QF_LIA"
+    inherited_invariants: list[str] = Field(default_factory=list)
+    own_invariants: list[str] = Field(default_factory=list)
+    unsat_core: list[str] = Field(default_factory=list)
+    detail: str = ""
+    witness: dict[str, Any] | None = None
+    elapsed_ms: float = 0.0
+
+
 class ProofReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -206,7 +231,11 @@ class ProofReport(BaseModel):
     conditional_deadlock_count: int = 0
     invariant_violation_count: int = 0
     redundant_rule_count: int = 0
+    dead_class_count: int = 0
+    dl_conflict_count: int = 0
+    lsp_violation_count: int = 0
     logic_fragment_counts: dict[str, int] = Field(default_factory=dict)
+    class_proofs: list[ClassSatisfiabilityProof] = Field(default_factory=list)
     reachability: list[ActionReachabilityProof] = Field(default_factory=list)
     redundant_rules: list[RedundantRuleFinding] = Field(default_factory=list)
     invariant_preservation: list[InvariantPreservationProof] = Field(default_factory=list)
@@ -255,6 +284,64 @@ def _normalize_overlays(
     )
 
 
+_STRUCTURAL_PROOF_CODES = frozenset(
+    {
+        "LSP_VIOLATION",
+        "INHERITANCE_CYCLE",
+        "DL_DISJOINT_VIOLATION",
+        "DL_CARDINALITY_CONFLICT",
+    }
+)
+
+
+def _lineage_types(ot_name: str, ancestors_map: Mapping[str, Sequence[str]]) -> set[str]:
+    return {ot_name, *ancestors_map.get(ot_name, ())}
+
+
+def _merge_structural_overlay_tolerantly(
+    eff: DeclarativeBlueprint,
+    ov_raw: CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any],
+) -> DeclarativeBlueprint:
+    """Layer overlay additives onto a copy without throwing on LSP/DL/cycle axioms."""
+    from .dsl import RelationSpec, _coerce_overlay
+
+    ov = _coerce_overlay(ov_raw)
+    out = copy.deepcopy(eff)
+    if ov.add_roles:
+        for r in ov.add_roles:
+            if r not in out.roles:
+                out.roles.append(r)
+    ot_map = {ot.name: ot for ot in out.object_types}
+    for nt in (*ov.add_object_types, *ov.derive_object_types):
+        if nt.name not in ot_map:
+            cloned = copy.deepcopy(nt)
+            out.object_types.append(cloned)
+            ot_map[cloned.name] = cloned
+    for pair in ov.add_disjoint_types:
+        if pair not in out.disjoint_types:
+            out.disjoint_types.append(tuple(pair))
+    for ot_n, flist in ov.add_fields.items():
+        if ot_n in ot_map:
+            existing_f = {f.name for f in ot_map[ot_n].fields}
+            for f in flist:
+                if f.name not in existing_f:
+                    ot_map[ot_n].fields.append(copy.deepcopy(f))
+    for ot_n, rlist in ov.add_relations.items():
+        if ot_n in ot_map:
+            existing_r = {r.field for r in ot_map[ot_n].relations}
+            for r in rlist:
+                if isinstance(r, RelationSpec) and r.field not in existing_r:
+                    ot_map[ot_n].relations.append(copy.deepcopy(r))
+    out.invariants.extend(copy.deepcopy(ov.add_invariants))
+    out.actions.extend(copy.deepcopy(ov.add_actions))
+    for act_n, extra_pres in ov.add_action_preconditions.items():
+        for a in out.actions:
+            if a.name == act_n:
+                a.preconditions.extend(copy.deepcopy(extra_pres))
+                break
+    return out
+
+
 def _resolve_effective_blueprint(
     target: DeclarativeBlueprint | OntologySpec | Mapping[str, Any],
     *,
@@ -263,11 +350,322 @@ def _resolve_effective_blueprint(
     | Mapping[str, Any]
     | Sequence[CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any]]
     | None = None,
+    allow_structural_errors: bool = False,
 ) -> DeclarativeBlueprint:
     eff = _to_blueprint(target)
     for ov in _normalize_overlays(overlay):
-        eff = apply_overlay(eff, ov)
+        try:
+            eff = apply_overlay(eff, ov)
+        except InvariantError as exc:
+            if allow_structural_errors and getattr(exc, "code", None) in _STRUCTURAL_PROOF_CODES:
+                eff = _merge_structural_overlay_tolerantly(eff, ov)
+            else:
+                raise
     return eff
+
+
+def _prepare_blueprint_for_prover(
+    bp: DeclarativeBlueprint,
+) -> tuple[
+    DeclarativeBlueprint,
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[Literal["DL_AXIOM_CONFLICT", "LSP_VIOLATION"], list[str], str]],
+]:
+    """Expand monotonic ``extends`` inheritance & collect structural LSP/DL conflicts."""
+    from .dsl import RelationSpec
+
+    raw_by_name = {ot.name: ot for ot in bp.object_types}
+    ancestors_map: dict[str, tuple[str, ...]] = {}
+    issues: dict[str, tuple[Literal["DL_AXIOM_CONFLICT", "LSP_VIOLATION"], list[str], str]] = {}
+    topo_valid: list[str] = []
+
+    # 1. Cycles & missing parents per node
+    visited_state: dict[str, int] = {}
+
+    def _walk(name: str, trail: list[str]) -> bool:
+        st = visited_state.get(name, 0)
+        if st == 2:
+            return name not in issues
+        if st == 1:
+            cyc = " -> ".join([*trail, name])
+            for node_n in trail[trail.index(name) :] if name in trail else trail:
+                issues[node_n] = (
+                    "LSP_VIOLATION",
+                    [f"cycle:{cyc}"],
+                    f"Inheritance cycle detected: {cyc}",
+                )
+            return False
+        visited_state[name] = 1
+        ot = raw_by_name[name]
+        parent_n = ot.extends
+        ok_chain = True
+        if parent_n is not None:
+            if parent_n == name:
+                issues[name] = (
+                    "LSP_VIOLATION",
+                    [f"cycle:{name}->{name}"],
+                    f"Self-inheritance cycle detected on {name!r}",
+                )
+                ok_chain = False
+            elif parent_n not in raw_by_name:
+                issues[name] = (
+                    "LSP_VIOLATION",
+                    [f"unknown_parent:{parent_n}"],
+                    f"ObjectType {name!r} extends unknown ObjectType {parent_n!r}",
+                )
+                ok_chain = False
+            else:
+                ok_chain = _walk(parent_n, [*trail, name])
+                if not ok_chain and name not in issues:
+                    issues[name] = (
+                        "LSP_VIOLATION",
+                        [f"ancestor_invalid:{parent_n}"],
+                        f"ObjectType {name!r} inherits from invalid parent {parent_n!r}",
+                    )
+        visited_state[name] = 2
+        if ok_chain:
+            ancestors_map[name] = (
+                (parent_n, *ancestors_map.get(parent_n, ())) if parent_n is not None else ()
+            )
+            topo_valid.append(name)
+        else:
+            ancestors_map.setdefault(name, ())
+        return ok_chain
+
+    for ot in bp.object_types:
+        _walk(ot.name, [])
+
+    # 2. Disjointness axioms & local relation cardinality checks
+    for ot in bp.object_types:
+        for rel in ot.relations:
+            c_issue = _relation_cardinality_issue(ot.name, rel)
+            if c_issue is not None and ot.name not in issues:
+                issues[ot.name] = (
+                    "DL_AXIOM_CONFLICT",
+                    [f"cardinality:{ot.name}.{rel.field}"],
+                    c_issue,
+                )
+        lineage = {ot.name, *ancestors_map.get(ot.name, ())}
+        for a, b in bp.disjoint_types:
+            if (a == b and ot.name == a) or (a != b and a in lineage and b in lineage):
+                if ot.name not in issues:
+                    issues[ot.name] = (
+                        "DL_AXIOM_CONFLICT",
+                        [f"disjoint:{a}!={b}"],
+                        f"Class {ot.name!r} violates disjointness axiom Disjoint({a!r}, {b!r})",
+                    )
+
+    # 3. Monotonic LSP checks & field/rel/FSM expansion in topological order
+    resolved_map: dict[str, ObjectTypeBlueprint] = {}
+    for name in topo_valid:
+        raw_ot = raw_by_name[name]
+        if raw_ot.exclude_fields and name not in issues:
+            issues[name] = (
+                "LSP_VIOLATION",
+                [f"exclude_fields:{','.join(raw_ot.exclude_fields)}"],
+                f"Subtype {name!r} excludes parent fields {raw_ot.exclude_fields}",
+            )
+        if raw_ot.extends is None:
+            resolved_map[name] = copy.deepcopy(raw_ot)
+            continue
+
+        parent = resolved_map[raw_ot.extends]
+        lsp_reasons: list[str] = []
+        lsp_cores: list[str] = []
+        sub_field_names = {sf.name for sf in raw_ot.fields}
+
+        pk_explicit = (
+            "primary_key" in raw_ot.model_fields_set
+            and raw_ot.primary_key != parent.primary_key
+            and (raw_ot.primary_key != "id" or "id" in sub_field_names)
+        )
+        if pk_explicit:
+            lsp_cores.append(f"primary_key:{parent.primary_key}->{raw_ot.primary_key}")
+            lsp_reasons.append(f"overrides primary_key {parent.primary_key!r} -> {raw_ot.primary_key!r}")
+        for sf in raw_ot.fields:
+            if sf.primary_key and sf.name != parent.primary_key:
+                lsp_cores.append(f"primary_key:{parent.primary_key}->{sf.name}")
+                lsp_reasons.append(f"redeclares primary_key field {sf.name!r}")
+
+        status_explicit = (
+            "status_field" in raw_ot.model_fields_set
+            and raw_ot.status_field != parent.status_field
+            and (raw_ot.status_field != "status" or "status" in sub_field_names)
+        )
+        if status_explicit:
+            lsp_cores.append(f"status_field:{parent.status_field}->{raw_ot.status_field}")
+            lsp_reasons.append(f"overrides status_field {parent.status_field!r} -> {raw_ot.status_field!r}")
+
+        if parent.append_only is True and raw_ot.append_only is False:
+            lsp_cores.append("append_only_dropped")
+            lsp_reasons.append("drops append_only=True")
+
+        p_fields = {f.name: f for f in parent.fields}
+        merged_fields = [copy.deepcopy(f) for f in parent.fields]
+        mf_idx = {f.name: idx for idx, f in enumerate(merged_fields)}
+        for sf in raw_ot.fields:
+            if sf.name in p_fields:
+                pf = p_fields[sf.name]
+                if sf.field_type != pf.field_type:
+                    lsp_cores.append(f"field_type:{sf.name}")
+                    lsp_reasons.append(f"re-types {sf.name!r} {pf.field_type} -> {sf.field_type}")
+                if pf.required and not sf.required and "required" in sf.model_fields_set:
+                    lsp_cores.append(f"field_required:{sf.name}")
+                    lsp_reasons.append(f"drops required on {sf.name!r}")
+                if pf.non_negative and not sf.non_negative and "non_negative" in sf.model_fields_set:
+                    lsp_cores.append(f"field_non_negative:{sf.name}")
+                    lsp_reasons.append(f"drops non_negative on {sf.name!r}")
+                merged_fields[mf_idx[sf.name]] = FieldSpec(
+                    name=pf.name,
+                    field_type=pf.field_type,
+                    default=sf.default if "default" in sf.model_fields_set else pf.default,
+                    required=bool(pf.required or sf.required),
+                    primary_key=bool(pf.primary_key),
+                    auto_id=bool(pf.auto_id or sf.auto_id),
+                    owned=bool(pf.owned or sf.owned),
+                    masked_roles=tuple(dict.fromkeys([*pf.masked_roles, *sf.masked_roles])),
+                    non_negative=bool(pf.non_negative or sf.non_negative),
+                    description=sf.description or pf.description,
+                )
+            else:
+                mf_idx[sf.name] = len(merged_fields)
+                merged_fields.append(copy.deepcopy(sf))
+
+        p_rels = {r.field: r for r in parent.relations}
+        merged_rels = [copy.deepcopy(r) for r in parent.relations]
+        mr_idx = {r.field: idx for idx, r in enumerate(merged_rels)}
+        for sr in raw_ot.relations:
+            if sr.field in p_rels:
+                pr = p_rels[sr.field]
+                if not pr.multiple and sr.multiple:
+                    lsp_cores.append(f"relation_multiple:{sr.field}")
+                    lsp_reasons.append(f"relaxes {sr.field!r} to multiple=True")
+                target_ok = (
+                    sr.target_type == pr.target_type
+                    or pr.target_type in ancestors_map.get(sr.target_type, ())
+                )
+                if not target_ok:
+                    lsp_cores.append(f"relation_target:{sr.field}")
+                    lsp_reasons.append(f"widens {sr.field!r} target to {sr.target_type!r}")
+                p_min, p_max = _effective_relation_bounds(pr)
+                min_set = "min_cardinality" in sr.model_fields_set
+                max_set = "max_cardinality" in sr.model_fields_set
+                if pr.required and "required" in sr.model_fields_set and not sr.required:
+                    lsp_cores.append(f"relation_required:{sr.field}")
+                    lsp_reasons.append(f"drops required on relation {sr.field!r}")
+                eff_sub_req = bool(pr.required or sr.required)
+                eff_sub_min_raw = int(sr.min_cardinality) if min_set else int(pr.min_cardinality)
+                eff_sub_min = max(eff_sub_min_raw, 1 if eff_sub_req else 0)
+                if eff_sub_min < p_min:
+                    lsp_cores.append(f"relation_min:{sr.field}")
+                    lsp_reasons.append(f"weakens {sr.field!r} min_cardinality {p_min} -> {eff_sub_min}")
+                if max_set:
+                    eff_sub_max_raw = sr.max_cardinality
+                    eff_sub_max = eff_sub_max_raw if sr.multiple else (
+                        eff_sub_max_raw if eff_sub_max_raw is not None else 1
+                    )
+                else:
+                    eff_sub_max_raw = pr.max_cardinality
+                    eff_sub_max = eff_sub_max_raw if sr.multiple else (
+                        min(eff_sub_max_raw, 1) if eff_sub_max_raw is not None else 1
+                    )
+                if p_max is not None and (eff_sub_max is None or eff_sub_max > p_max):
+                    lsp_cores.append(f"relation_max:{sr.field}")
+                    lsp_reasons.append(f"relaxes {sr.field!r} max_cardinality {p_max} -> {eff_sub_max}")
+                merged_rel = RelationSpec(
+                    field=sr.field,
+                    target_type=sr.target_type,
+                    multiple=sr.multiple if "multiple" in sr.model_fields_set else pr.multiple,
+                    owned=bool(pr.owned or sr.owned),
+                    required=eff_sub_req,
+                    min_cardinality=max(eff_sub_min_raw, pr.min_cardinality),
+                    max_cardinality=eff_sub_max_raw,
+                    description=sr.description or pr.description,
+                )
+                c_issue = _relation_cardinality_issue(name, merged_rel)
+                if c_issue is not None and name not in issues and not lsp_reasons:
+                    issues[name] = (
+                        "DL_AXIOM_CONFLICT",
+                        [f"cardinality:{name}.{sr.field}"],
+                        c_issue,
+                    )
+                merged_rels[mr_idx[sr.field]] = merged_rel
+            else:
+                mr_idx[sr.field] = len(merged_rels)
+                merged_rels.append(copy.deepcopy(sr))
+
+        if parent.initial_statuses is not None:
+            if raw_ot.initial_statuses is None:
+                resolved_init: list[str] | None = list(parent.initial_statuses)
+            else:
+                if not raw_ot.initial_statuses or not set(raw_ot.initial_statuses).issubset(
+                    set(parent.initial_statuses)
+                ):
+                    lsp_cores.append("fsm_initial_statuses")
+                    lsp_reasons.append(f"widens/empties initial_statuses {raw_ot.initial_statuses}")
+                resolved_init = list(raw_ot.initial_statuses)
+        else:
+            resolved_init = copy.deepcopy(raw_ot.initial_statuses)
+
+        if parent.transitions:
+            if not raw_ot.transitions:
+                resolved_trans = copy.deepcopy(parent.transitions)
+            else:
+                for src_s, dst_list in raw_ot.transitions.items():
+                    if src_s not in parent.transitions:
+                        lsp_cores.append(f"fsm_state:{src_s}")
+                        lsp_reasons.append(f"introduces unknown FSM state {src_s!r}")
+                    else:
+                        extra = [d for d in dst_list if d not in set(parent.transitions[src_s])]
+                        if extra:
+                            lsp_cores.append(f"fsm_edge:{src_s}->{','.join(extra)}")
+                            lsp_reasons.append(f"widens FSM transition {src_s!r} -> {extra}")
+                resolved_trans = copy.deepcopy(raw_ot.transitions)
+        else:
+            resolved_trans = copy.deepcopy(raw_ot.transitions)
+
+        if lsp_reasons and name not in issues:
+            issues[name] = (
+                "LSP_VIOLATION",
+                lsp_cores,
+                f"Subtype {name!r} violates parent {parent.name!r} behavioral contract: {'; '.join(lsp_reasons)}",
+            )
+
+        merged_vrules = dict(parent.voucher_delta_rules)
+        for bk, bv in raw_ot.voucher_delta_rules.items():
+            if bk in merged_vrules and tuple(merged_vrules[bk]) != tuple(bv) and name not in issues:
+                issues[name] = (
+                    "LSP_VIOLATION",
+                    [f"voucher_delta:{bk}"],
+                    f"Subtype {name!r} alters parent voucher_delta_rules[{bk!r}]",
+                )
+            merged_vrules[bk] = tuple(bv)
+
+        resolved_map[name] = ObjectTypeBlueprint(
+            name=name,
+            extends=raw_ot.extends,
+            archetype=raw_ot.archetype if ("archetype" in raw_ot.model_fields_set and raw_ot.archetype != "ObjectType") else parent.archetype,
+            primary_key=parent.primary_key,
+            title_field=raw_ot.title_field if raw_ot.title_field is not None else parent.title_field,
+            aggregate_root=raw_ot.aggregate_root if raw_ot.aggregate_root is not None else parent.aggregate_root,
+            append_only=raw_ot.append_only if raw_ot.append_only is not None else parent.append_only,
+            owned=raw_ot.owned,
+            fields=merged_fields,
+            exclude_fields=[],
+            relations=merged_rels,
+            status_field=parent.status_field,
+            initial_statuses=resolved_init,
+            transitions=resolved_trans,
+            voucher_delta_rules=merged_vrules,
+            view_tags=list(dict.fromkeys([*parent.view_tags, *raw_ot.view_tags])),
+            display_label=raw_ot.display_label or parent.display_label,
+        )
+
+    expanded = copy.deepcopy(bp)
+    expanded.object_types = [
+        resolved_map.get(ot.name, copy.deepcopy(ot)) for ot in bp.object_types
+    ]
+    return expanded, ancestors_map, issues
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +756,8 @@ class _StringCodec:
                 _collect_expr_strings(pre.when, collected)
                 _collect_expr_strings(pre.must_hold, collected)
             for mut in act.mutations:
+                if mut.when is not None:
+                    _collect_expr_strings(mut.when, collected)
                 for val_expr in mut.set_fields.values():
                     _collect_expr_strings(val_expr, collected)
         for inv in bp.invariants:
@@ -805,6 +1205,12 @@ class _Z3Compiler:
             return _SymVal(z3.RealVal(repr(val)), "float", is_null=False)
         if isinstance(val, str):
             return _SymVal(z3.IntVal(self.codec.encode(val)), "str", is_null=False)
+        if isinstance(val, (list, tuple)):
+            return _SymVal(
+                z3.IntVal(self.codec.encode(",".join(str(x) for x in val))),
+                "str",
+                is_null=False,
+            )
         raise InvariantError(f"unsupported scalar literal {val!r}", code="INVALID_PREDICATE_AST")
 
     @staticmethod
@@ -857,7 +1263,7 @@ class _Z3Compiler:
         guards: list[Any] | None = None,
     ) -> _SymVal:
         z3 = self.z3
-        if isinstance(node, (str, int, float, bool)) or node is None:
+        if isinstance(node, (str, int, float, bool, list, tuple)) or node is None:
             return self._literal_val(node)
         if not isinstance(node, dict):
             raise InvariantError(f"unsupported value AST node: {node!r}", code="INVALID_PREDICATE_AST")
@@ -1362,14 +1768,15 @@ def prove_action_reachability(
 ) -> list[ActionReachabilityProof]:
     """Prove global & conditional-branch reachability for every governed action."""
     z3 = _require_z3()
-    bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
+    raw_bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
+    bp, ancestors_map, _ = _prepare_blueprint_for_prover(raw_bp)
     custom_slices_map = _normalize_custom_slices(slices)
     extra_exprs = [
         expr for pairs in custom_slices_map.values() for _, expr in pairs
     ]
     codec = _StringCodec(bp, extra_exprs=extra_exprs)
 
-    target_filter = set(action_names) if action_names else None
+    target_filter = set(action_names) if action_names is not None else None
     results: list[ActionReachabilityProof] = []
 
     for act in bp.actions:
@@ -1415,19 +1822,28 @@ def prove_action_reachability(
                 sl_ctx["obj"] = default_subj
             compiled_custom.append((sl_name, comp.compile_bool(sl_ast, sl_ctx)))
 
-        # Track applicable global invariants (including linked entity types referenced by rules)
+        # Track applicable global invariants (including inherited ancestor invariants)
         inv_scope_types = ref_types | set(comp.named_entities.keys())
+        inv_scope_lineages: set[str] = set()
+        for tname in inv_scope_types:
+            inv_scope_lineages.update(_lineage_types(tname, ancestors_map))
         inv_trackers: list[tuple[str, Any]] = []
         for inv in bp.invariants:
-            if inv.target_type not in inv_scope_types:
+            if inv.target_type not in inv_scope_lineages:
                 continue
-            rows = comp.get_bmc_table(inv.target_type)
+            matching_types = sorted(
+                tname
+                for tname in inv_scope_types
+                if inv.target_type in _lineage_types(tname, ancestors_map)
+            )
             row_formulas = []
-            for row in rows:
-                sub_ctx = {"obj": row.entity}
-                w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
-                m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
-                row_formulas.append(z3.Implies(z3.And(row.present, w_z3), m_z3))
+            for mt in matching_types:
+                rows = comp.get_bmc_table(mt)
+                for row in rows:
+                    sub_ctx = {"obj": row.entity}
+                    w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
+                    m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
+                    row_formulas.append(z3.Implies(z3.And(row.present, w_z3), m_z3))
             inv_formula = z3.And(*row_formulas) if row_formulas else z3.BoolVal(True)
             inv_trackers.append((inv.name, inv_formula))
 
@@ -1772,9 +2188,10 @@ def prove_redundant_rules(
 ) -> list[RedundantRuleFinding]:
     """Identify precondition rules that are vacuous, tautological, or strictly implied."""
     z3 = _require_z3()
-    bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
+    raw_bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
+    bp, ancestors_map, _ = _prepare_blueprint_for_prover(raw_bp)
     codec = _StringCodec(bp)
-    target_filter = set(action_names) if action_names else None
+    target_filter = set(action_names) if action_names is not None else None
     findings: list[RedundantRuleFinding] = []
 
     for act in bp.actions:
@@ -1786,18 +2203,27 @@ def prove_redundant_rules(
         comp = _Z3Compiler(z3, bp, codec, bmc_bound=bmc_bound)
         actor, params, subjects, _ = _build_action_pre_context(comp, act)
         ref_types = _collect_action_referenced_types(act, subjects)
+        ref_lineages: set[str] = set()
+        for tname in ref_types:
+            ref_lineages.update(_lineage_types(tname, ancestors_map))
 
         inv_items: list[tuple[str, Any]] = []
         for inv in bp.invariants:
-            if inv.target_type not in ref_types:
+            if inv.target_type not in ref_lineages:
                 continue
-            rows = comp.get_bmc_table(inv.target_type)
+            matching_types = sorted(
+                tname
+                for tname in ref_types
+                if inv.target_type in _lineage_types(tname, ancestors_map)
+            )
             row_formulas = []
-            for row in rows:
-                sub_ctx = {"obj": row.entity}
-                w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
-                m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
-                row_formulas.append(z3.Implies(z3.And(row.present, w_z3), m_z3))
+            for mt in matching_types:
+                rows = comp.get_bmc_table(mt)
+                for row in rows:
+                    sub_ctx = {"obj": row.entity}
+                    w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
+                    m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
+                    row_formulas.append(z3.Implies(z3.And(row.present, w_z3), m_z3))
             inv_items.append(
                 (inv.name, z3.And(*row_formulas) if row_formulas else z3.BoolVal(True))
             )
@@ -1893,6 +2319,24 @@ def prove_redundant_rules(
 # ---------------------------------------------------------------------------
 # 3. Hoare-Triple Invariant Preservation {Pre ∧ I} Action {I'}
 # ---------------------------------------------------------------------------
+def _ite_is_null(z3_mod: Any, cond: Any, t_val: Any, e_val: Any) -> Any:
+    if t_val is False and e_val is False:
+        return False
+    if t_val is True and e_val is True:
+        return True
+    tb = (
+        z3_mod.BoolVal(True)
+        if t_val is True
+        else (z3_mod.BoolVal(False) if t_val is False else t_val)
+    )
+    eb = (
+        z3_mod.BoolVal(True)
+        if e_val is True
+        else (z3_mod.BoolVal(False) if e_val is False else e_val)
+    )
+    return z3_mod.If(cond, tb, eb)
+
+
 def _apply_mutations_symbolically(
     comp: _Z3Compiler,
     act: ActionBlueprint,
@@ -1900,33 +2344,49 @@ def _apply_mutations_symbolically(
     params: Mapping[str, _SymVal],
     subjects: Mapping[tuple[str, str], _SymEntity],
     anchor: _SymEntity | None,
+    *,
+    ancestors_map: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[
     dict[str, list[_SymRow]],
-    list[tuple[str, _SymEntity]],
+    list[tuple[str, _SymEntity, Any]],
     list[tuple[str, _SymEntity, _SymEntity]],
     list[Any],
 ]:
     """Symbolically execute declarative mutations sequentially.
 
-    Returns ``(post_tables, created_entities, modified_pairs, mut_guards)``.
+    Returns ``(post_tables, created_entities, modified_pairs, mut_guards)``,
+    where each item in ``created_entities`` is ``(ot_name, sym_entity, when_guard)``.
     """
     z3 = comp.z3
+    anc_map = ancestors_map or {}
     pre_tables: dict[str, list[_SymRow]] = {}
     post_tables: dict[str, list[_SymRow]] = {}
     mut_guards: list[Any] = []
 
     touched_types = {m.object_type for m in act.mutations if m.object_type in comp.ot_by_name}
+    touched_lineages: set[str] = set()
+    for tt in touched_types:
+        touched_lineages.update(_lineage_types(tt, anc_map))
+
     inv_table_types: set[str] = set()
+    for m in act.mutations:
+        if m.op == "delete" and m.object_type in comp.ot_by_name:
+            inv_table_types.add(m.object_type)
     for inv in comp.bp.invariants:
         inv_qtypes: set[str] = set()
         _collect_expr_refs(inv.when, set(), quant_types=inv_qtypes)
         _collect_expr_refs(inv.must_hold, set(), quant_types=inv_qtypes)
-        if inv.target_type in touched_types or (inv_qtypes & touched_types):
-            if inv.target_type in comp.ot_by_name:
-                inv_table_types.add(inv.target_type)
+        if not inv_qtypes:
+            continue
+        if inv.target_type in touched_lineages or (inv_qtypes & touched_lineages):
             for qt in inv_qtypes:
                 if qt in comp.ot_by_name:
                     inv_table_types.add(qt)
+            for tt in touched_types:
+                if tt in comp.ot_by_name and (
+                    inv.target_type in _lineage_types(tt, anc_map) or tt in inv_qtypes
+                ):
+                    inv_table_types.add(tt)
 
     # Snapshot pre-state tables if mutations need global updates across instances/BMC
     def _ensure_post_table(ot_name: str) -> list[_SymRow]:
@@ -1950,7 +2410,7 @@ def _apply_mutations_symbolically(
         return copied
 
     # Track symbolic snapshots of mutated/created entities for non_neg/FSM checks & witness decoding
-    created_entities: list[tuple[str, _SymEntity]] = []
+    created_entities: list[tuple[str, _SymEntity, Any]] = []
     # For each named pre-state subject or created entity, store live symbolic field dicts
     live_entities: dict[int, _SymEntity] = {}
     for ent in subjects.values():
@@ -1978,6 +2438,12 @@ def _apply_mutations_symbolically(
 
         if mut.op == "create":
             eval_ctx = {"param": params, "actor": actor}
+            w_mut = (
+                comp.compile_bool(mut.when, eval_ctx, pre_state=False, state_override=post_tables)
+                if mut.when is not None
+                else z3.BoolVal(True)
+            )
+            branch_guards: list[Any] = []
             new_ent = _SymEntity(ot=ot, tag=f"created_{ot_name}_{m_idx}")
             for fld in ot.fields:
                 if fld.name in mut.set_fields:
@@ -1986,7 +2452,7 @@ def _apply_mutations_symbolically(
                         eval_ctx,
                         pre_state=False,
                         state_override=post_tables,
-                        guards=mut_guards,
+                        guards=branch_guards,
                     )
                     new_ent.fields[fld.name] = val
                 elif fld.primary_key or fld.name == ot.primary_key:
@@ -2018,16 +2484,19 @@ def _apply_mutations_symbolically(
                         eval_ctx,
                         pre_state=False,
                         state_override=post_tables,
-                        guards=mut_guards,
+                        guards=branch_guards,
                     )
                 else:
                     new_ent.fields[rel.field] = comp._literal_val(None if not rel.required else "")
 
-            created_entities.append((ot_name, new_ent))
-            # If post_tables already exists or declarative invariants query/target this type, append created row
+            for bg in branch_guards:
+                mut_guards.append(z3.Implies(w_mut, bg) if mut.when is not None else bg)
+
+            created_entities.append((ot_name, new_ent, w_mut))
+            # If post_tables already exists or quantified invariants scan this type, append created row
             if ot_name in inv_table_types or ot_name in post_tables or ot_name in comp.bmc_tables:
                 rows = _ensure_post_table(ot_name)
-                rows.append(_SymRow(present=z3.BoolVal(True), entity=new_ent))
+                rows.append(_SymRow(present=w_mut, entity=new_ent))
             continue
 
         # modify or delete
@@ -2036,7 +2505,7 @@ def _apply_mutations_symbolically(
             if ref_parts[0] == "obj":
                 if anchor is None:
                     continue
-                linked_orig, fk_null = comp.resolve_linked_entity(anchor, ref_parts[1])
+                linked_orig, _fk_null = comp.resolve_linked_entity(anchor, ref_parts[1])
                 orig_target = linked_orig
                 for seg in ref_parts[2:]:
                     orig_target, _ = comp.resolve_linked_entity(orig_target, seg)
@@ -2079,13 +2548,24 @@ def _apply_mutations_symbolically(
             target_live = _get_live_copy(orig_target)
             eval_ctx = {"obj": target_live, "param": params, "actor": actor}
 
+        w_mut = (
+            comp.compile_bool(mut.when, eval_ctx, pre_state=False, state_override=post_tables)
+            if mut.when is not None
+            else z3.BoolVal(True)
+        )
+
         if mut.op == "delete":
             rows = _ensure_post_table(ot_name)
             for r in rows:
-                r.present = z3.And(r.present, r.entity.fields[ot.primary_key].expr != target_pk_sv.expr)
+                r.present = z3.If(
+                    w_mut,
+                    z3.And(r.present, r.entity.fields[ot.primary_key].expr != target_pk_sv.expr),
+                    r.present,
+                )
             continue
 
-        # Compute new field values before McCarthy update
+        # Compute new field values before McCarthy / guarded update
+        branch_guards = []
         computed_updates: dict[str, _SymVal] = {}
         for f_name, f_ast in mut.set_fields.items():
             computed_updates[f_name] = comp.compile_value(
@@ -2093,8 +2573,10 @@ def _apply_mutations_symbolically(
                 eval_ctx,
                 pre_state=False,
                 state_override=post_tables,
-                guards=mut_guards,
+                guards=branch_guards,
             )
+        for bg in branch_guards:
+            mut_guards.append(z3.Implies(w_mut, bg) if mut.when is not None else bg)
 
         # Update matching target_live AND any aliased live_entities of same type via McCarthy If
         target_pk_expr = target_pk_sv.expr
@@ -2102,21 +2584,26 @@ def _apply_mutations_symbolically(
             if live_ent.ot.name != ot_name:
                 continue
             same_pk = live_ent.fields[ot.primary_key].expr == target_pk_expr
+            hit_cond = w_mut if live_ent is target_live else z3.And(w_mut, same_pk)
             for f_name, new_sv in computed_updates.items():
                 if f_name not in live_ent.fields:
                     continue
                 old_sv = live_ent.fields[f_name]
-                if live_ent is target_live:
+                if live_ent is target_live and mut.when is None:
                     live_ent.fields[f_name] = new_sv
                 else:
                     if new_sv.kind in ("int", "float") and old_sv.kind in ("int", "float"):
                         ne_, oe_, rk = comp._coerce_arith_pair(new_sv, old_sv)
-                        live_ent.fields[f_name] = _SymVal(z3.If(same_pk, ne_, oe_), rk, is_null=old_sv.is_null)
+                        live_ent.fields[f_name] = _SymVal(
+                            z3.If(hit_cond, ne_, oe_),
+                            rk,
+                            is_null=_ite_is_null(z3, hit_cond, new_sv.is_null, old_sv.is_null),
+                        )
                     else:
                         live_ent.fields[f_name] = _SymVal(
-                            z3.If(same_pk, new_sv.expr, old_sv.expr),
+                            z3.If(hit_cond, new_sv.expr, old_sv.expr),
                             new_sv.kind if new_sv.kind != "null" else old_sv.kind,
-                            is_null=old_sv.is_null,
+                            is_null=_ite_is_null(z3, hit_cond, new_sv.is_null, old_sv.is_null),
                         )
 
         # Update post_tables via McCarthy If only when this type participates in global invariants/aggregates
@@ -2124,7 +2611,7 @@ def _apply_mutations_symbolically(
             rows = _ensure_post_table(ot_name)
             for row in rows:
                 same_pk = z3.And(
-                    row.present, row.entity.fields[ot.primary_key].expr == target_pk_expr
+                    row.present, w_mut, row.entity.fields[ot.primary_key].expr == target_pk_expr
                 )
                 for f_name, new_sv in computed_updates.items():
                     if f_name not in row.entity.fields:
@@ -2133,13 +2620,15 @@ def _apply_mutations_symbolically(
                     if new_sv.kind in ("int", "float") and old_sv.kind in ("int", "float"):
                         ne_, oe_, rk = comp._coerce_arith_pair(new_sv, old_sv)
                         row.entity.fields[f_name] = _SymVal(
-                            z3.If(same_pk, ne_, oe_), rk, is_null=old_sv.is_null
+                            z3.If(same_pk, ne_, oe_),
+                            rk,
+                            is_null=_ite_is_null(z3, same_pk, new_sv.is_null, old_sv.is_null),
                         )
                     else:
                         row.entity.fields[f_name] = _SymVal(
                             z3.If(same_pk, new_sv.expr, old_sv.expr),
                             new_sv.kind if new_sv.kind != "null" else old_sv.kind,
-                            is_null=old_sv.is_null,
+                            is_null=_ite_is_null(z3, same_pk, new_sv.is_null, old_sv.is_null),
                         )
 
         # Record pair for FSM / non_negative verification
@@ -2163,9 +2652,10 @@ def prove_invariant_preservation(
 ) -> list[InvariantPreservationProof]:
     """Prove inductive invariant preservation ``{Pre ∧ I} RuleAction {I'}`` via Hoare triples."""
     z3 = _require_z3()
-    bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
+    raw_bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
+    bp, ancestors_map, _ = _prepare_blueprint_for_prover(raw_bp)
     codec = _StringCodec(bp)
-    target_filter = set(action_names) if action_names else None
+    target_filter = set(action_names) if action_names is not None else None
     results: list[InvariantPreservationProof] = []
 
     for act in bp.actions:
@@ -2188,28 +2678,54 @@ def prove_invariant_preservation(
             pre_formulas.append(z3.Implies(w_z3, m_z3))
 
         post_tables, created_entities, modified_pairs, mut_guards = _apply_mutations_symbolically(
-            comp, act, actor, params, subjects, anchor
+            comp, act, actor, params, subjects, anchor, ancestors_map=ancestors_map
         )
 
-        # Ensure any pre-existing invariants applicable to mutated/created types hold in PRE-state
-        mutated_or_created_types = {ot for ot, _ in created_entities} | {
+        # Ensure any pre-existing invariants applicable to mutated/created types (or ancestors) hold in PRE-state
+        mutated_or_created_types = {ot for ot, _, _ in created_entities} | {
             ot for ot, _, _ in modified_pairs
         }
+        mutated_lineages: set[str] = set()
+        for mt in mutated_or_created_types:
+            mutated_lineages.update(_lineage_types(mt, ancestors_map))
+
+        pre_entities_all: list[_SymEntity] = []
+        seen_pre_ids: set[int] = set()
+        for ent in (*subjects.values(), *(b_ent for _, b_ent, _ in modified_pairs)):
+            if id(ent) not in seen_pre_ids:
+                seen_pre_ids.add(id(ent))
+                pre_entities_all.append(ent)
+
         applicable_invs: list[InvariantRuleSpec] = []
         pre_inv_formulas: list[Any] = []
         for inv in bp.invariants:
             inv_qtypes: set[str] = set()
             _collect_expr_refs(inv.when, set(), quant_types=inv_qtypes)
             _collect_expr_refs(inv.must_hold, set(), quant_types=inv_qtypes)
-            if inv.target_type in mutated_or_created_types or (inv_qtypes & mutated_or_created_types):
+            if inv.target_type in mutated_lineages or (inv_qtypes & mutated_lineages):
                 applicable_invs.append(inv)
-                rows = comp.get_bmc_table(inv.target_type)
-                rforms = []
-                for row in rows:
-                    sub_ctx = {"obj": row.entity}
-                    w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
-                    m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
-                    rforms.append(z3.Implies(z3.And(row.present, w_z3), m_z3))
+                rforms: list[Any] = []
+                for pre_ent in pre_entities_all:
+                    if inv.target_type in _lineage_types(pre_ent.ot.name, ancestors_map):
+                        sub_ctx = {"obj": pre_ent}
+                        w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
+                        m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
+                        rforms.append(z3.Implies(w_z3, m_z3))
+                need_bmc_pre = bool(inv_qtypes) or (inv.target_type in comp.bmc_tables) or (inv.target_type in post_tables)
+                if need_bmc_pre:
+                    bmc_targets = sorted(
+                        {inv.target_type}
+                        | {t for t in comp.bmc_tables if inv.target_type in _lineage_types(t, ancestors_map)}
+                    )
+                    for bt in bmc_targets:
+                        if bt not in comp.ot_by_name:
+                            continue
+                        rows = comp.get_bmc_table(bt)
+                        for row in rows:
+                            sub_ctx = {"obj": row.entity}
+                            w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
+                            m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
+                            rforms.append(z3.Implies(z3.And(row.present, w_z3), m_z3))
                 if rforms:
                     pre_inv_formulas.append(z3.And(*rforms))
 
@@ -2257,7 +2773,7 @@ def prove_invariant_preservation(
             )
 
         # Obligation A: Built-in non_negative fields on created or modified entities
-        for ot_name, new_ent in created_entities:
+        for ot_name, new_ent, c_guard in created_entities:
             for fld in new_ent.ot.fields:
                 if fld.non_negative:
                     fv = new_ent.fields[fld.name]
@@ -2266,7 +2782,13 @@ def prove_invariant_preservation(
                         cond = fv.expr >= z3.RealVal("0")
                     else:
                         cond = fv.expr >= 0
-                    obligations.append((f"{ot_name}.{fld.name}_non_negative", "NEGATIVE_VALUE", cond))
+                    obligations.append(
+                        (
+                            f"{ot_name}.{fld.name}_non_negative",
+                            "NEGATIVE_VALUE",
+                            z3.Implies(c_guard, cond),
+                        )
+                    )
 
         for ot_name, _before_ent, after_ent in modified_pairs:
             for fld in after_ent.ot.fields:
@@ -2280,7 +2802,7 @@ def prove_invariant_preservation(
                     obligations.append((f"{ot_name}.{fld.name}_non_negative", "NEGATIVE_VALUE", cond))
 
         # Obligation B: Built-in FSM transitions
-        for ot_name, new_ent in created_entities:
+        for ot_name, new_ent, c_guard in created_entities:
             ot = new_ent.ot
             if ot.initial_statuses is not None:
                 sf = new_ent.fields.get(ot.status_field)
@@ -2290,7 +2812,7 @@ def prove_invariant_preservation(
                         (
                             f"{ot_name}.initial_{ot.status_field}",
                             "ILLEGAL_INITIAL_STATUS",
-                            z3.Or(*allowed) if allowed else z3.BoolVal(False),
+                            z3.Implies(c_guard, z3.Or(*allowed) if allowed else z3.BoolVal(False)),
                         )
                     )
 
@@ -2320,26 +2842,26 @@ def prove_invariant_preservation(
             if not ot.voucher_delta_rules:
                 continue
             for bal_field, (v_type, v_link, v_delta) in ot.voucher_delta_rules.items():
-                if ot.name not in mutated_or_created_types and v_type not in mutated_or_created_types:
+                if ot.name not in mutated_lineages and v_type not in mutated_lineages:
                     continue
                 for _, before_ent, after_ent in modified_pairs:
-                    if before_ent.ot.name != ot.name:
+                    if ot.name not in _lineage_types(before_ent.ot.name, ancestors_map):
                         continue
                     bf = before_ent.fields[bal_field]
                     af = after_ent.fields[bal_field]
                     be, ae, _ = comp._coerce_arith_pair(bf, af)
                     ledger_delta = ae - be
-                    pk_expr = before_ent.fields[ot.primary_key].expr
+                    pk_expr = before_ent.fields[before_ent.ot.primary_key].expr
                     v_terms = []
-                    for c_ot, c_ent in created_entities:
-                        if c_ot != v_type:
+                    for c_ot, c_ent, c_guard in created_entities:
+                        if v_type not in _lineage_types(c_ot, ancestors_map):
                             continue
                         link_sv = c_ent.fields.get(v_link)
                         delta_sv = c_ent.fields.get(v_delta)
                         if link_sv is not None and delta_sv is not None:
                             v_terms.append(
                                 z3.If(
-                                    link_sv.expr == pk_expr,
+                                    z3.And(c_guard, link_sv.expr == pk_expr),
                                     z3.ToReal(delta_sv.expr)
                                     if not z3.is_real(delta_sv.expr)
                                     else delta_sv.expr,
@@ -2357,28 +2879,34 @@ def prove_invariant_preservation(
                         )
                     )
 
-        # Obligation D: Declarative invariants in post-state
+        # Obligation D: Declarative invariants (including inherited parent invariants) in post-state
         for inv in applicable_invs:
-            rows = post_tables.get(inv.target_type)
-            if rows is None and inv.target_type in comp.bmc_tables:
-                rows = comp.bmc_tables[inv.target_type]
             post_formulas: list[Any] = []
-            if rows is not None:
-                for row in rows:
-                    sub_ctx = {"obj": row.entity}
-                    w_post = (
-                        comp.compile_bool(
-                            inv.when, sub_ctx, pre_state=False, state_override=post_tables
+            checked_table_types = sorted(
+                t
+                for t in (set(post_tables.keys()) | set(comp.bmc_tables.keys()))
+                if inv.target_type in _lineage_types(t, ancestors_map)
+            )
+            for tb_type in checked_table_types:
+                rows = post_tables.get(tb_type)
+                if rows is None:
+                    rows = comp.bmc_tables.get(tb_type)
+                if rows is not None:
+                    for row in rows:
+                        sub_ctx = {"obj": row.entity}
+                        w_post = (
+                            comp.compile_bool(
+                                inv.when, sub_ctx, pre_state=False, state_override=post_tables
+                            )
+                            if inv.when
+                            else z3.BoolVal(True)
                         )
-                        if inv.when
-                        else z3.BoolVal(True)
-                    )
-                    m_post = comp.compile_bool(
-                        inv.must_hold, sub_ctx, pre_state=False, state_override=post_tables
-                    )
-                    post_formulas.append(z3.Implies(z3.And(row.present, w_post), m_post))
-            for c_ot, c_ent in created_entities:
-                if c_ot == inv.target_type and inv.target_type not in post_tables:
+                        m_post = comp.compile_bool(
+                            inv.must_hold, sub_ctx, pre_state=False, state_override=post_tables
+                        )
+                        post_formulas.append(z3.Implies(z3.And(row.present, w_post), m_post))
+            for c_ot, c_ent, c_guard in created_entities:
+                if inv.target_type in _lineage_types(c_ot, ancestors_map) and c_ot not in post_tables:
                     sub_ctx = {"obj": c_ent}
                     w_post = (
                         comp.compile_bool(
@@ -2390,9 +2918,9 @@ def prove_invariant_preservation(
                     m_post = comp.compile_bool(
                         inv.must_hold, sub_ctx, pre_state=False, state_override=post_tables
                     )
-                    post_formulas.append(z3.Implies(w_post, m_post))
+                    post_formulas.append(z3.Implies(z3.And(c_guard, w_post), m_post))
             for ot_name, _b_ent, after_ent in modified_pairs:
-                if ot_name == inv.target_type and inv.target_type not in post_tables:
+                if inv.target_type in _lineage_types(ot_name, ancestors_map) and ot_name not in post_tables:
                     sub_ctx = {"obj": after_ent}
                     w_post = (
                         comp.compile_bool(
@@ -2441,8 +2969,9 @@ def prove_invariant_preservation(
                 after_map: dict[str, dict[str, Any]] = {}
                 for ot_n, _b_ent, a_ent in modified_pairs:
                     after_map[f"{ot_n}(modified)"] = _decode_entity(z3, mdl, a_ent, codec)
-                for idx, (ot_n, c_ent) in enumerate(created_entities):
-                    after_map[f"{ot_n}(created_{idx})"] = _decode_entity(z3, mdl, c_ent, codec)
+                for idx, (ot_n, c_ent, c_guard) in enumerate(created_entities):
+                    if _eval_model_bool(z3, mdl, c_guard):
+                        after_map[f"{ot_n}(created_{idx})"] = _decode_entity(z3, mdl, c_ent, codec)
                 counterexamples.append(
                     InvariantCounterexample(
                         violated_invariant=ob_name,
@@ -2626,8 +3155,214 @@ def prove_upgrade_compatibility(
 
 
 # ---------------------------------------------------------------------------
-# 5. Unified Aggregator Entry Point
+# 5. CWA-DL & LSP Class Satisfiability Proofs + Unified Aggregator Entry Point
 # ---------------------------------------------------------------------------
+def _minimize_class_unsat_core(
+    z3_mod: Any,
+    background: Sequence[Any],
+    rule_items: Sequence[tuple[str, Any]],
+    candidate_names: list[str],
+    timeout_ms: int,
+) -> list[str]:
+    """Deterministically minimize class unsat_core by dropping redundant rules."""
+    if len(candidate_names) <= 1:
+        return candidate_names
+    formula_by_name = {name: f for name, f in rule_items}
+    active = list(candidate_names)
+    for cand in list(candidate_names):
+        if len(active) <= 1:
+            break
+        remaining = [r for r in active if r != cand]
+        chk_solver = z3_mod.Solver()
+        chk_solver.set("timeout", int(timeout_ms))
+        for bg in background:
+            chk_solver.add(bg)
+        for rname in remaining:
+            if rname in formula_by_name:
+                chk_solver.add(formula_by_name[rname])
+        if chk_solver.check() == z3_mod.unsat:
+            active = remaining
+    return active
+
+
+def prove_class_satisfiability(
+    blueprint_or_spec: DeclarativeBlueprint | OntologySpec | Mapping[str, Any],
+    *,
+    overlay: CustomerOverlaySpec
+    | EvolutionPatch
+    | Mapping[str, Any]
+    | Sequence[CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any]]
+    | None = None,
+    bmc_bound: int = 4,
+    timeout_ms: int = 5000,
+) -> list[ClassSatisfiabilityProof]:
+    """Prove every ObjectType class is mathematically satisfiable under CWA-DL & LSP."""
+    z3 = _require_z3()
+    raw_bp = _resolve_effective_blueprint(
+        blueprint_or_spec, overlay=overlay, allow_structural_errors=True
+    )
+    expanded_bp, ancestors_map, structural_issues = _prepare_blueprint_for_prover(raw_bp)
+    codec = _StringCodec(expanded_bp)
+    expanded_by_name = {ot.name: ot for ot in expanded_bp.object_types}
+
+    proofs: list[ClassSatisfiabilityProof] = []
+    for ot in expanded_bp.object_types:
+        t0 = time.perf_counter()
+        anc_chain = ancestors_map.get(ot.name, ())
+        inherited_invs = [
+            inv
+            for anc in reversed(anc_chain)
+            for inv in expanded_bp.invariants
+            if inv.target_type == anc
+        ]
+        own_invs = [inv for inv in expanded_bp.invariants if inv.target_type == ot.name]
+        inh_names = [i.name for i in inherited_invs]
+        own_names = [i.name for i in own_invs]
+
+        if ot.name in structural_issues:
+            st, core, det = structural_issues[ot.name]
+            proofs.append(
+                ClassSatisfiabilityProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status=st,
+                    logic_fragment=LogicFragment.EXACT_QF_LIA
+                    if hasattr(LogicFragment, "EXACT_QF_LIA")
+                    else "EXACT_QF_LIA",
+                    inherited_invariants=inh_names,
+                    own_invariants=own_names,
+                    unsat_core=list(core),
+                    detail=det,
+                    witness=None,
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+            continue
+
+        comp = _Z3Compiler(z3, expanded_bp, codec, bmc_bound=bmc_bound)
+        ent = comp.build_entity(ot.name, f"cls_{ot.name}", pre_state=True, register_congruence=True)
+
+        compiled_rules: list[tuple[str, Any, str]] = []
+        seen_rnames: set[str] = set()
+        for idx, inv in enumerate([*inherited_invs, *own_invs]):
+            if inv.name in seen_rnames:
+                continue
+            seen_rnames.add(inv.name)
+            sub_ctx = {"obj": ent}
+            w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when is not None else z3.BoolVal(True)
+            m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
+            inv_formula = z3.Implies(w_z3, m_z3)
+            trk_name = f"trk__cls_{idx}_{inv.name}"
+            compiled_rules.append((inv.name, inv_formula, trk_name))
+
+        solver = z3.Solver()
+        solver.set("timeout", int(timeout_ms))
+        solver.set("unsat_core", True)
+        solver.set("core.minimize", True)
+        for bg in comp.background:
+            solver.add(bg)
+
+        trk_map: dict[str, str] = {}
+        for rname, rformula, trk_name in compiled_rules:
+            trk_map[trk_name] = rname
+            solver.assert_and_track(rformula, z3.Bool(trk_name))
+
+        chk = solver.check()
+        frag = comp.logic_fragment()
+        if chk == z3.sat:
+            mdl = solver.model()
+            witness = _decode_entity(z3, mdl, ent, codec)
+            proofs.append(
+                ClassSatisfiabilityProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status="SATISFIABLE",
+                    logic_fragment=frag,
+                    inherited_invariants=inh_names,
+                    own_invariants=own_names,
+                    unsat_core=[],
+                    detail="",
+                    witness=witness,
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+        elif chk == z3.unsat:
+            raw_core = _extract_core_rule_names(solver.unsat_core(), trk_map)
+            rule_pairs = [(rname, rformula) for rname, rformula, _ in compiled_rules]
+            min_core = _minimize_class_unsat_core(
+                z3, comp.background, rule_pairs, raw_core, timeout_ms
+            )
+            if not min_core:
+                min_core = [f"domain:{ot.name}"]
+            proofs.append(
+                ClassSatisfiabilityProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status="UNSATISFIABLE_CLASS",
+                    logic_fragment=frag,
+                    inherited_invariants=inh_names,
+                    own_invariants=own_names,
+                    unsat_core=min_core,
+                    detail=f"Class {ot.name!r} has unsatisfiable constraints (core={min_core})",
+                    witness=None,
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+        else:
+            proofs.append(
+                ClassSatisfiabilityProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status="UNKNOWN",
+                    logic_fragment="UNKNOWN",
+                    inherited_invariants=inh_names,
+                    own_invariants=own_names,
+                    unsat_core=[],
+                    detail="Z3 returned unknown while checking class satisfiability",
+                    witness=None,
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+
+    # Pass 2: CWA fixed-point propagation for required / min>=1 relations targeting dead classes
+    proof_by_name = {cp.object_type: cp for cp in proofs}
+    changed = True
+    while changed:
+        changed = False
+        for idx, cp in enumerate(proofs):
+            if cp.status != "SATISFIABLE":
+                continue
+            ot = expanded_by_name[cp.object_type]
+            for rel in ot.relations:
+                eff_min, _ = _effective_relation_bounds(rel)
+                target_cp = proof_by_name.get(rel.target_type)
+                if (
+                    eff_min >= 1
+                    and target_cp is not None
+                    and target_cp.status in ("UNSATISFIABLE_CLASS", "DL_AXIOM_CONFLICT", "LSP_VIOLATION")
+                ):
+                    updated_cp = cp.model_copy(
+                        update={
+                            "status": "DL_AXIOM_CONFLICT",
+                            "witness": None,
+                            "unsat_core": [
+                                f"{ot.name}.{rel.field}->unsat:{rel.target_type}",
+                                *target_cp.unsat_core,
+                            ],
+                            "detail": (
+                                f"Relation {ot.name}.{rel.field} requires >= {eff_min} instance(s) "
+                                f"of unsatisfiable target {rel.target_type!r} ({target_cp.status})"
+                            ),
+                        }
+                    )
+                    proofs[idx] = updated_cp
+                    proof_by_name[cp.object_type] = updated_cp
+                    changed = True
+                    break
+
+    return proofs
+
+
 def prove_blueprint(
     blueprint_or_spec: DeclarativeBlueprint | OntologySpec | Mapping[str, Any],
     *,
@@ -2642,26 +3377,52 @@ def prove_blueprint(
     check_redundancy: bool = True,
     timeout_ms: int = 5000,
 ) -> ProofReport:
-    """Run reachability, redundancy, Hoare invariant preservation, and optional upgrade proofs."""
+    """Run class satisfiability/DL/LSP, reachability, redundancy, Hoare preservation, and upgrade proofs."""
     _require_z3()
     t0 = time.perf_counter()
 
     base_bp = _to_blueprint(blueprint_or_spec)
-    eff_bp = _resolve_effective_blueprint(base_bp, overlay=overlay)
+    eff_bp = _resolve_effective_blueprint(
+        base_bp, overlay=overlay, allow_structural_errors=True
+    )
+
+    class_proofs = prove_class_satisfiability(
+        eff_bp,
+        bmc_bound=bmc_bound,
+        timeout_ms=timeout_ms,
+    )
+    broken_cycle_types = {
+        c.object_type
+        for c in class_proofs
+        if any(tag.startswith(("cycle:", "unknown_parent:", "ancestor_invalid:")) for tag in c.unsat_core)
+    }
+
+    safe_action_names: list[str] | None = None
+    if broken_cycle_types:
+        safe_action_names = [
+            a.name
+            for a in eff_bp.actions
+            if not any(m.object_type in broken_cycle_types for m in a.mutations)
+            and not any(p.target_type in broken_cycle_types for p in a.preconditions)
+        ]
 
     reachability = prove_action_reachability(
         eff_bp,
+        action_names=safe_action_names,
         slices=slices,
         bmc_bound=bmc_bound,
         timeout_ms=timeout_ms,
     )
     redundant = (
-        prove_redundant_rules(eff_bp, bmc_bound=bmc_bound, timeout_ms=timeout_ms)
+        prove_redundant_rules(
+            eff_bp, action_names=safe_action_names, bmc_bound=bmc_bound, timeout_ms=timeout_ms
+        )
         if check_redundancy
         else []
     )
     inv_pres = prove_invariant_preservation(
         eff_bp,
+        action_names=safe_action_names,
         bmc_bound=bmc_bound,
         timeout_ms=timeout_ms,
     )
@@ -2680,14 +3441,24 @@ def prove_blueprint(
     total_deadlocks = sum(1 for r in reachability if r.status == "TOTAL_DEADLOCK")
     cond_deadlocks = sum(len(r.deadlocked_slices) for r in reachability)
     inv_violations = sum(1 for p in inv_pres if p.status == "VIOLATED")
+    dead_classes = sum(1 for c in class_proofs if c.status == "UNSATISFIABLE_CLASS")
+    dl_conflicts = sum(1 for c in class_proofs if c.status == "DL_AXIOM_CONFLICT")
+    lsp_violations = sum(1 for c in class_proofs if c.status == "LSP_VIOLATION")
+
     frag_counts: dict[str, int] = {}
-    for item in [*reachability, *redundant, *inv_pres]:
+    for item in [*class_proofs, *reachability, *redundant, *inv_pres]:
         frag_counts[item.logic_fragment] = frag_counts.get(item.logic_fragment, 0) + 1
 
     ok = (
         total_deadlocks == 0
         and cond_deadlocks == 0
         and inv_violations == 0
+        and dead_classes == 0
+        and dl_conflicts == 0
+        and lsp_violations == 0
+        and all(c.status != "UNKNOWN" for c in class_proofs)
+        and all(r.status != "UNKNOWN" for r in reachability)
+        and all(p.status != "UNKNOWN" for p in inv_pres)
         and (upgrade_report is None or upgrade_report.compatible)
     )
     total_rules = sum(len(a.preconditions) for a in eff_bp.actions)
@@ -2705,7 +3476,11 @@ def prove_blueprint(
         conditional_deadlock_count=cond_deadlocks,
         invariant_violation_count=inv_violations,
         redundant_rule_count=len(redundant),
+        dead_class_count=dead_classes,
+        dl_conflict_count=dl_conflicts,
+        lsp_violation_count=lsp_violations,
         logic_fragment_counts=frag_counts,
+        class_proofs=class_proofs,
         reachability=reachability,
         redundant_rules=redundant,
         invariant_preservation=inv_pres,
