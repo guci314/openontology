@@ -2047,6 +2047,7 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
         }
     ]
     starship_prompts = [
+        "在沙盘中让 Voyager 跃迁到 Alpha 星域",
         "当前可见星舰与曲速核心状态如何？",
         "我当前的星域权限范围是什么？",
         "最近有哪些跃迁拦截或审计记录？",
@@ -2072,19 +2073,27 @@ def build_console_service(
     mode: str = "standalone",
     db_path: str = ":memory:",
     demo_actor_switch: bool = True,
+    assistant_llm_client: Any = None,
+    enable_llm_assistant: bool | None = None,
 ) -> ConsoleService:
     cleaned = str(mode or "standalone").strip().lower()
     if cleaned == "standalone":
-        return build_standalone_enterprise_console(
+        svc = build_standalone_enterprise_console(
             db_path=db_path, demo_actor_switch=demo_actor_switch
         )
-    if cleaned in ("odoo19", "jsherp"):
-        return _build_erp_console(
+    elif cleaned in ("odoo19", "jsherp"):
+        svc = _build_erp_console(
             cleaned, db_path=db_path, demo_actor_switch=demo_actor_switch
         )
-    if cleaned == "starship":
-        return build_starship_console(demo_actor_switch=demo_actor_switch)
-    raise ValueError(f"unsupported console mode {mode!r}; expected standalone|odoo19|jsherp|starship")
+    elif cleaned == "starship":
+        svc = build_starship_console(demo_actor_switch=demo_actor_switch)
+    else:
+        raise ValueError(f"unsupported console mode {mode!r}; expected standalone|odoo19|jsherp|starship")
+    if assistant_llm_client is not None:
+        svc.assistant_llm_client = assistant_llm_client
+    if enable_llm_assistant is not None:
+        svc.enable_llm_assistant = enable_llm_assistant
+    return svc
 
 
 def main(argv: Sequence[str] | None = None) -> int:

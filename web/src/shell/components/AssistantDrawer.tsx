@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Bot, Send, Sparkles, X, ArrowUpRight } from 'lucide-react';
+import { Bot, Send, Sparkles, X, ArrowUpRight, CheckCircle2, AlertCircle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import type { AssistantCard, ConsoleMeta } from '../../api/client';
+import type { AssistantCard, AssistantToolTraceItem, ConsoleMeta } from '../../api/client';
 import { consoleApi } from '../../api/client';
 
 interface AssistantMessage {
@@ -10,6 +10,8 @@ interface AssistantMessage {
   text: string;
   highlights?: Array<{ label: string; value: string }>;
   cards?: AssistantCard[];
+  toolTrace?: AssistantToolTraceItem[];
+  sandboxId?: string | null;
 }
 
 interface AssistantDrawerProps {
@@ -18,6 +20,7 @@ interface AssistantDrawerProps {
   onClose: () => void;
   onInspectObject: (entityType: string, recordId: string) => void;
   onSelectSandboxPreset?: (presetId: string) => void;
+  onOpenSandboxSession?: (sandboxId: string) => void;
 }
 
 const FALLBACK_QUICK_PROMPTS = [
@@ -33,10 +36,12 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
   onClose,
   onInspectObject,
   onSelectSandboxPreset,
+  onOpenSandboxSession,
 }) => {
   const navigate = useNavigate();
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [activeSandboxId, setActiveSandboxId] = useState<string | null>(null);
   const welcomeText =
     meta.assistant_welcome ||
     `您好 ${meta.actor.display_name}！我是运行在「${meta.actor.title}」权限视角内的智能助手，可为您检索可见记录、待办审批与平行沙盘推演。`;
@@ -48,6 +53,10 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
     },
   ]);
   const streamEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setActiveSandboxId(null);
+  }, [meta.actor.actor_id]);
 
   useEffect(() => {
     if (!open) return;
@@ -72,9 +81,18 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
       ? meta.quick_prompts
       : FALLBACK_QUICK_PROMPTS;
 
+  const isLlmMode = meta.assistant_mode === 'llm_sandbox';
+  const modeBadgeLabel = isLlmMode
+    ? `DeepSeek 沙盘代理 · ${meta.assistant_model || 'deepseek-flash'}`
+    : '离线检索模式';
+
   const sendQuestion = async (textToSend: string) => {
     const trimmed = textToSend.trim();
     if (!trimmed || busy) return;
+    const historyTurns = messages
+      .filter((m) => m.id !== 'welcome' && m.text.trim().length > 0)
+      .slice(-8)
+      .map((m) => ({ role: m.sender, content: m.text }));
     const userMsg: AssistantMessage = {
       id: `u-${Date.now()}`,
       sender: 'user',
@@ -84,7 +102,13 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
     setInput('');
     setBusy(true);
     try {
-      const res = await consoleApi.assistantChat(trimmed);
+      const res = await consoleApi.assistantChat(trimmed, {
+        sandbox_id: activeSandboxId,
+        history: historyTurns,
+      });
+      if (res.sandbox_id) {
+        setActiveSandboxId(res.sandbox_id);
+      }
       setMessages((prev) => [
         ...prev,
         {
@@ -93,6 +117,8 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
           text: res.reply,
           highlights: res.highlights,
           cards: res.cards,
+          toolTrace: res.tool_trace,
+          sandboxId: res.sandbox_id ?? null,
         },
       ]);
     } catch (err) {
@@ -122,8 +148,20 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
               <Bot className="h-5 w-5" />
             </div>
             <div>
-              <h3 className="text-sm font-semibold text-slate-900">AI 数字智能管家</h3>
-              <p className="text-xs text-slate-500">
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-semibold text-slate-900">AI 数字智能管家</h3>
+                <span
+                  data-testid="assistant-mode-badge"
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                    isLlmMode
+                      ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200'
+                      : 'bg-slate-100 text-slate-600 ring-1 ring-slate-200'
+                  }`}
+                >
+                  {modeBadgeLabel}
+                </span>
+              </div>
+              <p className="mt-0.5 text-xs text-slate-500">
                 当前视角：{meta.actor.display_name}（{meta.actor.unit_name || meta.actor.title}）
               </p>
             </div>
@@ -172,7 +210,31 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
                     : 'border border-slate-200 bg-slate-50 text-slate-800'
                 }`}
               >
-                <p>{m.text}</p>
+                {m.toolTrace && m.toolTrace.length > 0 && (
+                  <div
+                    data-testid="assistant-tool-trace"
+                    className="mb-2 flex flex-wrap gap-1 border-b border-slate-200/80 pb-2"
+                  >
+                    {m.toolTrace.map((trace, idx) => (
+                      <span
+                        key={`${m.id}-tr-${idx}`}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                          trace.ok
+                            ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200'
+                            : 'bg-rose-50 text-rose-700 ring-1 ring-rose-200'
+                        }`}
+                      >
+                        {trace.ok ? (
+                          <CheckCircle2 className="h-2.5 w-2.5 shrink-0" />
+                        ) : (
+                          <AlertCircle className="h-2.5 w-2.5 shrink-0" />
+                        )}
+                        <span>{trace.summary}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <p className="whitespace-pre-wrap">{m.text}</p>
                 {m.highlights && m.highlights.length > 0 && (
                   <div className="mt-2.5 grid grid-cols-2 gap-1.5 border-t border-slate-200/80 pt-2">
                     {m.highlights.map((h) => (
@@ -193,19 +255,33 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
                     <button
                       key={`${m.id}-c-${i}`}
                       type="button"
+                      data-testid={`assistant-card-${card.kind}`}
                       onClick={() => {
                         if (card.kind === 'object' && card.object_type && card.object_id) {
                           onInspectObject(card.object_type, card.object_id);
                           onClose();
-                        } else if (card.kind === 'sandbox_preset') {
+                        } else if (card.kind === 'sandbox_session' && card.sandbox_id) {
+                          if (onOpenSandboxSession) {
+                            onOpenSandboxSession(card.sandbox_id);
+                          }
+                          onClose();
+                          navigate(card.route || '/sandbox');
+                        } else if (card.kind === 'sandbox_preset' || card.kind === 'sandbox') {
                           if (card.preset_id && onSelectSandboxPreset) {
                             onSelectSandboxPreset(card.preset_id);
                           }
                           onClose();
                           navigate(card.route || '/sandbox');
+                        } else if (card.kind === 'audit') {
+                          onClose();
+                          navigate(card.route || '/audit');
                         }
                       }}
-                      className="flex w-full items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-2 text-left transition hover:border-blue-300 hover:bg-blue-50/40"
+                      className={`flex w-full items-center justify-between rounded-xl border px-3 py-2 text-left transition ${
+                        card.kind === 'sandbox_session'
+                          ? 'border-emerald-300 bg-emerald-50/70 hover:border-emerald-400 hover:bg-emerald-50'
+                          : 'border-slate-200 bg-white hover:border-blue-300 hover:bg-blue-50/40'
+                      }`}
                     >
                       <div className="min-w-0 pr-2">
                         <div className="truncate text-xs font-semibold text-slate-900">
@@ -213,7 +289,11 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
                         </div>
                         <div className="truncate text-[11px] text-slate-500">{card.subtitle}</div>
                       </div>
-                      <ArrowUpRight className="h-4 w-4 shrink-0 text-blue-600" />
+                      <ArrowUpRight
+                        className={`h-4 w-4 shrink-0 ${
+                          card.kind === 'sandbox_session' ? 'text-emerald-700' : 'text-blue-600'
+                        }`}
+                      />
                     </button>
                   ))}
                 </div>
@@ -237,7 +317,11 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
               data-testid="assistant-input"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="输入问题，例如：当前有哪些待办或规则拦截..."
+              placeholder={
+                isLlmMode
+                  ? '输入自然语言指令，例如：在沙盘中试演一次状态调整...'
+                  : '输入问题，例如：当前有哪些待办或规则拦截...'
+              }
               className="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:bg-white focus:outline-none"
             />
             <button

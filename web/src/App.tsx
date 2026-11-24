@@ -36,6 +36,9 @@ const AppShell: React.FC = () => {
   >([]);
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [pendingPresetId, setPendingPresetId] = useState<string | null>(null);
+  const [pendingSandboxId, setPendingSandboxId] = useState<string | null>(null);
+  const consumePendingPreset = useCallback(() => setPendingPresetId(null), []);
+  const consumePendingSandbox = useCallback(() => setPendingSandboxId(null), []);
 
   const loadBootstrap = useCallback(async () => {
     try {
@@ -79,6 +82,7 @@ const AppShell: React.FC = () => {
       setDrawerTarget(null);
       setDrawerHistory([]);
       setPendingPresetId(null);
+      setPendingSandboxId(null);
       await loadBootstrap();
       setRefreshTick((t) => t + 1);
     },
@@ -177,7 +181,9 @@ const AppShell: React.FC = () => {
               schema={schema}
               pack={activePack}
               pendingPresetId={pendingPresetId}
-              onConsumePendingPreset={() => setPendingPresetId(null)}
+              onConsumePendingPreset={consumePendingPreset}
+              pendingSandboxId={pendingSandboxId}
+              onConsumePendingSandbox={consumePendingSandbox}
               onPromotedToPrimary={handleRefresh}
             />
           }
@@ -228,6 +234,10 @@ const AppShell: React.FC = () => {
         onClose={() => setAssistantOpen(false)}
         onInspectObject={openRootObject}
         onSelectSandboxPreset={(pid) => setPendingPresetId(pid)}
+        onOpenSandboxSession={(sid) => {
+          setPendingPresetId(null);
+          setPendingSandboxId(sid);
+        }}
       />
     </ShellLayout>
   );

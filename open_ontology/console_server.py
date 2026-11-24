@@ -21,11 +21,14 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 import json
 import mimetypes
+import os
 from pathlib import Path
 import re
 import socket
 import threading
 from typing import Any, Callable, Iterable, Mapping, Sequence
+import urllib.error
+import urllib.request
 import uuid
 
 from fastapi import Body, FastAPI, Request
@@ -510,9 +513,148 @@ class _AutonomyUpdatePayload(BaseModel):
     rules: list[_AutonomyRulePayload] | None = None
 
 
+@dataclass(frozen=True)
+class _LlmEndpointConfig:
+    """Resolved OpenAI-compatible LLM endpoint configuration."""
+
+    provider: str
+    api_key: str
+    base_url: str
+    model: str
+
+
+def _normalize_llm_model_name(base_url: str, raw_model: str) -> str:
+    """Normalize provider model aliases so official DeepSeek API accepts flash names."""
+    model_str = str(raw_model or "").strip()
+    if "api.deepseek.com" in str(base_url or "").lower() and model_str.lower() in (
+        "deepseek-v4.1-flash",
+        "deepseek/deepseek-v4.1-flash",
+    ):
+        return "deepseek-flash"
+    return model_str
+
+
+def _resolve_llm_assistant_config(
+    explicit_model: str | None = None,
+    explicit_base_url: str | None = None,
+) -> _LlmEndpointConfig | None:
+    """Resolve OpenAI-compatible assistant credentials in priority order."""
+    model_override = (
+        str(explicit_model).strip()
+        if explicit_model is not None and str(explicit_model).strip()
+        else None
+    )
+    base_override = (
+        str(explicit_base_url).strip()
+        if explicit_base_url is not None and str(explicit_base_url).strip()
+        else None
+    )
+
+    ds_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if ds_key:
+        base_url = (
+            base_override
+            or os.environ.get("DEEPSEEK_BASE_URL")
+            or "https://api.deepseek.com/v1"
+        ).strip().rstrip("/")
+        raw_model = (
+            model_override
+            or os.environ.get("OPEN_ONTOLOGY_ASSISTANT_MODEL")
+            or os.environ.get("DEEPSEEK_MODEL")
+            or "deepseek-flash"
+        )
+        return _LlmEndpointConfig(
+            provider="deepseek",
+            api_key=ds_key,
+            base_url=base_url,
+            model=_normalize_llm_model_name(base_url, raw_model),
+        )
+
+    or_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if or_key:
+        base_url = (
+            base_override
+            or os.environ.get("OPENROUTER_BASE_URL")
+            or "https://openrouter.ai/api/v1"
+        ).strip().rstrip("/")
+        raw_model = (
+            model_override
+            or os.environ.get("OPEN_ONTOLOGY_ASSISTANT_MODEL")
+            or "deepseek/deepseek-v4.1-flash"
+        )
+        return _LlmEndpointConfig(
+            provider="openrouter",
+            api_key=or_key,
+            base_url=base_url,
+            model=_normalize_llm_model_name(base_url, raw_model),
+        )
+
+    oa_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if oa_key:
+        base_url = (
+            base_override
+            or os.environ.get("OPENAI_BASE_URL")
+            or "https://api.openai.com/v1"
+        ).strip().rstrip("/")
+        raw_model = (
+            model_override
+            or os.environ.get("OPEN_ONTOLOGY_ASSISTANT_MODEL")
+            or "gpt-4o-mini"
+        )
+        return _LlmEndpointConfig(
+            provider="openai",
+            api_key=oa_key,
+            base_url=base_url,
+            model=_normalize_llm_model_name(base_url, raw_model),
+        )
+
+    return None
+
+
+def _default_openai_compatible_chat(
+    cfg: _LlmEndpointConfig,
+    request_body: Mapping[str, Any],
+    *,
+    timeout_s: float = 25.0,
+) -> dict[str, Any]:
+    """Perform a single stdlib HTTP POST to an OpenAI-compatible chat/completions endpoint."""
+    endpoint = f"{cfg.base_url.rstrip('/')}/chat/completions"
+    payload_bytes = json.dumps(dict(request_body), ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=payload_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {cfg.api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw_text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            detail = str(exc.reason or "")
+        raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"LLM network error: {exc.reason}") from None
+    parsed = json.loads(raw_text)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("LLM response payload is not a JSON object")
+    return parsed
+
+
 class _AssistantPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     message: str = ""
     question: str = ""
+    sandbox_id: str | None = None
+    history: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class _BlueprintProvePayload(BaseModel):
@@ -546,6 +688,10 @@ class ConsoleService:
             [OntologyRuntime, Actor, str, Mapping[str, Any]], dict[str, Any]
         ]
         | None = None,
+        assistant_llm_client: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        enable_llm_assistant: bool | None = None,
+        assistant_model: str | None = None,
+        assistant_base_url: str | None = None,
         admin_roles: Iterable[str] = _DEFAULT_ADMIN_ROLES,
         escalation_action: str | None = None,
         escalation_assignee_role: str | None = None,
@@ -564,6 +710,10 @@ class ConsoleService:
         self.assistant_welcome = str(assistant_welcome)
         self.value_unit_label = str(value_unit_label)
         self.assistant_responder = assistant_responder
+        self.assistant_llm_client = assistant_llm_client
+        self.enable_llm_assistant = enable_llm_assistant
+        self.assistant_model = assistant_model
+        self.assistant_base_url = assistant_base_url
         self.admin_roles = frozenset(admin_roles or _DEFAULT_ADMIN_ROLES)
         self._lock = threading.RLock()
         self._sandboxes: dict[str, _SandboxSession] = {}
@@ -829,6 +979,32 @@ class ConsoleService:
                         return str(snap[fallback_k])
         return ""
 
+    def _resolve_llm_mode_and_cfg(
+        self,
+    ) -> tuple[bool, _LlmEndpointConfig | None, str | None]:
+        if self.enable_llm_assistant is False:
+            return False, None, None
+        if self.assistant_llm_client is not None:
+            model_name = _normalize_llm_model_name(
+                self.assistant_base_url or "https://api.deepseek.com/v1",
+                self.assistant_model or "deepseek-flash",
+            )
+            return True, None, model_name
+        if os.environ.get("OPEN_ONTOLOGY_ASSISTANT_LLM", "").strip() == "0":
+            return False, None, None
+        if self.enable_llm_assistant is None and os.environ.get("PYTEST_CURRENT_TEST"):
+            return False, None, None
+        cfg = _resolve_llm_assistant_config(self.assistant_model, self.assistant_base_url)
+        if cfg is None:
+            return False, None, None
+        return True, cfg, cfg.model
+
+    def _llm_assistant_ready(self) -> bool:
+        return self._resolve_llm_mode_and_cfg()[0]
+
+    def _active_assistant_model_name(self) -> str | None:
+        return self._resolve_llm_mode_and_cfg()[2]
+
     # -- endpoints ---------------------------------------------------------
     def get_meta(self, actor: Actor) -> dict[str, Any]:
         with self._lock:
@@ -860,6 +1036,7 @@ class ConsoleService:
                 )
             except Exception:
                 welcome_text = welcome_tpl
+            llm_ready, _, llm_model = self._resolve_llm_mode_and_cfg()
             return {
                 "ok": True,
                 "world_mode": self.runtime.world_mode,
@@ -878,6 +1055,8 @@ class ConsoleService:
                 "sandbox_presets": self._visible_sandbox_presets(actor),
                 "quick_prompts": prompts,
                 "assistant_welcome": welcome_text,
+                "assistant_mode": "llm_sandbox" if llm_ready else "offline_fallback",
+                "assistant_model": llm_model,
                 "value_unit_label": self.value_unit_label,
                 "autonomy_mode": self.autonomy_controller.policy.default_mode,
                 "state_fingerprint": self.runtime.state_fingerprint(),
@@ -2957,7 +3136,658 @@ class ConsoleService:
                 "roles": behavior["roles"],
             }
 
-    # -- NL assistant (RLS scoped, 100% offline capable) -------------------
+    # -- NL assistant (Pure M2 LLM sandbox agent + offline fallback) -------
+    @staticmethod
+    def _build_m2_llm_tools() -> list[dict[str, Any]]:
+        """Declare strictly read + isolated-sandbox tools (never primary write/promote)."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_objects",
+                    "description": "查询当前用户权限可见范围内的本体对象列表（可查主世界或当前平行沙盘）。执行任何修改动作前应先调用本工具匹配对象主键与当前字段。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "object_type": {
+                                "type": "string",
+                                "description": "本体对象类型名称",
+                            },
+                            "in_sandbox": {
+                                "type": "boolean",
+                                "description": "是否读取当前平行沙盘分支状态；默认 false 读主世界",
+                            },
+                        },
+                        "required": ["object_type"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_sandbox_action",
+                    "description": "在当前用户专属的隔离平行沙盘（runtime.fork）中试演一次受治理动作，绝不修改真实主世界。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action_name": {
+                                "type": "string",
+                                "description": "要执行的动作内部名称",
+                            },
+                            "params": {
+                                "type": "object",
+                                "description": "传递给该动作的参数字典",
+                            },
+                        },
+                        "required": ["action_name", "params"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_sandbox_diff",
+                    "description": "获取当前平行沙盘相对真实主世界的全部对象新建/属性变更/删除差异。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_function",
+                    "description": "调用只读本体聚合或衍生查询函数（支持在主世界或当前沙盘运行）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fn_name": {
+                                "type": "string",
+                                "description": "只读函数内部名称",
+                            },
+                            "params": {
+                                "type": "object",
+                                "description": "函数参数字典",
+                            },
+                            "in_sandbox": {
+                                "type": "boolean",
+                                "description": "是否在当前平行沙盘中求值，默认 false",
+                            },
+                        },
+                        "required": ["fn_name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_audit_summary",
+                    "description": "查询当前用户权限可见范围内的审计运行记录摘要与最近合规拦截情况。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
+        ]
+
+    @staticmethod
+    def _sanitize_llm_history(
+        raw_history: Sequence[Mapping[str, Any]] | None,
+    ) -> list[dict[str, str]]:
+        cleaned: list[dict[str, str]] = []
+        for entry in raw_history or ():
+            if not isinstance(entry, Mapping):
+                continue
+            role = str(entry.get("role") or "").strip().lower()
+            content = entry.get("content")
+            if role in ("user", "assistant") and isinstance(content, str):
+                text = content.strip()
+                if text:
+                    cleaned.append({"role": role, "content": text[:1200]})
+        return cleaned[-8:]
+
+    def _build_m2_llm_system_prompt(
+        self,
+        actor: Actor,
+        active_sid: str | None,
+    ) -> str:
+        """Build a 100% domain-agnostic system prompt purely from spec + merged display."""
+        display = self._merged_display()
+        obj_labels = display.get("objects") or {}
+        act_labels = display.get("actions") or {}
+        fn_labels = display.get("functions") or {}
+        field_labels = display.get("fields") or {}
+        status_labels = display.get("statuses") or {}
+        value_labels = display.get("values") or {}
+        role_labels = display.get("roles") or {}
+
+        scoped_tbox = describe_tbox(self.runtime.spec, actor=actor)
+        scoped_behavior = describe_behavior(self.runtime.spec, actor=actor)
+        scoped_action_names = [a["name"] for a in scoped_behavior["actions"]]
+        prof = self._actor_profile(actor)
+
+        entities_info: list[dict[str, Any]] = []
+        for ot_desc in scoped_tbox["object_types"]:
+            ot_name = ot_desc["name"]
+            cls = self.runtime.spec.object_types.get(ot_name)
+            fields_brief = []
+            for f in ot_desc.get("fields", ()):
+                fname = f["name"]
+                f_info: dict[str, Any] = {
+                    "name": fname,
+                    "label": field_labels.get(fname) or fname,
+                    "type": f.get("type"),
+                }
+                if f.get("masked"):
+                    f_info["masked"] = True
+                if f.get("choices"):
+                    f_info["choices"] = list(f["choices"])
+                fields_brief.append(f_info)
+            entities_info.append(
+                {
+                    "name": ot_name,
+                    "display_label": obj_labels.get(ot_name) or ot_name,
+                    "primary_key": ot_desc.get("primary_key"),
+                    "status_field": ot_desc.get("status_field"),
+                    "transitions": (
+                        getattr(cls, "__transitions__", {}) if cls is not None else {}
+                    ),
+                    "fields": fields_brief,
+                }
+            )
+
+        actions_info: list[dict[str, Any]] = []
+        for aname in scoped_action_names:
+            act_def = self.runtime.spec.actions.get(aname)
+            if act_def is None:
+                continue
+            pschema = _enrich_action_params_schema(act_def)
+            actions_info.append(
+                {
+                    "name": aname,
+                    "display_label": act_labels.get(aname) or aname,
+                    "description": str(act_def.description or ""),
+                    "touched_object_types": list(act_def.touched_object_types or ()),
+                    "params_schema": {
+                        "properties": pschema.get("properties", {}),
+                        "required": pschema.get("required", []),
+                    },
+                }
+            )
+
+        functions_info = [
+            {
+                "name": fn_name,
+                "display_label": fn_labels.get(fn_name) or fn_name,
+                "description": str(fn_def.description or ""),
+            }
+            for fn_name, fn_def in sorted(self.runtime.spec.functions.items())
+        ]
+
+        vocab_hints: dict[str, str] = {}
+        for bucket in (value_labels, status_labels):
+            for k, v in bucket.items():
+                ks = str(k).strip()
+                vs = str(v).strip()
+                if ks and vs and ks not in vocab_hints:
+                    vocab_hints[ks] = vs
+
+        presets_hint = [
+            {
+                "title": p.get("title"),
+                "steps": p.get("steps", []),
+            }
+            for p in self._visible_sandbox_presets(actor)[:6]
+        ]
+
+        catalog = {
+            "actor": {
+                "actor_id": actor.actor_id,
+                "display_name": prof.get("display_name"),
+                "role": actor.role,
+                "role_label": role_labels.get(actor.role) or prof.get("title") or actor.role,
+                "clearance_tags": sorted(actor.clearance_tags),
+            },
+            "active_sandbox_id": active_sid,
+            "object_types": entities_info,
+            "allowed_actions": actions_info,
+            "read_only_functions": functions_info,
+            "value_dictionary": dict(list(vocab_hints.items())[:40]),
+            "sandbox_preset_examples": presets_hint,
+        }
+        catalog_json = json.dumps(catalog, ensure_ascii=False)
+        return (
+            "你是运行在受治理本体控制台上的 AI 数字智能管家（Pure M2 沙盘代理）。\n"
+            "严格遵守以下运行规范：\n"
+            "1. 当用户请求查询记录、执行操作、改变状态或进行假设推演时，先调用 `list_objects` 查看可见对象，依据标题、呼号或属性匹配真实主键编号（严禁臆测不存在的主键或字段值）。\n"
+            "2. 所有状态变更只能通过 `run_sandbox_action` 在隔离平行沙盘中执行，绝对不会污染真实主世界；若用户未明确某个有参考示例或最小正值的参数，优先使用参数 schema 默认值或预设示例中的典型值（切忌传入越界或负值导致不必要的参数错误）。\n"
+            "3. 将自然语言描述映射为对应类型和动作 schema 中声明的精确代码值（参考 `value_dictionary` 与字段 `enum`）。\n"
+            "4. 若权限校验（`PERMISSION_DENIED`）、行级隔离（`OBJECT_NOT_FOUND`）或本体不变式/状态机护栏拒绝执行，请如实说明拦截原因，绝不编造成功结果。\n"
+            "5. 成功在沙盘推演后，用简洁清晰的中文汇报动作结果与字段前后对比，明确指出真实主世界保持零脏写，并提示用户可点击下方卡片进入平行沙盘页面核对或晋升落盘。\n\n"
+            f"当前权限作用域内的本体目录：\n{catalog_json}"
+        )
+
+    def _execute_m2_assistant_tool(
+        self,
+        tool_name: str,
+        raw_args: Mapping[str, Any],
+        actor: Actor,
+        sandbox_holder: dict[str, Any],
+        tool_trace: list[dict[str, Any]],
+        discovered_objects: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self._lock:
+            display = self._merged_display()
+            obj_labels = display.get("objects") or {}
+            act_labels = display.get("actions") or {}
+            fn_labels = display.get("functions") or {}
+            active_sid: str | None = sandbox_holder.get("sid")
+
+            if tool_name == "list_objects":
+                ot_name = str(raw_args.get("object_type") or "").strip()
+                in_sbx = bool(raw_args.get("in_sandbox", False))
+                rt_override = None
+                if in_sbx and active_sid:
+                    rt_override = self._require_sandbox(active_sid, actor).fork_runtime
+                ot_label = obj_labels.get(ot_name) or ot_name or "对象"
+                try:
+                    listed = self.list_objects(ot_name, actor, runtime_override=rt_override)
+                except (OpenOntologyError, ValueError) as exc:
+                    err_code = getattr(exc, "code", None) or "UNKNOWN_OBJECT_TYPE"
+                    tool_trace.append(
+                        {"tool": "list_objects", "summary": f"查询 {ot_label} 失败", "ok": False}
+                    )
+                    return {"ok": False, "error_code": err_code, "error": str(exc)}
+                compact_items = [
+                    {
+                        "object_id": it["object_id"],
+                        "title": it["title"],
+                        "properties": it["properties"],
+                    }
+                    for it in listed["items"][:25]
+                ]
+                for it in compact_items[:6]:
+                    discovered_objects.append(
+                        {
+                            "object_type": listed["object_type"],
+                            "object_id": it["object_id"],
+                            "title": f"{listed['display_label']} · {it['title']}",
+                            "subtitle": f"编号 {it['object_id']}",
+                        }
+                    )
+                tool_trace.append(
+                    {
+                        "tool": "list_objects",
+                        "summary": f"查询 {listed['display_label']}（{listed['count']} 条）",
+                        "ok": True,
+                    }
+                )
+                return {
+                    "ok": True,
+                    "object_type": listed["object_type"],
+                    "display_label": listed["display_label"],
+                    "primary_key": listed["primary_key"],
+                    "count": listed["count"],
+                    "in_sandbox": bool(in_sbx and active_sid),
+                    "items": compact_items,
+                }
+
+            if tool_name == "run_sandbox_action":
+                action_name = str(raw_args.get("action_name") or "").strip()
+                raw_params = raw_args.get("params")
+                params_dict = dict(raw_params) if isinstance(raw_params, Mapping) else {}
+                act_label = act_labels.get(action_name) or action_name or "未知动作"
+
+                if not active_sid:
+                    created = self.create_sandbox(actor)
+                    active_sid = str(created["sandbox_id"])
+                    sandbox_holder["sid"] = active_sid
+                else:
+                    self._require_sandbox(active_sid, actor)
+
+                try:
+                    sub = self.submit_sandbox_action(
+                        active_sid,
+                        _SandboxSubmitRequest(
+                            steps=[_SandboxSubmitStep(action=action_name, params=params_dict)]
+                        ),
+                        actor,
+                    )
+                except (OpenOntologyError, ValueError) as exc:
+                    err_code = getattr(exc, "code", None) or "SANDBOX_STEP_REJECTED"
+                    hint = _translate_error_hint(err_code, str(exc), display=display)
+                    tool_trace.append(
+                        {
+                            "tool": "run_sandbox_action",
+                            "summary": f"沙盘执行 {act_label}（拦截：{err_code}）",
+                            "ok": False,
+                        }
+                    )
+                    return {
+                        "ok": False,
+                        "sandbox_id": active_sid,
+                        "error_code": err_code,
+                        "error": str(exc),
+                        "hint_zh": hint,
+                    }
+
+                diff = self.diff_sandbox(active_sid, actor)
+                sandbox_holder["last_diff"] = diff
+                if sub.get("ok"):
+                    tool_trace.append(
+                        {
+                            "tool": "run_sandbox_action",
+                            "summary": f"沙盘执行 {act_label}（{diff['total_changes']} 项变更）",
+                            "ok": True,
+                        }
+                    )
+                else:
+                    err_code = str(sub.get("error_code") or "REJECTED")
+                    tool_trace.append(
+                        {
+                            "tool": "run_sandbox_action",
+                            "summary": f"沙盘执行 {act_label}（拦截：{err_code}）",
+                            "ok": False,
+                        }
+                    )
+                return {
+                    "ok": bool(sub.get("ok")),
+                    "sandbox_id": active_sid,
+                    "step_results": sub.get("step_results", []),
+                    "diff_summary": {
+                        "step_count": diff["step_count"],
+                        "total_changes": diff["total_changes"],
+                        "updated": diff["updated"],
+                        "created": diff["created"],
+                        "deleted": diff["deleted"],
+                    },
+                    "error_code": sub.get("error_code"),
+                    "error": sub.get("error"),
+                    "hint_zh": sub.get("hint_zh"),
+                    "primary_fingerprint_unchanged": sub.get("primary_fingerprint_unchanged", True),
+                }
+
+            if tool_name == "get_sandbox_diff":
+                if not active_sid:
+                    tool_trace.append(
+                        {"tool": "get_sandbox_diff", "summary": "当前尚无沙盘改动", "ok": True}
+                    )
+                    return {
+                        "ok": True,
+                        "sandbox_id": None,
+                        "step_count": 0,
+                        "total_changes": 0,
+                        "updated": [],
+                        "created": [],
+                        "deleted": [],
+                    }
+                diff = self.diff_sandbox(active_sid, actor)
+                sandbox_holder["last_diff"] = diff
+                tool_trace.append(
+                    {
+                        "tool": "get_sandbox_diff",
+                        "summary": f"核对沙盘差异（{diff['step_count']} 步 · {diff['total_changes']} 项）",
+                        "ok": True,
+                    }
+                )
+                return diff
+
+            if tool_name == "run_function":
+                fn_name = str(raw_args.get("fn_name") or "").strip()
+                raw_params = raw_args.get("params")
+                params_dict = dict(raw_params) if isinstance(raw_params, Mapping) else {}
+                in_sbx = bool(raw_args.get("in_sandbox", False))
+                fn_label = fn_labels.get(fn_name) or fn_name or "函数"
+                rt_target = self.runtime
+                if in_sbx and active_sid:
+                    rt_target = self._require_sandbox(active_sid, actor).fork_runtime
+                try:
+                    result = rt_target.call_function(fn_name, params_dict, actor)
+                    tool_trace.append(
+                        {"tool": "run_function", "summary": f"计算指标 {fn_label}", "ok": True}
+                    )
+                    return {
+                        "ok": True,
+                        "function": fn_name,
+                        "in_sandbox": bool(in_sbx and active_sid),
+                        "result": result,
+                    }
+                except (OpenOntologyError, ValidationError, ValueError) as exc:
+                    err_code = getattr(exc, "code", None) or "FUNCTION_ERROR"
+                    tool_trace.append(
+                        {"tool": "run_function", "summary": f"计算 {fn_label} 失败", "ok": False}
+                    )
+                    return {"ok": False, "error_code": err_code, "error": str(exc)}
+
+            if tool_name == "get_audit_summary":
+                aud = self.get_audit(actor)
+                tool_trace.append(
+                    {
+                        "tool": "get_audit_summary",
+                        "summary": f"检索审计记录（{aud['summary']['total_runs']} 条）",
+                        "ok": True,
+                    }
+                )
+                compact_runs = [
+                    {
+                        "run_id": r["run_id"],
+                        "action_type": r["action_type"],
+                        "action_label": r["action_label"],
+                        "status": r["status"],
+                        "error_code": r.get("error_code"),
+                        "hint_zh": r.get("hint_zh"),
+                    }
+                    for r in aud["runs"][:8]
+                ]
+                return {"ok": True, "summary": aud["summary"], "recent_runs": compact_runs}
+
+            tool_trace.append(
+                {"tool": tool_name, "summary": f"未知工具 {tool_name}", "ok": False}
+            )
+            return {
+                "ok": False,
+                "error_code": "UNKNOWN_TOOL",
+                "error": f"unsupported tool {tool_name!r}",
+            }
+
+    def _run_llm_sandbox_assistant(
+        self,
+        question: str,
+        payload: _AssistantPayload,
+        actor: Actor,
+        *,
+        initial_sid: str | None,
+        cfg: _LlmEndpointConfig | None,
+        model_label: str,
+    ) -> dict[str, Any]:
+        """Run multi-round OpenAI tool-calling loop with lock released during HTTP I/O."""
+        with self._lock:
+            if initial_sid:
+                self._require_sandbox(initial_sid, actor)
+            sys_prompt = self._build_m2_llm_system_prompt(actor, initial_sid)
+        tools = self._build_m2_llm_tools()
+        history = self._sanitize_llm_history(payload.history)
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": sys_prompt},
+            *history,
+            {"role": "user", "content": question},
+        ]
+
+        def _invoke(body: Mapping[str, Any]) -> Mapping[str, Any]:
+            if self.assistant_llm_client is not None:
+                return self.assistant_llm_client(dict(body))
+            assert cfg is not None
+            return _default_openai_compatible_chat(cfg, body, timeout_s=25.0)
+
+        sandbox_holder: dict[str, Any] = {"sid": initial_sid, "last_diff": None}
+        tool_trace: list[dict[str, Any]] = []
+        discovered_objects: list[dict[str, Any]] = []
+        final_reply = ""
+        llm_error_note = ""
+
+        try:
+            for _ in range(5):
+                resp = _invoke(
+                    {
+                        "model": model_label,
+                        "messages": messages,
+                        "tools": tools,
+                        "tool_choice": "auto",
+                        "temperature": 0.1,
+                    }
+                )
+                choices = resp.get("choices") if isinstance(resp, Mapping) else None
+                if not isinstance(choices, list) or not choices:
+                    raise RuntimeError("LLM returned empty choices")
+                first = choices[0]
+                msg = first.get("message") if isinstance(first, Mapping) else None
+                if not isinstance(msg, Mapping):
+                    raise RuntimeError("LLM returned invalid choice message")
+                raw_tool_calls = msg.get("tool_calls") or []
+                if not raw_tool_calls:
+                    final_reply = str(msg.get("content") or "").strip()
+                    break
+
+                assistant_turn: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": [dict(tc) for tc in raw_tool_calls],
+                }
+                if msg.get("reasoning_content") is not None:
+                    assistant_turn["reasoning_content"] = msg.get("reasoning_content")
+                messages.append(assistant_turn)
+
+                for tc in raw_tool_calls:
+                    tc_id = str(tc.get("id") or f"tc-{uuid.uuid4().hex[:8]}")
+                    fn_obj = tc.get("function") if isinstance(tc, Mapping) else None
+                    t_name = str(fn_obj.get("name") or "") if isinstance(fn_obj, Mapping) else ""
+                    raw_args_val = (
+                        fn_obj.get("arguments") if isinstance(fn_obj, Mapping) else {}
+                    )
+                    parsed_args: dict[str, Any] = {}
+                    if isinstance(raw_args_val, Mapping):
+                        parsed_args = dict(raw_args_val)
+                    elif isinstance(raw_args_val, str) and raw_args_val.strip():
+                        try:
+                            loaded = json.loads(raw_args_val)
+                            if isinstance(loaded, Mapping):
+                                parsed_args = dict(loaded)
+                        except json.JSONDecodeError:
+                            parsed_args = {}
+
+                    t_res = self._execute_m2_assistant_tool(
+                        t_name,
+                        parsed_args,
+                        actor,
+                        sandbox_holder,
+                        tool_trace,
+                        discovered_objects,
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": json.dumps(t_res, ensure_ascii=False),
+                        }
+                    )
+
+            if not final_reply and tool_trace:
+                try:
+                    synth = _invoke(
+                        {
+                            "model": model_label,
+                            "messages": messages,
+                            "temperature": 0.1,
+                        }
+                    )
+                    s_choices = synth.get("choices") if isinstance(synth, Mapping) else None
+                    if isinstance(s_choices, list) and s_choices:
+                        s_msg = s_choices[0].get("message") or {}
+                        final_reply = str(s_msg.get("content") or "").strip()
+                except Exception:
+                    final_reply = ""
+        except Exception as exc:
+            llm_error_note = f"大模型推演调用暂时不可用（{str(exc)[:160]}）。"
+
+        final_sid: str | None = sandbox_holder.get("sid")
+        final_diff: dict[str, Any] | None = None
+        if final_sid:
+            with self._lock:
+                try:
+                    final_diff = self.diff_sandbox(final_sid, actor)
+                except OpenOntologyError:
+                    final_diff = None
+
+        cards: list[dict[str, Any]] = []
+        highlights: list[dict[str, str]] = []
+        if final_sid and final_diff and int(final_diff.get("step_count", 0)) > 0:
+            step_count = int(final_diff["step_count"])
+            total_changes = int(final_diff["total_changes"])
+            cards.append(
+                {
+                    "kind": "sandbox_session",
+                    "title": "平行沙盘推演已就绪",
+                    "subtitle": f"共 {step_count} 步推演 · {total_changes} 项变更（点击进入沙盘核对或晋升落盘）",
+                    "sandbox_id": final_sid,
+                    "route": "/sandbox",
+                }
+            )
+            highlights = [
+                {"label": "沙盘推演步数", "value": str(step_count)},
+                {"label": "变更记录数", "value": str(total_changes)},
+                {"label": "主世界脏写", "value": "0"},
+            ]
+        elif discovered_objects:
+            highlights = [
+                {"label": "已检索对象", "value": str(len(discovered_objects))},
+                {"label": "主世界脏写", "value": "0"},
+            ]
+
+        seen_obj_keys: set[tuple[str, str]] = set()
+        for item in discovered_objects:
+            k = (str(item["object_type"]), str(item["object_id"]))
+            if k in seen_obj_keys:
+                continue
+            seen_obj_keys.add(k)
+            cards.append(
+                {
+                    "kind": "object",
+                    "title": item["title"],
+                    "subtitle": item["subtitle"],
+                    "object_type": item["object_type"],
+                    "object_id": item["object_id"],
+                }
+            )
+            if len(cards) >= 6:
+                break
+
+        if llm_error_note:
+            reply_text = llm_error_note
+        elif final_reply:
+            reply_text = final_reply
+        elif final_diff and int(final_diff.get("step_count", 0)) > 0:
+            reply_text = (
+                f"已在隔离平行沙盘 {final_sid} 完成 {final_diff['step_count']} 步推演"
+                f"（涉及 {final_diff['total_changes']} 项变更），主世界保持零脏写。"
+            )
+        else:
+            reply_text = "已完成当前权限作用域内的检索分析。"
+
+        return {
+            "ok": True,
+            "reply": reply_text,
+            "highlights": highlights,
+            "cards": cards,
+            "assistant_mode": "llm_sandbox",
+            "assistant_model": model_label,
+            "sandbox_id": final_sid,
+            "tool_trace": tool_trace,
+            "rls_scope": sorted(actor.clearance_tags),
+        }
+
     def assistant_chat(
         self,
         payload: _AssistantPayload,
@@ -2965,45 +3795,72 @@ class ConsoleService:
     ) -> dict[str, Any]:
         with self._lock:
             question = (payload.message or payload.question or "").strip()
+            raw_sid = (payload.sandbox_id or "").strip() if payload.sandbox_id else ""
+            if raw_sid:
+                self._require_sandbox(raw_sid, actor)
+
+            llm_ready, cfg, model_label = self._resolve_llm_mode_and_cfg()
             if not question:
                 return {
                     "ok": True,
                     "reply": "请输入您想查询的运行指标、记录异常、待办审批或假设推演问题。",
                     "highlights": [],
                     "cards": [],
+                    "assistant_mode": "llm_sandbox" if llm_ready else "offline_fallback",
+                    "assistant_model": model_label,
+                    "sandbox_id": raw_sid or None,
+                    "tool_trace": [],
                     "rls_scope": sorted(actor.clearance_tags),
                 }
 
-            if self.assistant_responder is not None:
-                visible_runs = self._filter_runs_for_actor(
-                    self.runtime.list_action_runs(),
-                    actor,
-                )
-                custom = self.assistant_responder(
-                    self.runtime,
-                    actor,
-                    question,
-                    {
-                        "display": self._merged_display(),
-                        "work_queue": (
-                            self.work_queue_binding.model_dump(mode="json")
-                            if self.work_queue_binding
-                            else None
-                        ),
-                        "visible_presets": self._visible_sandbox_presets(actor),
-                        "visible_runs": visible_runs,
-                        "visible_rejected_runs": [
-                            r for r in visible_runs if r.get("status") == "REJECTED"
-                        ],
-                    },
-                )
-                return {
-                    "ok": True,
-                    **custom,
-                    "rls_scope": sorted(actor.clearance_tags),
-                }
+            if not llm_ready:
+                if self.assistant_responder is not None:
+                    visible_runs = self._filter_runs_for_actor(
+                        self.runtime.list_action_runs(),
+                        actor,
+                    )
+                    custom = self.assistant_responder(
+                        self.runtime,
+                        actor,
+                        question,
+                        {
+                            "display": self._merged_display(),
+                            "work_queue": (
+                                self.work_queue_binding.model_dump(mode="json")
+                                if self.work_queue_binding
+                                else None
+                            ),
+                            "visible_presets": self._visible_sandbox_presets(actor),
+                            "visible_runs": visible_runs,
+                            "visible_rejected_runs": [
+                                r for r in visible_runs if r.get("status") == "REJECTED"
+                            ],
+                        },
+                    )
+                    return {
+                        "ok": True,
+                        **custom,
+                        "assistant_mode": "offline_fallback",
+                        "assistant_model": None,
+                        "sandbox_id": raw_sid or custom.get("sandbox_id"),
+                        "tool_trace": custom.get("tool_trace", []),
+                        "rls_scope": sorted(actor.clearance_tags),
+                    }
 
-            return self._generic_m2_assistant(question, actor)
+                offline = self._generic_m2_assistant(question, actor)
+                if raw_sid and not offline.get("sandbox_id"):
+                    offline["sandbox_id"] = raw_sid
+                return offline
+
+        # Release self._lock before issuing external LLM network I/O
+        return self._run_llm_sandbox_assistant(
+            question,
+            payload,
+            actor,
+            initial_sid=raw_sid or None,
+            cfg=cfg,
+            model_label=model_label or "deepseek-flash",
+        )
 
     def _generic_m2_assistant(self, question: str, actor: Actor) -> dict[str, Any]:
         display = self._merged_display()
@@ -3069,6 +3926,33 @@ class ConsoleService:
                 f" 最近一次红线拦截为「{act_zh}」"
                 + (f"（{err_zh}）" if err_zh else "。")
             )
+
+        action_intent_tokens = (
+            "沙盘",
+            "推演",
+            "模拟",
+            "试演",
+            "执行",
+            "修改",
+            "更新",
+            "变更",
+            "跃迁",
+            "创建",
+            "删除",
+            "sandbox",
+            "execute",
+        )
+        mentions_action = any(tok in lower_q for tok in action_intent_tokens) or any(
+            aname.lower() in lower_q or str(act_labels.get(aname) or "").lower() in lower_q
+            for aname in self.runtime.spec.actions
+            if len(aname) >= 2
+        )
+        if mentions_action:
+            reply += (
+                "（当前处于离线检索模式，未连接大模型推理引擎来自动执行动作；"
+                "请在环境变量配置 DEEPSEEK_API_KEY 后重启控制台，或前往「平行沙盘推演」页面手动试演。）"
+            )
+
         return {
             "ok": True,
             "reply": reply,
@@ -3078,6 +3962,10 @@ class ConsoleService:
                 {"label": "红线拦截次数", "value": str(len(rejected))},
             ],
             "cards": matched_cards[:6],
+            "assistant_mode": "offline_fallback",
+            "assistant_model": None,
+            "sandbox_id": None,
+            "tool_trace": [],
             "rls_scope": sorted(actor.clearance_tags),
         }
 

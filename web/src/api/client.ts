@@ -80,6 +80,8 @@ export interface ConsoleMeta {
   sandbox_presets: SandboxPreset[];
   quick_prompts?: string[];
   assistant_welcome?: string;
+  assistant_mode?: 'llm_sandbox' | 'offline_fallback';
+  assistant_model?: string | null;
   value_unit_label?: string;
   autonomy_mode: string;
   state_fingerprint: Record<string, unknown>;
@@ -341,13 +343,20 @@ export interface AuditResponse {
 }
 
 export interface AssistantCard {
-  kind: 'object' | 'sandbox_preset';
+  kind: 'object' | 'sandbox' | 'sandbox_preset' | 'sandbox_session' | 'audit';
   title: string;
   subtitle: string;
   object_type?: string;
   object_id?: string;
   preset_id?: string;
+  sandbox_id?: string;
   route?: string;
+}
+
+export interface AssistantToolTraceItem {
+  tool: string;
+  summary: string;
+  ok: boolean;
 }
 
 export interface AssistantChatResponse {
@@ -355,6 +364,10 @@ export interface AssistantChatResponse {
   reply: string;
   highlights: Array<{ label: string; value: string }>;
   cards: AssistantCard[];
+  assistant_mode?: 'llm_sandbox' | 'offline_fallback';
+  assistant_model?: string | null;
+  sandbox_id?: string | null;
+  tool_trace?: AssistantToolTraceItem[];
   rls_scope: string[];
 }
 
@@ -797,10 +810,20 @@ export const consoleApi = {
     const qs = status ? `?status=${encodeURIComponent(status)}` : '';
     return apiFetch<AuditResponse>(`/api/audit${qs}`);
   },
-  assistantChat: (message: string) =>
+  assistantChat: (
+    message: string,
+    opts?: {
+      sandbox_id?: string | null;
+      history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    }
+  ) =>
     apiFetch<AssistantChatResponse>('/api/assistant/chat', {
       method: 'POST',
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({
+        message,
+        ...(opts?.sandbox_id ? { sandbox_id: opts.sandbox_id } : {}),
+        ...(opts?.history && opts.history.length > 0 ? { history: opts.history } : {}),
+      }),
     }),
   getAdminDevices: () => apiFetch<AdminDevicesResponse>('/api/admin/devices'),
   getAdminAutonomy: () => apiFetch<AdminAutonomyResponse>('/api/admin/autonomy'),

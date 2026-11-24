@@ -34,6 +34,8 @@ interface SandboxPageProps {
   pack: DomainViewPack | null;
   pendingPresetId: string | null;
   onConsumePendingPreset: () => void;
+  pendingSandboxId?: string | null;
+  onConsumePendingSandbox?: () => void;
   onPromotedToPrimary: () => void;
 }
 
@@ -43,6 +45,8 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
   pack,
   pendingPresetId,
   onConsumePendingPreset,
+  pendingSandboxId,
+  onConsumePendingSandbox,
   onPromotedToPrimary,
 }) => {
   const terms = resolveShellTerminology(pack);
@@ -74,7 +78,7 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
   }, []);
 
   useEffect(() => {
-    if (pendingPresetId) return;
+    if (pendingPresetId || pendingSandboxId) return;
     let active = true;
     consoleApi
       .createSandbox()
@@ -264,6 +268,43 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
       runPreset(target);
     }
   }, [pendingPresetId, meta.sandbox_presets, onConsumePendingPreset, runPreset]);
+
+  useEffect(() => {
+    if (!pendingSandboxId) return;
+    const targetSid = pendingSandboxId;
+    let active = true;
+    setBusy(true);
+    setActivePresetId(null);
+    const oldSid = sandboxIdRef.current;
+    if (oldSid && oldSid !== targetSid) {
+      consoleApi.destroySandbox(oldSid).catch(() => {});
+    }
+    sandboxIdRef.current = targetSid;
+    setSandboxId(targetSid);
+    refreshDiff(targetSid)
+      .then(() => {
+        if (!active) return;
+        setStatusBanner({
+          ok: true,
+          text: '已载入 AI 数字管家推演沙盘，可继续试演或点击「转正式执行」晋升落盘。',
+        });
+      })
+      .catch((err) => {
+        if (!active) return;
+        setStatusBanner({
+          ok: false,
+          text: err instanceof Error ? err.message : '载入推演沙盘失败',
+        });
+      })
+      .finally(() => {
+        if (!active) return;
+        setBusy(false);
+        onConsumePendingSandbox?.();
+      });
+    return () => {
+      active = false;
+    };
+  }, [pendingSandboxId, onConsumePendingSandbox, refreshDiff]);
 
   const handleRunCustomStep = async (e: React.FormEvent) => {
     e.preventDefault();
