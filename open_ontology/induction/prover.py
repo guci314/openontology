@@ -294,7 +294,7 @@ _STRUCTURAL_PROOF_CODES = frozenset(
 )
 
 
-def _lineage_types(ot_name: str, ancestors_map: Mapping[str, Sequence[str]]) -> set[str]:
+def _ancestor_closure(ot_name: str, ancestors_map: Mapping[str, Sequence[str]]) -> set[str]:
     return {ot_name, *ancestors_map.get(ot_name, ())}
 
 
@@ -445,9 +445,9 @@ def _prepare_blueprint_for_prover(
                     [f"cardinality:{ot.name}.{rel.field}"],
                     c_issue,
                 )
-        lineage = {ot.name, *ancestors_map.get(ot.name, ())}
+        ancestors = {ot.name, *ancestors_map.get(ot.name, ())}
         for a, b in bp.disjoint_types:
-            if (a == b and ot.name == a) or (a != b and a in lineage and b in lineage):
+            if (a == b and ot.name == a) or (a != b and a in ancestors and b in ancestors):
                 if ot.name not in issues:
                     issues[ot.name] = (
                         "DL_AXIOM_CONFLICT",
@@ -1829,17 +1829,17 @@ def prove_action_reachability(
 
         # Track applicable global invariants (including inherited ancestor invariants)
         inv_scope_types = ref_types | set(comp.named_entities.keys())
-        inv_scope_lineages: set[str] = set()
+        inv_scope_ancestors: set[str] = set()
         for tname in inv_scope_types:
-            inv_scope_lineages.update(_lineage_types(tname, ancestors_map))
+            inv_scope_ancestors.update(_ancestor_closure(tname, ancestors_map))
         inv_trackers: list[tuple[str, Any]] = []
         for inv in bp.invariants:
-            if inv.target_type not in inv_scope_lineages:
+            if inv.target_type not in inv_scope_ancestors:
                 continue
             matching_types = sorted(
                 tname
                 for tname in inv_scope_types
-                if inv.target_type in _lineage_types(tname, ancestors_map)
+                if inv.target_type in _ancestor_closure(tname, ancestors_map)
             )
             row_formulas = []
             for mt in matching_types:
@@ -2208,18 +2208,18 @@ def prove_redundant_rules(
         comp = _Z3Compiler(z3, bp, codec, bmc_bound=bmc_bound)
         actor, params, subjects, _ = _build_action_pre_context(comp, act)
         ref_types = _collect_action_referenced_types(act, subjects)
-        ref_lineages: set[str] = set()
+        ref_ancestors: set[str] = set()
         for tname in ref_types:
-            ref_lineages.update(_lineage_types(tname, ancestors_map))
+            ref_ancestors.update(_ancestor_closure(tname, ancestors_map))
 
         inv_items: list[tuple[str, Any]] = []
         for inv in bp.invariants:
-            if inv.target_type not in ref_lineages:
+            if inv.target_type not in ref_ancestors:
                 continue
             matching_types = sorted(
                 tname
                 for tname in ref_types
-                if inv.target_type in _lineage_types(tname, ancestors_map)
+                if inv.target_type in _ancestor_closure(tname, ancestors_map)
             )
             row_formulas = []
             for mt in matching_types:
@@ -2369,9 +2369,9 @@ def _apply_mutations_symbolically(
     mut_guards: list[Any] = []
 
     touched_types = {m.object_type for m in act.mutations if m.object_type in comp.ot_by_name}
-    touched_lineages: set[str] = set()
+    touched_ancestors: set[str] = set()
     for tt in touched_types:
-        touched_lineages.update(_lineage_types(tt, anc_map))
+        touched_ancestors.update(_ancestor_closure(tt, anc_map))
 
     inv_table_types: set[str] = set()
     for m in act.mutations:
@@ -2383,13 +2383,13 @@ def _apply_mutations_symbolically(
         _collect_expr_refs(inv.must_hold, set(), quant_types=inv_qtypes)
         if not inv_qtypes:
             continue
-        if inv.target_type in touched_lineages or (inv_qtypes & touched_lineages):
+        if inv.target_type in touched_ancestors or (inv_qtypes & touched_ancestors):
             for qt in inv_qtypes:
                 if qt in comp.ot_by_name:
                     inv_table_types.add(qt)
             for tt in touched_types:
                 if tt in comp.ot_by_name and (
-                    inv.target_type in _lineage_types(tt, anc_map) or tt in inv_qtypes
+                    inv.target_type in _ancestor_closure(tt, anc_map) or tt in inv_qtypes
                 ):
                     inv_table_types.add(tt)
 
@@ -2443,6 +2443,8 @@ def _apply_mutations_symbolically(
 
         if mut.op == "create":
             eval_ctx = {"param": params, "actor": actor}
+            if anchor is not None:
+                eval_ctx["source_obj"] = _get_live_copy(anchor)
             w_mut = (
                 comp.compile_bool(mut.when, eval_ctx, pre_state=False, state_override=post_tables)
                 if mut.when is not None
@@ -2690,9 +2692,9 @@ def prove_invariant_preservation(
         mutated_or_created_types = {ot for ot, _, _ in created_entities} | {
             ot for ot, _, _ in modified_pairs
         }
-        mutated_lineages: set[str] = set()
+        mutated_ancestors: set[str] = set()
         for mt in mutated_or_created_types:
-            mutated_lineages.update(_lineage_types(mt, ancestors_map))
+            mutated_ancestors.update(_ancestor_closure(mt, ancestors_map))
 
         pre_entities_all: list[_SymEntity] = []
         seen_pre_ids: set[int] = set()
@@ -2707,11 +2709,11 @@ def prove_invariant_preservation(
             inv_qtypes: set[str] = set()
             _collect_expr_refs(inv.when, set(), quant_types=inv_qtypes)
             _collect_expr_refs(inv.must_hold, set(), quant_types=inv_qtypes)
-            if inv.target_type in mutated_lineages or (inv_qtypes & mutated_lineages):
+            if inv.target_type in mutated_ancestors or (inv_qtypes & mutated_ancestors):
                 applicable_invs.append(inv)
                 rforms: list[Any] = []
                 for pre_ent in pre_entities_all:
-                    if inv.target_type in _lineage_types(pre_ent.ot.name, ancestors_map):
+                    if inv.target_type in _ancestor_closure(pre_ent.ot.name, ancestors_map):
                         sub_ctx = {"obj": pre_ent}
                         w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
                         m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
@@ -2720,7 +2722,7 @@ def prove_invariant_preservation(
                 if need_bmc_pre:
                     bmc_targets = sorted(
                         {inv.target_type}
-                        | {t for t in comp.bmc_tables if inv.target_type in _lineage_types(t, ancestors_map)}
+                        | {t for t in comp.bmc_tables if inv.target_type in _ancestor_closure(t, ancestors_map)}
                     )
                     for bt in bmc_targets:
                         if bt not in comp.ot_by_name:
@@ -2847,10 +2849,10 @@ def prove_invariant_preservation(
             if not ot.voucher_delta_rules:
                 continue
             for bal_field, (v_type, v_link, v_delta) in ot.voucher_delta_rules.items():
-                if ot.name not in mutated_lineages and v_type not in mutated_lineages:
+                if ot.name not in mutated_ancestors and v_type not in mutated_ancestors:
                     continue
                 for _, before_ent, after_ent in modified_pairs:
-                    if ot.name not in _lineage_types(before_ent.ot.name, ancestors_map):
+                    if ot.name not in _ancestor_closure(before_ent.ot.name, ancestors_map):
                         continue
                     bf = before_ent.fields[bal_field]
                     af = after_ent.fields[bal_field]
@@ -2859,7 +2861,7 @@ def prove_invariant_preservation(
                     pk_expr = before_ent.fields[before_ent.ot.primary_key].expr
                     v_terms = []
                     for c_ot, c_ent, c_guard in created_entities:
-                        if v_type not in _lineage_types(c_ot, ancestors_map):
+                        if v_type not in _ancestor_closure(c_ot, ancestors_map):
                             continue
                         link_sv = c_ent.fields.get(v_link)
                         delta_sv = c_ent.fields.get(v_delta)
@@ -2890,7 +2892,7 @@ def prove_invariant_preservation(
             checked_table_types = sorted(
                 t
                 for t in (set(post_tables.keys()) | set(comp.bmc_tables.keys()))
-                if inv.target_type in _lineage_types(t, ancestors_map)
+                if inv.target_type in _ancestor_closure(t, ancestors_map)
             )
             for tb_type in checked_table_types:
                 rows = post_tables.get(tb_type)
@@ -2911,7 +2913,7 @@ def prove_invariant_preservation(
                         )
                         post_formulas.append(z3.Implies(z3.And(row.present, w_post), m_post))
             for c_ot, c_ent, c_guard in created_entities:
-                if inv.target_type in _lineage_types(c_ot, ancestors_map) and c_ot not in post_tables:
+                if inv.target_type in _ancestor_closure(c_ot, ancestors_map) and c_ot not in post_tables:
                     sub_ctx = {"obj": c_ent}
                     w_post = (
                         comp.compile_bool(
@@ -2925,7 +2927,7 @@ def prove_invariant_preservation(
                     )
                     post_formulas.append(z3.Implies(z3.And(c_guard, w_post), m_post))
             for ot_name, _b_ent, after_ent in modified_pairs:
-                if inv.target_type in _lineage_types(ot_name, ancestors_map) and ot_name not in post_tables:
+                if inv.target_type in _ancestor_closure(ot_name, ancestors_map) and ot_name not in post_tables:
                     sub_ctx = {"obj": after_ent}
                     w_post = (
                         comp.compile_bool(

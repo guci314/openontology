@@ -2142,8 +2142,21 @@ def build_console_service(
         )
     elif cleaned == "starship":
         svc = build_starship_console(demo_actor_switch=demo_actor_switch)
+    elif cleaned == "medauto":
+        try:
+            from .medauto_export_extension import build_medauto_console
+        except ImportError:  # pragma: no cover - script execution fallback
+            from examples.medauto_export_extension import build_medauto_console
+
+        svc = build_medauto_console(
+            db_path=db_path or ":memory:",
+            demo_actor_switch=demo_actor_switch,
+            enable_llm_assistant=enable_llm_assistant,
+        )
     else:
-        raise ValueError(f"unsupported console mode {mode!r}; expected standalone|odoo19|jsherp|starship")
+        raise ValueError(
+            f"unsupported console mode {mode!r}; expected standalone|odoo19|jsherp|starship|medauto"
+        )
     if assistant_llm_client is not None:
         svc.assistant_llm_client = assistant_llm_client
     if enable_llm_assistant is not None:
@@ -2155,7 +2168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Launch OpenOntology Enterprise Digital Twin Console")
     parser.add_argument(
         "--mode",
-        choices=("standalone", "odoo19", "jsherp", "starship"),
+        choices=("standalone", "odoo19", "jsherp", "starship", "medauto"),
         default="standalone",
         help="Runtime world mounting mode (default: standalone)",
     )

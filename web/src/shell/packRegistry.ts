@@ -91,6 +91,10 @@ export function registerDomainPack(pack: DomainViewPack): void {
 }
 
 export function resolveActivePack(meta: ConsoleMeta, schema: SchemaCatalog): DomainViewPack | null {
+  const hint = meta?.pack_hint;
+  if (hint === 'none' || hint === 'pure_l1' || hint === 'blind') {
+    return null;
+  }
   for (const pack of registeredPacks) {
     if (pack.matches(meta, schema)) {
       return pack;

@@ -732,6 +732,56 @@ def _validate_expr_node(
         raise InvariantError(f"non-boolean op {op!r} in predicate position", code="INVALID_PREDICATE_AST")
 
 
+def _get_polymorphic(
+    view: EditBatch | InvariantView,
+    target_cls: type[ObjectType],
+    object_id: str,
+) -> ObjectType | None:
+    """Resolve an object by PK across ``target_cls`` and any derived concrete subtypes."""
+    found = view.get(target_cls, object_id)
+    if found is not None:
+        return found
+    for sub_cls in view.spec.subtypes_of(target_cls):
+        if sub_cls is target_cls:
+            continue
+        found = view.get(sub_cls, object_id)
+        if found is not None:
+            return found
+    return None
+
+
+def _require_polymorphic(
+    ctx: EditBatch,
+    target_cls: type[ObjectType],
+    object_id: str,
+) -> ObjectType:
+    """Require an object by PK across ``target_cls`` or any derived subtype, preserving missing error."""
+    found = _get_polymorphic(ctx, target_cls, object_id)
+    if found is not None:
+        return found
+    return ctx.require(target_cls, object_id)
+
+
+def _query_polymorphic(
+    view: EditBatch | InvariantView,
+    target_cls: type[ObjectType],
+) -> list[ObjectType]:
+    """Query rows across ``target_cls`` and all concrete subtypes without duplicate PK collisions."""
+    subtypes = view.spec.subtypes_of(target_cls)
+    if len(subtypes) <= 1:
+        return list(view.query(target_cls))
+    merged: list[ObjectType] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for sub_cls in subtypes:
+        pk_name = sub_cls.primary_key_name()
+        for item in view.query(sub_cls):
+            key = (sub_cls.__name__, str(getattr(item, pk_name)))
+            if key not in seen_keys:
+                seen_keys.add(key)
+                merged.append(item)
+    return merged
+
+
 def _resolve_ref(
     ref: str,
     context: dict[str, Any],
@@ -765,7 +815,7 @@ def _resolve_ref(
                     continue
                 try:
                     target_cls = view.spec.get_object_type(decl.range)
-                    current = view.get(target_cls, str(raw_val))
+                    current = _get_polymorphic(view, target_cls, str(raw_val))
                 except Exception:
                     current = raw_val
                 continue
@@ -827,7 +877,7 @@ def _eval_value(
             where = node.get("where")
             field_spec = node["field"]
             vals: list[int | float] = []
-            for cand in view.query(target_cls):
+            for cand in _query_polymorphic(view, target_cls):
                 sub_ctx = dict(context)
                 sub_ctx["target"] = cand
                 if where and not eval_predicate(where, sub_ctx, view):
@@ -902,7 +952,7 @@ def eval_predicate(
                 code="MISSING_SANDBOX_VIEW",
             )
         target_cls = view.spec.get_object_type(expr["object_type"])
-        candidates = view.query(target_cls)
+        candidates = _query_polymorphic(view, target_cls)
         where = expr.get("where")
         matched = 0
         for cand in candidates:
@@ -1560,8 +1610,8 @@ def _validate_disjoint_types(
                 code="DL_DISJOINT_VIOLATION",
             )
         for ot_name in sorted(known_types):
-            lineage = {ot_name, *ancestors_map.get(ot_name, ())}
-            if a in lineage and b in lineage:
+            ancestors = {ot_name, *ancestors_map.get(ot_name, ())}
+            if a in ancestors and b in ancestors:
                 raise InvariantError(
                     f"object type {ot_name!r} inherits from disjoint types ({a!r}, {b!r}) [DL_DISJOINT_VIOLATION]",
                     code="DL_DISJOINT_VIOLATION",
@@ -1580,19 +1630,7 @@ class _PolymorphicInvariantView:
 
     def query(self, cls: type[ObjectType] | str) -> list[Any]:
         target_cls = self._inner.spec.get_object_type(cls) if isinstance(cls, str) else cls
-        subtypes = self._inner.spec.subtypes_of(target_cls)
-        if len(subtypes) <= 1:
-            return self._inner.query(target_cls)
-        merged: list[Any] = []
-        seen_keys: set[tuple[str, str]] = set()
-        for sub_c in subtypes:
-            pk_name = sub_c.primary_key_name()
-            for item in self._inner.query(sub_c):
-                k = (sub_c.__name__, str(getattr(item, pk_name)))
-                if k not in seen_keys:
-                    seen_keys.add(k)
-                    merged.append(item)
-        return merged
+        return _query_polymorphic(self._inner, target_cls)
 
 
 def _wrap_spec_invariants_polymorphic(spec: OntologySpec) -> None:
@@ -2049,8 +2087,12 @@ def _validate_action_mutations_ast(
                     param_names=param_names,
                 )
         elif mut.op == "create":
-            mut_roots = frozenset({"param", "actor"})
-            ref_roots = {}
+            if has_subject and subject_type:
+                mut_roots = frozenset({"source_obj", "param", "actor"})
+                ref_roots = {"source_obj": subject_type}
+            else:
+                mut_roots = frozenset({"param", "actor"})
+                ref_roots = {}
         else:
             mut_roots = frozenset({"obj", "param", "actor"})
             ref_roots = {"obj": mut.object_type}
@@ -2784,8 +2826,8 @@ def apply_evolution_patch(
                             f"cannot remove {hit[0]}.{hit[1]} referenced by mutation target_ref on {act.name!r}",
                             code="FIELD_IN_USE",
                         )
-                mut_roots = {"obj": mut.object_type}
-                if mut.target_ref and anchor_type is not None:
+                mut_roots = {} if mut.op == "create" else {"obj": mut.object_type}
+                if (mut.target_ref or mut.op == "create") and anchor_type is not None:
                     mut_roots["source_obj"] = anchor_type
                 if mut.when is not None:
                     hit = _expr_removed_field_hit(
@@ -3551,9 +3593,9 @@ def _run_action_preconditions(
                         f"precondition {pre.name!r} requires non-null {idp!r}",
                         code="MISSING_ID_PARAM",
                     )
-                checked_objs.append(ctx.require(target_cls, str(cid)))
+                checked_objs.append(_require_polymorphic(ctx, target_cls, str(cid)))
         else:
-            checked_objs = list(ctx.query(target_cls))
+            checked_objs = _query_polymorphic(ctx, target_cls)
             if not checked_objs:
                 refs = [*_iter_ast_refs(pre.when or {}), *_iter_ast_refs(pre.must_hold)]
                 if not any(r.split(".")[0] == "obj" for r in refs):
@@ -3618,12 +3660,16 @@ def _make_rule_action_handler(
         if anchor_type is not None and anchor_id_param is not None and hasattr(params, anchor_id_param):
             raw_anchor_id = getattr(params, anchor_id_param, None)
             if raw_anchor_id is not None:
-                anchor_obj = ctx.require(ctx.spec.get_object_type(anchor_type), str(raw_anchor_id))
+                anchor_obj = _require_polymorphic(
+                    ctx, ctx.spec.get_object_type(anchor_type), str(raw_anchor_id)
+                )
 
         for mut in action_bp.mutations:
             target_cls = ctx.spec.get_object_type(mut.object_type)
             if mut.op == "create":
                 eval_ctx = {"param": params, "actor": ctx.actor}
+                if anchor_obj is not None:
+                    eval_ctx["source_obj"] = anchor_obj
                 if mut.when is not None and not eval_predicate(mut.when, eval_ctx, ctx):
                     continue
                 payload: dict[str, Any] = {}
@@ -3654,7 +3700,7 @@ def _make_rule_action_handler(
                     if isinstance(ref_val, ObjectType)
                     else str(ref_val)
                 )
-                existing = ctx.require(target_cls, target_id)
+                existing = _require_polymorphic(ctx, target_cls, target_id)
                 eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
                 if anchor_obj is not None:
                     eval_ctx["source_obj"] = anchor_obj
@@ -3678,7 +3724,7 @@ def _make_rule_action_handler(
                         code="MISSING_ID_PARAM",
                     )
                 target_id = str(getattr(params, mut.id_param))
-                existing = ctx.require(target_cls, target_id)
+                existing = _require_polymorphic(ctx, target_cls, target_id)
                 eval_ctx = {"obj": existing, "param": params, "actor": ctx.actor}
                 if mut.when is not None and not eval_predicate(mut.when, eval_ctx, ctx):
                     continue
@@ -3797,8 +3843,12 @@ def _compile_and_register_rule_action(
                     param_names=act_param_names,
                 )
         elif mut.op == "create":
-            mut_roots = frozenset({"param", "actor"})
-            mut_ref_roots = {}
+            if subject_type is not None:
+                mut_roots = frozenset({"source_obj", "param", "actor"})
+                mut_ref_roots = {"source_obj": subject_type}
+            else:
+                mut_roots = frozenset({"param", "actor"})
+                mut_ref_roots = {}
         else:
             mut_roots = frozenset({"obj", "param", "actor"})
             mut_ref_roots = {"obj": mut.object_type}
@@ -4990,6 +5040,40 @@ def apply_overlay_to_spec(
                 getattr(sub_cls, "__initial_statuses__", None),
                 {str(k): tuple(v) for k, v in updated_transitions[ot_name].items()},
             )
+
+    # Rebase any derived overlay types whose parent was itself subclassed in Step 3
+    for resolved_ot in resolved_new_ots:
+        if resolved_ot.extends is None:
+            continue
+        cur_child_cls = derived.object_types[resolved_ot.name]
+        cur_parent_cls = derived.object_types[resolved_ot.extends]
+        if issubclass(cur_child_cls, cur_parent_cls):
+            continue
+        raw_ot = raw_pending_by_name[resolved_ot.name]
+        prev_props = dict(getattr(cur_child_cls, "__object_properties__", None) or {})
+        rebuilt_cls, _nn, _fsm = _build_overlay_object_type(
+            resolved_ot,
+            base_cls=cur_parent_cls,
+            extra_security_field=(security_tag_field if resolved_ot.name in rls_set else None),
+            raw_field_names={f.name for f in raw_ot.fields},
+            raw_rel_names={r.field for r in raw_ot.relations},
+        )
+        parent_owned = cur_parent_cls.owned_spec()
+        if not rebuilt_cls.is_fully_owned() and isinstance(parent_owned, dict):
+            merged_child_owned = dict(parent_owned)
+            merged_child_owned.update(rebuilt_cls.owned_field_defaults())
+            rebuilt_cls.__owned__ = merged_child_owned
+        parent_nn = tuple(getattr(cur_parent_cls, "__non_negative_fields__", ()) or ())
+        child_nn = list(getattr(rebuilt_cls, "__non_negative_fields__", ()) or ())
+        for fn in parent_nn:
+            if fn not in child_nn:
+                child_nn.append(fn)
+        if child_nn:
+            rebuilt_cls.__non_negative_fields__ = tuple(child_nn)
+        merged_props = dict(getattr(cur_parent_cls, "__object_properties__", None) or {})
+        merged_props.update(prev_props)
+        rebuilt_cls.__object_properties__ = merged_props
+        derived.object_type(rebuilt_cls)
 
     if new_non_neg_map:
         nn_inv_name = f"overlay_{spec_overlay.overlay_id}_non_negative"
