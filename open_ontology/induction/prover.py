@@ -1591,13 +1591,18 @@ def _resolve_rule_id_param(
 ) -> str:
     if rule.id_param:
         return rule.id_param
+    created_id_params = {
+        m.id_param
+        for m in act.mutations
+        if m.object_type == rule.target_type and m.op == "create"
+    }
     for m in act.mutations:
         if m.object_type == rule.target_type and m.op != "create" and m.target_ref is None:
             return m.id_param
     ot = ot_by_name.get(rule.target_type)
     pk_name = ot.primary_key if ot is not None else "id"
     param_names = {p.name for p in act.params}
-    if pk_name in param_names:
+    if pk_name in param_names and pk_name not in created_id_params:
         return pk_name
     return f"__singleton_{rule.target_type}"
 

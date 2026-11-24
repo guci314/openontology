@@ -24,9 +24,15 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
+from open_ontology.induction.dsl import (
+    ActionBlueprint,
+    ActionMutationSpec,
+    DeclarativeBlueprint,
+    InvariantRuleSpec,
+    export_spec_blueprint,
+    register_rule_actions,
+)
 from open_ontology.spec import (
-    InvariantError,
     ObjectProperty,
     OntologySpec,
 )
@@ -195,234 +201,546 @@ class RecordP2pPaymentParams(BaseModel):
     payment_amount: float
 
 
-@spec.edit_function(
-    "confirm_p2p_order",
-    ConfirmP2pOrderParams,
-    touched_object_types=("P2pPurchaseOrder", "P2pSupplierProfile"),
-    description="校验供应商激活与正金额后确认标准采购订单。",
-)
-def confirm_p2p_order(ctx: Any, params: ConfirmP2pOrderParams) -> None:
-    po = ctx.require(P2pPurchaseOrder, params.po_id)
-    if po.status != "draft":
-        raise InvariantError(
-            f"P2pPurchaseOrder:{po.po_id} status is {po.status!r}, expected 'draft'",
-            code="PO_NOT_DRAFT",
-        )
-    supplier = ctx.require(P2pSupplierProfile, po.supplier)
-    if supplier.status != "active":
-        raise InvariantError(
-            f"P2pSupplierProfile:{supplier.profile_id} status is {supplier.status!r}, expected 'active'",
-            code="SUPPLIER_INACTIVE",
-        )
-    if po.amount_total <= 0 or po.ordered_qty <= 0:
-        raise InvariantError(
-            f"P2pPurchaseOrder:{po.po_id} ordered_qty/amount_total must be > 0",
-            code="NON_POSITIVE_PO_AMOUNT",
-        )
-    ctx.modify(po, status="confirmed")
+_P2P_RECEIPT_IS_DISPUTED = {
+    "op": "or",
+    "args": [
+        {
+            "op": "lt",
+            "left": {"ref": "param.received_qty"},
+            "right": {"ref": "obj.expected_qty"},
+        },
+        {
+            "op": "eq",
+            "left": {"ref": "param.inspection_status"},
+            "right": {"lit": "failed"},
+        },
+    ],
+}
+_P2P_PO_DISPUTED_FROM_RECEIPT = {
+    "op": "or",
+    "args": [
+        {
+            "op": "lt",
+            "left": {"ref": "param.received_qty"},
+            "right": {"ref": "source_obj.expected_qty"},
+        },
+        {
+            "op": "eq",
+            "left": {"ref": "param.inspection_status"},
+            "right": {"lit": "failed"},
+        },
+    ],
+}
+_P2P_PAYMENT_RESIDUAL_DIFF = {
+    "op": "sub",
+    "left": {"ref": "obj.amount_residual"},
+    "right": {"ref": "param.payment_amount"},
+}
+_P2P_PAYMENT_SETTLED = {
+    "op": "le",
+    "left": _P2P_PAYMENT_RESIDUAL_DIFF,
+    "right": {"lit": 1e-9},
+}
 
-spec.declare_action(
-    "confirm_p2p_order",
-    edit_function="confirm_p2p_order",
-    allowed_roles=("buyer", "procurement_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
-    description="校验供应商激活与正金额后确认标准采购订单。",
-)
-
-
-@spec.edit_function(
-    "record_p2p_receipt",
-    RecordP2pReceiptParams,
-    touched_object_types=("P2pGoodsReceipt", "P2pPurchaseOrder"),
-    description="登记采购收货实收数量与质检结论；短装/短磅或质检不合格即联动 PO 进入 disputed。",
-)
-def record_p2p_receipt(ctx: Any, params: RecordP2pReceiptParams) -> None:
-    receipt = ctx.require(P2pGoodsReceipt, params.receipt_id)
-    if receipt.status != "pending":
-        raise InvariantError(
-            f"P2pGoodsReceipt:{receipt.receipt_id} status is {receipt.status!r}, expected 'pending'",
-            code="RECEIPT_NOT_PENDING",
-        )
-    po = ctx.require(P2pPurchaseOrder, receipt.purchase_order)
-    if po.status not in ("confirmed", "disputed"):
-        raise InvariantError(
-            f"P2pPurchaseOrder:{po.po_id} status is {po.status!r}, expected confirmed/disputed",
-            code="PO_NOT_CONFIRMED",
-        )
-    if params.received_qty < 0:
-        raise InvariantError("received_qty must be >= 0", code="NEGATIVE_RECEIVED_QTY")
-    if params.inspection_status not in ("passed", "failed"):
-        raise InvariantError(
-            f"inspection_status {params.inspection_status!r} must be 'passed' or 'failed'",
-            code="INVALID_INSPECTION_STATUS",
-        )
-    is_disputed = params.received_qty < receipt.expected_qty or params.inspection_status == "failed"
-    ctx.modify(
-        receipt,
-        received_qty=params.received_qty,
-        inspection_status=params.inspection_status,
-        status="disputed" if is_disputed else "completed",
-    )
-    ctx.modify(po, status="disputed" if is_disputed else "received")
-
-spec.declare_action(
-    "record_p2p_receipt",
-    edit_function="record_p2p_receipt",
-    allowed_roles=("warehouse", "buyer", "procurement_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
-    description="登记采购收货实收数量与质检结论；短装/短磅或质检不合格即联动 PO 进入 disputed。",
-)
-
-
-@spec.edit_function(
-    "post_p2p_bill",
-    PostP2pBillParams,
-    touched_object_types=("P2pVendorBill", "P2pPurchaseOrder"),
-    description="正式过账供应商应付账单；若关联采购单处于 disputed 则以 PO_DISPUTED_BLOCKED 硬拦截。",
-)
-def post_p2p_bill(ctx: Any, params: PostP2pBillParams) -> None:
-    bill = ctx.require(P2pVendorBill, params.bill_id)
-    po = ctx.require(P2pPurchaseOrder, bill.purchase_order)
-    if po.status == "disputed":
-        raise InvariantError(
-            f"P2pPurchaseOrder:{po.po_id} is 'disputed'; resolve dispute before posting {bill.bill_id}",
-            code="PO_DISPUTED_BLOCKED",
-        )
-    if bill.status != "draft":
-        raise InvariantError(
-            f"P2pVendorBill:{bill.bill_id} status is {bill.status!r}, expected 'draft'",
-            code="BILL_NOT_DRAFT",
-        )
-    if po.status != "received":
-        raise InvariantError(
-            f"P2pPurchaseOrder:{po.po_id} status is {po.status!r}, expected 'received'",
-            code="PO_NOT_RECEIVED",
-        )
-    if bill.amount_total > po.amount_total + 1e-9:
-        raise InvariantError(
-            f"P2pVendorBill:{bill.bill_id} amount {bill.amount_total} exceeds settled PO amount {po.amount_total}",
-            code="BILL_EXCEEDS_PO_AMOUNT",
-        )
-    ctx.modify(bill, status="posted")
-    ctx.modify(po, status="billed")
-
-spec.declare_action(
-    "post_p2p_bill",
-    edit_function="post_p2p_bill",
-    allowed_roles=("finance", "finance_director", "procurement_manager", "steward", "ai_agent", "admin"),
-    description="正式过账供应商应付账单；若关联采购单处于 disputed 则以 PO_DISPUTED_BLOCKED 硬拦截。",
-)
-
-
-@spec.edit_function(
-    "resolve_p2p_dispute",
-    ResolveP2pDisputeParams,
-    touched_object_types=("P2pPurchaseOrder", "P2pGoodsReceipt", "WorkCard"),
-    description="凭已完成审批的 WorkCard 裁决采购争议，按核定结算金额解封 PO 与收货单。",
-)
-def resolve_p2p_dispute(ctx: Any, params: ResolveP2pDisputeParams) -> None:
-    po = ctx.require(P2pPurchaseOrder, params.po_id)
-    receipt = ctx.require(P2pGoodsReceipt, params.receipt_id)
-    card = ctx.require(WorkCard, params.work_card_id)
-    if po.status != "disputed":
-        raise InvariantError(
-            f"P2pPurchaseOrder:{po.po_id} must be 'disputed' to resolve",
-            code="PO_NOT_DISPUTED",
-        )
-    if receipt.purchase_order != po.po_id:
-        raise InvariantError(
-            f"P2pGoodsReceipt:{receipt.receipt_id} does not belong to {po.po_id}",
-            code="RECEIPT_PO_MISMATCH",
-        )
-    if receipt.status not in ("disputed", "completed"):
-        raise InvariantError(
-            f"P2pGoodsReceipt:{receipt.receipt_id} status {receipt.status!r} cannot resolve dispute",
-            code="RECEIPT_NOT_DISPUTED",
-        )
-    if card.status != "COMPLETED":
-        raise InvariantError(
-            f"WorkCard:{card.card_id} must be COMPLETED before resolving PO dispute",
-            code="WORK_CARD_NOT_COMPLETED",
-        )
-    if card.target_object_type != "P2pPurchaseOrder" or card.target_object_id != po.po_id:
-        raise InvariantError(
-            f"WorkCard:{card.card_id} does not target P2pPurchaseOrder:{po.po_id}",
-            code="WORK_CARD_TARGET_MISMATCH",
-        )
-    if params.settled_amount < 0:
-        raise InvariantError("settled_amount must be >= 0", code="NEGATIVE_SETTLED_AMOUNT")
-    ctx.modify(po, amount_total=params.settled_amount, status="received")
-    if receipt.status != "completed":
-        ctx.modify(receipt, status="completed")
-
-spec.declare_action(
-    "resolve_p2p_dispute",
-    edit_function="resolve_p2p_dispute",
-    allowed_roles=("procurement_manager", "finance_director", "steward", "admin"),
-    description="凭已完成审批的 WorkCard 裁决采购争议，按核定结算金额解封 PO 与收货单。",
-)
-
-
-@spec.edit_function(
-    "reconcile_p2p_bill",
-    ReconcileP2pBillParams,
-    touched_object_types=("P2pVendorBill", "P2pPurchaseOrder"),
-    description="将草稿应付账单金额与残值同步至已核定采购单金额。",
-)
-def reconcile_p2p_bill(ctx: Any, params: ReconcileP2pBillParams) -> None:
-    bill = ctx.require(P2pVendorBill, params.bill_id)
-    po = ctx.require(P2pPurchaseOrder, bill.purchase_order)
-    if bill.status != "draft":
-        raise InvariantError(
-            f"P2pVendorBill:{bill.bill_id} must be 'draft' to reconcile",
-            code="BILL_NOT_DRAFT",
-        )
-    if po.status != "received":
-        raise InvariantError(
-            f"P2pPurchaseOrder:{po.po_id} must be 'received' before reconciling bill",
-            code="PO_NOT_RECEIVED",
-        )
-    ctx.modify(
-        bill,
-        amount_total=po.amount_total,
-        amount_residual=po.amount_total,
-    )
-
-spec.declare_action(
-    "reconcile_p2p_bill",
-    edit_function="reconcile_p2p_bill",
-    allowed_roles=("buyer", "procurement_manager", "finance", "finance_director", "steward", "ai_agent", "admin"),
-    description="将草稿应付账单金额与残值同步至已核定采购单金额。",
-)
-
-
-@spec.edit_function(
-    "record_p2p_payment",
-    RecordP2pPaymentParams,
-    touched_object_types=("P2pVendorBill",),
-    description="登记已过账应付账单的付款核销，校验付款额位于 (0, amount_residual]。",
-)
-def record_p2p_payment(ctx: Any, params: RecordP2pPaymentParams) -> None:
-    bill = ctx.require(P2pVendorBill, params.bill_id)
-    if bill.status != "posted":
-        raise InvariantError(
-            f"P2pVendorBill:{bill.bill_id} must be 'posted' before recording payment",
-            code="BILL_NOT_POSTED",
-        )
-    if params.payment_amount <= 0:
-        raise InvariantError("payment_amount must be > 0", code="INVALID_PAYMENT_AMOUNT")
-    if params.payment_amount > bill.amount_residual + 1e-9:
-        raise InvariantError(
-            f"payment_amount {params.payment_amount} exceeds amount_residual {bill.amount_residual}",
-            code="PAYMENT_EXCEEDS_RESIDUAL",
-        )
-    remaining = max(0.0, bill.amount_residual - params.payment_amount)
-    new_state = "paid" if remaining <= 1e-9 else "partial"
-    ctx.modify(bill, amount_residual=remaining, payment_state=new_state)
-
-spec.declare_action(
-    "record_p2p_payment",
-    edit_function="record_p2p_payment",
-    allowed_roles=("finance", "finance_director", "steward", "admin"),
-    description="登记已过账应付账单的付款核销，校验付款额位于 (0, amount_residual]。",
+register_rule_actions(
+    spec,
+    [
+        (
+            ActionBlueprint(
+                name="confirm_p2p_order",
+                description="校验供应商激活与正金额后确认标准采购订单。",
+                allowed_roles=[
+                    "buyer",
+                    "procurement_manager",
+                    "ops",
+                    "finance_director",
+                    "steward",
+                    "ai_agent",
+                    "admin",
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="p2p_po_must_be_draft",
+                        code="PO_NOT_DRAFT",
+                        target_type="P2pPurchaseOrder",
+                        id_param="po_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "draft"},
+                        },
+                        description="仅草稿状态（draft）采购订单可执行确认。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_po_supplier_active",
+                        code="SUPPLIER_INACTIVE",
+                        target_type="P2pPurchaseOrder",
+                        id_param="po_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.supplier.status"},
+                            "right": {"lit": "active"},
+                        },
+                        description="采购订单关联供应商档案必须处于 active 状态。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_po_positive_totals",
+                        code="NON_POSITIVE_PO_AMOUNT",
+                        target_type="P2pPurchaseOrder",
+                        id_param="po_id",
+                        must_hold={
+                            "op": "and",
+                            "args": [
+                                {
+                                    "op": "gt",
+                                    "left": {"ref": "obj.amount_total"},
+                                    "right": {"lit": 0.0},
+                                },
+                                {
+                                    "op": "gt",
+                                    "left": {"ref": "obj.ordered_qty"},
+                                    "right": {"lit": 0.0},
+                                },
+                            ],
+                        },
+                        description="采购订单数量与金额必须严格大于 0。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pPurchaseOrder",
+                        id_param="po_id",
+                        set_fields={"status": {"lit": "confirmed"}},
+                    ),
+                ],
+            ),
+            ConfirmP2pOrderParams,
+        ),
+        (
+            ActionBlueprint(
+                name="record_p2p_receipt",
+                description="登记采购收货实收数量与质检结论；短装/短磅或质检不合格即联动 PO 进入 disputed。",
+                allowed_roles=[
+                    "warehouse",
+                    "buyer",
+                    "procurement_manager",
+                    "ops",
+                    "finance_director",
+                    "steward",
+                    "ai_agent",
+                    "admin",
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="p2p_receipt_must_be_pending",
+                        code="RECEIPT_NOT_PENDING",
+                        target_type="P2pGoodsReceipt",
+                        id_param="receipt_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "pending"},
+                        },
+                        description="仅待收货（pending）采购收货单可登记收货与质检结论。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_receipt_po_confirmable",
+                        code="PO_NOT_CONFIRMED",
+                        target_type="P2pGoodsReceipt",
+                        id_param="receipt_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.purchase_order.status"},
+                            "right": {"lit": ["confirmed", "disputed"]},
+                        },
+                        description="关联采购订单必须处于 confirmed 或 disputed 状态方可登记收货。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_receipt_non_negative_qty",
+                        code="NEGATIVE_RECEIVED_QTY",
+                        target_type="P2pGoodsReceipt",
+                        id_param="receipt_id",
+                        must_hold={
+                            "op": "ge",
+                            "left": {"ref": "param.received_qty"},
+                            "right": {"lit": 0.0},
+                        },
+                        description="实收数量 received_qty 不得为负。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_receipt_valid_inspection",
+                        code="INVALID_INSPECTION_STATUS",
+                        target_type="P2pGoodsReceipt",
+                        id_param="receipt_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "param.inspection_status"},
+                            "right": {"lit": ["passed", "failed"]},
+                        },
+                        description="质检结论 inspection_status 必须为 passed 或 failed。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pGoodsReceipt",
+                        id_param="receipt_id",
+                        set_fields={
+                            "received_qty": {"ref": "param.received_qty"},
+                            "inspection_status": {"ref": "param.inspection_status"},
+                            "status": {
+                                "op": "if_else",
+                                "cond": _P2P_RECEIPT_IS_DISPUTED,
+                                "then": {"lit": "disputed"},
+                                "else": {"lit": "completed"},
+                            },
+                        },
+                    ),
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pPurchaseOrder",
+                        target_ref="obj.purchase_order",
+                        set_fields={
+                            "status": {
+                                "op": "if_else",
+                                "cond": _P2P_PO_DISPUTED_FROM_RECEIPT,
+                                "then": {"lit": "disputed"},
+                                "else": {"lit": "received"},
+                            },
+                        },
+                    ),
+                ],
+            ),
+            RecordP2pReceiptParams,
+        ),
+        (
+            ActionBlueprint(
+                name="post_p2p_bill",
+                description="正式过账供应商应付账单；若关联采购单处于 disputed 则以 PO_DISPUTED_BLOCKED 硬拦截。",
+                allowed_roles=[
+                    "finance",
+                    "finance_director",
+                    "procurement_manager",
+                    "steward",
+                    "ai_agent",
+                    "admin",
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="p2p_bill_po_not_disputed",
+                        code="PO_DISPUTED_BLOCKED",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        must_hold={
+                            "op": "ne",
+                            "left": {"ref": "obj.purchase_order.status"},
+                            "right": {"lit": "disputed"},
+                        },
+                        description="关联采购订单处于争议挂起（disputed）时严禁过账应付账单。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_bill_must_be_draft",
+                        code="BILL_NOT_DRAFT",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "draft"},
+                        },
+                        description="仅草稿状态（draft）应付账单可执行过账。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_bill_po_must_be_received",
+                        code="PO_NOT_RECEIVED",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        when={
+                            "op": "ne",
+                            "left": {"ref": "obj.purchase_order.status"},
+                            "right": {"lit": "disputed"},
+                        },
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.purchase_order.status"},
+                            "right": {"lit": "received"},
+                        },
+                        description="非争议采购订单必须完成收货（received）方允许应付过账。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_bill_within_po_amount",
+                        code="BILL_EXCEEDS_PO_AMOUNT",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        must_hold={
+                            "op": "le",
+                            "left": {"ref": "obj.amount_total"},
+                            "right": {
+                                "op": "add",
+                                "left": {"ref": "obj.purchase_order.amount_total"},
+                                "right": {"lit": 1e-9},
+                            },
+                        },
+                        description="应付账单总额不得超过核定采购订单金额。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pVendorBill",
+                        id_param="bill_id",
+                        set_fields={"status": {"lit": "posted"}},
+                    ),
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pPurchaseOrder",
+                        target_ref="obj.purchase_order",
+                        set_fields={"status": {"lit": "billed"}},
+                    ),
+                ],
+            ),
+            PostP2pBillParams,
+        ),
+        (
+            ActionBlueprint(
+                name="resolve_p2p_dispute",
+                description="凭已完成审批的 WorkCard 裁决采购争议，按核定结算金额解封 PO 与收货单。",
+                allowed_roles=["procurement_manager", "finance_director", "steward", "admin"],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="p2p_dispute_po_disputed",
+                        code="PO_NOT_DISPUTED",
+                        target_type="P2pPurchaseOrder",
+                        id_param="po_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "disputed"},
+                        },
+                        description="仅 disputed 状态采购订单可裁决争议。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_dispute_receipt_matches_po",
+                        code="RECEIPT_PO_MISMATCH",
+                        target_type="P2pGoodsReceipt",
+                        id_param="receipt_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.purchase_order"},
+                            "right": {"ref": "param.po_id"},
+                        },
+                        description="收货单必须关联当前待裁决采购订单。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_dispute_receipt_status",
+                        code="RECEIPT_NOT_DISPUTED",
+                        target_type="P2pGoodsReceipt",
+                        id_param="receipt_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": ["disputed", "completed"]},
+                        },
+                        description="收货单状态必须为 disputed 或 completed。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_dispute_card_completed",
+                        code="WORK_CARD_NOT_COMPLETED",
+                        target_type="WorkCard",
+                        id_param="work_card_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "COMPLETED"},
+                        },
+                        description="裁决采购争议前关联审批工单卡必须已批结（COMPLETED）。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_dispute_card_target_match",
+                        code="WORK_CARD_TARGET_MISMATCH",
+                        target_type="WorkCard",
+                        id_param="work_card_id",
+                        must_hold={
+                            "op": "and",
+                            "args": [
+                                {
+                                    "op": "eq",
+                                    "left": {"ref": "obj.target_object_type"},
+                                    "right": {"lit": "P2pPurchaseOrder"},
+                                },
+                                {
+                                    "op": "eq",
+                                    "left": {"ref": "obj.target_object_id"},
+                                    "right": {"ref": "param.po_id"},
+                                },
+                            ],
+                        },
+                        description="审批工单卡必须指向目标 P2pPurchaseOrder。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_dispute_non_negative_settlement",
+                        code="NEGATIVE_SETTLED_AMOUNT",
+                        target_type="P2pPurchaseOrder",
+                        id_param="po_id",
+                        must_hold={
+                            "op": "ge",
+                            "left": {"ref": "param.settled_amount"},
+                            "right": {"lit": 0.0},
+                        },
+                        description="核定结算金额 settled_amount 不得为负。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pPurchaseOrder",
+                        id_param="po_id",
+                        set_fields={
+                            "amount_total": {"ref": "param.settled_amount"},
+                            "status": {"lit": "received"},
+                        },
+                    ),
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pGoodsReceipt",
+                        id_param="receipt_id",
+                        when={
+                            "op": "ne",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "completed"},
+                        },
+                        set_fields={"status": {"lit": "completed"}},
+                    ),
+                ],
+            ),
+            ResolveP2pDisputeParams,
+        ),
+        (
+            ActionBlueprint(
+                name="reconcile_p2p_bill",
+                description="将草稿应付账单金额与残值同步至已核定采购单金额。",
+                allowed_roles=[
+                    "buyer",
+                    "procurement_manager",
+                    "finance",
+                    "finance_director",
+                    "steward",
+                    "ai_agent",
+                    "admin",
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="p2p_reconcile_bill_draft",
+                        code="BILL_NOT_DRAFT",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "draft"},
+                        },
+                        description="仅草稿状态（draft）应付账单可执行对账重算。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_reconcile_po_received",
+                        code="PO_NOT_RECEIVED",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.purchase_order.status"},
+                            "right": {"lit": "received"},
+                        },
+                        description="对账前关联采购订单必须处于 received 状态。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pVendorBill",
+                        id_param="bill_id",
+                        set_fields={
+                            "amount_total": {"ref": "obj.purchase_order.amount_total"},
+                            "amount_residual": {"ref": "obj.purchase_order.amount_total"},
+                        },
+                    ),
+                ],
+            ),
+            ReconcileP2pBillParams,
+        ),
+        (
+            ActionBlueprint(
+                name="record_p2p_payment",
+                description="登记已过账应付账单的付款核销，校验付款额位于 (0, amount_residual]。",
+                allowed_roles=["finance", "finance_director", "steward", "admin"],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="p2p_payment_bill_posted",
+                        code="BILL_NOT_POSTED",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "posted"},
+                        },
+                        description="仅已过账（posted）应付账单可登记付款核销。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_payment_positive_amount",
+                        code="INVALID_PAYMENT_AMOUNT",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        must_hold={
+                            "op": "gt",
+                            "left": {"ref": "param.payment_amount"},
+                            "right": {"lit": 0.0},
+                        },
+                        description="付款金额 payment_amount 必须严格大于 0。",
+                    ),
+                    InvariantRuleSpec(
+                        name="p2p_payment_within_residual",
+                        code="PAYMENT_EXCEEDS_RESIDUAL",
+                        target_type="P2pVendorBill",
+                        id_param="bill_id",
+                        must_hold={
+                            "op": "le",
+                            "left": {"ref": "param.payment_amount"},
+                            "right": {
+                                "op": "add",
+                                "left": {"ref": "obj.amount_residual"},
+                                "right": {"lit": 1e-9},
+                            },
+                        },
+                        description="付款金额不得超过应付账单待结余款。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="P2pVendorBill",
+                        id_param="bill_id",
+                        set_fields={
+                            "amount_residual": {
+                                "op": "if_else",
+                                "cond": _P2P_PAYMENT_SETTLED,
+                                "then": {"lit": 0.0},
+                                "else": _P2P_PAYMENT_RESIDUAL_DIFF,
+                            },
+                            "payment_state": {
+                                "op": "if_else",
+                                "cond": _P2P_PAYMENT_SETTLED,
+                                "then": {"lit": "paid"},
+                                "else": {"lit": "partial"},
+                            },
+                        },
+                    ),
+                ],
+            ),
+            RecordP2pPaymentParams,
+        ),
+    ],
 )
 
 

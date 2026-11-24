@@ -92,6 +92,7 @@ def _extend_enterprise_governance_fields(bp: DeclarativeBlueprint) -> Declarativ
                 FieldSpec(name="vip_tier", field_type="str", default="STANDARD"),
                 FieldSpec(name="region", field_type="str", default="CN_EAST"),
                 FieldSpec(name="tax_verified", field_type="bool", default=True),
+                FieldSpec(name="payment_channel", field_type="str", default="WIRE"),
             ],
             "P2pPurchaseOrder": [
                 FieldSpec(name="sourcing_mode", field_type="str", default="CONTRACT"),
@@ -272,14 +273,14 @@ def build_paired_scenarios() -> list[dict[str, Any]]:
     cust_expedite_ov = CustomerOverlaySpec(
         overlay_id="cust_expedite_dropship",
         add_action_preconditions={
-            "post_p2p_bill": [
+            "post_o2c_invoice": [
                 InvariantRuleSpec(
-                    name="cust_dropship_bill_before_receipt",
-                    code="DROPSHIP_REQUIRES_CONFIRMED_PO",
-                    target_type="P2pVendorBill",
-                    id_param="bill_id",
+                    name="cust_dropship_invoice_before_delivery",
+                    code="DROPSHIP_REQUIRES_CONFIRMED_ORDER",
+                    target_type="O2cInvoice",
+                    id_param="invoice_id",
                     when=_op("eq", _ref("obj.payment_channel"), _lit("DROPSHIP_EXPRESS")),
-                    must_hold=_op("eq", _ref("obj.purchase_order.status"), _lit("confirmed")),
+                    must_hold=_op("eq", _ref("obj.order.status"), _lit("confirmed")),
                 )
             ]
         },
@@ -288,16 +289,16 @@ def build_paired_scenarios() -> list[dict[str, Any]]:
     v2_tight = apply_overlay(
         base,
         CustomerOverlaySpec(
-            overlay_id="std_v2_mandatory_receipt",
+            overlay_id="std_v2_mandatory_delivery",
             target_version="2.0.0",
             add_action_preconditions={
-                "post_p2p_bill": [
+                "post_o2c_invoice": [
                     InvariantRuleSpec(
-                        name="v2_std_receipt_required_before_bill",
-                        code="RECEIPT_REQUIRED_BEFORE_BILL",
-                        target_type="P2pVendorBill",
-                        id_param="bill_id",
-                        must_hold=_op("eq", _ref("obj.purchase_order.status"), _lit("received")),
+                        name="v2_std_delivery_required_before_invoice",
+                        code="DELIVERY_REQUIRED_BEFORE_INVOICE",
+                        target_type="O2cInvoice",
+                        id_param="invoice_id",
+                        must_hold=_op("in", _ref("obj.order.status"), _lit(["delivered", "invoiced"])),
                     )
                 ]
             },
@@ -306,16 +307,17 @@ def build_paired_scenarios() -> list[dict[str, Any]]:
     v2_compat = apply_overlay(
         base,
         CustomerOverlaySpec(
-            overlay_id="std_v2_non_disputed_only",
+            overlay_id="std_v2_wire_delivery_only",
             target_version="2.0.0",
             add_action_preconditions={
-                "post_p2p_bill": [
+                "post_o2c_invoice": [
                     InvariantRuleSpec(
-                        name="v2_std_no_disputed_bill",
-                        code="PO_DISPUTED_BLOCKED",
-                        target_type="P2pVendorBill",
-                        id_param="bill_id",
-                        must_hold=_op("ne", _ref("obj.purchase_order.status"), _lit("disputed")),
+                        name="v2_std_wire_delivery_required_before_invoice",
+                        code="DELIVERY_REQUIRED_BEFORE_INVOICE",
+                        target_type="O2cInvoice",
+                        id_param="invoice_id",
+                        when=_op("eq", _ref("obj.payment_channel"), _lit("WIRE")),
+                        must_hold=_op("in", _ref("obj.order.status"), _lit(["delivered", "invoiced"])),
                     )
                 ]
             },
@@ -325,7 +327,7 @@ def build_paired_scenarios() -> list[dict[str, Any]]:
         {
             "id": "C3",
             "category": "UPGRADE_REGRESSION_V1_TO_V2",
-            "target_action": "post_p2p_bill",
+            "target_action": "post_o2c_invoice",
             "expect_defect": True,
             "mode": "upgrade",
             "base_v1": v1_bp,
@@ -338,7 +340,7 @@ def build_paired_scenarios() -> list[dict[str, Any]]:
         {
             "id": "N3",
             "category": "CLEAN_CONTROL_C3",
-            "target_action": "post_p2p_bill",
+            "target_action": "post_o2c_invoice",
             "expect_defect": False,
             "mode": "upgrade",
             "base_v1": v1_bp,
@@ -922,7 +924,7 @@ def _random_field_val(
             return round(rng.uniform(0.08, 0.45), 4)
         if "rate" in fspec.name:
             return round(rng.uniform(0.0, 0.35), 4)
-        if fspec.name in ("amount_total", "amount", "planned_qty") and prefer_compliant:
+        if fspec.name in ("amount_total", "amount", "planned_qty", "ordered_qty") and prefer_compliant:
             return round(rng.uniform(1500.0, 500000.0), 2)
         lo = 0.0 if fspec.non_negative else -1000.0
         return round(rng.uniform(lo, 500000.0), 2)
@@ -1080,23 +1082,27 @@ def fuzz_blueprint(
                     rel_variants = q_variants
 
                 state_ok = False
-                for r_map in rel_variants:
-                    fview = _FuzzView(spec, {subj_type: [obj], **r_map})
-                    for role in allowed_roles:
-                        ctx = {
-                            "obj": obj,
-                            "param": p_obj,
-                            "actor": Actor(actor_id=f"fuzz:{role}", role=role, clearance_tags={"*"}),
-                        }
-                        ok_all = True
-                        for pre in act.preconditions:
-                            if pre.when is not None and not eval_predicate(pre.when, ctx, fview):
-                                continue
-                            if not eval_predicate(pre.must_hold, ctx, fview):
-                                ok_all = False
+                for subj_st in states:
+                    obj_variant = subj_cls(**{**data, subj_ot.status_field: subj_st})
+                    for r_map in rel_variants:
+                        fview = _FuzzView(spec, {subj_type: [obj_variant], **r_map})
+                        for role in allowed_roles:
+                            ctx = {
+                                "obj": obj_variant,
+                                "param": p_obj,
+                                "actor": Actor(actor_id=f"fuzz:{role}", role=role, clearance_tags={"*"}),
+                            }
+                            ok_all = True
+                            for pre in act.preconditions:
+                                if pre.when is not None and not eval_predicate(pre.when, ctx, fview):
+                                    continue
+                                if not eval_predicate(pre.must_hold, ctx, fview):
+                                    ok_all = False
+                                    break
+                            if ok_all:
+                                state_ok = True
                                 break
-                        if ok_all:
-                            state_ok = True
+                        if state_ok:
                             break
                     if state_ok:
                         break

@@ -22,6 +22,12 @@ from typing import Any, ClassVar, Literal, Sequence
 
 from pydantic import BaseModel
 
+from open_ontology.induction.dsl import (
+    ActionBlueprint,
+    ActionMutationSpec,
+    InvariantRuleSpec,
+    register_rule_action,
+)
 from open_ontology.spec import (
     AutoID,
     InvariantError,
@@ -380,17 +386,6 @@ def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
     )
 
 
-def _claim_work_card(ctx: Any, params: ClaimWorkCardParams) -> None:
-    card = ctx.require(WorkCard, params.card_id)
-    _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=False)
-    ctx.modify(
-        card,
-        status="IN_PROGRESS",
-        claimed_by_actor_id=ctx.actor.actor_id,
-        external_ref=params.external_ref or card.external_ref,
-    )
-
-
 def _complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> None:
     card = ctx.require(WorkCard, params.card_id)
     _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
@@ -422,43 +417,6 @@ def _complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> None:
         resolved_by_actor_id=ctx.actor.actor_id,
         resolution_note=params.resolution_note or card.resolution_note,
         external_ref=params.external_ref or card.external_ref,
-    )
-
-
-def _reject_work_card(ctx: Any, params: RejectWorkCardParams) -> None:
-    card = ctx.require(WorkCard, params.card_id)
-    _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
-    ctx.modify(
-        card,
-        status="REJECTED",
-        resolved_by_actor_id=ctx.actor.actor_id,
-        resolution_note=params.resolution_note or card.resolution_note,
-    )
-
-
-def _mark_sla_breached(ctx: Any, params: MarkWorkCardSlaBreachedParams) -> None:
-    card = ctx.require(WorkCard, params.card_id)
-    ctx.modify(
-        card,
-        status="SLA_BREACHED",
-        resolution_note=params.resolution_note or card.resolution_note,
-    )
-
-
-def _cancel_work_card(ctx: Any, params: CancelWorkCardParams) -> None:
-    card = ctx.require(WorkCard, params.card_id)
-    if ctx.actor.actor_id != card.requester_actor_id and ctx.actor.role not in (
-        "steward",
-        "admin",
-    ):
-        raise InvariantError(
-            f"actor {ctx.actor.actor_id!r} may not cancel WorkCard:{card.card_id}",
-            code="WORK_CARD_CANCEL_FORBIDDEN",
-        )
-    ctx.modify(
-        card,
-        status="CANCELLED",
-        resolution_note=params.resolution_note or card.resolution_note,
     )
 
 
@@ -571,7 +529,7 @@ def register_work_card_primitives(
         target_spec.invariants["work_card_segregation_of_duties"].handler.__declarative_rule__ = wc_inv_rules[1]  # type: ignore[attr-defined]
 
     all_card_roles = tuple(dict.fromkeys([*eff_openers, *eff_resolvers]))
-    work_card_specs: tuple[
+    edit_fn_work_card_specs: tuple[
         tuple[str, type[BaseModel], Any, tuple[str, ...], tuple[str, ...], str], ...
     ] = (
         (
@@ -583,14 +541,6 @@ def register_work_card_primitives(
             "开立 M1 WorkCard（只记录原始意图与参数，绝不缓存 object_diff_json）。",
         ),
         (
-            "claim_work_card",
-            ClaimWorkCardParams,
-            _claim_work_card,
-            eff_resolvers,
-            (),
-            "认领推进 WorkCard（OPEN/SLA_BREACHED -> IN_PROGRESS）并记录外部回执号。",
-        ),
-        (
             "complete_work_card",
             CompleteWorkCardParams,
             _complete_work_card,
@@ -598,33 +548,9 @@ def register_work_card_primitives(
             eff_resolvers,
             "批结 WorkCard；若为 APPROVAL 卡且目标动作纯自有则在 t1 当场重算执行，源系统写动作须经 settle_work_card 提供 settled_run_id。",
         ),
-        (
-            "reject_work_card",
-            RejectWorkCardParams,
-            _reject_work_card,
-            eff_resolvers,
-            (),
-            "驳回 WorkCard（校验 SoD 后跃迁为 REJECTED）。",
-        ),
-        (
-            "mark_work_card_sla_breached",
-            MarkWorkCardSlaBreachedParams,
-            _mark_sla_breached,
-            all_card_roles,
-            (),
-            "标记超时未处理 WorkCard 为 SLA_BREACHED。",
-        ),
-        (
-            "cancel_work_card",
-            CancelWorkCardParams,
-            _cancel_work_card,
-            all_card_roles,
-            (),
-            "撤销不再需要的 WorkCard（仅原申请人或 steward/admin 可撤销）。",
-        ),
     )
 
-    for act_name, params_cls, ef_handler, act_allowed, act_revert, desc in work_card_specs:
+    for act_name, params_cls, ef_handler, act_allowed, act_revert, desc in edit_fn_work_card_specs:
         if act_name not in target_spec.edit_functions:
             target_spec.edit_function(
                 act_name,
@@ -641,6 +567,287 @@ def register_work_card_primitives(
                 affects_source=False,
                 description=desc,
             )
+
+    priv_admin_roles = [r for r in ("admin",) if not declared_roles or r in declared_roles]
+    priv_cancel_roles = [r for r in ("steward", "admin") if not declared_roles or r in declared_roles]
+    assignee_must_hold: dict[str, Any] = (
+        {"op": "eq", "left": {"ref": "actor.role"}, "right": {"ref": "obj.assignee_role"}}
+        if not priv_admin_roles
+        else {
+            "op": "or",
+            "args": [
+                {"op": "eq", "left": {"ref": "actor.role"}, "right": {"ref": "obj.assignee_role"}},
+                {"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": priv_admin_roles}},
+            ],
+        }
+    )
+    cancel_must_hold: dict[str, Any] = (
+        {"op": "eq", "left": {"ref": "actor.actor_id"}, "right": {"ref": "obj.requester_actor_id"}}
+        if not priv_cancel_roles
+        else {
+            "op": "or",
+            "args": [
+                {
+                    "op": "eq",
+                    "left": {"ref": "actor.actor_id"},
+                    "right": {"ref": "obj.requester_actor_id"},
+                },
+                {"op": "in", "left": {"ref": "actor.role"}, "right": {"lit": priv_cancel_roles}},
+            ],
+        }
+    )
+    sod_pre = InvariantRuleSpec(
+        name="sod_no_self_resolution",
+        code="SOD_SELF_APPROVAL_FORBIDDEN",
+        target_type="WorkCard",
+        id_param="card_id",
+        must_hold={
+            "op": "ne",
+            "left": {"ref": "actor.actor_id"},
+            "right": {"ref": "obj.requester_actor_id"},
+        },
+        description="SoD: resolver actor_id must differ from WorkCard.requester_actor_id.",
+    )
+    assignee_pre = InvariantRuleSpec(
+        name="assignee_role_match",
+        code="WORK_CARD_ASSIGNEE_MISMATCH",
+        target_type="WorkCard",
+        id_param="card_id",
+        when={"op": "ne", "left": {"ref": "obj.assignee_role"}, "right": {"lit": ""}},
+        must_hold=assignee_must_hold,
+        description="Actor role must match WorkCard.assignee_role (or admin).",
+    )
+
+    rule_work_card_specs: tuple[tuple[ActionBlueprint, type[BaseModel]], ...] = (
+        (
+            ActionBlueprint(
+                name="claim_work_card",
+                description="认领推进 WorkCard（OPEN/SLA_BREACHED -> IN_PROGRESS）并记录外部回执号。",
+                allowed_roles=list(eff_resolvers),
+                affects_source=False,
+                preconditions=[
+                    assignee_pre,
+                    InvariantRuleSpec(
+                        name="work_card_claimable_status",
+                        code="ILLEGAL_DOCUMENT_TRANSITION",
+                        target_type="WorkCard",
+                        id_param="card_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": ["OPEN", "IN_PROGRESS", "SLA_BREACHED"]},
+                        },
+                        description="仅 OPEN/IN_PROGRESS/SLA_BREACHED 状态工单卡可认领推进。",
+                    ),
+                    InvariantRuleSpec(
+                        name="work_card_reclaim_no_active_duplicate",
+                        code="DUPLICATE_ACTIVE_WORK_CARD",
+                        target_type="WorkCard",
+                        id_param="card_id",
+                        when={"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "SLA_BREACHED"}},
+                        must_hold={
+                            "op": "not_exists",
+                            "object_type": "WorkCard",
+                            "where": {
+                                "op": "and",
+                                "args": [
+                                    {"op": "ne", "left": {"ref": "target.card_id"}, "right": {"ref": "obj.card_id"}},
+                                    {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"ref": "obj.card_kind"}},
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "target.target_object_type"},
+                                        "right": {"ref": "obj.target_object_type"},
+                                    },
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "target.target_object_id"},
+                                        "right": {"ref": "obj.target_object_id"},
+                                    },
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "target.requested_action"},
+                                        "right": {"ref": "obj.requested_action"},
+                                    },
+                                    {
+                                        "op": "in",
+                                        "left": {"ref": "target.status"},
+                                        "right": {"lit": ["OPEN", "IN_PROGRESS"]},
+                                    },
+                                ],
+                            },
+                        },
+                        description="超时重启认领不得与同目标同动作在途工单卡冲突。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="WorkCard",
+                        id_param="card_id",
+                        set_fields={
+                            "status": {"lit": "IN_PROGRESS"},
+                            "claimed_by_actor_id": {"ref": "actor.actor_id"},
+                            "external_ref": {
+                                "op": "if_else",
+                                "cond": {
+                                    "op": "ne",
+                                    "left": {"ref": "param.external_ref"},
+                                    "right": {"lit": ""},
+                                },
+                                "then": {"ref": "param.external_ref"},
+                                "else": {"ref": "obj.external_ref"},
+                            },
+                        },
+                    ),
+                ],
+            ),
+            ClaimWorkCardParams,
+        ),
+        (
+            ActionBlueprint(
+                name="reject_work_card",
+                description="驳回 WorkCard（校验 SoD 后跃迁为 REJECTED）。",
+                allowed_roles=list(eff_resolvers),
+                affects_source=False,
+                preconditions=[
+                    sod_pre,
+                    assignee_pre,
+                    InvariantRuleSpec(
+                        name="work_card_rejectable_status",
+                        code="ILLEGAL_DOCUMENT_TRANSITION",
+                        target_type="WorkCard",
+                        id_param="card_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": ["OPEN", "IN_PROGRESS", "SLA_BREACHED"]},
+                        },
+                        description="仅未终态 WorkCard 可驳回为 REJECTED。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="WorkCard",
+                        id_param="card_id",
+                        set_fields={
+                            "status": {"lit": "REJECTED"},
+                            "resolved_by_actor_id": {"ref": "actor.actor_id"},
+                            "resolution_note": {
+                                "op": "if_else",
+                                "cond": {
+                                    "op": "ne",
+                                    "left": {"ref": "param.resolution_note"},
+                                    "right": {"lit": ""},
+                                },
+                                "then": {"ref": "param.resolution_note"},
+                                "else": {"ref": "obj.resolution_note"},
+                            },
+                        },
+                    ),
+                ],
+            ),
+            RejectWorkCardParams,
+        ),
+        (
+            ActionBlueprint(
+                name="mark_work_card_sla_breached",
+                description="标记超时未处理 WorkCard 为 SLA_BREACHED。",
+                allowed_roles=list(all_card_roles),
+                affects_source=False,
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="work_card_sla_breachable_status",
+                        code="ILLEGAL_DOCUMENT_TRANSITION",
+                        target_type="WorkCard",
+                        id_param="card_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": ["OPEN", "IN_PROGRESS", "SLA_BREACHED"]},
+                        },
+                        description="仅在途 WorkCard 可标记为 SLA_BREACHED。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="WorkCard",
+                        id_param="card_id",
+                        set_fields={
+                            "status": {"lit": "SLA_BREACHED"},
+                            "resolution_note": {
+                                "op": "if_else",
+                                "cond": {
+                                    "op": "ne",
+                                    "left": {"ref": "param.resolution_note"},
+                                    "right": {"lit": ""},
+                                },
+                                "then": {"ref": "param.resolution_note"},
+                                "else": {"ref": "obj.resolution_note"},
+                            },
+                        },
+                    ),
+                ],
+            ),
+            MarkWorkCardSlaBreachedParams,
+        ),
+        (
+            ActionBlueprint(
+                name="cancel_work_card",
+                description="撤销不再需要的 WorkCard（仅原申请人或 steward/admin 可撤销）。",
+                allowed_roles=list(all_card_roles),
+                affects_source=False,
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="cancel_work_card_authority",
+                        code="WORK_CARD_CANCEL_FORBIDDEN",
+                        target_type="WorkCard",
+                        id_param="card_id",
+                        must_hold=cancel_must_hold,
+                        description="仅原申请人或 steward/admin 可撤销 WorkCard。",
+                    ),
+                    InvariantRuleSpec(
+                        name="work_card_cancellable_status",
+                        code="ILLEGAL_DOCUMENT_TRANSITION",
+                        target_type="WorkCard",
+                        id_param="card_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": ["OPEN", "IN_PROGRESS", "SLA_BREACHED", "CANCELLED"]},
+                        },
+                        description="已批结或已驳回工单卡不可再撤销为 CANCELLED。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="WorkCard",
+                        id_param="card_id",
+                        set_fields={
+                            "status": {"lit": "CANCELLED"},
+                            "resolution_note": {
+                                "op": "if_else",
+                                "cond": {
+                                    "op": "ne",
+                                    "left": {"ref": "param.resolution_note"},
+                                    "right": {"lit": ""},
+                                },
+                                "then": {"ref": "param.resolution_note"},
+                                "else": {"ref": "obj.resolution_note"},
+                            },
+                        },
+                    ),
+                ],
+            ),
+            CancelWorkCardParams,
+        ),
+    )
+
+    for act_bp, p_cls in rule_work_card_specs:
+        if act_bp.name not in target_spec.actions:
+            register_rule_action(target_spec, act_bp, params_cls=p_cls)
 
     target_spec.update_display(
         {

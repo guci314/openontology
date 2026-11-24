@@ -77,12 +77,12 @@ def test_blueprint_enterprise_standalone_rls_and_tripartite_kinetics() -> None:
         assert cfo_bp["ok"] is True
         summary = cfo_bp["summary"]
         assert summary["object_type_count"] == 29
-        assert summary["rule_action_count"] >= 2
-        assert summary["edit_function_action_count"] >= 31
+        assert summary["rule_action_count"] == 24
+        assert summary["edit_function_action_count"] == 9
         assert summary["action_count"] == (
             summary["rule_action_count"] + summary["edit_function_action_count"]
         )
-        assert summary["edit_function_count"] >= 31
+        assert summary["edit_function_count"] == 9
         assert summary["function_count"] == 3
         assert summary["invariant_count"] >= 13
         assert summary["fsm_object_count"] >= 20
@@ -117,10 +117,21 @@ def test_blueprint_enterprise_standalone_rls_and_tripartite_kinetics() -> None:
         assert rule_act["rule_summary"]["mutation_count"] == 1
         assert "O2cOrder" in rule_act["touched_object_types"]
 
-        ef_act = act_by_name["post_o2c_invoice"]
+        post_inv_act = act_by_name["post_o2c_invoice"]
+        assert post_inv_act["implementation_kind"] == "rule"
+        assert post_inv_act["edit_function_name"] is None
+        assert post_inv_act["rule_summary"]["precondition_count"] == 3
+        assert post_inv_act["rule_summary"]["mutation_count"] == 2
+
+        ef_act = act_by_name["complete_work_card"]
         assert ef_act["implementation_kind"] == "edit_function"
-        assert ef_act["edit_function_name"] == "post_o2c_invoice"
+        assert ef_act["edit_function_name"] == "complete_work_card"
         assert ef_act["rule_summary"] is None
+
+        offboard_act = act_by_name["offboard_employee"]
+        assert offboard_act["implementation_kind"] == "edit_function"
+        assert offboard_act["edit_function_name"] == "offboard_employee"
+        assert offboard_act["rule_summary"] is None
 
         # WO-29B: generic rule precondition enum enrichment on /api/blueprint & /api/tbox
         vip_bp_prop = act_by_name["upgrade_account_vip_tier"]["params_schema"]["properties"]["vip_tier"]
@@ -157,9 +168,9 @@ def test_blueprint_starship_blind_and_coupled_ownership() -> None:
             "object_type_count": 2,
             "link_count": 1,
             "action_count": 2,
-            "rule_action_count": 0,
-            "edit_function_action_count": 2,
-            "edit_function_count": 2,
+            "rule_action_count": 2,
+            "edit_function_action_count": 0,
+            "edit_function_count": 0,
             "function_count": 1,
             "invariant_count": 1,
             "fsm_object_count": 1,
@@ -478,3 +489,192 @@ def test_blueprint_playwright_e2e_enterprise_and_starship() -> None:
     assert page_errors == [], f"Page errors: {page_errors}"
     assert failed_requests == [], f"Failed requests: {failed_requests}"
     assert bad_responses == [], f"HTTP >=400 responses: {bad_responses}"
+
+
+def test_wo33_doal_dogfooding_expressiveness_and_z3_hoare_proofs() -> None:
+    """Verify WO-33 register_rule_action(s), >=70% DOAL Rule ratio, and Z3 Hoare proofs."""
+    from pydantic import BaseModel
+
+    from open_ontology import Actor, InvariantError, ObjectType, OntologyRuntime, OntologySpec
+    from open_ontology.induction import (
+        ActionBlueprint,
+        ActionMutationSpec,
+        InvariantRuleSpec,
+        export_spec_blueprint,
+        register_rule_action,
+        register_rule_actions,
+    )
+    from examples.std_enterprise_world_model import build_enterprise_standard_spec
+
+    # 1. Unit check for register_rule_action / register_rule_actions
+    class CustomBumpParams(BaseModel):
+        item_id: str
+        delta: int
+
+    class _Widget(ObjectType):
+        __primary_key__ = "item_id"
+        item_id: str
+        count: int = 0
+        status: str = "open"
+
+    unit_spec = OntologySpec()
+    unit_spec.role("worker", "Operator")
+    unit_spec.object_type(_Widget)
+
+    bad_ef_bp = ActionBlueprint(name="bad_ef", edit_function="some_ef")
+    with pytest.raises(InvariantError) as e_ef:
+        register_rule_action(unit_spec, bad_ef_bp)
+    assert e_ef.value.code == "INVALID_ACTION_RULE"
+
+    bad_role_bp = ActionBlueprint(name="bad_role", allowed_roles=["ghost_role"])
+    with pytest.raises(InvariantError) as e_role:
+        register_rule_action(unit_spec, bad_role_bp)
+    assert e_role.value.code == "UNKNOWN_ROLE"
+
+    bad_ref_bp = ActionBlueprint(
+        name="bad_ref",
+        allowed_roles=["worker"],
+        mutations=[
+            ActionMutationSpec(
+                op="modify",
+                object_type="_Widget",
+                id_param="item_id",
+                set_fields={"count": {"ref": "obj.nonexistent"}},
+            )
+        ],
+    )
+    with pytest.raises(InvariantError):
+        register_rule_action(unit_spec, bad_ref_bp, params_cls=CustomBumpParams)
+
+    bump_bp = ActionBlueprint(
+        name="bump_widget",
+        display_label="Bump Widget",
+        allowed_roles=["worker"],
+        preconditions=[
+            InvariantRuleSpec(
+                name="positive_delta",
+                code="NON_POSITIVE_DELTA",
+                target_type="_Widget",
+                id_param="item_id",
+                must_hold={"op": "gt", "left": {"ref": "param.delta"}, "right": {"lit": 0}},
+            )
+        ],
+        mutations=[
+            ActionMutationSpec(
+                op="modify",
+                object_type="_Widget",
+                id_param="item_id",
+                set_fields={
+                    "count": {"op": "add", "left": {"ref": "obj.count"}, "right": {"ref": "param.delta"}}
+                },
+            )
+        ],
+    )
+    act_def = register_rule_actions(unit_spec, [(bump_bp, CustomBumpParams)])[0]
+    assert act_def.implementation_kind == "rule"
+    assert act_def.edit_function is None
+    assert act_def.params is CustomBumpParams
+    assert hasattr(act_def.handler, "__declarative_mutations__")
+    exported_unit = export_spec_blueprint(unit_spec, model_id="unit_rule_test")
+    exported_act = next(a for a in exported_unit.actions if a.name == "bump_widget")
+    assert len(exported_act.mutations) == 1
+    assert exported_act.display_label == "Bump Widget"
+
+    rt_unit = OntologyRuntime(unit_spec, db_path=":memory:")
+    try:
+        op_actor = Actor(actor_id="op-1", role="worker", clearance_tags={"*"})
+        rt_unit.put_object(_Widget(item_id="W-1", count=3))
+        rt_unit.submit_action("BUMP-1", "bump_widget", {"item_id": "W-1", "delta": 4}, op_actor)
+        assert rt_unit.get_object(_Widget, "W-1", op_actor).count == 7
+    finally:
+        rt_unit.close()
+
+    # 2. Verify exact Rule vs EditFunction partition across Enterprise & Starship
+    expected_efs = {
+        "close_fiscal_period",
+        "complete_work_card",
+        "issue_material_to_work_order",
+        "offboard_employee",
+        "open_work_card",
+        "post_journal_entry",
+        "record_production_output",
+        "reparent_department",
+        "reverse_journal_entry",
+    }
+
+    std_spec = build_enterprise_standard_spec()
+    std_rule_names = sorted(
+        k for k, a in std_spec.actions.items() if a.implementation_kind == "rule"
+    )
+    std_ef_names = {
+        k for k, a in std_spec.actions.items() if a.implementation_kind == "edit_function"
+    }
+    assert len(std_spec.actions) == 31
+    assert len(std_rule_names) == 22
+    assert std_ef_names == expected_efs
+
+    ent_svc = build_console_service(mode="standalone", demo_actor_switch=False)
+    try:
+        ent_spec = ent_svc.runtime.spec
+        ent_rule_names = sorted(
+            k for k, a in ent_spec.actions.items() if a.implementation_kind == "rule"
+        )
+        ent_ef_names = {
+            k for k, a in ent_spec.actions.items() if a.implementation_kind == "edit_function"
+        }
+        assert len(ent_spec.actions) == 33
+        assert len(ent_rule_names) == 24
+        assert ent_ef_names == expected_efs
+        assert len(ent_rule_names) / len(ent_spec.actions) >= 0.70
+
+        star_svc = build_starship_console(demo_actor_switch=False)
+        try:
+            star_spec = star_svc.runtime.spec
+            assert sorted(
+                k for k, a in star_spec.actions.items() if a.implementation_kind == "rule"
+            ) == ["jump_sector", "refuel_ship"]
+            assert not any(
+                a.implementation_kind == "edit_function" for a in star_spec.actions.values()
+            )
+
+            pytest.importorskip("z3")
+            from open_ontology.induction.prover import prove_blueprint
+
+            rep_std = prove_blueprint(std_spec, check_redundancy=True)
+            assert rep_std.ok is True
+            assert rep_std.dead_class_count == 0
+            assert rep_std.total_deadlock_count == 0
+            assert rep_std.conditional_deadlock_count == 0
+            assert rep_std.invariant_violation_count == 0
+            assert rep_std.redundant_rule_count == 0
+            assert {r.action_name for r in rep_std.reachability if r.implementation_kind == "rule"} == set(std_rule_names)
+            assert all(r.status == "REACHABLE" for r in rep_std.reachability if r.implementation_kind == "rule")
+            assert {p.action_name for p in rep_std.invariant_preservation} == set(std_rule_names)
+            assert all(p.status == "PROVED" for p in rep_std.invariant_preservation)
+
+            rep_ent = prove_blueprint(ent_spec, check_redundancy=True)
+            assert rep_ent.ok is True
+            assert rep_ent.dead_class_count == 0
+            assert rep_ent.total_deadlock_count == 0
+            assert rep_ent.conditional_deadlock_count == 0
+            assert rep_ent.invariant_violation_count == 0
+            assert {r.action_name for r in rep_ent.reachability if r.implementation_kind == "rule"} == set(ent_rule_names)
+            assert all(r.status == "REACHABLE" for r in rep_ent.reachability if r.implementation_kind == "rule")
+            assert {p.action_name for p in rep_ent.invariant_preservation} == set(ent_rule_names)
+            assert all(p.status == "PROVED" for p in rep_ent.invariant_preservation)
+
+            rep_star = prove_blueprint(star_spec, check_redundancy=True)
+            assert rep_star.ok is True
+            assert rep_star.dead_class_count == 0
+            assert rep_star.total_deadlock_count == 0
+            assert rep_star.conditional_deadlock_count == 0
+            assert rep_star.invariant_violation_count == 0
+            assert rep_star.redundant_rule_count == 0
+            assert {r.action_name for r in rep_star.reachability} == {"jump_sector", "refuel_ship"}
+            assert all(r.status == "REACHABLE" for r in rep_star.reachability)
+            assert {p.action_name for p in rep_star.invariant_preservation} == {"jump_sector", "refuel_ship"}
+            assert all(p.status == "PROVED" for p in rep_star.invariant_preservation)
+        finally:
+            star_svc.runtime.close()
+    finally:
+        ent_svc.runtime.close()

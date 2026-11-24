@@ -14,8 +14,15 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
-from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
+from open_ontology.induction.dsl import (
+    ActionBlueprint,
+    ActionMutationSpec,
+    DeclarativeBlueprint,
+    InvariantRuleSpec,
+    export_spec_blueprint,
+    register_rule_actions,
+)
+from open_ontology.spec import ObjectProperty, OntologySpec
 
 try:
     from .business_ontology import MasterEntity, ProcessDocument
@@ -129,72 +136,120 @@ class ResolveCrmTicketParams(BaseModel):
     resolution_summary: str = ""
 
 
-@spec.edit_function(
-    "win_crm_deal",
-    WinCrmDealParams,
-    description="将处于报价/谈判阶段的 CRM 商机推进为赢单（CLOSED_WON）。",
-    touched_object_types=("CrmDeal",),
-)
-def win_crm_deal(ctx: Any, params: WinCrmDealParams) -> None:
-    deal = ctx.require(CrmDeal, params.deal_id)
-    if deal.stage not in ("PROPOSAL", "NEGOTIATION"):
-        raise InvariantError(
-            f"CrmDeal:{deal.deal_id} stage {deal.stage!r} cannot transition to CLOSED_WON",
-            code="INVALID_DEAL_STAGE",
-        )
-    ctx.modify(deal, stage="CLOSED_WON")
-
-spec.declare_action(
-    "win_crm_deal",
-    edit_function="win_crm_deal",
-    allowed_roles=("sales_rep", "sales_manager", "finance_director", "steward", "ai_agent", "admin"),
-    description="将处于报价/谈判阶段的 CRM 商机推进为赢单（CLOSED_WON）。",
-)
-
-
-@spec.edit_function(
-    "lose_crm_deal",
-    LoseCrmDealParams,
-    description="将进行中的 CRM 商机标记为输单（CLOSED_LOST）并记录输单原因。",
-    touched_object_types=("CrmDeal",),
-)
-def lose_crm_deal(ctx: Any, params: LoseCrmDealParams) -> None:
-    deal = ctx.require(CrmDeal, params.deal_id)
-    if deal.stage not in ("PROSPECTING", "QUALIFICATION", "PROPOSAL", "NEGOTIATION"):
-        raise InvariantError(
-            f"CrmDeal:{deal.deal_id} stage {deal.stage!r} cannot transition to CLOSED_LOST",
-            code="INVALID_DEAL_STAGE",
-        )
-    ctx.modify(deal, stage="CLOSED_LOST", loss_reason=params.loss_reason)
-
-spec.declare_action(
-    "lose_crm_deal",
-    edit_function="lose_crm_deal",
-    allowed_roles=("sales_rep", "sales_manager", "steward", "ai_agent", "admin"),
-    description="将进行中的 CRM 商机标记为输单（CLOSED_LOST）并记录输单原因。",
-)
-
-
-@spec.edit_function(
-    "resolve_crm_ticket",
-    ResolveCrmTicketParams,
-    description="将待处理/处理中的客户工单解决为 RESOLVED。",
-    touched_object_types=("CrmTicket",),
-)
-def resolve_crm_ticket(ctx: Any, params: ResolveCrmTicketParams) -> None:
-    ticket = ctx.require(CrmTicket, params.ticket_id)
-    if ticket.status not in ("OPEN", "IN_PROGRESS"):
-        raise InvariantError(
-            f"CrmTicket:{ticket.ticket_id} status {ticket.status!r} cannot transition to RESOLVED",
-            code="INVALID_TICKET_STATUS",
-        )
-    ctx.modify(ticket, status="RESOLVED", resolution_summary=params.resolution_summary)
-
-spec.declare_action(
-    "resolve_crm_ticket",
-    edit_function="resolve_crm_ticket",
-    allowed_roles=("support_agent", "ops", "steward", "ai_agent", "admin"),
-    description="将待处理/处理中的客户工单解决为 RESOLVED。",
+register_rule_actions(
+    spec,
+    [
+        (
+            ActionBlueprint(
+                name="win_crm_deal",
+                description="将处于报价/谈判阶段的 CRM 商机推进为赢单（CLOSED_WON）。",
+                allowed_roles=[
+                    "sales_rep",
+                    "sales_manager",
+                    "finance_director",
+                    "steward",
+                    "ai_agent",
+                    "admin",
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="crm_deal_winnable_stage",
+                        code="INVALID_DEAL_STAGE",
+                        target_type="CrmDeal",
+                        id_param="deal_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.stage"},
+                            "right": {"lit": ["PROPOSAL", "NEGOTIATION"]},
+                        },
+                        description="仅报价（PROPOSAL）或谈判（NEGOTIATION）阶段商机可推进为赢单。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="CrmDeal",
+                        id_param="deal_id",
+                        set_fields={"stage": {"lit": "CLOSED_WON"}},
+                    ),
+                ],
+            ),
+            WinCrmDealParams,
+        ),
+        (
+            ActionBlueprint(
+                name="lose_crm_deal",
+                description="将进行中的 CRM 商机标记为输单（CLOSED_LOST）并记录输单原因。",
+                allowed_roles=["sales_rep", "sales_manager", "steward", "ai_agent", "admin"],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="crm_deal_losable_stage",
+                        code="INVALID_DEAL_STAGE",
+                        target_type="CrmDeal",
+                        id_param="deal_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.stage"},
+                            "right": {
+                                "lit": [
+                                    "PROSPECTING",
+                                    "QUALIFICATION",
+                                    "PROPOSAL",
+                                    "NEGOTIATION",
+                                ]
+                            },
+                        },
+                        description="仅进行中商机可标记为输单（CLOSED_LOST）。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="CrmDeal",
+                        id_param="deal_id",
+                        set_fields={
+                            "stage": {"lit": "CLOSED_LOST"},
+                            "loss_reason": {"ref": "param.loss_reason"},
+                        },
+                    ),
+                ],
+            ),
+            LoseCrmDealParams,
+        ),
+        (
+            ActionBlueprint(
+                name="resolve_crm_ticket",
+                description="将待处理/处理中的客户工单解决为 RESOLVED。",
+                allowed_roles=["support_agent", "ops", "steward", "ai_agent", "admin"],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="crm_ticket_resolvable_status",
+                        code="INVALID_TICKET_STATUS",
+                        target_type="CrmTicket",
+                        id_param="ticket_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": ["OPEN", "IN_PROGRESS"]},
+                        },
+                        description="仅 OPEN 或 IN_PROGRESS 状态工单可解决为 RESOLVED。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="CrmTicket",
+                        id_param="ticket_id",
+                        set_fields={
+                            "status": {"lit": "RESOLVED"},
+                            "resolution_summary": {"ref": "param.resolution_summary"},
+                        },
+                    ),
+                ],
+            ),
+            ResolveCrmTicketParams,
+        ),
+    ],
 )
 
 

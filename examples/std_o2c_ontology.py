@@ -12,8 +12,15 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
-from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
+from open_ontology.induction.dsl import (
+    ActionBlueprint,
+    ActionMutationSpec,
+    DeclarativeBlueprint,
+    InvariantRuleSpec,
+    export_spec_blueprint,
+    register_rule_actions,
+)
+from open_ontology.spec import ObjectProperty, OntologySpec
 
 try:
     from .business_ontology import MasterEntity, ProcessDocument
@@ -157,126 +164,241 @@ class RecordO2cPaymentParams(BaseModel):
     payment_amount: float = Field(..., ge=0.0)
 
 
-@spec.edit_function(
-    "confirm_o2c_order",
-    ConfirmO2cOrderParams,
-    description="校验草稿状态与正金额后确认标准销售订单。",
-    touched_object_types=("O2cOrder",),
-)
-def confirm_o2c_order(ctx: Any, params: ConfirmO2cOrderParams) -> None:
-    order = ctx.require(O2cOrder, params.order_id)
-    if order.status != "draft":
-        raise InvariantError(
-            f"O2cOrder:{order.order_id} status {order.status!r} must be 'draft' to confirm",
-            code="ORDER_NOT_DRAFT",
-        )
-    if order.amount_total <= 0:
-        raise InvariantError(
-            f"O2cOrder:{order.order_id} amount_total={order.amount_total} must be > 0",
-            code="NON_POSITIVE_ORDER_AMOUNT",
-        )
-    ctx.modify(order, status="confirmed")
+_O2C_PAYMENT_RESIDUAL_DIFF = {
+    "op": "sub",
+    "left": {"ref": "obj.amount_residual"},
+    "right": {"ref": "param.payment_amount"},
+}
+_O2C_PAYMENT_SETTLED = {
+    "op": "le",
+    "left": _O2C_PAYMENT_RESIDUAL_DIFF,
+    "right": {"lit": 1e-9},
+}
 
-spec.declare_action(
-    "confirm_o2c_order",
-    edit_function="confirm_o2c_order",
-    allowed_roles=("sales_rep", "sales_manager", "ops", "finance_director", "steward", "ai_agent", "admin"),
-    description="校验草稿状态与正金额后确认标准销售订单。",
-)
-
-
-@spec.edit_function(
-    "complete_o2c_delivery",
-    CompleteO2cDeliveryParams,
-    description="完成待发货履约单并同步推进关联销售订单为已发货（delivered）。",
-    touched_object_types=("O2cDelivery", "O2cOrder"),
-)
-def complete_o2c_delivery(ctx: Any, params: CompleteO2cDeliveryParams) -> None:
-    delivery = ctx.require(O2cDelivery, params.delivery_id)
-    if delivery.status != "pending":
-        raise InvariantError(
-            f"O2cDelivery:{delivery.delivery_id} status {delivery.status!r} must be 'pending'",
-            code="DELIVERY_NOT_PENDING",
-        )
-    order = ctx.require(O2cOrder, delivery.order)
-    if order.status != "confirmed":
-        raise InvariantError(
-            f"O2cOrder:{order.order_id} status {order.status!r} must be 'confirmed' before delivery",
-            code="ORDER_NOT_CONFIRMED",
-        )
-    ctx.modify(delivery, status="completed")
-    ctx.modify(order, status="delivered")
-
-spec.declare_action(
-    "complete_o2c_delivery",
-    edit_function="complete_o2c_delivery",
-    allowed_roles=("warehouse", "ops", "finance_director", "steward", "ai_agent", "admin"),
-    description="完成待发货履约单并同步推进关联销售订单为已发货（delivered）。",
-)
-
-
-@spec.edit_function(
-    "post_o2c_invoice",
-    PostO2cInvoiceParams,
-    description="将草稿应收发票正式过账并将关联订单推进为已开票（invoiced）。",
-    touched_object_types=("O2cInvoice", "O2cOrder"),
-)
-def post_o2c_invoice(ctx: Any, params: PostO2cInvoiceParams) -> None:
-    invoice = ctx.require(O2cInvoice, params.invoice_id)
-    if invoice.status != "draft":
-        raise InvariantError(
-            f"O2cInvoice:{invoice.invoice_id} status {invoice.status!r} must be 'draft' to post",
-            code="INVOICE_NOT_DRAFT",
-        )
-    order = ctx.require(O2cOrder, invoice.order)
-    if order.status not in ("confirmed", "delivered", "invoiced"):
-        raise InvariantError(
-            f"O2cOrder:{order.order_id} status {order.status!r} is not billable",
-            code="ORDER_NOT_BILLABLE",
-        )
-    ctx.modify(invoice, status="posted")
-    ctx.modify(order, status="invoiced")
-
-spec.declare_action(
-    "post_o2c_invoice",
-    edit_function="post_o2c_invoice",
-    allowed_roles=("finance", "finance_director", "steward", "ai_agent", "admin"),
-    description="将草稿应收发票正式过账并将关联订单推进为已开票（invoiced）。",
-)
-
-
-@spec.edit_function(
-    "record_o2c_payment",
-    RecordO2cPaymentParams,
-    description="登记已过账发票的回款核销（支持分期部分核销与全额结清）。",
-    touched_object_types=("O2cInvoice",),
-)
-def record_o2c_payment(ctx: Any, params: RecordO2cPaymentParams) -> None:
-    invoice = ctx.require(O2cInvoice, params.invoice_id)
-    if invoice.status != "posted":
-        raise InvariantError(
-            f"O2cInvoice:{invoice.invoice_id} status {invoice.status!r} must be 'posted'",
-            code="INVOICE_NOT_POSTED",
-        )
-    if params.payment_amount <= 0:
-        raise InvariantError(
-            f"payment_amount={params.payment_amount} must be > 0",
-            code="INVALID_PAYMENT_AMOUNT",
-        )
-    if params.payment_amount > invoice.amount_residual:
-        raise InvariantError(
-            f"payment_amount={params.payment_amount} exceeds amount_residual={invoice.amount_residual}",
-            code="PAYMENT_EXCEEDS_RESIDUAL",
-        )
-    new_residual = max(0.0, round(invoice.amount_residual - params.payment_amount, 6))
-    new_payment_state = "paid" if new_residual <= 1e-9 else "partial"
-    ctx.modify(invoice, amount_residual=new_residual, payment_state=new_payment_state)
-
-spec.declare_action(
-    "record_o2c_payment",
-    edit_function="record_o2c_payment",
-    allowed_roles=("finance", "finance_director", "steward", "ai_agent", "admin"),
-    description="登记已过账发票的回款核销（支持分期部分核销与全额结清）。",
+register_rule_actions(
+    spec,
+    [
+        (
+            ActionBlueprint(
+                name="confirm_o2c_order",
+                description="校验草稿状态与正金额后确认标准销售订单。",
+                allowed_roles=[
+                    "sales_rep",
+                    "sales_manager",
+                    "ops",
+                    "finance_director",
+                    "steward",
+                    "ai_agent",
+                    "admin",
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="o2c_order_must_be_draft",
+                        code="ORDER_NOT_DRAFT",
+                        target_type="O2cOrder",
+                        id_param="order_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "draft"},
+                        },
+                        description="仅草稿状态（draft）销售订单可执行确认。",
+                    ),
+                    InvariantRuleSpec(
+                        name="o2c_order_positive_amount",
+                        code="NON_POSITIVE_ORDER_AMOUNT",
+                        target_type="O2cOrder",
+                        id_param="order_id",
+                        must_hold={
+                            "op": "gt",
+                            "left": {"ref": "obj.amount_total"},
+                            "right": {"lit": 0.0},
+                        },
+                        description="销售订单总额必须严格大于 0。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="O2cOrder",
+                        id_param="order_id",
+                        set_fields={"status": {"lit": "confirmed"}},
+                    ),
+                ],
+            ),
+            ConfirmO2cOrderParams,
+        ),
+        (
+            ActionBlueprint(
+                name="complete_o2c_delivery",
+                description="完成待发货履约单并同步推进关联销售订单为已发货（delivered）。",
+                allowed_roles=[
+                    "warehouse",
+                    "ops",
+                    "finance_director",
+                    "steward",
+                    "ai_agent",
+                    "admin",
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="o2c_delivery_must_be_pending",
+                        code="DELIVERY_NOT_PENDING",
+                        target_type="O2cDelivery",
+                        id_param="delivery_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "pending"},
+                        },
+                        description="仅待发货（pending）履约单可执行完成确认。",
+                    ),
+                    InvariantRuleSpec(
+                        name="o2c_delivery_order_confirmed",
+                        code="ORDER_NOT_CONFIRMED",
+                        target_type="O2cDelivery",
+                        id_param="delivery_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.order.status"},
+                            "right": {"lit": "confirmed"},
+                        },
+                        description="关联销售订单必须已确认（confirmed）方可执行发货确认。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="O2cDelivery",
+                        id_param="delivery_id",
+                        set_fields={"status": {"lit": "completed"}},
+                    ),
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="O2cOrder",
+                        target_ref="obj.order",
+                        set_fields={"status": {"lit": "delivered"}},
+                    ),
+                ],
+            ),
+            CompleteO2cDeliveryParams,
+        ),
+        (
+            ActionBlueprint(
+                name="post_o2c_invoice",
+                description="将草稿应收发票正式过账并将关联订单推进为已开票（invoiced）。",
+                allowed_roles=["finance", "finance_director", "steward", "ai_agent", "admin"],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="o2c_invoice_must_be_draft",
+                        code="INVOICE_NOT_DRAFT",
+                        target_type="O2cInvoice",
+                        id_param="invoice_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "draft"},
+                        },
+                        description="仅草稿状态（draft）应收发票可执行正式过账。",
+                    ),
+                    InvariantRuleSpec(
+                        name="o2c_invoice_order_billable",
+                        code="ORDER_NOT_BILLABLE",
+                        target_type="O2cInvoice",
+                        id_param="invoice_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.order.status"},
+                            "right": {"lit": ["confirmed", "delivered", "invoiced"]},
+                        },
+                        description="关联销售订单必须已确认/已发货/已开票方可过账应收发票。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="O2cInvoice",
+                        id_param="invoice_id",
+                        set_fields={"status": {"lit": "posted"}},
+                    ),
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="O2cOrder",
+                        target_ref="obj.order",
+                        set_fields={"status": {"lit": "invoiced"}},
+                    ),
+                ],
+            ),
+            PostO2cInvoiceParams,
+        ),
+        (
+            ActionBlueprint(
+                name="record_o2c_payment",
+                description="登记已过账发票的回款核销（支持分期部分核销与全额结清）。",
+                allowed_roles=["finance", "finance_director", "steward", "ai_agent", "admin"],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="o2c_payment_invoice_posted",
+                        code="INVOICE_NOT_POSTED",
+                        target_type="O2cInvoice",
+                        id_param="invoice_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "posted"},
+                        },
+                        description="仅已过账（posted）应收发票可登记回款核销。",
+                    ),
+                    InvariantRuleSpec(
+                        name="o2c_payment_positive_amount",
+                        code="INVALID_PAYMENT_AMOUNT",
+                        target_type="O2cInvoice",
+                        id_param="invoice_id",
+                        must_hold={
+                            "op": "gt",
+                            "left": {"ref": "param.payment_amount"},
+                            "right": {"lit": 0.0},
+                        },
+                        description="回款核销金额必须严格大于 0。",
+                    ),
+                    InvariantRuleSpec(
+                        name="o2c_payment_within_residual",
+                        code="PAYMENT_EXCEEDS_RESIDUAL",
+                        target_type="O2cInvoice",
+                        id_param="invoice_id",
+                        must_hold={
+                            "op": "le",
+                            "left": {"ref": "param.payment_amount"},
+                            "right": {"ref": "obj.amount_residual"},
+                        },
+                        description="回款核销金额不得超过发票待结余款。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="O2cInvoice",
+                        id_param="invoice_id",
+                        set_fields={
+                            "amount_residual": {
+                                "op": "if_else",
+                                "cond": _O2C_PAYMENT_SETTLED,
+                                "then": {"lit": 0.0},
+                                "else": _O2C_PAYMENT_RESIDUAL_DIFF,
+                            },
+                            "payment_state": {
+                                "op": "if_else",
+                                "cond": _O2C_PAYMENT_SETTLED,
+                                "then": {"lit": "paid"},
+                                "else": {"lit": "partial"},
+                            },
+                        },
+                    ),
+                ],
+            ),
+            RecordO2cPaymentParams,
+        ),
+    ],
 )
 
 

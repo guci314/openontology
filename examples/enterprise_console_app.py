@@ -51,6 +51,7 @@ from open_ontology.induction import (
     CustomerOverlaySpec,
     FieldSpec,
     InvariantRuleSpec,
+    register_rule_actions,
 )
 from open_ontology.org_authority import OrgDirectory, hash_auth_token
 
@@ -1863,6 +1864,7 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
     class WarpCore(ObjectType):
         __primary_key__ = "core_id"
         __title__ = "label"
+        __non_negative_fields__ = ("output_gw",)
         core_id: str
         label: str
         output_gw: int = 120
@@ -1872,6 +1874,7 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
         __primary_key__ = "ship_id"
         __title__ = "callsign"
         __aggregate_root__ = True
+        __non_negative_fields__ = ("fuel_cells",)
         __security_tag_fields__ = ("sector",)
         __status_field__ = "status"
         __initial_statuses__ = ("active", "docked")
@@ -1906,39 +1909,81 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
     blind_spec.object_type(WarpCore)
     blind_spec.object_type(Starship)
 
-    @blind_spec.edit_function("jump_sector", JumpSectorParams)
-    def jump_sector(ctx: Any, params: JumpSectorParams) -> None:
-        ship = ctx.require(Starship, params.ship_id)
-        if ship.fuel_cells < params.cost_cells:
-            raise InvariantError(
-                f"Starship:{ship.ship_id} fuel_cells={ship.fuel_cells} < {params.cost_cells}",
-                code="INSUFFICIENT_FUEL",
-            )
-        ctx.modify(
-            ship,
-            sector=params.target_sector,
-            fuel_cells=ship.fuel_cells - params.cost_cells,
-        )
-
-    blind_spec.declare_action(
-        "jump_sector",
-        edit_function="jump_sector",
-        allowed_roles=("navigator", "commander", "admin"),
-        touched_object_types=("Starship",),
-    )
-
-    @blind_spec.edit_function("refuel_ship", RefuelCoreParams)
-    def refuel_ship(ctx: Any, params: RefuelCoreParams) -> None:
-        ship = ctx.require(Starship, params.ship_id)
-        if params.added_cells <= 0:
-            raise InvariantError("added_cells must be positive", code="INVALID_FUEL_AMOUNT")
-        ctx.modify(ship, fuel_cells=ship.fuel_cells + params.added_cells)
-
-    blind_spec.declare_action(
-        "refuel_ship",
-        edit_function="refuel_ship",
-        allowed_roles=("commander", "admin"),
-        touched_object_types=("Starship",),
+    register_rule_actions(
+        blind_spec,
+        [
+            (
+                ActionBlueprint(
+                    name="jump_sector",
+                    allowed_roles=["navigator", "commander", "admin"],
+                    preconditions=[
+                        InvariantRuleSpec(
+                            name="ship_has_sufficient_fuel",
+                            code="INSUFFICIENT_FUEL",
+                            target_type="Starship",
+                            id_param="ship_id",
+                            must_hold={
+                                "op": "ge",
+                                "left": {"ref": "obj.fuel_cells"},
+                                "right": {"ref": "param.cost_cells"},
+                            },
+                            description="Starship fuel_cells must cover jump cost_cells.",
+                        ),
+                    ],
+                    mutations=[
+                        ActionMutationSpec(
+                            op="modify",
+                            object_type="Starship",
+                            id_param="ship_id",
+                            set_fields={
+                                "sector": {"ref": "param.target_sector"},
+                                "fuel_cells": {
+                                    "op": "sub",
+                                    "left": {"ref": "obj.fuel_cells"},
+                                    "right": {"ref": "param.cost_cells"},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+                JumpSectorParams,
+            ),
+            (
+                ActionBlueprint(
+                    name="refuel_ship",
+                    allowed_roles=["commander", "admin"],
+                    preconditions=[
+                        InvariantRuleSpec(
+                            name="positive_added_cells",
+                            code="INVALID_FUEL_AMOUNT",
+                            target_type="Starship",
+                            id_param="ship_id",
+                            must_hold={
+                                "op": "gt",
+                                "left": {"ref": "param.added_cells"},
+                                "right": {"lit": 0},
+                            },
+                            description="added_cells must be positive.",
+                        ),
+                    ],
+                    mutations=[
+                        ActionMutationSpec(
+                            op="modify",
+                            object_type="Starship",
+                            id_param="ship_id",
+                            set_fields={
+                                "fuel_cells": {
+                                    "op": "add",
+                                    "left": {"ref": "obj.fuel_cells"},
+                                    "right": {"ref": "param.added_cells"},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+                RefuelCoreParams,
+            ),
+        ],
     )
 
     @blind_spec.function("fleet_fuel_total", FleetFuelParams, description="计算当前可见舰队燃料总量与跃迁能量值")
@@ -1969,6 +2014,16 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
                     code="NEGATIVE_FUEL",
                 )
         return True
+
+    blind_spec.invariants["starship_non_negative_fuel"].handler.__declarative_rule__ = (  # type: ignore[attr-defined]
+        InvariantRuleSpec(
+            name="starship_non_negative_fuel",
+            code="NEGATIVE_FUEL",
+            target_type="Starship",
+            must_hold={"op": "ge", "left": {"ref": "obj.fuel_cells"}, "right": {"lit": 0}},
+            description="星际战舰燃料电池储备与曲速核心功率严禁为负。",
+        ).model_dump(mode="json")
+    )
 
     blind_spec.update_display(
         {

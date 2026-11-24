@@ -96,6 +96,8 @@ from .dsl import (
     export_spec_blueprint,
     expr_depth,
     migrate_m0_snapshot,
+    register_rule_action,
+    register_rule_actions,
     validate_predicate_ast,
 )
 from .friction import (
@@ -229,6 +231,8 @@ __all__ = [
     "migrate_m0_snapshot",
     "compile_blueprint",
     "export_spec_blueprint",
+    "register_rule_action",
+    "register_rule_actions",
     "dsl_schema_prompt_guide",
     # External phenomenon & adapter mapping
     "ExternalFieldProfile",

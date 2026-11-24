@@ -21,7 +21,14 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
+from open_ontology.induction.dsl import (
+    ActionBlueprint,
+    ActionMutationSpec,
+    DeclarativeBlueprint,
+    InvariantRuleSpec,
+    export_spec_blueprint,
+    register_rule_action,
+)
 from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
 
 try:
@@ -493,26 +500,36 @@ spec.declare_action(
 )
 
 
-@spec.edit_function(
-    "start_fiscal_period_closing",
-    StartFiscalPeriodClosingParams,
-    description="将开放中的会计期间切入结账中状态（open -> closing），冻结日常凭证过账。",
-    touched_object_types=("FiscalPeriod",),
-)
-def start_fiscal_period_closing(ctx: Any, params: StartFiscalPeriodClosingParams) -> None:
-    period = ctx.require(FiscalPeriod, params.period_id)
-    if period.status != "open":
-        raise InvariantError(
-            f"FiscalPeriod:{period.period_id} status is {period.status!r}, expected 'open'",
-            code="PERIOD_NOT_OPEN",
-        )
-    ctx.modify(period, status="closing")
-
-spec.declare_action(
-    "start_fiscal_period_closing",
-    edit_function="start_fiscal_period_closing",
-    allowed_roles=("chief_accountant", "finance_director", "admin"),
-    description="将开放中的会计期间切入结账中状态（open -> closing），冻结日常凭证过账。",
+register_rule_action(
+    spec,
+    ActionBlueprint(
+        name="start_fiscal_period_closing",
+        description="将开放中的会计期间切入结账中状态（open -> closing），冻结日常凭证过账。",
+        allowed_roles=["chief_accountant", "finance_director", "admin"],
+        preconditions=[
+            InvariantRuleSpec(
+                name="r2r_period_must_be_open",
+                code="PERIOD_NOT_OPEN",
+                target_type="FiscalPeriod",
+                id_param="period_id",
+                must_hold={
+                    "op": "eq",
+                    "left": {"ref": "obj.status"},
+                    "right": {"lit": "open"},
+                },
+                description="仅开放中（open）会计期间可执行启动结账。",
+            ),
+        ],
+        mutations=[
+            ActionMutationSpec(
+                op="modify",
+                object_type="FiscalPeriod",
+                id_param="period_id",
+                set_fields={"status": {"lit": "closing"}},
+            ),
+        ],
+    ),
+    params_cls=StartFiscalPeriodClosingParams,
 )
 
 

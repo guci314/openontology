@@ -71,6 +71,8 @@ __all__ = [
     "migrate_m0_snapshot",
     "export_spec_blueprint",
     "compile_blueprint",
+    "register_rule_action",
+    "register_rule_actions",
     "dsl_schema_prompt_guide",
 ]
 
@@ -3516,12 +3518,17 @@ def _run_action_preconditions(
         if pre.id_param:
             explicit_id_params.append(pre.id_param)
         else:
+            created_id_params = {
+                m.id_param
+                for m in mutations
+                if m.object_type == pre.target_type and m.op == "create"
+            }
             for m in mutations:
                 if m.object_type == pre.target_type and m.op != "create" and m.target_ref is None:
                     explicit_id_params.append(m.id_param)
             if not explicit_id_params:
                 pk_name = target_cls.primary_key_name()
-                if pk_name in param_fields:
+                if pk_name in param_fields and pk_name not in created_id_params:
                     explicit_id_params.append(pk_name)
             if not explicit_id_params:
                 for pname, finfo in param_fields.items():
@@ -3623,7 +3630,9 @@ def _make_rule_action_handler(
                 for k, v_expr in mut.set_fields.items():
                     payload[k] = _eval_value(v_expr, eval_ctx, ctx)
                 if target_cls.__primary_key__ not in payload and hasattr(params, mut.id_param):
-                    payload[target_cls.__primary_key__] = getattr(params, mut.id_param)
+                    pk_val = getattr(params, mut.id_param)
+                    if pk_val is not None:
+                        payload[target_cls.__primary_key__] = pk_val
                 obj = target_cls(**payload)
                 ctx.create(obj)
             elif mut.target_ref is not None:
@@ -3687,83 +3696,51 @@ def _make_rule_action_handler(
     return _handler
 
 
-def _compile_and_register_action_blueprint(
+def _compile_and_register_rule_action(
     spec: OntologySpec,
     act: ActionBlueprint,
     *,
     ot_by_name: Mapping[str, ObjectTypeBlueprint],
     valid_type_names: set[str],
     compiled_valid_roles: set[str],
-) -> str | None:
+    params_cls: type[BaseModel] | None = None,
+) -> tuple[ActionDef, str | None]:
     _assert_safe_identifier(act.name, "action name")
-    param_defs, act_param_names = _compile_param_defs(act.params)
-
     if act.edit_function is not None:
-        ef = spec.get_edit_function(act.edit_function)
-        extra_param_defs = {k: v for k, v in param_defs.items() if k not in ef.params.model_fields}
-        params_cls: type[BaseModel] | None = (
-            create_model(
-                f"{act.name}_Params",
-                __base__=ef.params,
-                __module__="open_ontology_overlay",
-                **extra_param_defs,
+        raise InvariantError(
+            f"action {act.name!r} cannot specify edit_function={act.edit_function!r} when compiled as rule",
+            code="INVALID_ACTION_RULE",
+        )
+    if params_cls is not None:
+        if not (isinstance(params_cls, type) and issubclass(params_cls, BaseModel)):
+            raise InvariantError(
+                f"action {act.name!r} params_cls must be a Pydantic BaseModel subclass",
+                code="INVALID_PARAM_SCHEMA",
             )
-            if extra_param_defs
-            else None
-        )
-        effective_param_names = set((params_cls or ef.params).model_fields.keys())
-        subject_type: str | None = None
-        subject_id_param: str | None = None
-        for pre in act.preconditions:
-            s_ot = ot_by_name.get(pre.target_type)
-            s_idp = pre.id_param or (s_ot.primary_key if s_ot is not None else "id")
-            if s_idp in effective_param_names:
-                subject_type, subject_id_param = pre.target_type, s_idp
-                break
-        _validate_preconditions_for_spec(
-            act.name,
-            act.preconditions,
-            ot_by_name=ot_by_name,
-            valid_type_names=valid_type_names,
-            valid_roles=compiled_valid_roles,
-            param_names=effective_param_names,
-        )
-        touched_types = set(ef.touched_object_types) | {pre.target_type for pre in act.preconditions}
-        action_def = spec.declare_action(
-            act.name,
-            edit_function=ef.name,
-            params=params_cls,
-            allowed_roles=tuple(act.allowed_roles),
-            revert_roles=tuple(act.revert_roles),
-            affects_source=act.affects_source,
-            description=act.description,
-            view_tags=tuple(act.view_tags),
-            touched_object_types=tuple(sorted(touched_types)),
-            submission_criteria=tuple(pre.model_dump(mode="json") for pre in act.preconditions),
-        )
-        if act.preconditions:
-            orig_handler = action_def.handler
-            pre_tuple = tuple(copy.deepcopy(p) for p in act.preconditions)
+        compiled_params_cls: type[BaseModel] = params_cls
+        act_param_names = set(params_cls.model_fields.keys())
+        extra_bp_params = {p.name for p in act.params} - act_param_names
+        if extra_bp_params:
+            raise InvariantError(
+                f"action {act.name!r} ActionBlueprint.params {sorted(extra_bp_params)} "
+                f"missing from params_cls {params_cls.__name__}",
+                code="PARAM_SCHEMA_MISMATCH",
+            )
+    else:
+        param_defs, act_param_names = _compile_param_defs(act.params)
+        compiled_params_cls = create_model(f"{act.name}_Params", **param_defs)
 
-            def _wrapped_ef(ctx: EditBatch, params: BaseModel) -> Any:
-                _run_action_preconditions(ctx, params, pre_tuple)
-                return orig_handler(ctx, params)
-
-            spec.actions[act.name] = action_def.model_copy(update={"handler": _wrapped_ef})
-        return act.display_label or None
-
-    params_cls_rule = create_model(f"{act.name}_Params", **param_defs)
     subject_type = None
     subject_id_param = None
     for m in act.mutations:
-        if m.op != "create" and m.target_ref is None and m.id_param in param_defs:
+        if m.op != "create" and m.target_ref is None and m.id_param in act_param_names:
             subject_type, subject_id_param = m.object_type, m.id_param
             break
     if subject_type is None:
         for pre in act.preconditions:
             s_ot = ot_by_name.get(pre.target_type)
             s_idp = pre.id_param or (s_ot.primary_key if s_ot is not None else "id")
-            if s_idp in param_defs:
+            if s_idp in act_param_names:
                 subject_type, subject_id_param = pre.target_type, s_idp
                 break
 
@@ -3851,9 +3828,9 @@ def _compile_and_register_action_blueprint(
     touched_types = {mut.object_type for mut in act.mutations} | {
         pre.target_type for pre in act.preconditions
     }
-    spec.declare_rule_action(
+    act_def = spec.declare_rule_action(
         act.name,
-        params=params_cls_rule,
+        params=compiled_params_cls,
         handler=_make_rule_action_handler(act, subject_type, subject_id_param),
         allowed_roles=tuple(act.allowed_roles),
         revert_roles=tuple(act.revert_roles),
@@ -3863,7 +3840,152 @@ def _compile_and_register_action_blueprint(
         touched_object_types=tuple(sorted(touched_types)),
         submission_criteria=tuple(pre.model_dump(mode="json") for pre in act.preconditions),
     )
-    return act.display_label or None
+    return act_def, (act.display_label or None)
+
+
+def register_rule_action(
+    spec: OntologySpec,
+    action_bp: ActionBlueprint,
+    *,
+    params_cls: type[BaseModel] | None = None,
+) -> ActionDef:
+    """Validate and register a declarative DOAL ``ActionBlueprint`` directly on ``spec``.
+
+    Preserves ``params_cls`` when supplied, validates predicate ASTs, schema references,
+    and closed RBAC roles against ``spec``, and registers a ``rule`` action with
+    ``__declarative_mutations__`` so ``export_spec_blueprint`` and Z3 proofs preserve
+    full declarative semantics.
+    """
+    if not isinstance(spec, OntologySpec):
+        raise TypeError(f"expected OntologySpec, got {type(spec).__name__}")
+    if not isinstance(action_bp, ActionBlueprint):
+        raise TypeError(f"expected ActionBlueprint, got {type(action_bp).__name__}")
+    if action_bp.edit_function is not None:
+        raise InvariantError(
+            f"register_rule_action {action_bp.name!r} forbids edit_function={action_bp.edit_function!r}; "
+            "use @spec.edit_function + spec.declare_action for Python edit functions",
+            code="INVALID_ACTION_RULE",
+        )
+    if action_bp.name in spec.actions:
+        raise InvariantError(
+            f"duplicate action declaration {action_bp.name!r}",
+            code="DUPLICATE_ACTION",
+        )
+    ot_by_name = _spec_to_object_blueprints(spec)
+    valid_type_names = set(spec.object_types.keys())
+    compiled_valid_roles = set(spec.roles.keys())
+    if compiled_valid_roles:
+        _validate_action_closed_roles(
+            action_bp,
+            compiled_valid_roles,
+            context_prefix="rule action",
+        )
+    act_def, display_label = _compile_and_register_rule_action(
+        spec,
+        action_bp,
+        ot_by_name=ot_by_name,
+        valid_type_names=valid_type_names,
+        compiled_valid_roles=compiled_valid_roles,
+        params_cls=params_cls,
+    )
+    if display_label:
+        spec.update_display({"actions": {action_bp.name: display_label}})
+    return act_def
+
+
+def register_rule_actions(
+    spec: OntologySpec,
+    action_bps: Sequence[ActionBlueprint | tuple[ActionBlueprint, type[BaseModel] | None]],
+) -> list[ActionDef]:
+    """Validate and register a sequence of declarative DOAL rule actions onto ``spec``."""
+    registered: list[ActionDef] = []
+    for entry in action_bps:
+        if isinstance(entry, tuple):
+            if len(entry) != 2:
+                raise ValueError(
+                    "register_rule_actions tuple entries must be (ActionBlueprint, params_cls), "
+                    f"got length {len(entry)}"
+                )
+            act_bp, p_cls = entry
+            registered.append(register_rule_action(spec, act_bp, params_cls=p_cls))
+        else:
+            registered.append(register_rule_action(spec, entry))
+    return registered
+
+
+def _compile_and_register_action_blueprint(
+    spec: OntologySpec,
+    act: ActionBlueprint,
+    *,
+    ot_by_name: Mapping[str, ObjectTypeBlueprint],
+    valid_type_names: set[str],
+    compiled_valid_roles: set[str],
+) -> str | None:
+    _assert_safe_identifier(act.name, "action name")
+
+    if act.edit_function is not None:
+        param_defs, _ = _compile_param_defs(act.params)
+        ef = spec.get_edit_function(act.edit_function)
+        extra_param_defs = {k: v for k, v in param_defs.items() if k not in ef.params.model_fields}
+        params_cls: type[BaseModel] | None = (
+            create_model(
+                f"{act.name}_Params",
+                __base__=ef.params,
+                __module__="open_ontology_overlay",
+                **extra_param_defs,
+            )
+            if extra_param_defs
+            else None
+        )
+        effective_param_names = set((params_cls or ef.params).model_fields.keys())
+        subject_type: str | None = None
+        subject_id_param: str | None = None
+        for pre in act.preconditions:
+            s_ot = ot_by_name.get(pre.target_type)
+            s_idp = pre.id_param or (s_ot.primary_key if s_ot is not None else "id")
+            if s_idp in effective_param_names:
+                subject_type, subject_id_param = pre.target_type, s_idp
+                break
+        _validate_preconditions_for_spec(
+            act.name,
+            act.preconditions,
+            ot_by_name=ot_by_name,
+            valid_type_names=valid_type_names,
+            valid_roles=compiled_valid_roles,
+            param_names=effective_param_names,
+        )
+        touched_types = set(ef.touched_object_types) | {pre.target_type for pre in act.preconditions}
+        action_def = spec.declare_action(
+            act.name,
+            edit_function=ef.name,
+            params=params_cls,
+            allowed_roles=tuple(act.allowed_roles),
+            revert_roles=tuple(act.revert_roles),
+            affects_source=act.affects_source,
+            description=act.description,
+            view_tags=tuple(act.view_tags),
+            touched_object_types=tuple(sorted(touched_types)),
+            submission_criteria=tuple(pre.model_dump(mode="json") for pre in act.preconditions),
+        )
+        if act.preconditions:
+            orig_handler = action_def.handler
+            pre_tuple = tuple(copy.deepcopy(p) for p in act.preconditions)
+
+            def _wrapped_ef(ctx: EditBatch, params: BaseModel) -> Any:
+                _run_action_preconditions(ctx, params, pre_tuple)
+                return orig_handler(ctx, params)
+
+            spec.actions[act.name] = action_def.model_copy(update={"handler": _wrapped_ef})
+        return act.display_label or None
+
+    _, display_label = _compile_and_register_rule_action(
+        spec,
+        act,
+        ot_by_name=ot_by_name,
+        valid_type_names=valid_type_names,
+        compiled_valid_roles=compiled_valid_roles,
+    )
+    return display_label
 
 
 def _validate_preconditions_for_spec(
@@ -4956,9 +5078,9 @@ def apply_overlay_to_spec(
         expected_types=EditFunctionDef,
         kind_label="custom_edit_functions",
     ):
-        if ef_def.name in base_spec.edit_functions:
+        if ef_def.name in base_spec.edit_functions or ef_def.name in base_spec.actions:
             raise InvariantError(
-                f"overlay custom edit_function {ef_def.name!r} collides with standard edit_function",
+                f"overlay custom edit_function {ef_def.name!r} collides with standard contract",
                 code="OVERLAY_BREAKS_STANDARD_CONTRACT",
             )
         derived.edit_functions[ef_def.name] = ef_def
@@ -5126,6 +5248,12 @@ def apply_overlay_to_spec(
 
         if to_prepend:
             orig_handler = cur_act.handler
+            orig_muts = getattr(orig_handler, "__declarative_mutations__", None)
+            orig_mut_specs = (
+                tuple(ActionMutationSpec.model_validate(m) for m in orig_muts)
+                if orig_muts
+                else ()
+            )
             pre_tuple = tuple(to_prepend)
 
             def _wrapped_action_handler(
@@ -5133,9 +5261,13 @@ def apply_overlay_to_spec(
                 params: BaseModel,
                 _orig: Callable[..., Any] = orig_handler,
                 _pres: tuple[InvariantRuleSpec, ...] = pre_tuple,
+                _muts: tuple[ActionMutationSpec, ...] = orig_mut_specs,
             ) -> Any:
-                _run_action_preconditions(ctx, params, _pres)
+                _run_action_preconditions(ctx, params, _pres, mutations=_muts)
                 return _orig(ctx, params)
+
+            if orig_muts is not None:
+                _wrapped_action_handler.__declarative_mutations__ = copy.deepcopy(orig_muts)  # type: ignore[attr-defined]
 
             merged_touched = tuple(
                 dict.fromkeys([*cur_act.touched_object_types, *(p.target_type for p in to_prepend)])

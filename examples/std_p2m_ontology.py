@@ -17,7 +17,14 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
+from open_ontology.induction.dsl import (
+    ActionBlueprint,
+    ActionMutationSpec,
+    DeclarativeBlueprint,
+    InvariantRuleSpec,
+    export_spec_blueprint,
+    register_rule_action,
+)
 from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
 
 try:
@@ -264,47 +271,91 @@ def _has_completed_scrap_work_card(ctx: Any, output_id: str) -> bool:
     return False
 
 
-@spec.edit_function(
-    "release_work_order",
-    ReleaseWorkOrderParams,
-    description="校验 BOM 有效与正计划量后将草稿生产工单下达至车间（draft -> released）。",
-    touched_object_types=("WorkOrder",),
-)
-def release_work_order(ctx: Any, params: ReleaseWorkOrderParams) -> None:
-    wo = ctx.require(WorkOrder, params.work_order_id)
-    if wo.status != "draft":
-        raise InvariantError(
-            f"WorkOrder:{wo.work_order_id} status is {wo.status!r}, expected 'draft'",
-            code="WORK_ORDER_NOT_DRAFT",
-        )
-    bom = ctx.require(BomSpec, wo.bom)
-    if bom.status != "active":
-        raise InvariantError(
-            f"BomSpec:{bom.bom_id} status is {bom.status!r}, expected 'active'",
-            code="BOM_NOT_ACTIVE",
-        )
-    if bom.input_per_unit <= 0:
-        raise InvariantError(
-            f"BomSpec:{bom.bom_id} input_per_unit={bom.input_per_unit} must be > 0",
-            code="INVALID_BOM_RATIO",
-        )
-    if bom.output_resource != wo.output_resource:
-        raise InvariantError(
-            f"WorkOrder:{wo.work_order_id} output_resource={wo.output_resource!r} != BomSpec output_resource={bom.output_resource!r}",
-            code="WORK_ORDER_OUTPUT_MISMATCH",
-        )
-    if wo.planned_qty <= 0:
-        raise InvariantError(
-            f"WorkOrder:{wo.work_order_id} planned_qty={wo.planned_qty} must be > 0",
-            code="NON_POSITIVE_PLANNED_QTY",
-        )
-    ctx.modify(wo, status="released")
-
-spec.declare_action(
-    "release_work_order",
-    edit_function="release_work_order",
-    allowed_roles=("production_planner", "plant_manager", "ops", "steward", "ai_agent", "admin"),
-    description="校验 BOM 有效与正计划量后将草稿生产工单下达至车间（draft -> released）。",
+register_rule_action(
+    spec,
+    ActionBlueprint(
+        name="release_work_order",
+        description="校验 BOM 有效与正计划量后将草稿生产工单下达至车间（draft -> released）。",
+        allowed_roles=[
+            "production_planner",
+            "plant_manager",
+            "ops",
+            "steward",
+            "ai_agent",
+            "admin",
+        ],
+        preconditions=[
+            InvariantRuleSpec(
+                name="p2m_wo_must_be_draft",
+                code="WORK_ORDER_NOT_DRAFT",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                must_hold={
+                    "op": "eq",
+                    "left": {"ref": "obj.status"},
+                    "right": {"lit": "draft"},
+                },
+                description="仅草稿状态（draft）生产工单可执行下达。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_wo_bom_active",
+                code="BOM_NOT_ACTIVE",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                must_hold={
+                    "op": "eq",
+                    "left": {"ref": "obj.bom.status"},
+                    "right": {"lit": "active"},
+                },
+                description="关联物料清单 BomSpec 必须处于 active 状态。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_wo_bom_positive_ratio",
+                code="INVALID_BOM_RATIO",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                must_hold={
+                    "op": "gt",
+                    "left": {"ref": "obj.bom.input_per_unit"},
+                    "right": {"lit": 0.0},
+                },
+                description="BomSpec 单耗比例 input_per_unit 必须严格大于 0。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_wo_bom_output_match",
+                code="WORK_ORDER_OUTPUT_MISMATCH",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                must_hold={
+                    "op": "eq",
+                    "left": {"ref": "obj.bom.output_resource"},
+                    "right": {"ref": "obj.output_resource"},
+                },
+                description="工单产出品必须与 BomSpec.output_resource 一致。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_wo_positive_planned_qty",
+                code="NON_POSITIVE_PLANNED_QTY",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                must_hold={
+                    "op": "gt",
+                    "left": {"ref": "obj.planned_qty"},
+                    "right": {"lit": 0.0},
+                },
+                description="生产工单计划产量 planned_qty 必须严格大于 0。",
+            ),
+        ],
+        mutations=[
+            ActionMutationSpec(
+                op="modify",
+                object_type="WorkOrder",
+                id_param="work_order_id",
+                set_fields={"status": {"lit": "released"}},
+            ),
+        ],
+    ),
+    params_cls=ReleaseWorkOrderParams,
 )
 
 
@@ -465,55 +516,169 @@ spec.declare_action(
 )
 
 
-@spec.edit_function(
-    "close_work_order",
-    CloseWorkOrderParams,
-    description="完工关闭工单（须已领料且有良品产出）或取消未领料工单（已领料工单禁直接取消）。",
-    touched_object_types=("WorkOrder",),
-)
-def close_work_order(ctx: Any, params: CloseWorkOrderParams) -> None:
-    wo = ctx.require(WorkOrder, params.work_order_id)
-    if params.target_status not in ("completed", "cancelled"):
-        raise InvariantError(
-            f"target_status={params.target_status!r} must be 'completed' or 'cancelled'",
-            code="INVALID_WORK_ORDER_CLOSE_TARGET",
-        )
-    if params.target_status == "cancelled":
-        if wo.issued_qty > 0 or wo.status == "in_progress":
-            raise InvariantError(
-                f"WorkOrder:{wo.work_order_id} already has material issued (issued_qty={wo.issued_qty}); cannot cancel",
+register_rule_action(
+    spec,
+    ActionBlueprint(
+        name="close_work_order",
+        description="完工关闭工单（须已领料且有良品产出）或取消未领料工单（已领料工单禁直接取消）。",
+        allowed_roles=[
+            "production_planner",
+            "plant_manager",
+            "shopfloor",
+            "ops",
+            "steward",
+            "ai_agent",
+            "admin",
+        ],
+        preconditions=[
+            InvariantRuleSpec(
+                name="p2m_close_valid_target",
+                code="INVALID_WORK_ORDER_CLOSE_TARGET",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                must_hold={
+                    "op": "in",
+                    "left": {"ref": "param.target_status"},
+                    "right": {"lit": ["completed", "cancelled"]},
+                },
+                description="工单关闭目标状态仅限 completed 或 cancelled。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_cancel_no_issued_material",
                 code="CANNOT_CANCEL_ISSUED_WORK_ORDER",
-            )
-        if wo.status not in ("draft", "released"):
-            raise InvariantError(
-                f"WorkOrder:{wo.work_order_id} status {wo.status!r} cannot transition to 'cancelled'",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                when={
+                    "op": "eq",
+                    "left": {"ref": "param.target_status"},
+                    "right": {"lit": "cancelled"},
+                },
+                must_hold={
+                    "op": "and",
+                    "args": [
+                        {
+                            "op": "le",
+                            "left": {"ref": "obj.issued_qty"},
+                            "right": {"lit": 0.0},
+                        },
+                        {
+                            "op": "ne",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "in_progress"},
+                        },
+                    ],
+                },
+                description="已领料或已进入生产中（in_progress）工单严禁直接取消。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_cancel_allowed_status",
                 code="WORK_ORDER_NOT_CANCELLABLE",
-            )
-        ctx.modify(wo, status="cancelled")
-        return
-
-    if wo.status in ("completed", "cancelled"):
-        raise InvariantError(
-            f"WorkOrder:{wo.work_order_id} status {wo.status!r} cannot transition to 'completed'",
-            code="WORK_ORDER_NOT_IN_PROGRESS",
-        )
-    if wo.status != "in_progress" or wo.issued_qty <= 0:
-        raise InvariantError(
-            f"WorkOrder:{wo.work_order_id} cannot complete without material issue",
-            code="CANNOT_COMPLETE_WITHOUT_MATERIAL_ISSUE",
-        )
-    if wo.completed_good_qty <= 0:
-        raise InvariantError(
-            f"WorkOrder:{wo.work_order_id} requires completed_good_qty > 0 before closing",
-            code="WORK_ORDER_NO_GOOD_OUTPUT",
-        )
-    ctx.modify(wo, status="completed")
-
-spec.declare_action(
-    "close_work_order",
-    edit_function="close_work_order",
-    allowed_roles=("production_planner", "plant_manager", "shopfloor", "ops", "steward", "ai_agent", "admin"),
-    description="完工关闭工单（须已领料且有良品产出）或取消未领料工单（已领料工单禁直接取消）。",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                when={
+                    "op": "and",
+                    "args": [
+                        {
+                            "op": "eq",
+                            "left": {"ref": "param.target_status"},
+                            "right": {"lit": "cancelled"},
+                        },
+                        {
+                            "op": "ne",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "in_progress"},
+                        },
+                    ],
+                },
+                must_hold={
+                    "op": "in",
+                    "left": {"ref": "obj.status"},
+                    "right": {"lit": ["draft", "released"]},
+                },
+                description="仅 draft 或 released 状态且未领料工单允许取消。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_complete_not_terminal",
+                code="WORK_ORDER_NOT_IN_PROGRESS",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                when={
+                    "op": "eq",
+                    "left": {"ref": "param.target_status"},
+                    "right": {"lit": "completed"},
+                },
+                must_hold={
+                    "op": "not_in",
+                    "left": {"ref": "obj.status"},
+                    "right": {"lit": ["completed", "cancelled"]},
+                },
+                description="终态工单（completed/cancelled）不可重复完工关闭。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_complete_has_material_issue",
+                code="CANNOT_COMPLETE_WITHOUT_MATERIAL_ISSUE",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                when={
+                    "op": "and",
+                    "args": [
+                        {
+                            "op": "eq",
+                            "left": {"ref": "param.target_status"},
+                            "right": {"lit": "completed"},
+                        },
+                        {
+                            "op": "not_in",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": ["completed", "cancelled"]},
+                        },
+                    ],
+                },
+                must_hold={
+                    "op": "and",
+                    "args": [
+                        {
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "in_progress"},
+                        },
+                        {
+                            "op": "gt",
+                            "left": {"ref": "obj.issued_qty"},
+                            "right": {"lit": 0.0},
+                        },
+                    ],
+                },
+                description="未领料投料工单严禁直接完工关闭。",
+            ),
+            InvariantRuleSpec(
+                name="p2m_complete_has_good_output",
+                code="WORK_ORDER_NO_GOOD_OUTPUT",
+                target_type="WorkOrder",
+                id_param="work_order_id",
+                when={
+                    "op": "eq",
+                    "left": {"ref": "param.target_status"},
+                    "right": {"lit": "completed"},
+                },
+                must_hold={
+                    "op": "gt",
+                    "left": {"ref": "obj.completed_good_qty"},
+                    "right": {"lit": 0.0},
+                },
+                description="完工关闭工单前须至少存在正的合格品累计产出。",
+            ),
+        ],
+        mutations=[
+            ActionMutationSpec(
+                op="modify",
+                object_type="WorkOrder",
+                id_param="work_order_id",
+                set_fields={"status": {"ref": "param.target_status"}},
+            ),
+        ],
+    ),
+    params_cls=CloseWorkOrderParams,
 )
 
 

@@ -21,7 +21,14 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
+from open_ontology.induction.dsl import (
+    ActionBlueprint,
+    ActionMutationSpec,
+    DeclarativeBlueprint,
+    InvariantRuleSpec,
+    export_spec_blueprint,
+    register_rule_actions,
+)
 from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
 
 try:
@@ -306,18 +313,416 @@ def h2r_employee_fsm(diff: Any, _view: Any) -> bool:
     return True
 
 
-def _has_completed_mandate_escalation_card(ctx: Any, mandate_id: str) -> bool:
-    for card in ctx.query(WorkCard):
-        if (
-            card.status == "COMPLETED"
-            and card.card_kind == "APPROVAL"
-            and card.assignee_role in ("hr_director", "admin")
-            and card.target_object_type == "AuthorityMandate"
-            and card.target_object_id == mandate_id
-            and card.requested_action == "grant_authority_mandate"
-        ):
-            return True
-    return False
+_H2R_MANDATE_VALID_ROLE_LIST = list(VALID_STD_ROLE_NAMES)
+_H2R_MANDATE_PRIVILEGED_ROLE = {
+    "op": "in",
+    "left": {"ref": "actor.role"},
+    "right": {"lit": ["hr_director", "admin"]},
+}
+_H2R_MANDATE_COMPLETED_APPROVAL_CARD = {
+    "op": "exists",
+    "object_type": "WorkCard",
+    "where": {
+        "op": "and",
+        "args": [
+            {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "COMPLETED"}},
+            {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"lit": "APPROVAL"}},
+            {
+                "op": "in",
+                "left": {"ref": "target.assignee_role"},
+                "right": {"lit": ["hr_director", "admin"]},
+            },
+            {
+                "op": "eq",
+                "left": {"ref": "target.target_object_type"},
+                "right": {"lit": "AuthorityMandate"},
+            },
+            {
+                "op": "eq",
+                "left": {"ref": "target.target_object_id"},
+                "right": {"ref": "param.mandate_id"},
+            },
+            {
+                "op": "eq",
+                "left": {"ref": "target.requested_action"},
+                "right": {"lit": "grant_authority_mandate"},
+            },
+        ],
+    },
+}
+
+register_rule_actions(
+    spec,
+    [
+        (
+            ActionBlueprint(
+                name="assign_employee_position",
+                description="员工入职转正或调岗；禁止对已离职员工调岗，并校验目标部门/岗位激活且相互匹配。",
+                allowed_roles=["hr_admin", "hr_director", "steward", "admin"],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="h2r_assign_not_offboarded",
+                        code="EMPLOYEE_OFFBOARDED",
+                        target_type="Employee",
+                        id_param="employee_id",
+                        must_hold={
+                            "op": "ne",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "offboarded"},
+                        },
+                        description="已离职（offboarded）员工禁止调岗或转正。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_assign_dept_active",
+                        code="DEPARTMENT_NOT_ACTIVE",
+                        target_type="Department",
+                        id_param="department_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "active"},
+                        },
+                        description="目标部门必须处于 active 状态。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_assign_pos_active",
+                        code="POSITION_NOT_ACTIVE",
+                        target_type="JobPosition",
+                        id_param="position_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "active"},
+                        },
+                        description="目标岗位必须处于 active 状态。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_assign_pos_dept_match",
+                        code="POSITION_DEPARTMENT_MISMATCH",
+                        target_type="JobPosition",
+                        id_param="position_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.department"},
+                            "right": {"ref": "param.department_id"},
+                        },
+                        description="目标岗位必须隶属于目标部门。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_assign_pos_valid_role",
+                        code="UNKNOWN_ROLE",
+                        target_type="JobPosition",
+                        id_param="position_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.role_name"},
+                            "right": {"lit": _H2R_MANDATE_VALID_ROLE_LIST},
+                        },
+                        description="目标岗位绑定角色必须属于闭集 STD_ROLES。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="modify",
+                        object_type="Employee",
+                        id_param="employee_id",
+                        set_fields={
+                            "department": {"ref": "param.department_id"},
+                            "position": {"ref": "param.position_id"},
+                            "status": {
+                                "op": "if_else",
+                                "cond": {
+                                    "op": "eq",
+                                    "left": {"ref": "param.activate"},
+                                    "right": {"lit": True},
+                                },
+                                "then": {"lit": "active"},
+                                "else": {"ref": "obj.status"},
+                            },
+                        },
+                    ),
+                ],
+            ),
+            AssignEmployeePositionParams,
+        ),
+        (
+            ActionBlueprint(
+                name="grant_authority_mandate",
+                description="授予动态权限委派：强守闭集角色校验、双边在职校验、SoD 禁自授权及上限越权拦截/升级审批。",
+                allowed_roles=[
+                    "hr_admin",
+                    "hr_director",
+                    "plant_manager",
+                    "procurement_manager",
+                    "sales_manager",
+                    "finance_director",
+                    "chief_accountant",
+                    "steward",
+                    "ai_agent",
+                    "admin",
+                ],
+                preconditions=[
+                    InvariantRuleSpec(
+                        name="h2r_mandate_valid_role",
+                        code="UNKNOWN_ROLE",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "param.role_name"},
+                            "right": {"lit": _H2R_MANDATE_VALID_ROLE_LIST},
+                        },
+                        description="委派角色 role_name 必须属于闭集 STD_ROLES。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_positive_ceiling",
+                        code="NON_POSITIVE_MANDATE_CEILING",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "gt",
+                            "left": {"ref": "param.ceiling_cents"},
+                            "right": {"lit": 0},
+                        },
+                        description="授权上限 ceiling_cents 必须严格大于 0。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_id_fresh",
+                        code="MANDATE_ALREADY_EXISTS",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "not_exists",
+                            "object_type": "AuthorityMandate",
+                            "where": {
+                                "op": "eq",
+                                "left": {"ref": "target.mandate_id"},
+                                "right": {"ref": "param.mandate_id"},
+                            },
+                        },
+                        description="委派凭证 mandate_id 不可重复创建。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_no_self_grant_rule",
+                        code="MANDATE_SELF_GRANT_FORBIDDEN",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "and",
+                            "args": [
+                                {
+                                    "op": "ne",
+                                    "left": {"ref": "obj.employee_id"},
+                                    "right": {"ref": "param.grantee_id"},
+                                },
+                                {
+                                    "op": "not_exists",
+                                    "object_type": "Employee",
+                                    "where": {
+                                        "op": "and",
+                                        "args": [
+                                            {
+                                                "op": "eq",
+                                                "left": {"ref": "target.employee_id"},
+                                                "right": {"ref": "param.grantee_id"},
+                                            },
+                                            {
+                                                "op": "ne",
+                                                "left": {"ref": "obj.actor_id"},
+                                                "right": {"lit": ""},
+                                            },
+                                            {
+                                                "op": "eq",
+                                                "left": {"ref": "target.actor_id"},
+                                                "right": {"ref": "obj.actor_id"},
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                        },
+                        description="职责分离（SoD）：授权人与被授权人（含相同 actor_id）不得为同一人。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_grantor_active",
+                        code="EMPLOYEE_NOT_ACTIVE",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "active"},
+                        },
+                        description="授权人必须处于在职（active）状态。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_grantee_active",
+                        code="EMPLOYEE_NOT_ACTIVE",
+                        target_type="Employee",
+                        id_param="grantee_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.status"},
+                            "right": {"lit": "active"},
+                        },
+                        description="被授权人必须处于在职（active）状态。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_grantor_pos_active",
+                        code="POSITION_NOT_ACTIVE",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "obj.position.status"},
+                            "right": {"lit": "active"},
+                        },
+                        description="授权人岗位必须处于 active 状态。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_grantor_pos_role_known",
+                        code="UNKNOWN_ROLE",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "in",
+                            "left": {"ref": "obj.position.role_name"},
+                            "right": {"lit": _H2R_MANDATE_VALID_ROLE_LIST},
+                        },
+                        description="授权人岗位角色必须属于闭集 STD_ROLES。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_no_impersonation",
+                        code="MANDATE_GRANTOR_IMPERSONATION_FORBIDDEN",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "or",
+                            "args": [
+                                _H2R_MANDATE_PRIVILEGED_ROLE,
+                                {
+                                    "op": "and",
+                                    "args": [
+                                        {
+                                            "op": "ne",
+                                            "left": {"ref": "obj.actor_id"},
+                                            "right": {"lit": ""},
+                                        },
+                                        {
+                                            "op": "eq",
+                                            "left": {"ref": "obj.actor_id"},
+                                            "right": {"ref": "actor.actor_id"},
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                        description="非高权批准者提交授权委派时必须为授权人本人身份（禁冒充他人授权）。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_admin_delegation_guard",
+                        code="ADMIN_ROLE_DELEGATION_FORBIDDEN",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        when={
+                            "op": "eq",
+                            "left": {"ref": "param.role_name"},
+                            "right": {"lit": "admin"},
+                        },
+                        must_hold={
+                            "op": "eq",
+                            "left": {"ref": "actor.role"},
+                            "right": {"lit": "admin"},
+                        },
+                        description="仅 admin 角色可委派 admin 权限。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_no_role_escalation",
+                        code="MANDATE_ROLE_ESCALATION_FORBIDDEN",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        must_hold={
+                            "op": "or",
+                            "args": [
+                                _H2R_MANDATE_PRIVILEGED_ROLE,
+                                {
+                                    "op": "eq",
+                                    "left": {"ref": "param.role_name"},
+                                    "right": {"ref": "obj.position.role_name"},
+                                },
+                            ],
+                        },
+                        description="非高权批准者不得越级授予超出授权人自身岗位角色的委派权限。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_escalation_approval_guard",
+                        code="APPROVAL_REQUIRED_AUTHORITY_ESCALATION",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        when={
+                            "op": "eq",
+                            "left": {"ref": "param.escalate_approval"},
+                            "right": {"lit": True},
+                        },
+                        must_hold={
+                            "op": "or",
+                            "args": [
+                                _H2R_MANDATE_PRIVILEGED_ROLE,
+                                _H2R_MANDATE_COMPLETED_APPROVAL_CARD,
+                                {
+                                    "op": "le",
+                                    "left": {"ref": "param.ceiling_cents"},
+                                    "right": {"ref": "obj.position.approval_ceiling_cents"},
+                                },
+                            ],
+                        },
+                        description="启用升级审批标志且授权上限超出授权人审批阈值时，触发 hr_director WorkCard 审批门禁。",
+                    ),
+                    InvariantRuleSpec(
+                        name="h2r_mandate_ceiling_guard",
+                        code="MANDATE_EXCEEDS_GRANTOR_CEILING",
+                        target_type="Employee",
+                        id_param="grantor_id",
+                        when={
+                            "op": "eq",
+                            "left": {"ref": "param.escalate_approval"},
+                            "right": {"lit": False},
+                        },
+                        must_hold={
+                            "op": "or",
+                            "args": [
+                                _H2R_MANDATE_PRIVILEGED_ROLE,
+                                {
+                                    "op": "le",
+                                    "left": {"ref": "param.ceiling_cents"},
+                                    "right": {"ref": "obj.position.approval_ceiling_cents"},
+                                },
+                            ],
+                        },
+                        description="未启用升级审批时，非高权委派额度严禁超出授权人岗位审批上限。",
+                    ),
+                ],
+                mutations=[
+                    ActionMutationSpec(
+                        op="create",
+                        object_type="AuthorityMandate",
+                        id_param="mandate_id",
+                        set_fields={
+                            "mandate_id": {"ref": "param.mandate_id"},
+                            "grantor": {"ref": "param.grantor_id"},
+                            "grantee": {"ref": "param.grantee_id"},
+                            "role_name": {"ref": "param.role_name"},
+                            "ceiling_cents": {"ref": "param.ceiling_cents"},
+                            "scope_tag": {"ref": "param.scope_tag"},
+                            "status": {"lit": "active"},
+                        },
+                    ),
+                ],
+            ),
+            GrantAuthorityMandateParams,
+        ),
+    ],
+)
 
 
 @spec.edit_function(
@@ -373,165 +778,6 @@ spec.declare_action(
     edit_function="reparent_department",
     allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
     description="变更部门上级归属节点；强制校验 DAG 防环（禁指向自身或任何后代）及同主体隔离。",
-)
-
-
-@spec.edit_function(
-    "assign_employee_position",
-    AssignEmployeePositionParams,
-    description="员工入职转正或调岗；禁止对已离职员工调岗，并校验目标部门/岗位激活且相互匹配。",
-    touched_object_types=("Employee",),
-)
-def assign_employee_position(ctx: Any, params: AssignEmployeePositionParams) -> None:
-    emp = ctx.require(Employee, params.employee_id)
-    if emp.status == "offboarded":
-        raise InvariantError(
-            f"Employee:{emp.employee_id} is offboarded and cannot be assigned",
-            code="EMPLOYEE_OFFBOARDED",
-        )
-    dept = ctx.require(Department, params.department_id)
-    if dept.status != "active":
-        raise InvariantError(
-            f"Department:{dept.department_id} status is {dept.status!r}, expected 'active'",
-            code="DEPARTMENT_NOT_ACTIVE",
-        )
-    pos = ctx.require(JobPosition, params.position_id)
-    if pos.status != "active":
-        raise InvariantError(
-            f"JobPosition:{pos.position_id} status is {pos.status!r}, expected 'active'",
-            code="POSITION_NOT_ACTIVE",
-        )
-    if pos.department != dept.department_id:
-        raise InvariantError(
-            f"JobPosition:{pos.position_id} belongs to Department:{pos.department}, not {dept.department_id}",
-            code="POSITION_DEPARTMENT_MISMATCH",
-        )
-    if pos.role_name not in VALID_STD_ROLE_NAMES:
-        raise InvariantError(
-            f"JobPosition:{pos.position_id}.role_name={pos.role_name!r} is not in STD_ROLES",
-            code="UNKNOWN_ROLE",
-        )
-
-    next_status = "active" if params.activate else emp.status
-    ctx.modify(
-        emp,
-        department=dept.department_id,
-        position=pos.position_id,
-        status=next_status,
-    )
-
-spec.declare_action(
-    "assign_employee_position",
-    edit_function="assign_employee_position",
-    allowed_roles=("hr_admin", "hr_director", "steward", "admin"),
-    description="员工入职转正或调岗；禁止对已离职员工调岗，并校验目标部门/岗位激活且相互匹配。",
-)
-
-
-@spec.edit_function(
-    "grant_authority_mandate",
-    GrantAuthorityMandateParams,
-    description="授予动态权限委派：强守闭集角色校验、双边在职校验、SoD 禁自授权及上限越权拦截/升级审批。",
-    touched_object_types=("AuthorityMandate",),
-)
-def grant_authority_mandate(ctx: Any, params: GrantAuthorityMandateParams) -> None:
-    if params.role_name not in VALID_STD_ROLE_NAMES:
-        raise InvariantError(
-            f"role_name {params.role_name!r} is not in closed STD_ROLES",
-            code="UNKNOWN_ROLE",
-        )
-    if params.ceiling_cents <= 0:
-        raise InvariantError("ceiling_cents must be > 0", code="NON_POSITIVE_MANDATE_CEILING")
-    if ctx.get(AuthorityMandate, params.mandate_id) is not None:
-        raise InvariantError(
-            f"AuthorityMandate:{params.mandate_id} already exists",
-            code="MANDATE_ALREADY_EXISTS",
-        )
-
-    grantor = ctx.require(Employee, params.grantor_id)
-    grantee = ctx.require(Employee, params.grantee_id)
-    if grantor.employee_id == grantee.employee_id or (
-        grantor.actor_id and grantor.actor_id == grantee.actor_id
-    ):
-        raise InvariantError(
-            f"SoD violation: Employee:{grantor.employee_id} cannot grant mandate to self",
-            code="MANDATE_SELF_GRANT_FORBIDDEN",
-        )
-    if grantor.status != "active" or grantee.status != "active":
-        raise InvariantError(
-            f"Both grantor ({grantor.status!r}) and grantee ({grantee.status!r}) must be 'active'",
-            code="EMPLOYEE_NOT_ACTIVE",
-        )
-
-    grantor_pos = ctx.require(JobPosition, grantor.position)
-    if grantor_pos.status != "active":
-        raise InvariantError(
-            f"Grantor JobPosition:{grantor_pos.position_id} is {grantor_pos.status!r}",
-            code="POSITION_NOT_ACTIVE",
-        )
-    if grantor_pos.role_name not in VALID_STD_ROLE_NAMES:
-        raise InvariantError(
-            f"Grantor JobPosition:{grantor_pos.position_id}.role_name={grantor_pos.role_name!r} is unknown",
-            code="UNKNOWN_ROLE",
-        )
-
-    is_privileged = ctx.actor.role in ("hr_director", "admin") or _has_completed_mandate_escalation_card(
-        ctx, params.mandate_id
-    )
-    if not is_privileged and (not grantor.actor_id or grantor.actor_id != ctx.actor.actor_id):
-        raise InvariantError(
-            f"Actor {ctx.actor.actor_id!r} ({ctx.actor.role!r}) cannot impersonate grantor Employee:{grantor.employee_id} (actor_id={grantor.actor_id!r})",
-            code="MANDATE_GRANTOR_IMPERSONATION_FORBIDDEN",
-        )
-    if params.role_name == "admin" and ctx.actor.role != "admin":
-        raise InvariantError(
-            "Only 'admin' may grant an 'admin' AuthorityMandate",
-            code="ADMIN_ROLE_DELEGATION_FORBIDDEN",
-        )
-    if params.role_name != grantor_pos.role_name and not is_privileged:
-        raise InvariantError(
-            f"Grantor Employee:{grantor.employee_id} role {grantor_pos.role_name!r} cannot escalate mandate to {params.role_name!r}",
-            code="MANDATE_ROLE_ESCALATION_FORBIDDEN",
-        )
-    if params.ceiling_cents > grantor_pos.approval_ceiling_cents and not is_privileged:
-        if params.escalate_approval:
-            raise InvariantError(
-                f"Mandate ceiling_cents={params.ceiling_cents} exceeds grantor ceiling {grantor_pos.approval_ceiling_cents}; requires hr_director approval",
-                code="APPROVAL_REQUIRED_AUTHORITY_ESCALATION",
-            )
-        raise InvariantError(
-            f"Mandate ceiling_cents={params.ceiling_cents} exceeds grantor approval_ceiling_cents={grantor_pos.approval_ceiling_cents}",
-            code="MANDATE_EXCEEDS_GRANTOR_CEILING",
-        )
-
-    ctx.create(
-        AuthorityMandate(
-            mandate_id=params.mandate_id,
-            grantor=grantor.employee_id,
-            grantee=grantee.employee_id,
-            role_name=params.role_name,
-            ceiling_cents=params.ceiling_cents,
-            scope_tag=params.scope_tag,
-            status="active",
-        )
-    )
-
-spec.declare_action(
-    "grant_authority_mandate",
-    edit_function="grant_authority_mandate",
-    allowed_roles=(
-        "hr_admin",
-        "hr_director",
-        "plant_manager",
-        "procurement_manager",
-        "sales_manager",
-        "finance_director",
-        "chief_accountant",
-        "steward",
-        "ai_agent",
-        "admin",
-    ),
-    description="授予动态权限委派：强守闭集角色校验、双边在职校验、SoD 禁自授权及上限越权拦截/升级审批。",
 )
 
 
