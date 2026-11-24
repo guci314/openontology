@@ -361,15 +361,17 @@ export const M1TopologyGraph: React.FC<M1TopologyGraphProps> = ({
               const labelX = 0.25 * startX + 0.5 * ctrlX + 0.25 * endX;
               const labelY = 0.25 * startY + 0.5 * ctrlY + 0.25 * endY;
 
+              const isDraftAdded = link.draft_status === 'draft_added';
               return (
-                <g key={`${link.name}-${idx}`} opacity={dimmed ? 0.14 : isHighlighted ? 1 : 0.65}>
+                <g key={`${link.name}-${idx}`} opacity={dimmed ? 0.14 : isHighlighted || isDraftAdded ? 1 : 0.65}>
                   <path
                     d={`M ${startX.toFixed(1)} ${startY.toFixed(1)} Q ${ctrlX.toFixed(1)} ${ctrlY.toFixed(1)} ${endX.toFixed(1)} ${endY.toFixed(1)}`}
                     fill="none"
-                    stroke={isHighlighted ? '#2563EB' : '#94A3B8'}
-                    strokeWidth={isHighlighted ? 2.1 : 1.15}
+                    stroke={isDraftAdded ? '#7C3AED' : isHighlighted ? '#2563EB' : '#94A3B8'}
+                    strokeWidth={isDraftAdded ? 2.1 : isHighlighted ? 2.1 : 1.15}
+                    strokeDasharray={isDraftAdded ? '5 3' : undefined}
                     markerEnd={
-                      isHighlighted ? 'url(#bp-arrow-active)' : 'url(#bp-arrow-muted)'
+                      isHighlighted || isDraftAdded ? 'url(#bp-arrow-active)' : 'url(#bp-arrow-muted)'
                     }
                   />
                   {(isHighlighted || alwaysShowEdgeLabels) && (
@@ -412,12 +414,19 @@ export const M1TopologyGraph: React.FC<M1TopologyGraphProps> = ({
               const hasFsm = Boolean(meta.status_field || Object.keys(meta.transitions).length > 0);
               const hasDevices = meta.attached_devices.length > 0;
 
+              const isDraftAdded = meta.draft_status === 'draft_added';
+              const isDraftModified = meta.draft_status === 'draft_modified';
+
               let opacity = 1;
               if (searchNeedle && !matchesSearch) opacity = 0.24;
               else if (focusType && !isNeighbor) opacity = 0.42;
 
               const strokeColor = isSelected
                 ? '#0F172A'
+                : isDraftAdded
+                ? '#7C3AED'
+                : isDraftModified
+                ? '#D97706'
                 : isHovered
                 ? '#2563EB'
                 : matchesSearch && searchNeedle
@@ -441,9 +450,10 @@ export const M1TopologyGraph: React.FC<M1TopologyGraphProps> = ({
                     width={nodeW}
                     height={nodeH}
                     rx={12}
-                    fill={isSelected ? '#EFF6FF' : '#FFFFFF'}
+                    fill={isSelected ? '#EFF6FF' : isDraftAdded ? '#F5F3FF' : '#FFFFFF'}
                     stroke={strokeColor}
-                    strokeWidth={isSelected ? 2.2 : isHovered ? 1.8 : 1.2}
+                    strokeWidth={isSelected || isDraftAdded ? 2.2 : isHovered ? 1.8 : 1.2}
+                    strokeDasharray={isDraftAdded ? '5 3' : undefined}
                   />
                   {/* Title */}
                   <text
@@ -506,6 +516,31 @@ export const M1TopologyGraph: React.FC<M1TopologyGraphProps> = ({
                         fill="#0369A1"
                       >
                         外设
+                      </text>
+                    </g>
+                  )}
+
+                  {(isDraftAdded || isDraftModified) && (
+                    <g
+                      data-testid={`blueprint-draft-badge-${meta.name}`}
+                      transform={`translate(${hasDevices ? nodeW - 102 : nodeW - 56}, 10)`}
+                    >
+                      <rect
+                        width={46}
+                        height={16}
+                        rx={5}
+                        fill={isDraftAdded ? '#EDE9FE' : '#FEF3C7'}
+                        stroke={isDraftAdded ? '#C4B5FD' : '#FCD34D'}
+                      />
+                      <text
+                        x={23}
+                        y={11}
+                        textAnchor="middle"
+                        fontSize="8.5"
+                        fontWeight="700"
+                        fill={isDraftAdded ? '#6D28D9' : '#B45309'}
+                      >
+                        {isDraftAdded ? '草稿新增' : '草稿扩展'}
                       </text>
                     </g>
                   )}

@@ -472,6 +472,7 @@ export interface BlueprintEntityMeta {
   touched_by_actions: string[];
   in_role_scope: boolean;
   visible_count: number;
+  draft_status?: 'base' | 'draft_added' | 'draft_modified';
 }
 
 export interface BlueprintLinkMeta {
@@ -486,6 +487,7 @@ export interface BlueprintLinkMeta {
   max_cardinality?: number | null;
   inverse_name?: string | null;
   description: string;
+  draft_status?: 'base' | 'draft_added' | 'draft_modified';
 }
 
 export interface BlueprintRuleSummary {
@@ -515,6 +517,7 @@ export interface BlueprintActionMeta {
   params_schema: Record<string, unknown>;
   rule_summary: BlueprintRuleSummary | null;
   autonomy_mode: string;
+  draft_status?: 'base' | 'draft_added' | 'draft_modified';
 }
 
 export interface BlueprintEditFunctionMeta {
@@ -539,6 +542,7 @@ export interface BlueprintInvariantMeta {
   name: string;
   code: string | null;
   description: string;
+  draft_status?: 'base' | 'draft_added' | 'draft_modified';
 }
 
 export interface BlueprintSummary {
@@ -674,6 +678,42 @@ export interface BlueprintProveResponse {
   redundant_rules?: BlueprintRedundantRuleFinding[];
 }
 
+export interface M1EscalationTicket {
+  kind: 'edit_function_escalation';
+  ticket_id: string;
+  title: string;
+  reason: string;
+  affected_objects: string[];
+  specification_notes: string;
+  created_at: string;
+}
+
+export interface M1DraftResponse {
+  ok: boolean;
+  draft_id: string;
+  draft_overlay: Record<string, unknown>;
+  draft_has_changes: boolean;
+  draft_clauses_zh: string[];
+  preview_blueprint: BlueprintResponse;
+  proof_report: BlueprintProveResponse | null;
+  escalations: M1EscalationTicket[];
+}
+
+export interface M1ExpertChatResponse extends M1DraftResponse {
+  reply: string;
+  assistant_mode: 'llm_sandbox' | 'offline_fallback';
+  assistant_model?: string | null;
+  tool_trace: AssistantToolTraceItem[];
+  cards: Array<Record<string, unknown>>;
+}
+
+export interface M1DraftApplyResponse {
+  ok: boolean;
+  applied_draft_id: string;
+  blueprint: BlueprintResponse;
+  proof_report: BlueprintProveResponse;
+}
+
 const ACTOR_STORAGE_KEY = 'oo_console_actor_id';
 
 function readStoredActorId(): string | null {
@@ -741,6 +781,33 @@ export const consoleApi = {
       method: 'POST',
       body: JSON.stringify({ force_refresh: forceRefresh }),
     }),
+  blueprintExpertChat: (
+    message: string,
+    opts?: {
+      draft_id?: string | null;
+      history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    }
+  ) =>
+    apiFetch<M1ExpertChatResponse>('/api/blueprint/expert/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        ...(opts?.draft_id ? { draft_id: opts.draft_id } : {}),
+        ...(opts?.history && opts.history.length > 0 ? { history: opts.history } : {}),
+      }),
+    }),
+  getBlueprintDraft: (draftId: string) =>
+    apiFetch<M1DraftResponse>(`/api/blueprint/drafts/${encodeURIComponent(draftId)}`),
+  deleteBlueprintDraft: (draftId: string) =>
+    apiFetch<{ ok: boolean; draft_id: string; deleted: boolean }>(
+      `/api/blueprint/drafts/${encodeURIComponent(draftId)}`,
+      { method: 'DELETE' }
+    ),
+  applyBlueprintDraft: (draftId: string) =>
+    apiFetch<M1DraftApplyResponse>(
+      `/api/blueprint/drafts/${encodeURIComponent(draftId)}/apply`,
+      { method: 'POST' }
+    ),
   listObjects: (typeName: string, opts?: { status?: string; q?: string }) => {
     const params = new URLSearchParams();
     if (opts?.status) params.set('status', opts.status);

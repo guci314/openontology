@@ -648,6 +648,9 @@ def _default_openai_compatible_chat(
     return parsed
 
 
+_MAX_M1_DRAFTS = 32
+
+
 class _AssistantPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -655,6 +658,27 @@ class _AssistantPayload(BaseModel):
     question: str = ""
     sandbox_id: str | None = None
     history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class _M1ExpertChatPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    message: str = ""
+    draft_id: str | None = None
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@dataclass
+class _M1DraftSession:
+    """Isolated actor-owned M1 DOAL draft overlay session."""
+
+    draft_id: str
+    owner_actor_id: str
+    created_at: str
+    last_used_at: str
+    overlay: Any
+    escalations: list[dict[str, Any]] = field(default_factory=list)
+    last_proof: dict[str, Any] | None = None
 
 
 class _BlueprintProvePayload(BaseModel):
@@ -717,6 +741,7 @@ class ConsoleService:
         self.admin_roles = frozenset(admin_roles or _DEFAULT_ADMIN_ROLES)
         self._lock = threading.RLock()
         self._sandboxes: dict[str, _SandboxSession] = {}
+        self._m1_drafts: dict[str, _M1DraftSession] = {}
         self._proof_cache: dict[tuple[str, bool], dict[str, Any]] = {}
 
         self._demo_profiles: dict[str, DemoActorProfile] = {}
@@ -774,6 +799,7 @@ class ConsoleService:
                 except Exception:
                     pass
             self._sandboxes.clear()
+            self._m1_drafts.clear()
 
     def _infer_work_queue_binding(self) -> WorkQueueBinding | None:
         """Purely structural M2 detection of an active queue object schema."""
@@ -1067,7 +1093,13 @@ class ConsoleService:
                 },
             }
 
-    def _collect_invariants(self, display: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _collect_invariants(
+        self,
+        display: Mapping[str, Any],
+        *,
+        spec_override: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        target_spec = spec_override or self.runtime.spec
         inv_labels = display.get("invariants") or {}
 
         def _inv_desc(name: str, code: str, raw_desc: str) -> str:
@@ -1082,11 +1114,11 @@ class ConsoleService:
         dedup_invs: dict[tuple[str, str], dict[str, Any]] = {}
         raw_invs = [
             ("state", inv.name, inv.code, _inv_desc(inv.name, inv.code, inv.description))
-            for inv in sorted(self.runtime.spec.invariants.values(), key=lambda i: i.name)
+            for inv in sorted(target_spec.invariants.values(), key=lambda i: i.name)
         ] + [
             ("transition", tinv.name, tinv.code, _inv_desc(tinv.name, tinv.code, tinv.description))
             for tinv in sorted(
-                self.runtime.spec.transition_invariants.values(), key=lambda i: i.name
+                target_spec.transition_invariants.values(), key=lambda i: i.name
             )
         ]
         for kind_v, name_v, code_v, desc_v in raw_invs:
@@ -1108,12 +1140,15 @@ class ConsoleService:
     def _export_runtime_blueprint(
         self,
         display: Mapping[str, Any],
+        *,
+        spec_override: Any | None = None,
     ) -> tuple[Any, str, str, str]:
         from .induction.dsl import blueprint_fingerprint, export_spec_blueprint
 
-        ont_raw = self.runtime.spec.display.get("ontologies") or {}
+        target_spec = spec_override or self.runtime.spec
+        ont_raw = target_spec.display.get("ontologies") or {}
         merged_ont = display.get("ontologies") or {}
-        raw_id = getattr(self.runtime.spec, "name", None) or (
+        raw_id = getattr(target_spec, "name", None) or (
             str(list(ont_raw.keys())[-1]) if ont_raw else "model_under_proof"
         )
         safe_id = re.sub(r"[^A-Za-z0-9_]", "_", str(raw_id)).strip("_") or "model_under_proof"
@@ -1122,8 +1157,8 @@ class ConsoleService:
         spec_name = str(
             merged_ont.get(raw_id) or ont_raw.get(raw_id) or self.app_title or raw_id
         )
-        spec_version = str(getattr(self.runtime.spec, "version", None) or "1.0")
-        bp = export_spec_blueprint(self.runtime.spec, model_id=safe_id)
+        spec_version = str(getattr(target_spec, "version", None) or "1.0")
+        bp = export_spec_blueprint(target_spec, model_id=safe_id)
         return bp, spec_name, spec_version, blueprint_fingerprint(bp)
 
     def _describe_devices_by_object(
@@ -1264,348 +1299,543 @@ class ConsoleService:
                 "invariants": invariants,
             }
 
-    def get_blueprint(self, actor: Actor) -> dict[str, Any]:
-        with self._lock:
-            display = self._merged_display()
-            obj_labels = display.get("objects") or {}
-            field_labels = display.get("fields") or {}
-            field_overrides = display.get("field_overrides") or {}
-            act_labels = display.get("actions") or {}
-            ef_labels = display.get("edit_functions") or {}
-            fn_labels = display.get("functions") or {}
-            link_labels = display.get("links") or display.get("object_properties") or {}
-            card_labels = display.get("cardinalities") or {
-                "many-to-one": "N:1",
-                "one-to-many": "1:N",
-                "many-to-many": "M:N",
-                "one-to-one": "1:1",
-            }
-
-            bp, spec_name, spec_version, bp_fp = self._export_runtime_blueprint(display)
-            bp_actions = {act_bp.name: act_bp for act_bp in bp.actions}
-            bp_ot_map = {ot_bp.name: ot_bp for ot_bp in bp.object_types}
-            bp_rel_map = {
-                (ot_bp.name, rel.field): rel
-                for ot_bp in bp.object_types
-                for rel in ot_bp.relations
-            }
-
-            scoped_tbox = describe_tbox(self.runtime.spec, actor=actor)
-            scoped_type_names = {ot["name"] for ot in scoped_tbox["object_types"]}
-            tbox = describe_tbox(self.runtime.spec)
-            scoped_behavior = describe_behavior(self.runtime.spec, actor=actor)
-            scoped_action_names = {a["name"] for a in scoped_behavior["actions"]}
-
-            devices_by_type, device_synced_types = self._describe_devices_by_object()
-            pk_to_type = {
-                str(cls.primary_key_name()): name
-                for name, cls in self.runtime.spec.object_types.items()
-            }
-
-            actions_out: list[dict[str, Any]] = []
-            for act_def in sorted(self.runtime.spec.actions.values(), key=lambda a: a.name):
-                aname = act_def.name
-                act_bp = bp_actions.get(aname)
-                touched = list(act_def.touched_object_types or ())
-                if not touched and act_bp is not None:
-                    seen_t: list[str] = []
-                    for mut in act_bp.mutations:
-                        if mut.object_type not in seen_t:
-                            seen_t.append(mut.object_type)
-                    if seen_t:
-                        touched = seen_t
-                if not touched and act_def.params is not None:
-                    inferred: list[str] = []
-                    for pname in getattr(act_def.params, "model_fields", {}):
-                        mapped = pk_to_type.get(pname)
-                        if mapped and mapped not in inferred:
-                            inferred.append(mapped)
-                    touched = inferred
-
-                rule_summary: dict[str, Any] | None = None
-                if act_def.implementation_kind == "rule":
-                    pres = list(act_bp.preconditions) if act_bp is not None else []
-                    muts = list(act_bp.mutations) if act_bp is not None else []
-                    rule_summary = {
-                        "precondition_count": len(pres),
-                        "preconditions": [
-                            {
-                                "name": p.name,
-                                "code": p.code,
-                                "description": p.description,
-                            }
-                            for p in pres
-                        ],
-                        "mutation_count": len(muts),
-                        "mutations": [
-                            {
-                                "op": m.op,
-                                "object_type": m.object_type,
-                                "set_fields": sorted(str(k) for k in m.set_fields.keys()),
-                            }
-                            for m in muts
-                        ],
-                    }
-
-                actions_out.append(
-                    {
-                        "name": aname,
-                        "display_label": str(act_labels.get(aname) or aname),
-                        "description": str(act_def.description or ""),
-                        "implementation_kind": str(act_def.implementation_kind),
-                        "edit_function_name": act_def.edit_function,
-                        "allowed_roles": list(act_def.allowed_roles),
-                        "in_role_scope": aname in scoped_action_names,
-                        "touched_object_types": touched,
-                        "params_schema": _enrich_action_params_schema(act_def),
-                        "rule_summary": rule_summary,
-                        "autonomy_mode": self._resolve_action_autonomy_label(aname, actor),
-                    }
-                )
-
-            edit_functions_out: list[dict[str, Any]] = []
-            for ef in sorted(self.runtime.spec.edit_functions.values(), key=lambda e: e.name):
-                bound_actions = [
-                    a["name"]
-                    for a in actions_out
-                    if a["edit_function_name"] == ef.name
-                ]
-                ef_touched = list(ef.touched_object_types or ())
-                if not ef_touched:
-                    seen_ef: list[str] = []
-                    for bname in bound_actions:
-                        bact = next((x for x in actions_out if x["name"] == bname), None)
-                        if bact:
-                            for ot_t in bact["touched_object_types"]:
-                                if ot_t not in seen_ef:
-                                    seen_ef.append(ot_t)
-                    ef_touched = seen_ef
-                edit_functions_out.append(
-                    {
-                        "name": ef.name,
-                        "display_label": str(
-                            ef_labels.get(ef.name) or act_labels.get(ef.name) or ef.name
-                        ),
-                        "description": str(ef.description or ""),
-                        "touched_object_types": ef_touched,
-                        "bound_actions": bound_actions,
-                        "params_schema": (
-                            ef.params.model_json_schema() if ef.params is not None else {}
-                        ),
-                    }
-                )
-
-            functions_out: list[dict[str, Any]] = []
-            for fn_def in sorted(self.runtime.spec.functions.values(), key=lambda f: f.name):
-                functions_out.append(
-                    {
-                        "name": fn_def.name,
-                        "display_label": str(fn_labels.get(fn_def.name) or fn_def.name),
-                        "description": str(fn_def.description or ""),
-                        "read_only": bool(fn_def.read_only),
-                        "params_schema": (
-                            fn_def.params.model_json_schema()
-                            if fn_def.params is not None
-                            else {}
-                        ),
-                    }
-                )
-
-            object_types_out: list[dict[str, Any]] = []
-            base_doc = str(
-                getattr(
-                    next(iter(self.runtime.spec.object_types.values())).__mro__[-3],
-                    "__doc__",
-                    "",
-                )
-                or ""
-            ) if self.runtime.spec.object_types else ""
-
-            for ot in sorted(tbox["object_types"], key=lambda o: str(o["name"])):
-                ot_name = str(ot["name"])
-                cls = self.runtime.spec.get_object_type(ot_name)
-                visible_count = len(self.runtime.query_objects(cls, actor))
-                status_field = getattr(cls, "__status_field__", None)
-                initial_statuses = [
-                    str(s) for s in (getattr(cls, "__initial_statuses__", ()) or ())
-                ]
-                raw_transitions = getattr(cls, "__transitions__", {}) or {}
-                transitions: dict[str, list[str]] = {
-                    str(k): [str(dst) for dst in v]
-                    for k, v in raw_transitions.items()
-                }
-                terminal_statuses: list[str] = []
-                if transitions:
-                    ordered_states: list[str] = []
-                    for st in initial_statuses:
-                        if st not in ordered_states:
-                            ordered_states.append(st)
-                    for src_s, dst_list in transitions.items():
-                        if src_s not in ordered_states:
-                            ordered_states.append(src_s)
-                        for dst_s in dst_list:
-                            if dst_s not in ordered_states:
-                                ordered_states.append(dst_s)
-                    terminal_statuses = [
-                        st
-                        for st in ordered_states
-                        if len(transitions.get(st, ())) == 0
-                    ]
-
-                cls_doc = str(getattr(cls, "__doc__", "") or "").strip()
-                clean_doc = ""
-                if cls_doc and cls_doc != base_doc.strip():
-                    clean_doc = cls_doc.splitlines()[0].strip()
-
-                owned_set = set(ot.get("owned_fields") or ())
-                fully_owned = cls.is_fully_owned()
-                type_is_synced = (
-                    ot_name in device_synced_types or cls.is_read_only_source()
-                ) and not fully_owned
-
-                fields_out: list[dict[str, Any]] = []
-                for fld in ot["fields"]:
-                    fname = str(fld["name"])
-                    flabel = str(
-                        field_overrides.get(f"{ot_name}.{fname}")
-                        or field_labels.get(fname)
-                        or fname
-                    )
-                    is_overlay_ext = (
-                        (not fully_owned and fname in owned_set)
-                        or fname.startswith("x_")
-                    )
-                    if is_overlay_ext:
-                        ownership = "overlay_extension"
-                    elif type_is_synced:
-                        ownership = "external_synced"
-                    else:
-                        ownership = "ontology_owned"
-
-                    fields_out.append(
-                        {
-                            "name": fname,
-                            "display_label": flabel,
-                            "type": str(fld.get("type", "Any")),
-                            "required": bool(fld.get("required", False)),
-                            "is_primary_key": fname == str(ot["primary_key"]),
-                            "is_status_field": bool(status_field and fname == status_field),
-                            "ownership": ownership,
-                        }
-                    )
-
-                object_types_out.append(
-                    {
-                        "name": ot_name,
-                        "display_label": str(obj_labels.get(ot_name) or ot_name),
-                        "description": clean_doc,
-                        "extends": bp_ot_map[ot_name].extends if ot_name in bp_ot_map else None,
-                        "primary_key": str(ot["primary_key"]),
-                        "status_field": status_field,
-                        "initial_statuses": initial_statuses,
-                        "transitions": transitions,
-                        "terminal_statuses": terminal_statuses,
-                        "fields": fields_out,
-                        "attached_devices": list(devices_by_type.get(ot_name, [])),
-                        "touched_by_actions": [
-                            a["name"]
-                            for a in actions_out
-                            if ot_name in a["touched_object_types"]
-                        ],
-                        "in_role_scope": ot_name in scoped_type_names,
-                        "visible_count": visible_count,
-                    }
-                )
-
-            links_out: list[dict[str, Any]] = []
-            for prop in sorted(
-                tbox["object_properties"],
-                key=lambda p: (str(p.get("domain", "")), str(p.get("field", ""))),
-            ):
-                pname = str(prop.get("name", ""))
-                fname = str(prop.get("field", ""))
-                card = str(prop.get("cardinality", "many-to-one"))
-                raw_label = (
-                    link_labels.get(pname)
-                    or field_overrides.get(pname)
-                    or field_labels.get(fname)
-                    or fname
-                    or pname
-                )
-                src_name = str(prop.get("domain", ""))
-                rel_meta = bp_rel_map.get((src_name, fname))
-                links_out.append(
-                    {
-                        "name": pname,
-                        "field": fname,
-                        "display_label": str(raw_label),
-                        "source": src_name,
-                        "target": str(prop.get("range", "")),
-                        "cardinality": card,
-                        "cardinality_label": str(card_labels.get(card, card)),
-                        "min_cardinality": int(rel_meta.min_cardinality) if rel_meta is not None else 0,
-                        "max_cardinality": rel_meta.max_cardinality if rel_meta is not None else None,
-                        "inverse_name": prop.get("inverse_name"),
-                        "description": str(prop.get("description") or ""),
-                    }
-                )
-
-            invariants_out = self._collect_invariants(display)
-            rule_count = sum(
-                1 for a in actions_out if a["implementation_kind"] == "rule"
-            )
-            ef_action_count = sum(
-                1 for a in actions_out if a["implementation_kind"] == "edit_function"
-            )
-            fsm_object_count = sum(
-                1 for o in object_types_out if o["status_field"] or o["transitions"]
-            )
-
-            return {
-                "ok": True,
-                "spec_name": spec_name,
-                "spec_version": spec_version,
-                "blueprint_fingerprint": bp_fp,
-                "summary": {
-                    "object_type_count": len(object_types_out),
-                    "link_count": len(links_out),
-                    "action_count": len(actions_out),
-                    "rule_action_count": rule_count,
-                    "edit_function_action_count": ef_action_count,
-                    "edit_function_count": len(edit_functions_out),
-                    "function_count": len(functions_out),
-                    "invariant_count": len(invariants_out),
-                    "fsm_object_count": fsm_object_count,
-                },
-                "object_types": object_types_out,
-                "disjoint_types": [[a, b] for a, b in bp.disjoint_types],
-                "links": links_out,
-                "actions": actions_out,
-                "edit_functions": edit_functions_out,
-                "functions": functions_out,
-                "invariants": invariants_out,
-            }
-
-    def prove_current_blueprint(
+    def _build_blueprint_from_spec(
         self,
+        target_spec: Any,
         actor: Actor,
         *,
-        force_refresh: bool = False,
+        draft_overlay: Any | None = None,
     ) -> dict[str, Any]:
-        del actor  # Authenticated by _resolve_actor before entry
+        display = _merge_display(_load_base_display(), target_spec.display or {})
+        obj_labels = display.get("objects") or {}
+        field_labels = display.get("fields") or {}
+        field_overrides = display.get("field_overrides") or {}
+        act_labels = display.get("actions") or {}
+        ef_labels = display.get("edit_functions") or {}
+        fn_labels = display.get("functions") or {}
+        link_labels = display.get("links") or display.get("object_properties") or {}
+        card_labels = display.get("cardinalities") or {
+            "many-to-one": "N:1",
+            "one-to-many": "1:N",
+            "many-to-many": "M:N",
+            "one-to-one": "1:1",
+        }
+
+        bp, spec_name, spec_version, bp_fp = self._export_runtime_blueprint(
+            display, spec_override=target_spec
+        )
+        bp_actions = {act_bp.name: act_bp for act_bp in bp.actions}
+        bp_ot_map = {ot_bp.name: ot_bp for ot_bp in bp.object_types}
+        bp_rel_map = {
+            (ot_bp.name, rel.field): rel
+            for ot_bp in bp.object_types
+            for rel in ot_bp.relations
+        }
+
+        draft_added_types: set[str] = set()
+        draft_modified_types: set[str] = set()
+        draft_added_links: set[tuple[str, str]] = set()
+        draft_added_actions: set[str] = set()
+        draft_modified_actions: set[str] = set()
+        draft_added_invs: set[str] = set()
+        if draft_overlay is not None:
+            for ot_bp in (*draft_overlay.add_object_types, *draft_overlay.derive_object_types):
+                draft_added_types.add(ot_bp.name)
+                for rel in ot_bp.relations:
+                    draft_added_links.add((ot_bp.name, rel.field))
+            draft_modified_types = (
+                set(draft_overlay.add_fields.keys())
+                | set(draft_overlay.add_relations.keys())
+                | set(draft_overlay.update_transitions.keys())
+            )
+            for ot_n, rels in draft_overlay.add_relations.items():
+                for rel in rels:
+                    draft_added_links.add((ot_n, rel.field))
+            draft_added_actions = {a.name for a in draft_overlay.add_actions}
+            draft_modified_actions = (
+                {a.name for a in draft_overlay.update_actions}
+                | set(draft_overlay.add_action_preconditions.keys())
+                | set(draft_overlay.restrict_allowed_roles.keys())
+                | set(draft_overlay.update_revert_roles.keys())
+            )
+            draft_added_invs = {inv.name for inv in draft_overlay.add_invariants}
+
+        scoped_tbox = describe_tbox(target_spec, actor=actor)
+        scoped_type_names = {ot["name"] for ot in scoped_tbox["object_types"]}
+        tbox = describe_tbox(target_spec)
+        scoped_behavior = describe_behavior(target_spec, actor=actor)
+        scoped_action_names = {a["name"] for a in scoped_behavior["actions"]}
+
+        devices_by_type, device_synced_types = self._describe_devices_by_object()
+        pk_to_type = {
+            str(cls.primary_key_name()): name
+            for name, cls in target_spec.object_types.items()
+        }
+
+        actions_out: list[dict[str, Any]] = []
+        for act_def in sorted(target_spec.actions.values(), key=lambda a: a.name):
+            aname = act_def.name
+            act_bp = bp_actions.get(aname)
+            touched = list(act_def.touched_object_types or ())
+            if not touched and act_bp is not None:
+                seen_t: list[str] = []
+                for mut in act_bp.mutations:
+                    if mut.object_type not in seen_t:
+                        seen_t.append(mut.object_type)
+                if seen_t:
+                    touched = seen_t
+            if not touched and act_def.params is not None:
+                inferred: list[str] = []
+                for pname in getattr(act_def.params, "model_fields", {}):
+                    mapped = pk_to_type.get(pname)
+                    if mapped and mapped not in inferred:
+                        inferred.append(mapped)
+                touched = inferred
+
+            rule_summary: dict[str, Any] | None = None
+            if act_def.implementation_kind == "rule":
+                pres = list(act_bp.preconditions) if act_bp is not None else []
+                muts = list(act_bp.mutations) if act_bp is not None else []
+                rule_summary = {
+                    "precondition_count": len(pres),
+                    "preconditions": [
+                        {
+                            "name": p.name,
+                            "code": p.code,
+                            "description": p.description,
+                        }
+                        for p in pres
+                    ],
+                    "mutation_count": len(muts),
+                    "mutations": [
+                        {
+                            "op": m.op,
+                            "object_type": m.object_type,
+                            "set_fields": sorted(str(k) for k in m.set_fields.keys()),
+                        }
+                        for m in muts
+                    ],
+                }
+
+            act_status = (
+                "draft_added"
+                if aname in draft_added_actions
+                else "draft_modified"
+                if aname in draft_modified_actions
+                else "base"
+            )
+            actions_out.append(
+                {
+                    "name": aname,
+                    "display_label": str(act_labels.get(aname) or aname),
+                    "description": str(act_def.description or ""),
+                    "implementation_kind": str(act_def.implementation_kind),
+                    "edit_function_name": act_def.edit_function,
+                    "allowed_roles": list(act_def.allowed_roles),
+                    "in_role_scope": aname in scoped_action_names,
+                    "touched_object_types": touched,
+                    "params_schema": _enrich_action_params_schema(act_def),
+                    "rule_summary": rule_summary,
+                    "autonomy_mode": self._resolve_action_autonomy_label(aname, actor),
+                    "draft_status": act_status,
+                }
+            )
+
+        edit_functions_out: list[dict[str, Any]] = []
+        for ef in sorted(target_spec.edit_functions.values(), key=lambda e: e.name):
+            bound_actions = [
+                a["name"]
+                for a in actions_out
+                if a["edit_function_name"] == ef.name
+            ]
+            ef_touched = list(ef.touched_object_types or ())
+            if not ef_touched:
+                seen_ef: list[str] = []
+                for bname in bound_actions:
+                    bact = next((x for x in actions_out if x["name"] == bname), None)
+                    if bact:
+                        for ot_t in bact["touched_object_types"]:
+                            if ot_t not in seen_ef:
+                                seen_ef.append(ot_t)
+                ef_touched = seen_ef
+            edit_functions_out.append(
+                {
+                    "name": ef.name,
+                    "display_label": str(
+                        ef_labels.get(ef.name) or act_labels.get(ef.name) or ef.name
+                    ),
+                    "description": str(ef.description or ""),
+                    "touched_object_types": ef_touched,
+                    "bound_actions": bound_actions,
+                    "params_schema": (
+                        ef.params.model_json_schema() if ef.params is not None else {}
+                    ),
+                }
+            )
+
+        functions_out: list[dict[str, Any]] = []
+        for fn_def in sorted(target_spec.functions.values(), key=lambda f: f.name):
+            functions_out.append(
+                {
+                    "name": fn_def.name,
+                    "display_label": str(fn_labels.get(fn_def.name) or fn_def.name),
+                    "description": str(fn_def.description or ""),
+                    "read_only": bool(fn_def.read_only),
+                    "params_schema": (
+                        fn_def.params.model_json_schema()
+                        if fn_def.params is not None
+                        else {}
+                    ),
+                }
+            )
+
+        object_types_out: list[dict[str, Any]] = []
+        base_doc = str(
+            getattr(
+                next(iter(target_spec.object_types.values())).__mro__[-3],
+                "__doc__",
+                "",
+            )
+            or ""
+        ) if target_spec.object_types else ""
+
+        for ot in sorted(tbox["object_types"], key=lambda o: str(o["name"])):
+            ot_name = str(ot["name"])
+            cls = target_spec.get_object_type(ot_name)
+            if ot_name in self.runtime.spec.object_types:
+                live_cls = self.runtime.spec.get_object_type(ot_name)
+                visible_count = len(self.runtime.query_objects(live_cls, actor))
+            else:
+                visible_count = 0
+            status_field = getattr(cls, "__status_field__", None)
+            initial_statuses = [
+                str(s) for s in (getattr(cls, "__initial_statuses__", ()) or ())
+            ]
+            raw_transitions = getattr(cls, "__transitions__", {}) or {}
+            transitions: dict[str, list[str]] = {
+                str(k): [str(dst) for dst in v]
+                for k, v in raw_transitions.items()
+            }
+            terminal_statuses: list[str] = []
+            if transitions:
+                ordered_states: list[str] = []
+                for st in initial_statuses:
+                    if st not in ordered_states:
+                        ordered_states.append(st)
+                for src_s, dst_list in transitions.items():
+                    if src_s not in ordered_states:
+                        ordered_states.append(src_s)
+                    for dst_s in dst_list:
+                        if dst_s not in ordered_states:
+                            ordered_states.append(dst_s)
+                terminal_statuses = [
+                    st
+                    for st in ordered_states
+                    if len(transitions.get(st, ())) == 0
+                ]
+
+            cls_doc = str(getattr(cls, "__doc__", "") or "").strip()
+            clean_doc = ""
+            if cls_doc and cls_doc != base_doc.strip():
+                clean_doc = cls_doc.splitlines()[0].strip()
+
+            owned_set = set(ot.get("owned_fields") or ())
+            fully_owned = cls.is_fully_owned()
+            type_is_synced = (
+                ot_name in device_synced_types or cls.is_read_only_source()
+            ) and not fully_owned
+
+            fields_out: list[dict[str, Any]] = []
+            for fld in ot["fields"]:
+                fname = str(fld["name"])
+                flabel = str(
+                    field_overrides.get(f"{ot_name}.{fname}")
+                    or field_labels.get(fname)
+                    or fname
+                )
+                is_overlay_ext = (
+                    (not fully_owned and fname in owned_set)
+                    or fname.startswith("x_")
+                )
+                if is_overlay_ext:
+                    ownership = "overlay_extension"
+                elif type_is_synced:
+                    ownership = "external_synced"
+                else:
+                    ownership = "ontology_owned"
+
+                fields_out.append(
+                    {
+                        "name": fname,
+                        "display_label": flabel,
+                        "type": str(fld.get("type", "Any")),
+                        "required": bool(fld.get("required", False)),
+                        "is_primary_key": fname == str(ot["primary_key"]),
+                        "is_status_field": bool(status_field and fname == status_field),
+                        "ownership": ownership,
+                    }
+                )
+
+            ot_status = (
+                "draft_added"
+                if ot_name in draft_added_types
+                else "draft_modified"
+                if ot_name in draft_modified_types
+                else "base"
+            )
+            object_types_out.append(
+                {
+                    "name": ot_name,
+                    "display_label": str(obj_labels.get(ot_name) or ot_name),
+                    "description": clean_doc,
+                    "extends": bp_ot_map[ot_name].extends if ot_name in bp_ot_map else None,
+                    "primary_key": str(ot["primary_key"]),
+                    "status_field": status_field,
+                    "initial_statuses": initial_statuses,
+                    "transitions": transitions,
+                    "terminal_statuses": terminal_statuses,
+                    "fields": fields_out,
+                    "attached_devices": list(devices_by_type.get(ot_name, [])),
+                    "touched_by_actions": [
+                        a["name"]
+                        for a in actions_out
+                        if ot_name in a["touched_object_types"]
+                    ],
+                    "in_role_scope": ot_name in scoped_type_names,
+                    "visible_count": visible_count,
+                    "draft_status": ot_status,
+                }
+            )
+
+        links_out: list[dict[str, Any]] = []
+        for prop in sorted(
+            tbox["object_properties"],
+            key=lambda p: (str(p.get("domain", "")), str(p.get("field", ""))),
+        ):
+            pname = str(prop.get("name", ""))
+            fname = str(prop.get("field", ""))
+            card = str(prop.get("cardinality", "many-to-one"))
+            src_name = str(prop.get("domain", ""))
+            raw_label = (
+                link_labels.get(pname)
+                or field_overrides.get(pname)
+                or field_overrides.get(f"{src_name}.{fname}")
+                or field_labels.get(fname)
+                or fname
+                or pname
+            )
+            rel_meta = bp_rel_map.get((src_name, fname))
+            lnk_status = (
+                "draft_added"
+                if (src_name, fname) in draft_added_links
+                else "base"
+            )
+            links_out.append(
+                {
+                    "name": pname,
+                    "field": fname,
+                    "display_label": str(raw_label),
+                    "source": src_name,
+                    "target": str(prop.get("range", "")),
+                    "cardinality": card,
+                    "cardinality_label": str(card_labels.get(card, card)),
+                    "min_cardinality": int(rel_meta.min_cardinality) if rel_meta is not None else 0,
+                    "max_cardinality": rel_meta.max_cardinality if rel_meta is not None else None,
+                    "inverse_name": prop.get("inverse_name"),
+                    "description": str(prop.get("description") or ""),
+                    "draft_status": lnk_status,
+                }
+            )
+
+        invariants_out = [
+            {
+                **inv,
+                "draft_status": (
+                    "draft_added"
+                    if inv["name"] in draft_added_invs
+                    else "base"
+                ),
+            }
+            for inv in self._collect_invariants(display, spec_override=target_spec)
+        ]
+        rule_count = sum(
+            1 for a in actions_out if a["implementation_kind"] == "rule"
+        )
+        ef_action_count = sum(
+            1 for a in actions_out if a["implementation_kind"] == "edit_function"
+        )
+        fsm_object_count = sum(
+            1 for o in object_types_out if o["status_field"] or o["transitions"]
+        )
+
+        return {
+            "ok": True,
+            "spec_name": spec_name,
+            "spec_version": spec_version,
+            "blueprint_fingerprint": bp_fp,
+            "summary": {
+                "object_type_count": len(object_types_out),
+                "link_count": len(links_out),
+                "action_count": len(actions_out),
+                "rule_action_count": rule_count,
+                "edit_function_action_count": ef_action_count,
+                "edit_function_count": len(edit_functions_out),
+                "function_count": len(functions_out),
+                "invariant_count": len(invariants_out),
+                "fsm_object_count": fsm_object_count,
+            },
+            "object_types": object_types_out,
+            "disjoint_types": [[a, b] for a, b in bp.disjoint_types],
+            "links": links_out,
+            "actions": actions_out,
+            "edit_functions": edit_functions_out,
+            "functions": functions_out,
+            "invariants": invariants_out,
+        }
+
+    def get_blueprint(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            return self._build_blueprint_from_spec(self.runtime.spec, actor)
+
+    def _format_proof_report_dict(
+        self,
+        report: Any,
+        display: Mapping[str, Any],
+        declared_invs: Sequence[Mapping[str, Any]],
+        *,
+        cached: bool = False,
+    ) -> dict[str, Any]:
+        obj_labels = display.get("objects") or {}
+        act_labels = display.get("actions") or {}
+        inv_labels = display.get("invariants") or {}
+
+        deadlocked_actions = (
+            report.total_deadlock_count + report.conditional_deadlock_count
+        )
+        reachable_actions = sum(
+            1 for r in report.reachability if r.status == "REACHABLE"
+        )
+        total_invariants = len(report.invariant_preservation)
+        preserved_invariants = sum(
+            1 for p in report.invariant_preservation if p.status == "PROVED"
+        )
+        violated_invariants = report.invariant_violation_count
+        total_classes = len(report.class_proofs)
+        satisfiable_classes = sum(
+            1 for c in report.class_proofs if c.status == "SATISFIABLE"
+        )
+
+        frag_counts = dict(report.logic_fragment_counts)
+        total_frags = sum(frag_counts.values())
+        exact_frags = sum(
+            cnt
+            for frag, cnt in frag_counts.items()
+            if frag.startswith("EXACT_QF_LIA") or frag.startswith("EXACT_QF_LRA")
+        )
+        exact_linear_ratio = (
+            round(exact_frags / total_frags, 4) if total_frags > 0 else 1.0
+        )
+
+        class_proofs = [
+            {
+                **item.model_dump(mode="json"),
+                "display_label": str(obj_labels.get(item.object_type) or item.object_type),
+                "extends_display_label": (
+                    str(obj_labels.get(item.extends) or item.extends)
+                    if item.extends
+                    else None
+                ),
+                "unsat_core_labels": [
+                    str(inv_labels.get(n) or n) for n in item.unsat_core
+                ],
+            }
+            for item in report.class_proofs
+        ]
+        action_proofs = [
+            {
+                **item.model_dump(mode="json"),
+                "display_label": str(
+                    act_labels.get(item.action_name) or item.action_name
+                ),
+            }
+            for item in report.reachability
+        ]
+        invariant_proofs = [
+            {
+                **item.model_dump(mode="json"),
+                "display_label": str(
+                    act_labels.get(item.action_name) or item.action_name
+                ),
+                "checked_invariant_labels": [
+                    str(inv_labels.get(n) or n) for n in item.checked_invariants
+                ],
+                "violated_invariant_labels": [
+                    str(inv_labels.get(n) or n) for n in item.violated_invariants
+                ],
+            }
+            for item in report.invariant_preservation
+        ]
+        redundant_rules = [
+            {
+                **item.model_dump(mode="json"),
+                "action_display_label": str(
+                    act_labels.get(item.action_name) or item.action_name
+                ),
+                "rule_display_label": str(
+                    inv_labels.get(item.rule_name) or item.rule_name
+                ),
+            }
+            for item in report.redundant_rules
+        ]
+
+        verdict = (
+            "PROVEN_CLEAN"
+            if (
+                report.ok
+                and deadlocked_actions == 0
+                and violated_invariants == 0
+                and report.dead_class_count == 0
+                and report.dl_conflict_count == 0
+                and report.lsp_violation_count == 0
+            )
+            else "ISSUES_FOUND"
+        )
+
+        return {
+            "ok": True,
+            "prover_available": True,
+            "cached": cached,
+            "verdict": verdict,
+            "elapsed_ms": report.elapsed_ms,
+            "blueprint_fingerprint": report.blueprint_fingerprint,
+            "summary": {
+                "total_classes": total_classes,
+                "satisfiable_classes": satisfiable_classes,
+                "dead_class_count": report.dead_class_count,
+                "dl_conflict_count": report.dl_conflict_count,
+                "lsp_violation_count": report.lsp_violation_count,
+                "total_actions": report.total_actions_checked,
+                "reachable_actions": reachable_actions,
+                "deadlocked_actions": deadlocked_actions,
+                "total_invariants": total_invariants,
+                "preserved_invariants": preserved_invariants,
+                "violated_invariants": violated_invariants,
+                "declared_invariant_count": len(declared_invs),
+                "redundant_rule_count": report.redundant_rule_count,
+                "exact_linear_ratio": exact_linear_ratio,
+                "fragment_counts": frag_counts,
+            },
+            "class_proofs": class_proofs,
+            "action_proofs": action_proofs,
+            "invariant_proofs": invariant_proofs,
+            "redundant_rules": redundant_rules,
+        }
+
+    def _prove_spec_unlocked(self, target_spec: Any) -> dict[str, Any]:
         from .induction.prover import ProverUnavailableError, prove_blueprint
 
-        with self._lock:
-            display = self._merged_display()
-            _, _, _, bp_fp = self._export_runtime_blueprint(display)
-            cache_key = (bp_fp, True)
-            if not force_refresh and cache_key in self._proof_cache:
-                cached_payload = copy.deepcopy(self._proof_cache[cache_key])
-                cached_payload["cached"] = True
-                return cached_payload
-
         try:
-            report = prove_blueprint(self.runtime.spec, check_redundancy=True)
+            report = prove_blueprint(target_spec, check_redundancy=True)
         except ProverUnavailableError:
             return {
                 "ok": True,
@@ -1614,137 +1844,40 @@ class ConsoleService:
                 "message": "未安装可选形式化证明器依赖（核心运行态零影响）。",
                 "install_hint": "pip install 'open-ontology[prove]'",
             }
+        with self._lock:
+            display = _merge_display(_load_base_display(), target_spec.display or {})
+            declared_invs = self._collect_invariants(display, spec_override=target_spec)
+            return self._format_proof_report_dict(report, display, declared_invs)
+
+    def _prove_draft_overlay(self, overlay: Any) -> dict[str, Any]:
+        from .induction.dsl import apply_overlay_to_spec
 
         with self._lock:
+            preview_spec = apply_overlay_to_spec(self.runtime.spec, overlay)
+        return self._prove_spec_unlocked(preview_spec)
+
+    def prove_current_blueprint(
+        self,
+        actor: Actor,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        del actor  # Authenticated by _resolve_actor before entry
+        with self._lock:
             display = self._merged_display()
-            obj_labels = display.get("objects") or {}
-            act_labels = display.get("actions") or {}
-            inv_labels = display.get("invariants") or {}
-            declared_invs = self._collect_invariants(display)
+            _, _, _, bp_fp = self._export_runtime_blueprint(display)
+            cache_key = (bp_fp, True)
+            if not force_refresh and cache_key in self._proof_cache:
+                cached_payload = copy.deepcopy(self._proof_cache[cache_key])
+                cached_payload["cached"] = True
+                return cached_payload
+            live_spec = self.runtime.spec
 
-            deadlocked_actions = (
-                report.total_deadlock_count + report.conditional_deadlock_count
-            )
-            reachable_actions = sum(
-                1 for r in report.reachability if r.status == "REACHABLE"
-            )
-            total_invariants = len(report.invariant_preservation)
-            preserved_invariants = sum(
-                1 for p in report.invariant_preservation if p.status == "PROVED"
-            )
-            violated_invariants = report.invariant_violation_count
-            total_classes = len(report.class_proofs)
-            satisfiable_classes = sum(
-                1 for c in report.class_proofs if c.status == "SATISFIABLE"
-            )
-
-            frag_counts = dict(report.logic_fragment_counts)
-            total_frags = sum(frag_counts.values())
-            exact_frags = sum(
-                cnt
-                for frag, cnt in frag_counts.items()
-                if frag.startswith("EXACT_QF_LIA") or frag.startswith("EXACT_QF_LRA")
-            )
-            exact_linear_ratio = (
-                round(exact_frags / total_frags, 4) if total_frags > 0 else 1.0
-            )
-
-            class_proofs = [
-                {
-                    **item.model_dump(mode="json"),
-                    "display_label": str(obj_labels.get(item.object_type) or item.object_type),
-                    "extends_display_label": (
-                        str(obj_labels.get(item.extends) or item.extends)
-                        if item.extends
-                        else None
-                    ),
-                    "unsat_core_labels": [
-                        str(inv_labels.get(n) or n) for n in item.unsat_core
-                    ],
-                }
-                for item in report.class_proofs
-            ]
-            action_proofs = [
-                {
-                    **item.model_dump(mode="json"),
-                    "display_label": str(
-                        act_labels.get(item.action_name) or item.action_name
-                    ),
-                }
-                for item in report.reachability
-            ]
-            invariant_proofs = [
-                {
-                    **item.model_dump(mode="json"),
-                    "display_label": str(
-                        act_labels.get(item.action_name) or item.action_name
-                    ),
-                    "checked_invariant_labels": [
-                        str(inv_labels.get(n) or n) for n in item.checked_invariants
-                    ],
-                    "violated_invariant_labels": [
-                        str(inv_labels.get(n) or n) for n in item.violated_invariants
-                    ],
-                }
-                for item in report.invariant_preservation
-            ]
-            redundant_rules = [
-                {
-                    **item.model_dump(mode="json"),
-                    "action_display_label": str(
-                        act_labels.get(item.action_name) or item.action_name
-                    ),
-                    "rule_display_label": str(
-                        inv_labels.get(item.rule_name) or item.rule_name
-                    ),
-                }
-                for item in report.redundant_rules
-            ]
-
-            verdict = (
-                "PROVEN_CLEAN"
-                if (
-                    report.ok
-                    and deadlocked_actions == 0
-                    and violated_invariants == 0
-                    and report.dead_class_count == 0
-                    and report.dl_conflict_count == 0
-                    and report.lsp_violation_count == 0
-                )
-                else "ISSUES_FOUND"
-            )
-
-            result: dict[str, Any] = {
-                "ok": True,
-                "prover_available": True,
-                "cached": False,
-                "verdict": verdict,
-                "elapsed_ms": report.elapsed_ms,
-                "blueprint_fingerprint": report.blueprint_fingerprint,
-                "summary": {
-                    "total_classes": total_classes,
-                    "satisfiable_classes": satisfiable_classes,
-                    "dead_class_count": report.dead_class_count,
-                    "dl_conflict_count": report.dl_conflict_count,
-                    "lsp_violation_count": report.lsp_violation_count,
-                    "total_actions": report.total_actions_checked,
-                    "reachable_actions": reachable_actions,
-                    "deadlocked_actions": deadlocked_actions,
-                    "total_invariants": total_invariants,
-                    "preserved_invariants": preserved_invariants,
-                    "violated_invariants": violated_invariants,
-                    "declared_invariant_count": len(declared_invs),
-                    "redundant_rule_count": report.redundant_rule_count,
-                    "exact_linear_ratio": exact_linear_ratio,
-                    "fragment_counts": frag_counts,
-                },
-                "class_proofs": class_proofs,
-                "action_proofs": action_proofs,
-                "invariant_proofs": invariant_proofs,
-                "redundant_rules": redundant_rules,
-            }
-            self._proof_cache[cache_key] = copy.deepcopy(result)
-            return result
+        result = self._prove_spec_unlocked(live_spec)
+        if result.get("prover_available"):
+            with self._lock:
+                self._proof_cache[cache_key] = copy.deepcopy(result)
+        return result
 
     def list_objects(
         self,
@@ -3969,6 +4102,1489 @@ class ConsoleService:
             "rls_scope": sorted(actor.clearance_tags),
         }
 
+    # -- M1 Isolated DOAL Drafts & Ontology Expert Agent -------------------
+    def _create_m1_draft(self, actor: Actor) -> _M1DraftSession:
+        from .induction.dsl import CustomerOverlaySpec
+
+        while len(self._m1_drafts) >= _MAX_M1_DRAFTS:
+            oldest_id = min(
+                self._m1_drafts,
+                key=lambda k: self._m1_drafts[k].last_used_at,
+            )
+            self._m1_drafts.pop(oldest_id, None)
+        now = _utc_now_iso()
+        did = f"M1D-{uuid.uuid4().hex[:8].upper()}"
+        display = self._merged_display()
+        _, _, _, _ = self._export_runtime_blueprint(display)
+        ov = CustomerOverlaySpec(
+            overlay_id=f"overlay_{did.lower()}",
+            description="交互式 M1 DOAL 扩展草稿",
+        )
+        sess = _M1DraftSession(
+            draft_id=did,
+            owner_actor_id=actor.actor_id,
+            created_at=now,
+            last_used_at=now,
+            overlay=ov,
+        )
+        self._m1_drafts[did] = sess
+        return sess
+
+    def _require_m1_draft(self, draft_id: str, actor: Actor) -> _M1DraftSession:
+        sess = self._m1_drafts.get(draft_id)
+        if sess is None:
+            raise ObjectNotFoundError(f"M1 draft {draft_id!r} not found")
+        if sess.owner_actor_id != actor.actor_id and actor.role not in self.admin_roles:
+            raise PermissionDeniedError(
+                f"actor {actor.actor_id!r} cannot access M1 draft {draft_id!r}"
+            )
+        sess.last_used_at = _utc_now_iso()
+        return sess
+
+    @staticmethod
+    def _overlay_has_changes(overlay: Any) -> bool:
+        return any(
+            bool(getattr(overlay, attr, None))
+            for attr in (
+                "add_roles",
+                "add_object_types",
+                "derive_object_types",
+                "add_disjoint_types",
+                "add_fields",
+                "add_relations",
+                "update_transitions",
+                "add_actions",
+                "update_actions",
+                "add_action_preconditions",
+                "restrict_allowed_roles",
+                "update_revert_roles",
+                "add_invariants",
+                "add_views",
+                "update_views",
+                "migrations",
+            )
+        )
+
+    @staticmethod
+    def _clean_overlay_export_dict(overlay: Any) -> dict[str, Any]:
+        dumped = overlay.model_dump(mode="json", exclude_defaults=True)
+        dumped.setdefault("overlay_id", str(getattr(overlay, "overlay_id", "")))
+        return dumped
+
+    @staticmethod
+    def _expr_to_zh(node: Any, display: Mapping[str, Any]) -> str:
+        field_labels = display.get("fields") or {}
+        if isinstance(node, Mapping):
+            if set(node.keys()) == {"lit"}:
+                return json.dumps(node["lit"], ensure_ascii=False)
+            if set(node.keys()) == {"ref"}:
+                ref_s = str(node["ref"])
+                parts = ref_s.split(".")
+                if len(parts) >= 2 and parts[0] in ("obj", "param"):
+                    prefix = "对象" if parts[0] == "obj" else "参数"
+                    fname = ".".join(parts[1:])
+                    flbl = field_labels.get(parts[1]) or parts[1]
+                    if len(parts) == 2 and flbl != parts[1]:
+                        return f"{prefix}.{flbl}({fname})"
+                return ref_s
+            op = str(node.get("op") or "")
+            if op == "and":
+                return " 且 ".join(
+                    ConsoleService._expr_to_zh(a, display) for a in (node.get("args") or ())
+                )
+            if op == "or":
+                return "(" + " 或 ".join(
+                    ConsoleService._expr_to_zh(a, display) for a in (node.get("args") or ())
+                ) + ")"
+            if op == "not":
+                return f"非({ConsoleService._expr_to_zh(node.get('arg'), display)})"
+            op_map = {
+                "eq": "=",
+                "ne": "!=",
+                "lt": "<",
+                "le": "<=",
+                "gt": ">",
+                "ge": ">=",
+                "add": "+",
+                "sub": "-",
+                "mul": "*",
+                "div": "/",
+                "in": "属于",
+                "not_in": "不属于",
+            }
+            if op in op_map:
+                l_s = ConsoleService._expr_to_zh(node.get("left"), display)
+                r_s = ConsoleService._expr_to_zh(node.get("right"), display)
+                return f"({l_s} {op_map[op]} {r_s})"
+            if op in ("exists", "not_exists", "count_eq", "count_ge", "count_le"):
+                ot = node.get("object_type", "")
+                where_s = (
+                    ConsoleService._expr_to_zh(node.get("where"), display)
+                    if node.get("where")
+                    else "任意"
+                )
+                return f"{op}({ot}: {where_s})"
+            return json.dumps(node, ensure_ascii=False)
+        return json.dumps(node, ensure_ascii=False)
+
+    @classmethod
+    def _render_doal_clauses_zh(
+        cls,
+        overlay: Any,
+        display: Mapping[str, Any],
+    ) -> list[str]:
+        obj_labels = {**(display.get("objects") or {}), **((overlay.display or {}).get("objects") or {})}
+        field_labels = {**(display.get("fields") or {}), **((overlay.display or {}).get("fields") or {})}
+        act_labels = {**(display.get("actions") or {}), **((overlay.display or {}).get("actions") or {})}
+        clauses: list[str] = []
+
+        for ot in (*overlay.add_object_types, *overlay.derive_object_types):
+            lbl = obj_labels.get(ot.name) or ot.display_label or ot.name
+            ext = f"继承自 {obj_labels.get(ot.extends) or ot.extends}" if ot.extends else "独立根类型"
+            f_parts = []
+            for fld in ot.fields:
+                flags = []
+                if fld.non_negative:
+                    flags.append("非负")
+                if fld.required:
+                    flags.append("必填")
+                flbl = field_labels.get(fld.name) or fld.name
+                f_parts.append(
+                    f"{flbl}({fld.name}:{fld.field_type}" + (f",{','.join(flags)}" if flags else "") + ")"
+                )
+            rel_parts = []
+            for rel in ot.relations:
+                bound = f"[{rel.min_cardinality},{rel.max_cardinality if rel.max_cardinality is not None else '∞'}]"
+                rel_parts.append(f"{rel.field}->{rel.target_type} {bound}")
+            detail = "；".join(
+                p
+                for p in (
+                    ext,
+                    f"字段: {', '.join(f_parts)}" if f_parts else "",
+                    f"关系: {', '.join(rel_parts)}" if rel_parts else "",
+                    f"状态机分支: {len(ot.transitions)} 态" if ot.transitions else "",
+                )
+                if p
+            )
+            clauses.append(f"新增实体「{lbl}({ot.name})」：{detail}")
+
+        for ot_name, flds in overlay.add_fields.items():
+            olbl = obj_labels.get(ot_name) or ot_name
+            f_desc = ", ".join(
+                f"{f.name}:{f.field_type}" + ("[非负]" if f.non_negative else "")
+                for f in flds
+            )
+            clauses.append(f"单调扩展「{olbl}({ot_name})」新增字段：{f_desc}")
+
+        for ot_name, rels in overlay.add_relations.items():
+            olbl = obj_labels.get(ot_name) or ot_name
+            r_desc = ", ".join(
+                f"{r.field}->{r.target_type}[{r.min_cardinality},{r.max_cardinality if r.max_cardinality is not None else '∞'}]"
+                for r in rels
+            )
+            clauses.append(f"单调扩展「{olbl}({ot_name})」新增关系：{r_desc}")
+
+        for ot_name, trans in overlay.update_transitions.items():
+            olbl = obj_labels.get(ot_name) or ot_name
+            clauses.append(f"收窄实体「{olbl}({ot_name})」状态机跃迁为：{json.dumps(trans, ensure_ascii=False)}")
+
+        for a, b in overlay.add_disjoint_types:
+            clauses.append(f"声明本体互斥公理：{a} ⊓ {b} = ⊥（实例不可交叉重叠）")
+
+        for act in overlay.add_actions:
+            albl = act_labels.get(act.name) or act.display_label or act.name
+            pres = [
+                f"{p.code}({cls._expr_to_zh(p.must_hold, display)})"
+                for p in act.preconditions
+            ]
+            muts = []
+            for m in act.mutations:
+                assigns = ", ".join(
+                    f"{k} := {cls._expr_to_zh(v, display)}"
+                    for k, v in m.set_fields.items()
+                )
+                guard = f"当({cls._expr_to_zh(m.when, display)}) " if m.when is not None else ""
+                muts.append(f"{guard}{m.op} {m.object_type} [{assigns}]")
+            clauses.append(
+                f"新增 Rule 动作「{albl}({act.name})」[角色:{','.join(act.allowed_roles)}]："
+                + (f"前置=[{'; '.join(pres)}]，" if pres else "")
+                + f"变更=[{'; '.join(muts)}]"
+            )
+
+        for inv in overlay.add_invariants:
+            guard = f"当({cls._expr_to_zh(inv.when, display)}) " if inv.when is not None else ""
+            clauses.append(
+                f"新增红线不变量「{inv.name}[{inv.code}]」作用于 {inv.target_type}："
+                f"{guard}必须满足 {cls._expr_to_zh(inv.must_hold, display)}"
+            )
+
+        return clauses
+
+    @staticmethod
+    def _coerce_field_spec_dict(raw: Mapping[str, Any]) -> tuple[dict[str, Any], str | None]:
+        d = dict(raw)
+        disp_lbl = str(d.pop("display_label", "") or "").strip() or None
+        if "field_type" not in d and "type" in d:
+            d["field_type"] = d.pop("type")
+        ft_map = {"integer": "int", "number": "float", "string": "str", "boolean": "bool"}
+        raw_ft = str(d.get("field_type") or "str").strip().lower()
+        d["field_type"] = ft_map.get(raw_ft, raw_ft)
+        allowed_keys = {
+            "name",
+            "field_type",
+            "default",
+            "required",
+            "primary_key",
+            "auto_id",
+            "owned",
+            "masked_roles",
+            "non_negative",
+            "description",
+        }
+        return {k: v for k, v in d.items() if k in allowed_keys}, disp_lbl
+
+    @staticmethod
+    def _coerce_relation_spec_dict(raw: Mapping[str, Any]) -> tuple[dict[str, Any], str | None]:
+        d = dict(raw)
+        disp_lbl = str(d.pop("display_label", "") or "").strip() or None
+        if "target_type" not in d and "target" in d:
+            d["target_type"] = d.pop("target")
+        if "field" not in d and "name" in d:
+            d["field"] = d.pop("name")
+        allowed_keys = {
+            "field",
+            "target_type",
+            "multiple",
+            "owned",
+            "required",
+            "min_cardinality",
+            "max_cardinality",
+            "description",
+        }
+        return {k: v for k, v in d.items() if k in allowed_keys}, disp_lbl
+
+    @staticmethod
+    def _coerce_invariant_rule_dict(
+        raw: Mapping[str, Any],
+        *,
+        default_id_param: str | None = None,
+    ) -> dict[str, Any]:
+        d = dict(raw)
+        name_s = str(d.get("name") or "rule").strip()
+        if not d.get("code"):
+            d["code"] = re.sub(r"[^A-Z0-9_]", "_", name_s.upper()).strip("_") or "RULE_VIOLATION"
+        if default_id_param and not d.get("id_param"):
+            d["id_param"] = default_id_param
+        allowed_keys = {"name", "code", "target_type", "id_param", "when", "must_hold", "description"}
+        return {k: v for k, v in d.items() if k in allowed_keys}
+
+    @staticmethod
+    def _coerce_mutation_spec_dict(
+        raw: Mapping[str, Any],
+        *,
+        pk_lookup: Mapping[str, str],
+    ) -> dict[str, Any]:
+        d = dict(raw)
+        ot_n = str(d.get("object_type") or "").strip()
+        if not d.get("id_param") and ot_n in pk_lookup:
+            d["id_param"] = pk_lookup[ot_n]
+        allowed_keys = {"op", "object_type", "id_param", "target_ref", "when", "set_fields"}
+        return {k: v for k, v in d.items() if k in allowed_keys}
+
+    def _merged_draft_display(self, overlay: Any) -> dict[str, Any]:
+        base_disp = self._merged_display()
+        extra = getattr(overlay, "display", None) or {}
+        return _merge_display(base_disp, extra)
+
+    def _validate_candidate_overlay(self, candidate: Any) -> Any:
+        from .induction.dsl import apply_overlay_to_spec
+
+        return apply_overlay_to_spec(self.runtime.spec, candidate)
+
+    def _build_draft_bundle(
+        self,
+        draft: _M1DraftSession,
+        actor: Actor,
+        *,
+        proof_report: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from .induction.dsl import apply_overlay_to_spec
+
+        has_changes = self._overlay_has_changes(draft.overlay)
+        preview_spec = apply_overlay_to_spec(self.runtime.spec, draft.overlay)
+        preview_bp = self._build_blueprint_from_spec(
+            preview_spec,
+            actor,
+            draft_overlay=draft.overlay if has_changes else None,
+        )
+        disp = self._merged_draft_display(draft.overlay)
+        clauses_zh = self._render_doal_clauses_zh(draft.overlay, disp)
+        resolved_proof = proof_report if proof_report is not None else draft.last_proof
+        return {
+            "draft_id": draft.draft_id,
+            "draft_overlay": self._clean_overlay_export_dict(draft.overlay),
+            "draft_has_changes": has_changes,
+            "draft_clauses_zh": clauses_zh,
+            "preview_blueprint": preview_bp,
+            "proof_report": resolved_proof,
+            "escalations": list(draft.escalations),
+        }
+
+    @staticmethod
+    def _build_m1_expert_tools() -> list[dict[str, Any]]:
+        """Declare strictly declarative DOAL M1 modeling + Z3 + escalation tools."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect_m1_blueprint",
+                    "description": "查看当前基座模型及草稿中所有的实体、子类继承、字段、关系、动作、不变量与互斥公理。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "include_draft": {"type": "boolean", "default": True},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "upsert_draft_object",
+                    "description": "在当前 DOAL 草稿层新增或更新实体类型（设置 extends 可创建单调继承子类；严禁覆盖基座标准实体）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "PascalCase 实体类名"},
+                            "display_label": {"type": "string", "description": "实体中文名称"},
+                            "extends": {"type": "string", "description": "可选父类名（创建子类时填基座或草稿父类名）"},
+                            "primary_key": {"type": "string", "description": "主键字段名（若 extends 非空则继承父类主键，无需改写）"},
+                            "fields": {
+                                "type": "array",
+                                "description": "新增或细化字段列表，每项含 name, field_type(str|int|float|bool), default, required, non_negative, display_label",
+                                "items": {"type": "object"},
+                            },
+                            "relations": {
+                                "type": "array",
+                                "description": "语义关系列表，每项含 field, target_type, multiple, required, min_cardinality, max_cardinality, display_label",
+                                "items": {"type": "object"},
+                            },
+                            "status_field": {"type": "string"},
+                            "initial_statuses": {"type": "array", "items": {"type": "string"}},
+                            "transitions": {"type": "object"},
+                        },
+                        "required": ["name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "extend_base_object",
+                    "description": "向已有基座实体单调追加新字段、新关系或收窄状态机（严格遵守 LSP，禁止删改基座契约）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "object_type": {"type": "string"},
+                            "add_fields": {"type": "array", "items": {"type": "object"}},
+                            "add_relations": {"type": "array", "items": {"type": "object"}},
+                            "narrow_transitions": {"type": "object"},
+                        },
+                        "required": ["object_type"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_draft_object",
+                    "description": "删除当前草稿中新增的实体或子类（系统将物理阻断任何删除基座实体的请求）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "upsert_draft_link",
+                    "description": "为草稿实体新增/更新语义关系，或为基座实体追加扩展语义关系（含最小/最大基数约束）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "source_object": {"type": "string"},
+                            "field": {"type": "string"},
+                            "target_type": {"type": "string"},
+                            "multiple": {"type": "boolean"},
+                            "required": {"type": "boolean"},
+                            "min_cardinality": {"type": "integer"},
+                            "max_cardinality": {"type": ["integer", "null"]},
+                            "display_label": {"type": "string"},
+                        },
+                        "required": ["source_object", "field", "target_type"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_draft_link",
+                    "description": "删除草稿中新增的语义关系（禁止删除基座关系）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "source_object": {"type": "string"},
+                            "field": {"type": "string"},
+                        },
+                        "required": ["source_object", "field"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "upsert_draft_rule_action",
+                    "description": "在草稿层新增或更新纯声明式 Rule 动作（支持 JSON AST 前置条件 preconditions 与有限分支守卫 when 的 mutations）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "display_label": {"type": "string"},
+                            "description": {"type": "string"},
+                            "allowed_roles": {"type": "array", "items": {"type": "string"}},
+                            "params": {"type": "array", "items": {"type": "object"}},
+                            "preconditions": {"type": "array", "items": {"type": "object"}},
+                            "mutations": {"type": "array", "items": {"type": "object"}},
+                        },
+                        "required": ["name", "mutations"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_draft_rule_action",
+                    "description": "删除草稿中新增的 Rule 动作（禁止删除或改写基座动作及原语）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "upsert_draft_invariant",
+                    "description": "在草稿层新增或更新一条作用于目标实体全实例的声明式红线不变量。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "code": {"type": "string"},
+                            "target_type": {"type": "string"},
+                            "must_hold": {"type": "object"},
+                            "when": {"type": ["object", "null"]},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["name", "code", "target_type", "must_hold"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_draft_invariant",
+                    "description": "删除草稿中新增的红线不变量（禁止删除基座红线）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "upsert_draft_disjoint",
+                    "description": "在草稿层声明两个本体类型互斥（DisjointWith）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "type_a": {"type": "string"},
+                            "type_b": {"type": "string"},
+                        },
+                        "required": ["type_a", "type_b"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_draft_disjoint",
+                    "description": "删除草稿中新增的互斥公理（禁止删除基座互斥公理）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "type_a": {"type": "string"},
+                            "type_b": {"type": "string"},
+                        },
+                        "required": ["type_a", "type_b"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "prove_draft_mathematics",
+                    "description": "调用 Z3 SMT 形式化定理证明器对「基座 + 当前 DOAL 草稿」执行 PO-1~PO-4（类可满足性/死类检测、LSP、死锁、Hoare 不变量保持、冗余规则）全面数学证明。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "escalate_to_edit_function",
+                    "description": "当用户提出超出可判定一阶/QF_LIA DOAL 边界的图灵完备需求（如任意递归图遍历、循环批处理、非线性物理算法、密码/外部 IO）时，提交工程升级提案并拒绝伪造近似 DOAL。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "affected_objects": {"type": "array", "items": {"type": "string"}},
+                            "specification_notes": {"type": "string"},
+                        },
+                        "required": ["title", "reason"],
+                    },
+                },
+            },
+        ]
+
+    def _build_m1_expert_system_prompt(
+        self,
+        actor: Actor,
+        draft: _M1DraftSession,
+    ) -> str:
+        from .induction.dsl import apply_overlay_to_spec
+
+        preview_spec = apply_overlay_to_spec(self.runtime.spec, draft.overlay)
+        disp = self._merged_draft_display(draft.overlay)
+        obj_labels = disp.get("objects") or {}
+        act_labels = disp.get("actions") or {}
+        tbox = describe_tbox(preview_spec)
+        behavior = describe_behavior(preview_spec)
+        base_type_names = sorted(self.runtime.spec.object_types.keys())
+        base_action_names = sorted(self.runtime.spec.actions.keys())
+        base_inv_names = sorted(
+            set(self.runtime.spec.invariants.keys())
+            | set(self.runtime.spec.transition_invariants.keys())
+        )
+        valid_roles = sorted(preview_spec.roles.keys())
+
+        entities_summary = [
+            {
+                "name": ot["name"],
+                "display_label": obj_labels.get(ot["name"]) or ot["name"],
+                "primary_key": ot["primary_key"],
+                "extends": getattr(preview_spec.get_object_type(ot["name"]), "__extends_type__", None),
+                "is_base": ot["name"] in self.runtime.spec.object_types,
+                "fields": [f["name"] for f in ot.get("fields", ())],
+            }
+            for ot in tbox["object_types"]
+        ]
+        summary_json = json.dumps(
+            {
+                "draft_id": draft.draft_id,
+                "actor_role": actor.role,
+                "declared_roles": valid_roles,
+                "base_immutable_types": base_type_names,
+                "base_immutable_actions": base_action_names,
+                "base_immutable_invariants": base_inv_names,
+                "current_entities": entities_summary,
+                "current_actions": [
+                    {
+                        "name": a["name"],
+                        "display_label": act_labels.get(a["name"]) or a["name"],
+                        "implementation_kind": preview_spec.actions[a["name"]].implementation_kind,
+                    }
+                    for a in behavior["actions"]
+                ],
+                "current_clauses_zh": self._render_doal_clauses_zh(draft.overlay, disp),
+            },
+            ensure_ascii=False,
+        )
+        return (
+            "你是 OpenOntology M1 本体架构专家（DOAL 形式化建模引擎 + Z3 定理证明顾问）。\n"
+            "严格遵循以下核心原则：\n"
+            "1. **两层严格边界**：\n"
+            "   - `base_immutable_*` 为基座标准契约，只读 + 仅支持单调扩展（`extend_base_object` 或通过 `upsert_draft_object(..., extends=...)` 派生严格子类）。禁止删除、覆盖或弱化基座类型/字段/关系/动作/状态机/不变量。\n"
+            "   - 草稿层 (`draft_*`) 中的新增实体、子类、关系、Rule 动作、不变量和互斥公理支持完整增删改查 (CRUD)。\n"
+            "2. **纯声明式 DOAL JSON AST 语法**：\n"
+            "   - 比较/逻辑表达式：`{\"op\": \"eq|ne|lt|le|gt|ge|add|sub|mul|div|in|not_in\", \"left\": <expr>, \"right\": <expr>}`，`{\"op\": \"and|or\", \"args\": [...]}`，`{\"op\": \"not\", \"arg\": <expr>}`；\n"
+            "   - 引用 `{\"ref\": \"obj.<字段>\"}`、`{\"ref\": \"param.<参数>\"}`、`{\"ref\": \"actor.role\"}`；字面量 `{\"lit\": 值}`；\n"
+            "   - 创建子类时若沿用父类主键，无需重传 `primary_key`；给 `extend_base_object` 加扩展字段建议优先 `x_` 前缀；新增 Rule 动作若希望立即通过 Hoare `wp` 证明且无违例，请注意为减值/上限等操作配齐声明式前置条件 `preconditions` 或分支守卫 `when`！\n"
+            "3. **图灵完备边界升级 (AG-3)**：遇到任意深度图递归、动态循环遍历、非线性数值迭代或需自定义外部代码原语的需求，必须调用 `escalate_to_edit_function`，绝不伪造近似规则。\n"
+            "4. **修改即证明**：每次修改草稿后，务必调用 `prove_draft_mathematics` 获取 Z3 PO-1~PO-4 数学证明结果（关注死类 `UNSATISFIABLE_CLASS` 极小冲突核、Hoare 反例），并用精准中文汇报变更条款与数学核验结论。\n\n"
+            f"当前 M1 建模上下文：\n{summary_json}"
+        )
+
+    def _execute_m1_expert_tool(
+        self,
+        tool_name: str,
+        raw_args: Mapping[str, Any],
+        actor: Actor,
+        draft_id: str,
+        tool_trace: list[dict[str, Any]],
+        mutated_flag: list[bool],
+    ) -> dict[str, Any]:
+        from .induction.dsl import (
+            ActionBlueprint,
+            ActionMutationSpec,
+            FieldSpec,
+            InvariantRuleSpec,
+            ObjectTypeBlueprint,
+            RelationSpec,
+            apply_overlay_to_spec,
+        )
+
+        # Tool 12 runs Z3 without holding self._lock for proof execution
+        if tool_name == "prove_draft_mathematics":
+            with self._lock:
+                draft = self._require_m1_draft(draft_id, actor)
+                ov_copy = copy.deepcopy(draft.overlay)
+            try:
+                proof = self._prove_draft_overlay(ov_copy)
+            except (OpenOntologyError, ValueError, ValidationError) as exc:
+                err_code = getattr(exc, "code", None) or "INVALID_DOAL_DRAFT"
+                tool_trace.append(
+                    {"tool": "prove_draft_mathematics", "summary": f"Z3 建模核验失败（{err_code}）", "ok": False}
+                )
+                return {"ok": False, "error_code": err_code, "error": str(exc)}
+            with self._lock:
+                draft = self._require_m1_draft(draft_id, actor)
+                draft.last_proof = proof
+                disp = self._merged_draft_display(draft.overlay)
+                clauses_zh = self._render_doal_clauses_zh(draft.overlay, disp)
+            if not proof.get("prover_available"):
+                tool_trace.append(
+                    {"tool": "prove_draft_mathematics", "summary": "Z3 未安装（降级跳过）", "ok": True}
+                )
+                return {**proof, "draft_clauses_zh": clauses_zh}
+            verdict = str(proof.get("verdict") or "ISSUES_FOUND")
+            ok_flag = verdict == "PROVEN_CLEAN"
+            tool_trace.append(
+                {
+                    "tool": "prove_draft_mathematics",
+                    "summary": "Z3 全路径证明通过" if ok_flag else f"Z3 发现冲突（{verdict}）",
+                    "ok": True,
+                }
+            )
+            return {
+                "ok": True,
+                "verdict": verdict,
+                "summary": proof.get("summary"),
+                "class_proofs": [
+                    cp for cp in (proof.get("class_proofs") or ()) if cp.get("status") != "SATISFIABLE"
+                ],
+                "action_proofs": [
+                    ap for ap in (proof.get("action_proofs") or ()) if ap.get("status") != "REACHABLE"
+                ],
+                "invariant_proofs": [
+                    ip for ip in (proof.get("invariant_proofs") or ()) if ip.get("status") != "PROVED"
+                ],
+                "redundant_rules": proof.get("redundant_rules") or [],
+                "draft_clauses_zh": clauses_zh,
+            }
+
+        with self._lock:
+            draft = self._require_m1_draft(draft_id, actor)
+            base_spec = self.runtime.spec
+            base_ot_names = set(base_spec.object_types.keys())
+            base_act_names = set(base_spec.actions.keys())
+            base_inv_names = set(base_spec.invariants.keys()) | set(base_spec.transition_invariants.keys())
+            base_disjoints = {
+                tuple(sorted((str(a), str(b))))
+                for a, b in (getattr(base_spec, "__disjoint_types__", ()) or ())
+            }
+            valid_roles = sorted(base_spec.roles.keys())
+
+            def _pk_lookup(spec_obj: Any, candidate_ov: Any) -> dict[str, str]:
+                m = {k: cls.primary_key_name() for k, cls in spec_obj.object_types.items()}
+                for ot_item in (*candidate_ov.add_object_types, *candidate_ov.derive_object_types):
+                    if ot_item.extends and ot_item.extends in m:
+                        m[ot_item.name] = m[ot_item.extends]
+                    else:
+                        m[ot_item.name] = ot_item.primary_key
+                return m
+
+            def _fail(tool_lbl: str, code: str, msg: str) -> dict[str, Any]:
+                tool_trace.append({"tool": tool_name, "summary": f"{tool_lbl} 拒绝（{code}）", "ok": False})
+                return {"ok": False, "error_code": code, "error": msg}
+
+            def _commit_candidate(candidate_ov: Any, trace_msg: str) -> dict[str, Any]:
+                preview_spec = apply_overlay_to_spec(base_spec, candidate_ov)
+                draft.overlay = candidate_ov
+                draft.last_proof = None
+                mutated_flag[0] = True
+                disp = self._merged_draft_display(draft.overlay)
+                clauses_zh = self._render_doal_clauses_zh(draft.overlay, disp)
+                tool_trace.append({"tool": tool_name, "summary": trace_msg, "ok": True})
+                return {
+                    "ok": True,
+                    "draft_id": draft.draft_id,
+                    "object_count": len(preview_spec.object_types),
+                    "draft_clauses_zh": clauses_zh,
+                }
+
+            if tool_name == "inspect_m1_blueprint":
+                inc = bool(raw_args.get("include_draft", True))
+                target_sp = apply_overlay_to_spec(base_spec, draft.overlay) if inc else base_spec
+                bp_dict = self._build_blueprint_from_spec(
+                    target_sp,
+                    actor,
+                    draft_overlay=draft.overlay if (inc and self._overlay_has_changes(draft.overlay)) else None,
+                )
+                tool_trace.append(
+                    {
+                        "tool": "inspect_m1_blueprint",
+                        "summary": f"检查模型契约（{bp_dict['summary']['object_type_count']} 类 · {bp_dict['summary']['action_count']} 动作）",
+                        "ok": True,
+                    }
+                )
+                return {
+                    "ok": True,
+                    "summary": bp_dict["summary"],
+                    "object_types": [
+                        {
+                            "name": o["name"],
+                            "display_label": o["display_label"],
+                            "extends": o.get("extends"),
+                            "primary_key": o["primary_key"],
+                            "draft_status": o.get("draft_status", "base"),
+                            "fields": [f["name"] for f in o["fields"]],
+                            "transitions": o["transitions"],
+                        }
+                        for o in bp_dict["object_types"]
+                    ],
+                    "links": [
+                        {
+                            "source": lk["source"],
+                            "field": lk["field"],
+                            "target": lk["target"],
+                            "min_cardinality": lk.get("min_cardinality", 0),
+                            "max_cardinality": lk.get("max_cardinality"),
+                            "draft_status": lk.get("draft_status", "base"),
+                        }
+                        for lk in bp_dict["links"]
+                    ],
+                    "actions": [
+                        {
+                            "name": a["name"],
+                            "implementation_kind": a["implementation_kind"],
+                            "draft_status": a.get("draft_status", "base"),
+                        }
+                        for a in bp_dict["actions"]
+                    ],
+                    "invariants": bp_dict["invariants"],
+                    "disjoint_types": bp_dict.get("disjoint_types", []),
+                }
+
+            if tool_name == "upsert_draft_object":
+                name = str(raw_args.get("name") or "").strip()
+                if not name:
+                    return _fail("定义实体", "INVALID_IDENTIFIER", "object name is required")
+                if name in base_ot_names:
+                    return _fail(
+                        f"覆盖实体 {name}",
+                        "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                        f"不能覆盖或重定义基座标准实体 {name!r}，请使用 extend_base_object 扩展或设置 extends 派生子类。",
+                    )
+                extends = str(raw_args.get("extends") or "").strip() or None
+                disp_lbl = str(raw_args.get("display_label") or "").strip()
+                candidate = copy.deepcopy(draft.overlay)
+
+                try:
+                    raw_fields = list(raw_args.get("fields") or ())
+                    coerced_fields: list[FieldSpec] = []
+                    for rf in raw_fields:
+                        f_dict, f_lbl = self._coerce_field_spec_dict(rf)
+                        f_obj = FieldSpec(**f_dict)
+                        coerced_fields.append(f_obj)
+                        if f_lbl:
+                            candidate.display.setdefault("fields", {})[f_obj.name] = f_lbl
+
+                    raw_rels = list(raw_args.get("relations") or ())
+                    coerced_rels: list[RelationSpec] = []
+                    for rr in raw_rels:
+                        r_dict, r_lbl = self._coerce_relation_spec_dict(rr)
+                        r_obj = RelationSpec(**r_dict)
+                        coerced_rels.append(r_obj)
+                        if r_lbl:
+                            candidate.display.setdefault("fields", {})[r_obj.field] = r_lbl
+
+                    ot_kwargs: dict[str, Any] = {
+                        "name": name,
+                        "fields": coerced_fields,
+                        "relations": coerced_rels,
+                    }
+                    if extends is not None:
+                        ot_kwargs["extends"] = extends
+                    raw_pk = raw_args.get("primary_key")
+                    sub_field_names = {f.name for f in coerced_fields}
+                    if raw_pk and (not extends or (raw_pk != "id" or "id" in sub_field_names)):
+                        ot_kwargs["primary_key"] = str(raw_pk)
+                    if raw_args.get("status_field") and (not extends or raw_args.get("status_field") != "status"):
+                        ot_kwargs["status_field"] = str(raw_args["status_field"])
+                    if raw_args.get("initial_statuses") is not None:
+                        ot_kwargs["initial_statuses"] = list(raw_args["initial_statuses"])
+                    if raw_args.get("transitions") is not None:
+                        ot_kwargs["transitions"] = {
+                            str(k): list(v) for k, v in dict(raw_args["transitions"]).items()
+                        }
+                    if disp_lbl:
+                        ot_kwargs["display_label"] = disp_lbl
+                        candidate.display.setdefault("objects", {})[name] = disp_lbl
+
+                    ot_bp = ObjectTypeBlueprint(**ot_kwargs)
+                    candidate.add_object_types = [o for o in candidate.add_object_types if o.name != name]
+                    candidate.derive_object_types = [o for o in candidate.derive_object_types if o.name != name]
+                    if extends is not None:
+                        candidate.derive_object_types.append(ot_bp)
+                    else:
+                        candidate.add_object_types.append(ot_bp)
+                    return _commit_candidate(candidate, f"草稿写入实体 {disp_lbl or name}({name})")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(
+                        f"定义实体 {name}",
+                        getattr(exc, "code", None) or "LSP_OR_SCHEMA_ERROR",
+                        str(exc),
+                    )
+
+            if tool_name == "extend_base_object":
+                ot_name = str(raw_args.get("object_type") or "").strip()
+                if ot_name not in base_ot_names:
+                    return _fail(
+                        f"扩展实体 {ot_name}",
+                        "UNKNOWN_OBJECT_TYPE",
+                        f"{ot_name!r} 不是当前基座实体；若为草稿实体请使用 upsert_draft_object。",
+                    )
+                base_cls = base_spec.object_types[ot_name]
+                candidate = copy.deepcopy(draft.overlay)
+                try:
+                    for rf in raw_args.get("add_fields") or ():
+                        f_dict, f_lbl = self._coerce_field_spec_dict(rf)
+                        f_obj = FieldSpec(**f_dict)
+                        if f_obj.name in base_cls.model_fields:
+                            return _fail(
+                                f"修改基座字段 {ot_name}.{f_obj.name}",
+                                "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                                f"禁止修改基座已有字段 {ot_name}.{f_obj.name}；请使用新增扩展字段（如 x_ 前缀）或 derive subtype。",
+                            )
+                        cur_list = [f for f in candidate.add_fields.get(ot_name, []) if f.name != f_obj.name]
+                        cur_list.append(f_obj)
+                        candidate.add_fields[ot_name] = cur_list
+                        if f_lbl:
+                            candidate.display.setdefault("fields", {})[f_obj.name] = f_lbl
+
+                    for rr in raw_args.get("add_relations") or ():
+                        r_dict, r_lbl = self._coerce_relation_spec_dict(rr)
+                        r_obj = RelationSpec(**r_dict)
+                        if r_obj.field in base_cls.model_fields:
+                            return _fail(
+                                f"修改基座关系 {ot_name}.{r_obj.field}",
+                                "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                                f"禁止覆盖基座已有关系字段 {ot_name}.{r_obj.field}。",
+                            )
+                        cur_rels = [r for r in candidate.add_relations.get(ot_name, []) if r.field != r_obj.field]
+                        cur_rels.append(r_obj)
+                        candidate.add_relations[ot_name] = cur_rels
+                        if r_lbl:
+                            candidate.display.setdefault("fields", {})[r_obj.field] = r_lbl
+
+                    if raw_args.get("narrow_transitions") is not None:
+                        candidate.update_transitions[ot_name] = {
+                            str(k): list(v) for k, v in dict(raw_args["narrow_transitions"]).items()
+                        }
+
+                    return _commit_candidate(candidate, f"单调扩展基座实体 {ot_name}")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(
+                        f"扩展实体 {ot_name}",
+                        getattr(exc, "code", None) or "LSP_VIOLATION",
+                        str(exc),
+                    )
+
+            if tool_name == "delete_draft_object":
+                name = str(raw_args.get("name") or "").strip()
+                if name in base_ot_names:
+                    return _fail(
+                        f"删除基座实体 {name}",
+                        "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                        f"基座标准实体 {name!r} 受契约保护，严禁删除。",
+                    )
+                in_add = any(o.name == name for o in draft.overlay.add_object_types)
+                in_der = any(o.name == name for o in draft.overlay.derive_object_types)
+                if not in_add and not in_der:
+                    return _fail(f"删除草稿实体 {name}", "OBJECT_NOT_FOUND", f"草稿中不存在实体 {name!r}")
+                candidate = copy.deepcopy(draft.overlay)
+                candidate.add_object_types = [o for o in candidate.add_object_types if o.name != name]
+                candidate.derive_object_types = [o for o in candidate.derive_object_types if o.name != name]
+                candidate.add_fields.pop(name, None)
+                candidate.add_relations.pop(name, None)
+                candidate.update_transitions.pop(name, None)
+                try:
+                    return _commit_candidate(candidate, f"删除草稿实体 {name}")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(
+                        f"删除草稿实体 {name}",
+                        getattr(exc, "code", None) or "DEPENDENCY_CONFLICT",
+                        str(exc),
+                    )
+
+            if tool_name == "upsert_draft_link":
+                src = str(raw_args.get("source_object") or "").strip()
+                fld = str(raw_args.get("field") or "").strip()
+                tgt = str(raw_args.get("target_type") or "").strip()
+                disp_lbl = str(raw_args.get("display_label") or "").strip()
+                candidate = copy.deepcopy(draft.overlay)
+                try:
+                    r_dict, _ = self._coerce_relation_spec_dict(
+                        {
+                            "field": fld,
+                            "target_type": tgt,
+                            "multiple": bool(raw_args.get("multiple", False)),
+                            "required": bool(raw_args.get("required", False)),
+                            "min_cardinality": int(raw_args.get("min_cardinality", 0) or 0),
+                            "max_cardinality": raw_args.get("max_cardinality"),
+                        }
+                    )
+                    rel_obj = RelationSpec(**r_dict)
+                    if src in base_ot_names:
+                        base_cls = base_spec.object_types[src]
+                        if fld in base_cls.model_fields:
+                            return _fail(
+                                f"覆盖基座关系 {src}.{fld}",
+                                "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                                f"禁止覆盖基座已有关系或字段 {src}.{fld}。",
+                            )
+                        cur = [r for r in candidate.add_relations.get(src, []) if r.field != fld]
+                        cur.append(rel_obj)
+                        candidate.add_relations[src] = cur
+                    else:
+                        found = False
+                        for lst in (candidate.add_object_types, candidate.derive_object_types):
+                            for ot in lst:
+                                if ot.name == src:
+                                    ot.relations = [r for r in ot.relations if r.field != fld] + [rel_obj]
+                                    found = True
+                        if not found:
+                            return _fail(f"添加关系 {src}.{fld}", "UNKNOWN_OBJECT_TYPE", f"未找到源实体 {src!r}")
+                    if disp_lbl:
+                        candidate.display.setdefault("fields", {})[fld] = disp_lbl
+                        candidate.display.setdefault("field_overrides", {})[f"{src}.{fld}"] = disp_lbl
+                    return _commit_candidate(candidate, f"草稿写入关系 {src}.{fld} -> {tgt}")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(
+                        f"添加关系 {src}.{fld}",
+                        getattr(exc, "code", None) or "INVALID_RELATION",
+                        str(exc),
+                    )
+
+            if tool_name == "delete_draft_link":
+                src = str(raw_args.get("source_object") or "").strip()
+                fld = str(raw_args.get("field") or "").strip()
+                if src in base_ot_names:
+                    base_props = getattr(base_spec.object_types[src], "__object_properties__", {}) or {}
+                    if fld in base_props or fld in base_spec.object_types[src].model_fields:
+                        return _fail(
+                            f"删除基座关系 {src}.{fld}",
+                            "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                            f"基座标准关系 {src}.{fld} 严禁删除。",
+                        )
+                candidate = copy.deepcopy(draft.overlay)
+                removed = False
+                if src in candidate.add_relations:
+                    before_len = len(candidate.add_relations[src])
+                    candidate.add_relations[src] = [r for r in candidate.add_relations[src] if r.field != fld]
+                    removed = len(candidate.add_relations[src]) < before_len
+                    if not candidate.add_relations[src]:
+                        candidate.add_relations.pop(src, None)
+                for lst in (candidate.add_object_types, candidate.derive_object_types):
+                    for ot in lst:
+                        if ot.name == src:
+                            before_len = len(ot.relations)
+                            ot.relations = [r for r in ot.relations if r.field != fld]
+                            removed = removed or (len(ot.relations) < before_len)
+                if not removed:
+                    return _fail(f"删除关系 {src}.{fld}", "OBJECT_NOT_FOUND", f"草稿中不存在关系 {src}.{fld}")
+                try:
+                    return _commit_candidate(candidate, f"删除草稿关系 {src}.{fld}")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(f"删除关系 {src}.{fld}", getattr(exc, "code", None) or "INVALID_DOAL_DRAFT", str(exc))
+
+            if tool_name == "upsert_draft_rule_action":
+                name = str(raw_args.get("name") or "").strip()
+                if not name:
+                    return _fail("定义动作", "INVALID_IDENTIFIER", "action name is required")
+                if name in base_act_names:
+                    return _fail(
+                        f"覆盖基座动作 {name}",
+                        "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                        f"基座标准动作或原语 {name!r} 受契约保护，禁止覆盖；请新建派生动作或仅追加前置条件。",
+                    )
+                candidate = copy.deepcopy(draft.overlay)
+                try:
+                    pk_map = _pk_lookup(base_spec, candidate)
+                    disp_lbl = str(raw_args.get("display_label") or "").strip()
+                    raw_roles = raw_args.get("allowed_roles")
+                    if raw_roles:
+                        roles_list = [str(r).strip() for r in raw_roles if str(r).strip()]
+                    else:
+                        defaults = [r for r in dict.fromkeys([actor.role, "admin"]) if not valid_roles or r in valid_roles]
+                        roles_list = defaults or (valid_roles[:1] if valid_roles else ["admin"])
+
+                    coerced_params: list[FieldSpec] = []
+                    for rp in raw_args.get("params") or ():
+                        p_dict, p_lbl = self._coerce_field_spec_dict(rp)
+                        p_obj = FieldSpec(**p_dict)
+                        coerced_params.append(p_obj)
+                        if p_lbl:
+                            candidate.display.setdefault("fields", {})[p_obj.name] = p_lbl
+
+                    coerced_muts = [
+                        ActionMutationSpec(**self._coerce_mutation_spec_dict(rm, pk_lookup=pk_map))
+                        for rm in (raw_args.get("mutations") or ())
+                    ]
+                    first_mut_ot = coerced_muts[0].object_type if coerced_muts else ""
+                    first_mut_idp = coerced_muts[0].id_param if coerced_muts else None
+                    coerced_pres = [
+                        InvariantRuleSpec(
+                            **self._coerce_invariant_rule_dict(
+                                {"target_type": first_mut_ot, **dict(rp)},
+                                default_id_param=first_mut_idp,
+                            )
+                        )
+                        for rp in (raw_args.get("preconditions") or ())
+                    ]
+                    act_bp = ActionBlueprint(
+                        name=name,
+                        display_label=disp_lbl,
+                        description=str(raw_args.get("description") or ""),
+                        allowed_roles=roles_list,
+                        params=coerced_params,
+                        preconditions=coerced_pres,
+                        mutations=coerced_muts,
+                    )
+                    if disp_lbl:
+                        candidate.display.setdefault("actions", {})[name] = disp_lbl
+                    candidate.add_actions = [a for a in candidate.add_actions if a.name != name] + [act_bp]
+                    return _commit_candidate(candidate, f"草稿写入 Rule 动作 {disp_lbl or name}({name})")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(f"定义动作 {name}", getattr(exc, "code", None) or "INVALID_ACTION", str(exc))
+
+            if tool_name == "delete_draft_rule_action":
+                name = str(raw_args.get("name") or "").strip()
+                if name in base_act_names:
+                    return _fail(
+                        f"删除基座动作 {name}",
+                        "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                        f"基座标准动作 {name!r} 受契约保护，严禁删除。",
+                    )
+                if not any(a.name == name for a in draft.overlay.add_actions):
+                    return _fail(f"删除动作 {name}", "ACTION_NOT_FOUND", f"草稿中不存在动作 {name!r}")
+                candidate = copy.deepcopy(draft.overlay)
+                candidate.add_actions = [a for a in candidate.add_actions if a.name != name]
+                try:
+                    return _commit_candidate(candidate, f"删除草稿动作 {name}")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(f"删除动作 {name}", getattr(exc, "code", None) or "INVALID_DOAL_DRAFT", str(exc))
+
+            if tool_name == "upsert_draft_invariant":
+                name = str(raw_args.get("name") or "").strip()
+                if name in base_inv_names:
+                    return _fail(
+                        f"覆盖基座不变量 {name}",
+                        "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                        f"基座标准不变量 {name!r} 受契约保护，禁止覆盖。",
+                    )
+                candidate = copy.deepcopy(draft.overlay)
+                try:
+                    inv_obj = InvariantRuleSpec(**self._coerce_invariant_rule_dict(raw_args))
+                    candidate.add_invariants = [i for i in candidate.add_invariants if i.name != inv_obj.name] + [inv_obj]
+                    return _commit_candidate(candidate, f"草稿写入红线不变量 {inv_obj.name}[{inv_obj.code}]")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(f"定义不变量 {name}", getattr(exc, "code", None) or "INVALID_PREDICATE_AST", str(exc))
+
+            if tool_name == "delete_draft_invariant":
+                name = str(raw_args.get("name") or "").strip()
+                if name in base_inv_names:
+                    return _fail(
+                        f"删除基座不变量 {name}",
+                        "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                        f"基座标准不变量 {name!r} 受契约保护，严禁删除。",
+                    )
+                if not any(i.name == name for i in draft.overlay.add_invariants):
+                    return _fail(f"删除不变量 {name}", "OBJECT_NOT_FOUND", f"草稿中不存在不变量 {name!r}")
+                candidate = copy.deepcopy(draft.overlay)
+                candidate.add_invariants = [i for i in candidate.add_invariants if i.name != name]
+                try:
+                    return _commit_candidate(candidate, f"删除草稿不变量 {name}")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(f"删除不变量 {name}", getattr(exc, "code", None) or "INVALID_DOAL_DRAFT", str(exc))
+
+            if tool_name == "upsert_draft_disjoint":
+                ta = str(raw_args.get("type_a") or "").strip()
+                tb = str(raw_args.get("type_b") or "").strip()
+                candidate = copy.deepcopy(draft.overlay)
+                pair = tuple(sorted((ta, tb)))
+                existing = {tuple(sorted((a, b))) for a, b in candidate.add_disjoint_types}
+                if pair not in existing:
+                    candidate.add_disjoint_types.append((ta, tb))
+                try:
+                    return _commit_candidate(candidate, f"草稿声明互斥 {ta} ⊓ {tb} = ⊥")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(f"互斥公理 {ta}/{tb}", getattr(exc, "code", None) or "DL_DISJOINT_VIOLATION", str(exc))
+
+            if tool_name == "delete_draft_disjoint":
+                ta = str(raw_args.get("type_a") or "").strip()
+                tb = str(raw_args.get("type_b") or "").strip()
+                pair = tuple(sorted((ta, tb)))
+                if pair in base_disjoints:
+                    return _fail(
+                        f"删除基座互斥公理 {ta}/{tb}",
+                        "OVERLAY_BREAKS_STANDARD_CONTRACT",
+                        f"基座互斥公理 ({ta}, {tb}) 受契约保护，严禁删除。",
+                    )
+                candidate = copy.deepcopy(draft.overlay)
+                before_len = len(candidate.add_disjoint_types)
+                candidate.add_disjoint_types = [
+                    (a, b) for a, b in candidate.add_disjoint_types if tuple(sorted((a, b))) != pair
+                ]
+                if len(candidate.add_disjoint_types) == before_len:
+                    return _fail(f"删除互斥公理 {ta}/{tb}", "OBJECT_NOT_FOUND", "草稿中不存在该互斥公理")
+                try:
+                    return _commit_candidate(candidate, f"删除草稿互斥 {ta}/{tb}")
+                except (OpenOntologyError, ValueError, ValidationError) as exc:
+                    return _fail(f"删除互斥 {ta}/{tb}", getattr(exc, "code", None) or "INVALID_DOAL_DRAFT", str(exc))
+
+            if tool_name == "escalate_to_edit_function":
+                ticket = {
+                    "kind": "edit_function_escalation",
+                    "ticket_id": f"ESC-{len(draft.escalations) + 1:03d}",
+                    "title": str(raw_args.get("title") or "图灵完备原语工程升级").strip(),
+                    "reason": str(raw_args.get("reason") or "超出可判定一阶/QF_LIA DOAL 边界").strip(),
+                    "affected_objects": [str(x) for x in (raw_args.get("affected_objects") or ())],
+                    "specification_notes": str(raw_args.get("specification_notes") or "").strip(),
+                    "created_at": _utc_now_iso(),
+                }
+                draft.escalations.append(ticket)
+                tool_trace.append(
+                    {
+                        "tool": "escalate_to_edit_function",
+                        "summary": f"已生成图灵完备原语升级单 {ticket['ticket_id']}",
+                        "ok": True,
+                    }
+                )
+                return {"ok": True, "escalated": True, "ticket": ticket}
+
+            tool_trace.append({"tool": tool_name, "summary": f"未知建模工具 {tool_name}", "ok": False})
+            return {"ok": False, "error_code": "UNKNOWN_TOOL", "error": f"unsupported tool {tool_name!r}"}
+
+    def _run_m1_ontology_expert(
+        self,
+        question: str,
+        payload: _M1ExpertChatPayload,
+        actor: Actor,
+        *,
+        draft_id: str,
+        cfg: _LlmEndpointConfig | None,
+        model_label: str,
+    ) -> dict[str, Any]:
+        """Run bounded OpenAI tool-calling loop for M1 DOAL authoring with lock released on HTTP I/O."""
+        with self._lock:
+            draft = self._require_m1_draft(draft_id, actor)
+            sys_prompt = self._build_m1_expert_system_prompt(actor, draft)
+
+        tools = self._build_m1_expert_tools()
+        history = self._sanitize_llm_history(payload.history)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": sys_prompt},
+            *history,
+            {"role": "user", "content": question},
+        ]
+
+        def _invoke(body: Mapping[str, Any]) -> Mapping[str, Any]:
+            if self.assistant_llm_client is not None:
+                return self.assistant_llm_client(dict(body))
+            assert cfg is not None
+            return _default_openai_compatible_chat(cfg, body, timeout_s=25.0)
+
+        tool_trace: list[dict[str, Any]] = []
+        mutated_flag = [False]
+        proved_after_last_mut = False
+        final_reply = ""
+        llm_error_note = ""
+
+        try:
+            for _ in range(6):
+                resp = _invoke(
+                    {
+                        "model": model_label,
+                        "messages": messages,
+                        "tools": tools,
+                        "tool_choice": "auto",
+                        "temperature": 0.1,
+                    }
+                )
+                choices = resp.get("choices") if isinstance(resp, Mapping) else None
+                if not isinstance(choices, list) or not choices:
+                    raise RuntimeError("LLM returned empty choices")
+                msg = choices[0].get("message") if isinstance(choices[0], Mapping) else None
+                if not isinstance(msg, Mapping):
+                    raise RuntimeError("LLM returned invalid message")
+                raw_tool_calls = msg.get("tool_calls") or []
+                if not raw_tool_calls:
+                    final_reply = str(msg.get("content") or "").strip()
+                    break
+
+                assistant_turn: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": [dict(tc) for tc in raw_tool_calls],
+                }
+                if msg.get("reasoning_content") is not None:
+                    assistant_turn["reasoning_content"] = msg.get("reasoning_content")
+                messages.append(assistant_turn)
+
+                for tc in raw_tool_calls:
+                    tc_id = str(tc.get("id") or f"m1tc-{uuid.uuid4().hex[:8]}")
+                    fn_obj = tc.get("function") if isinstance(tc, Mapping) else None
+                    t_name = str(fn_obj.get("name") or "") if isinstance(fn_obj, Mapping) else ""
+                    raw_args_val = fn_obj.get("arguments") if isinstance(fn_obj, Mapping) else {}
+                    parsed_args: dict[str, Any] = {}
+                    if isinstance(raw_args_val, Mapping):
+                        parsed_args = dict(raw_args_val)
+                    elif isinstance(raw_args_val, str) and raw_args_val.strip():
+                        try:
+                            loaded = json.loads(raw_args_val)
+                            if isinstance(loaded, Mapping):
+                                parsed_args = dict(loaded)
+                        except json.JSONDecodeError:
+                            parsed_args = {}
+
+                    before_mut = mutated_flag[0]
+                    mutated_flag[0] = False
+                    t_res = self._execute_m1_expert_tool(
+                        t_name,
+                        parsed_args,
+                        actor,
+                        draft_id,
+                        tool_trace,
+                        mutated_flag,
+                    )
+                    if mutated_flag[0]:
+                        proved_after_last_mut = False
+                    elif before_mut:
+                        mutated_flag[0] = True
+                    if t_name == "prove_draft_mathematics" and t_res.get("ok"):
+                        proved_after_last_mut = True
+
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": json.dumps(t_res, ensure_ascii=False),
+                        }
+                    )
+
+            if not final_reply and tool_trace:
+                try:
+                    synth = _invoke(
+                        {
+                            "model": model_label,
+                            "messages": messages,
+                            "temperature": 0.1,
+                        }
+                    )
+                    s_choices = synth.get("choices") if isinstance(synth, Mapping) else None
+                    if isinstance(s_choices, list) and s_choices:
+                        s_msg = s_choices[0].get("message") or {}
+                        final_reply = str(s_msg.get("content") or "").strip()
+                except Exception:
+                    final_reply = ""
+        except Exception as exc:
+            llm_error_note = f"本体专家大模型调用暂时不可用（{str(exc)[:160]}）。"
+
+        # Guarantee Z3 proof is fresh whenever the draft overlay changed during this turn
+        if mutated_flag[0] and not proved_after_last_mut:
+            try:
+                with self._lock:
+                    cur_draft = self._require_m1_draft(draft_id, actor)
+                    ov_copy = copy.deepcopy(cur_draft.overlay)
+                fresh_proof = self._prove_draft_overlay(ov_copy)
+                with self._lock:
+                    cur_draft = self._require_m1_draft(draft_id, actor)
+                    cur_draft.last_proof = fresh_proof
+                    tool_trace.append(
+                        {
+                            "tool": "prove_draft_mathematics",
+                            "summary": (
+                                "Z3 未安装（降级跳过）"
+                                if not fresh_proof.get("prover_available")
+                                else (
+                                    "Z3 自动证明通过"
+                                    if fresh_proof.get("verdict") == "PROVEN_CLEAN"
+                                    else f"Z3 自动核验发现问题（{fresh_proof.get('verdict')}）"
+                                )
+                            ),
+                            "ok": True,
+                        }
+                    )
+            except Exception:
+                pass
+
+        with self._lock:
+            cur_draft = self._require_m1_draft(draft_id, actor)
+            bundle = self._build_draft_bundle(cur_draft, actor)
+
+        cards: list[dict[str, Any]] = []
+        for esc in bundle["escalations"][-3:]:
+            cards.append(
+                {
+                    "kind": "edit_function_escalation",
+                    "title": f"图灵完备原语升级建议 · {esc['ticket_id']}",
+                    "subtitle": f"{esc['title']}（需工程化 Python 原语）",
+                    "ticket": esc,
+                }
+            )
+
+        if llm_error_note:
+            reply_text = llm_error_note
+        elif final_reply:
+            reply_text = final_reply
+        elif bundle["draft_has_changes"]:
+            reply_text = (
+                f"已更新 M1 DOAL 草稿 {bundle['draft_id']}，共 {len(bundle['draft_clauses_zh'])} 条扩展定义。"
+            )
+        else:
+            reply_text = "已完成当前 M1 本体蓝图检查。"
+
+        return {
+            "ok": True,
+            "reply": reply_text,
+            "assistant_mode": "llm_sandbox",
+            "assistant_model": model_label,
+            "tool_trace": tool_trace,
+            "cards": cards,
+            **bundle,
+        }
+
+    def m1_expert_chat(
+        self,
+        payload: _M1ExpertChatPayload,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        with self._lock:
+            question = (payload.message or "").strip()
+            raw_did = (payload.draft_id or "").strip() if payload.draft_id else ""
+            if raw_did:
+                draft = self._require_m1_draft(raw_did, actor)
+            else:
+                draft = self._create_m1_draft(actor)
+            draft_id = draft.draft_id
+            llm_ready, cfg, model_label = self._resolve_llm_mode_and_cfg()
+
+            if not question:
+                bundle = self._build_draft_bundle(draft, actor)
+                return {
+                    "ok": True,
+                    "reply": "请描述您希望新增或扩展的模型实体、关系、声明式 Rule 动作或红线不变量。",
+                    "assistant_mode": "llm_sandbox" if llm_ready else "offline_fallback",
+                    "assistant_model": model_label,
+                    "tool_trace": [],
+                    "cards": [],
+                    **bundle,
+                }
+
+            if not llm_ready:
+                bundle = self._build_draft_bundle(draft, actor)
+                return {
+                    "ok": True,
+                    "reply": (
+                        "当前处于离线模式，未配置大模型推理密钥（DEEPSEEK_API_KEY），"
+                        "无法将自然语言自动编译为 DOAL 增量；请在配置密钥后使用 AI 本体论专家，或通过工具直接提交 DOAL overlay.json。"
+                    ),
+                    "assistant_mode": "offline_fallback",
+                    "assistant_model": None,
+                    "tool_trace": [],
+                    "cards": [],
+                    **bundle,
+                }
+
+        return self._run_m1_ontology_expert(
+            question,
+            payload,
+            actor,
+            draft_id=draft_id,
+            cfg=cfg,
+            model_label=model_label or "deepseek-flash",
+        )
+
+    def get_m1_draft(self, draft_id: str, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            draft = self._require_m1_draft(draft_id, actor)
+            return {"ok": True, **self._build_draft_bundle(draft, actor)}
+
+    def delete_m1_draft(self, draft_id: str, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            self._require_m1_draft(draft_id, actor)
+            self._m1_drafts.pop(draft_id, None)
+            return {"ok": True, "draft_id": draft_id, "deleted": True}
+
+    def apply_m1_draft(self, draft_id: str, actor: Actor) -> dict[str, Any]:
+        from .induction.dsl import apply_overlay_to_spec
+
+        with self._lock:
+            draft = self._require_m1_draft(draft_id, actor)
+            if not self.demo_actor_switch:
+                err = PermissionDeniedError(
+                    "Production M1 changes must be exported as DOAL overlay.json and merged via Git PR/CI"
+                )
+                err.code = "PRODUCTION_APPLY_REQUIRES_GIT_PR"  # type: ignore[attr-defined]
+                raise err
+            ov_copy = copy.deepcopy(draft.overlay)
+
+        proof = self._prove_draft_overlay(ov_copy)
+        if proof.get("prover_available") and proof.get("verdict") != "PROVEN_CLEAN":
+            raise InvariantError(
+                f"M1 draft {draft_id!r} failed Z3 formal verification (verdict={proof.get('verdict')})",
+                code="DRAFT_PROOF_FAILED",
+            )
+
+        with self._lock:
+            self._require_m1_draft(draft_id, actor)
+            derived_spec = apply_overlay_to_spec(self.runtime.spec, ov_copy)
+            self.runtime.spec = derived_spec
+            self.runtime._sync_registry()
+            self.work_queue_binding = self.work_queue_binding or self._infer_work_queue_binding()
+            self._proof_cache.clear()
+            self._m1_drafts.pop(draft_id, None)
+            new_bp = self._build_blueprint_from_spec(self.runtime.spec, actor)
+            if proof.get("prover_available"):
+                fp = new_bp["blueprint_fingerprint"]
+                self._proof_cache[(fp, True)] = copy.deepcopy(proof)
+            return {
+                "ok": True,
+                "applied_draft_id": draft_id,
+                "blueprint": new_bp,
+                "proof_report": proof,
+            }
+
 
 def _status_for_error(exc: Exception) -> int:
     if isinstance(exc, PermissionDeniedError):
@@ -4272,6 +5888,25 @@ def create_console_app(
     @app.get("/api/admin/org")
     def api_admin_org(req: Request) -> dict[str, Any]:
         return service.admin_org(_actor_from_request(req))
+
+    @app.post("/api/blueprint/expert/chat")
+    def api_blueprint_expert_chat(
+        payload: _M1ExpertChatPayload,
+        req: Request,
+    ) -> dict[str, Any]:
+        return service.m1_expert_chat(payload, _actor_from_request(req))
+
+    @app.get("/api/blueprint/drafts/{draft_id}")
+    def api_blueprint_draft_get(draft_id: str, req: Request) -> dict[str, Any]:
+        return service.get_m1_draft(draft_id, _actor_from_request(req))
+
+    @app.delete("/api/blueprint/drafts/{draft_id}")
+    def api_blueprint_draft_delete(draft_id: str, req: Request) -> dict[str, Any]:
+        return service.delete_m1_draft(draft_id, _actor_from_request(req))
+
+    @app.post("/api/blueprint/drafts/{draft_id}/apply")
+    def api_blueprint_draft_apply(draft_id: str, req: Request) -> dict[str, Any]:
+        return service.apply_m1_draft(draft_id, _actor_from_request(req))
 
     @app.post("/api/assistant/chat")
     def api_assistant_chat(payload: _AssistantPayload, req: Request) -> dict[str, Any]:

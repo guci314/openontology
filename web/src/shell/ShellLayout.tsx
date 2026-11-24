@@ -1,5 +1,5 @@
 import React from 'react';
-import { NavLink } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import {
   Activity,
   Bot,
@@ -9,6 +9,7 @@ import {
   Network,
   Settings,
   ShieldCheck,
+  Sparkles,
   UserCheck,
 } from 'lucide-react';
 import type { ConsoleMeta } from '../api/client';
@@ -19,6 +20,7 @@ interface ShellLayoutProps {
   pack?: DomainViewPack | null;
   onSwitchActor: (actorId: string) => Promise<void>;
   onOpenAssistant: () => void;
+  onOpenOntologyExpert?: () => void;
   children: React.ReactNode;
 }
 
@@ -27,8 +29,11 @@ export const ShellLayout: React.FC<ShellLayoutProps> = ({
   pack,
   onSwitchActor,
   onOpenAssistant,
+  onOpenOntologyExpert,
   children,
 }) => {
+  const location = useLocation();
+  const isBlueprintRoute = location.pathname.startsWith('/blueprint');
   const terms = resolveShellTerminology(pack);
   const modeLabel =
     meta.world_mode === 'coupled' ? '实时外设耦合模式' : '独立自治沙盘内核';
@@ -96,17 +101,29 @@ export const ShellLayout: React.FC<ShellLayoutProps> = ({
             )}
           </nav>
 
-          {/* Right: AI Assistant & Persona RLS Switcher */}
+          {/* Right: Route-Aware M0/M1 Dual Agent & Persona RLS Switcher */}
           <div className="flex shrink-0 items-center gap-1.5 xl:gap-2">
-            <button
-              type="button"
-              data-testid="open-assistant-btn"
-              onClick={onOpenAssistant}
-              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-blue-200 bg-blue-50/70 px-2.5 xl:px-3 py-1.5 text-xs font-semibold text-blue-800 transition hover:bg-blue-100"
-            >
-              <Bot className="h-4 w-4 shrink-0" />
-              <span>AI 数字管家</span>
-            </button>
+            {isBlueprintRoute ? (
+              <button
+                type="button"
+                data-testid="open-ontology-expert-btn"
+                onClick={() => onOpenOntologyExpert?.()}
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-violet-200 bg-violet-50/80 px-2.5 xl:px-3 py-1.5 text-xs font-semibold text-violet-800 transition hover:bg-violet-100"
+              >
+                <Sparkles className="h-4 w-4 shrink-0" />
+                <span>AI 本体论专家</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                data-testid="open-assistant-btn"
+                onClick={onOpenAssistant}
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-blue-200 bg-blue-50/70 px-2.5 xl:px-3 py-1.5 text-xs font-semibold text-blue-800 transition hover:bg-blue-100"
+              >
+                <Bot className="h-4 w-4 shrink-0" />
+                <span>AI 数字管家</span>
+              </button>
+            )}
 
             {meta.demo_actor_switch && meta.demo_actors.length > 0 ? (
               <div className="relative flex items-center rounded-xl border border-slate-200 bg-white px-2.5 py-1 shadow-sm">

@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import {
   ConsoleMeta,
+  M1DraftResponse,
   SchemaCatalog,
   consoleApi,
   getActiveActorId,
@@ -15,12 +16,14 @@ import { AuditPage } from './shell/pages/AuditPage';
 import { AdminPage } from './shell/pages/AdminPage';
 import { DynamicObjectDrawer } from './shell/components/DynamicObjectDrawer';
 import { AssistantDrawer } from './shell/components/AssistantDrawer';
+import { OntologyExpertDrawer } from './shell/components/blueprint/OntologyExpertDrawer';
 import { DomainViewPack, resolveActivePack } from './shell/packRegistry';
 import { registerEnterprisePack } from './packs/enterprise';
 
 registerEnterprisePack();
 
 const AppShell: React.FC = () => {
+  const location = useLocation();
   const [meta, setMeta] = useState<ConsoleMeta | null>(null);
   const [schema, setSchema] = useState<SchemaCatalog | null>(null);
   const [activePack, setActivePack] = useState<DomainViewPack | null>(null);
@@ -35,10 +38,20 @@ const AppShell: React.FC = () => {
     Array<{ entityType: string; recordId: string }>
   >([]);
   const [assistantOpen, setAssistantOpen] = useState(false);
+  const [expertOpen, setExpertOpen] = useState(false);
+  const [m1Draft, setM1Draft] = useState<M1DraftResponse | null>(null);
   const [pendingPresetId, setPendingPresetId] = useState<string | null>(null);
   const [pendingSandboxId, setPendingSandboxId] = useState<string | null>(null);
   const consumePendingPreset = useCallback(() => setPendingPresetId(null), []);
   const consumePendingSandbox = useCallback(() => setPendingSandboxId(null), []);
+
+  useEffect(() => {
+    if (location.pathname.startsWith('/blueprint')) {
+      setAssistantOpen(false);
+    } else {
+      setExpertOpen(false);
+    }
+  }, [location.pathname]);
 
   const loadBootstrap = useCallback(async () => {
     try {
@@ -81,6 +94,9 @@ const AppShell: React.FC = () => {
       setActiveActorId(actorId);
       setDrawerTarget(null);
       setDrawerHistory([]);
+      setAssistantOpen(false);
+      setExpertOpen(false);
+      setM1Draft(null);
       setPendingPresetId(null);
       setPendingSandboxId(null);
       await loadBootstrap();
@@ -88,6 +104,36 @@ const AppShell: React.FC = () => {
     },
     [loadBootstrap]
   );
+
+  const handleExportM1Draft = useCallback(() => {
+    if (!m1Draft?.draft_has_changes) return;
+    const blob = new Blob([JSON.stringify(m1Draft.draft_overlay, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `doal_overlay_${m1Draft.draft_id}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }, [m1Draft]);
+
+  const handleDiscardM1Draft = useCallback(async () => {
+    if (m1Draft?.draft_id) {
+      await consoleApi.deleteBlueprintDraft(m1Draft.draft_id).catch(() => {});
+    }
+    setM1Draft(null);
+  }, [m1Draft]);
+
+  const handleApplyM1Draft = useCallback(async () => {
+    if (!m1Draft?.draft_id || !m1Draft.draft_has_changes) return;
+    await consoleApi.applyBlueprintDraft(m1Draft.draft_id);
+    setM1Draft(null);
+    setExpertOpen(false);
+    handleRefresh();
+  }, [m1Draft, handleRefresh]);
 
   const openRootObject = useCallback((entityType: string, recordId: string) => {
     setDrawerHistory([]);
@@ -146,6 +192,7 @@ const AppShell: React.FC = () => {
       pack={activePack}
       onSwitchActor={handleSwitchActor}
       onOpenAssistant={() => setAssistantOpen(true)}
+      onOpenOntologyExpert={() => setExpertOpen(true)}
     >
       <Routes>
         <Route
@@ -169,6 +216,12 @@ const AppShell: React.FC = () => {
               key={meta.actor.actor_id}
               meta={meta}
               pack={activePack}
+              refreshTick={refreshTick}
+              draftState={m1Draft}
+              onOpenExpert={() => setExpertOpen(true)}
+              onExportDraft={handleExportM1Draft}
+              onApplyDraft={handleApplyM1Draft}
+              onDiscardDraft={handleDiscardM1Draft}
             />
           }
         />
@@ -228,7 +281,7 @@ const AppShell: React.FC = () => {
       />
 
       <AssistantDrawer
-        key={meta.actor.actor_id}
+        key={`m0-${meta.actor.actor_id}`}
         open={assistantOpen}
         meta={meta}
         onClose={() => setAssistantOpen(false)}
@@ -238,6 +291,18 @@ const AppShell: React.FC = () => {
           setPendingPresetId(null);
           setPendingSandboxId(sid);
         }}
+      />
+
+      <OntologyExpertDrawer
+        key={`m1-${meta.actor.actor_id}`}
+        open={expertOpen}
+        meta={meta}
+        draftState={m1Draft}
+        onDraftUpdated={setM1Draft}
+        onExportDraft={handleExportM1Draft}
+        onApplyDraft={handleApplyM1Draft}
+        onDiscardDraft={handleDiscardM1Draft}
+        onClose={() => setExpertOpen(false)}
       />
     </ShellLayout>
   );

@@ -15,6 +15,7 @@ import type {
   BlueprintProveResponse,
   BlueprintResponse,
   ConsoleMeta,
+  M1DraftResponse,
 } from '../../api/client';
 import { consoleApi } from '../../api/client';
 import { displayRoleName } from '../i18nErrorMap';
@@ -26,6 +27,12 @@ import { Z3ProvePanel } from '../components/blueprint/Z3ProvePanel';
 interface BlueprintPageProps {
   meta: ConsoleMeta;
   pack?: DomainViewPack | null;
+  refreshTick?: number;
+  draftState?: M1DraftResponse | null;
+  onOpenExpert?: () => void;
+  onExportDraft?: () => void;
+  onApplyDraft?: () => Promise<void>;
+  onDiscardDraft?: () => Promise<void>;
 }
 
 type BottomTab = 'actions' | 'primitives' | 'invariants';
@@ -46,7 +53,16 @@ const AUTONOMY_BADGE: Record<string, { label: string; cls: string }> = {
   },
 };
 
-export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
+export const BlueprintPage: React.FC<BlueprintPageProps> = ({
+  meta,
+  pack,
+  refreshTick = 0,
+  draftState,
+  onOpenExpert,
+  onExportDraft,
+  onApplyDraft,
+  onDiscardDraft,
+}) => {
   const [blueprint, setBlueprint] = useState<BlueprintResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -92,7 +108,17 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
 
   useEffect(() => {
     loadBlueprint();
-  }, [loadBlueprint, meta.actor.actor_id]);
+  }, [loadBlueprint, meta.actor.actor_id, refreshTick]);
+
+  const activeBlueprint = useMemo(
+    () => (draftState?.draft_has_changes ? draftState.preview_blueprint : blueprint),
+    [draftState, blueprint]
+  );
+
+  const activeProveResult = useMemo(
+    () => (draftState?.draft_has_changes && draftState.proof_report ? draftState.proof_report : proveResult),
+    [draftState, proveResult]
+  );
 
   const handleRunProve = useCallback(async (forceRefresh = false) => {
     setProveLoading(true);
@@ -110,13 +136,13 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
   }, []);
 
   const selectedEntity = useMemo(
-    () => blueprint?.object_types.find((o) => o.name === selectedType) || null,
-    [blueprint, selectedType]
+    () => activeBlueprint?.object_types.find((o) => o.name === selectedType) || null,
+    [activeBlueprint, selectedType]
   );
 
   const filteredActions = useMemo(() => {
-    if (!blueprint) return [];
-    return blueprint.actions.filter((act) => {
+    if (!activeBlueprint) return [];
+    return activeBlueprint.actions.filter((act) => {
       if (actionFilter === 'rule') return act.implementation_kind === 'rule';
       if (actionFilter === 'edit_function') return act.implementation_kind === 'edit_function';
       if (actionFilter === 'selected') {
@@ -124,7 +150,7 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
       }
       return true;
     });
-  }, [blueprint, actionFilter, selectedType]);
+  }, [activeBlueprint, actionFilter, selectedType]);
 
   if (loadError) {
     return (
@@ -141,7 +167,7 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
     );
   }
 
-  if (loading || !blueprint) {
+  if (loading || !activeBlueprint) {
     return (
       <div
         data-testid="blueprint-loading"
@@ -152,10 +178,70 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
     );
   }
 
-  const { summary } = blueprint;
+  const { summary } = activeBlueprint;
+  const isDraftPreview = Boolean(draftState?.draft_has_changes);
+  const draftProofBlocked = Boolean(
+    activeProveResult?.prover_available && activeProveResult?.verdict === 'ISSUES_FOUND'
+  );
 
   return (
     <div className="space-y-5" data-testid="blueprint-page">
+      {/* Draft Live Preview Banner */}
+      {isDraftPreview && draftState && (
+        <div
+          data-testid="blueprint-draft-banner"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-violet-300 bg-violet-50/90 px-5 py-3 text-xs text-violet-950 shadow-sm"
+        >
+          <div className="flex items-center gap-2.5">
+            <Sparkles className="h-4 w-4 shrink-0 text-violet-700" />
+            <div>
+              <span className="font-semibold">
+                正在预览 M1 草稿增量（{draftState.draft_id} · {draftState.draft_clauses_zh.length} 项变更，尚未应用到主世界）
+              </span>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {onOpenExpert && (
+              <button
+                type="button"
+                onClick={onOpenExpert}
+                className="rounded-lg border border-violet-300 bg-white px-2.5 py-1 font-medium text-violet-800 hover:bg-violet-100/60"
+              >
+                继续编辑草稿
+              </button>
+            )}
+            {onExportDraft && (
+              <button
+                type="button"
+                onClick={onExportDraft}
+                className="rounded-lg border border-violet-300 bg-white px-2.5 py-1 font-medium text-violet-800 hover:bg-violet-100/60"
+              >
+                导出 DOAL JSON
+              </button>
+            )}
+            {meta.demo_actor_switch && onApplyDraft && (
+              <button
+                type="button"
+                disabled={draftProofBlocked}
+                onClick={() => onApplyDraft()}
+                className="rounded-lg bg-violet-700 px-3 py-1 font-semibold text-white hover:bg-violet-800 disabled:opacity-45"
+              >
+                应用到演示世界
+              </button>
+            )}
+            {onDiscardDraft && (
+              <button
+                type="button"
+                onClick={() => onDiscardDraft()}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-600 hover:bg-slate-50"
+              >
+                放弃草稿
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Header Strip */}
       <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200/80 bg-white px-5 py-4 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
         <div>
@@ -165,18 +251,18 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
             </h1>
             <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-medium text-slate-700 ring-1 ring-slate-200">
               <Lock className="h-3 w-3 text-slate-500" />
-              只读蓝图 · 变更经由 Git / Overlay CI
+              {isDraftPreview ? '草稿实时预览中' : '只读蓝图 · 变更经由 Git / Overlay CI'}
             </span>
           </div>
           <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-            <span className="font-medium text-slate-700">{blueprint.spec_name}</span>
+            <span className="font-medium text-slate-700">{activeBlueprint.spec_name}</span>
             <span>·</span>
             <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-700">
-              v{blueprint.spec_version}
+              v{activeBlueprint.spec_version}
             </code>
             <span>·</span>
             <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-500">
-              #{blueprint.blueprint_fingerprint.slice(0, 12)}
+              #{activeBlueprint.blueprint_fingerprint.slice(0, 12)}
             </code>
           </div>
         </div>
@@ -248,10 +334,10 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
 
       {/* Z3 Formal Proof Panel */}
       <Z3ProvePanel
-        result={proveResult}
+        result={activeProveResult}
         loading={proveLoading}
         error={proveError}
-        collapsed={proveCollapsed}
+        collapsed={isDraftPreview ? proveCollapsed && !draftProofBlocked : proveCollapsed}
         onToggleCollapse={() => setProveCollapsed((v) => !v)}
         onReRun={() => handleRunProve(true)}
       />
@@ -260,8 +346,8 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
         <div className="lg:col-span-7">
           <M1TopologyGraph
-            objectTypes={blueprint.object_types}
-            links={blueprint.links}
+            objectTypes={activeBlueprint.object_types}
+            links={activeBlueprint.links}
             selectedType={selectedType}
             onSelectType={(name) => setSelectedType(name)}
           />
@@ -269,7 +355,7 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
         <div className="lg:col-span-5">
           <ObjectBlueprintInspector
             entity={selectedEntity}
-            actions={blueprint.actions}
+            actions={activeBlueprint.actions}
             display={meta.display}
             onSelectActionFilter={(typeName) => {
               setSelectedType(typeName);
@@ -300,7 +386,7 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
               }`}
             >
               <Zap className="h-3.5 w-3.5" />
-              <span>治理动作契约 ({blueprint.actions.length})</span>
+              <span>治理动作契约 ({activeBlueprint.actions.length})</span>
             </button>
 
             <button
@@ -316,7 +402,7 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
               <Code2 className="h-3.5 w-3.5" />
               <span>
                 图灵完备原语 & 只读函数 (
-                {blueprint.edit_functions.length + blueprint.functions.length})
+                {activeBlueprint.edit_functions.length + activeBlueprint.functions.length})
               </span>
             </button>
 
@@ -331,7 +417,7 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
               }`}
             >
               <ShieldCheck className="h-3.5 w-3.5" />
-              <span>系统红线不变量 ({blueprint.invariants.length})</span>
+              <span>系统红线不变量 ({activeBlueprint.invariants.length})</span>
             </button>
           </div>
 
@@ -339,7 +425,7 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
             <div className="flex flex-wrap items-center gap-1.5 text-xs">
               {(
                 [
-                  ['all', `全部 (${blueprint.actions.length})`],
+                  ['all', `全部 (${activeBlueprint.actions.length})`],
                   ['rule', `声明式 Rule (${summary.rule_action_count})`],
                   ['edit_function', `受审 EditFunction (${summary.edit_function_action_count})`],
                   ['selected', selectedEntity ? `仅 ${selectedEntity.display_label}` : '当前选中'],
@@ -375,11 +461,16 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
                 filteredActions.map((act) => {
                   const isRule = act.implementation_kind === 'rule';
                   const autoBadge = AUTONOMY_BADGE[act.autonomy_mode] || AUTONOMY_BADGE.auto;
+                  const isDraftAct = act.draft_status === 'draft_added';
                   return (
                     <div
                       key={act.name}
                       data-testid={`blueprint-action-${act.name}`}
-                      className="flex flex-col justify-between rounded-xl border border-slate-200 bg-slate-50/40 p-4"
+                      className={`flex flex-col justify-between rounded-xl border p-4 ${
+                        isDraftAct
+                          ? 'border-violet-300 bg-violet-50/40'
+                          : 'border-slate-200 bg-slate-50/40'
+                      }`}
                     >
                       <div>
                         <div className="flex flex-wrap items-start justify-between gap-2">
@@ -388,6 +479,11 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
                               <span className="text-sm font-semibold text-slate-900">
                                 {act.display_label}
                               </span>
+                              {isDraftAct && (
+                                <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800">
+                                  草稿新增
+                                </span>
+                              )}
                               <span
                                 className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
                                   isRule
@@ -497,10 +593,10 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
               <div>
                 <div className="mb-3 flex items-center gap-2 text-xs font-semibold text-slate-900">
                   <GitFork className="h-4 w-4 text-violet-700" />
-                  <span>图灵完备写原语 · EditFunctions ({blueprint.edit_functions.length})</span>
+                  <span>图灵完备写原语 · EditFunctions ({activeBlueprint.edit_functions.length})</span>
                 </div>
                 <div className="max-h-96 space-y-2 overflow-y-auto pr-1">
-                  {blueprint.edit_functions.map((ef) => (
+                  {activeBlueprint.edit_functions.map((ef) => (
                     <div
                       key={ef.name}
                       className="rounded-xl border border-slate-200 bg-slate-50/50 p-3 text-xs"
@@ -526,10 +622,10 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
               <div>
                 <div className="mb-3 flex items-center gap-2 text-xs font-semibold text-slate-900">
                   <Eye className="h-4 w-4 text-emerald-700" />
-                  <span>只读计算函数 · Read-Only Functions ({blueprint.functions.length})</span>
+                  <span>只读计算函数 · Read-Only Functions ({activeBlueprint.functions.length})</span>
                 </div>
                 <div className="max-h-96 space-y-2 overflow-y-auto pr-1">
-                  {blueprint.functions.map((fn) => (
+                  {activeBlueprint.functions.map((fn) => (
                     <div
                       key={fn.name}
                       className="rounded-xl border border-emerald-200/80 bg-emerald-50/30 p-3 text-xs"
@@ -553,15 +649,24 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
 
           {bottomTab === 'invariants' && (
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              {blueprint.invariants.map((inv) => (
+              {activeBlueprint.invariants.map((inv) => (
                 <div
                   key={`${inv.kind}:${inv.code || inv.name}`}
-                  className="rounded-xl border border-slate-200 bg-slate-50/40 p-4 text-xs"
+                  className={`rounded-xl border p-4 text-xs ${
+                    inv.draft_status === 'draft_added'
+                      ? 'border-violet-300 bg-violet-50/40'
+                      : 'border-slate-200 bg-slate-50/40'
+                  }`}
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
                       <Layers className="h-3.5 w-3.5 text-slate-600" />
                       <span className="font-mono font-semibold text-slate-900">{inv.name}</span>
+                      {inv.draft_status === 'draft_added' && (
+                        <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800">
+                          草稿新增
+                        </span>
+                      )}
                     </div>
                     <span
                       className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${

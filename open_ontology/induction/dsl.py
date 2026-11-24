@@ -3484,10 +3484,20 @@ def _compile_param_defs(params: Sequence[FieldSpec]) -> tuple[dict[str, Any], se
         _assert_safe_identifier(p.name, "action param")
         py_type = _resolve_scalar_type(p.field_type)
         if p.required:
-            default_val = ... if p.default is None else p.default
+            default_val: Any = ... if p.default is None else p.default
         else:
             default_val = _default_for_type(py_type) if p.default is None else p.default
-        param_defs[p.name] = (py_type, default_val)
+        if p.non_negative and py_type in (int, float):
+            field_spec_val: Any = Field(
+                default=default_val,
+                ge=0,
+                description=p.description or None,
+            )
+        elif p.description:
+            field_spec_val = Field(default=default_val, description=p.description)
+        else:
+            field_spec_val = default_val
+        param_defs[p.name] = (py_type, field_spec_val)
     return param_defs, set(param_defs.keys())
 
 
