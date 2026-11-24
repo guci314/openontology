@@ -101,6 +101,7 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({ meta, pack }) => {
     try {
       const res = await consoleApi.proveBlueprint(forceRefresh);
       setProveResult(res);
+      setProveCollapsed(Boolean(res.prover_available && res.verdict === 'PROVEN_CLEAN'));
     } catch (err) {
       setProveError(err instanceof Error ? err.message : '执行形式化体检失败');
     } finally {

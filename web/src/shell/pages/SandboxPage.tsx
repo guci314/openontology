@@ -10,12 +10,14 @@ import {
 } from 'lucide-react';
 import type {
   ConsoleMeta,
+  DisplayDictionary,
   RecordInstance,
   SandboxDiffResponse,
   SandboxPreset,
   SchemaCatalog,
 } from '../../api/client';
 import { consoleApi } from '../../api/client';
+import { ObjectRefCombobox } from '../components/ObjectRefCombobox';
 import {
   displayActionName,
   displayEntityName,
@@ -54,7 +56,8 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
   const [selectedAction, setSelectedAction] = useState<string>('');
   const [formValues, setFormValues] = useState<Record<string, string>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-  const [candidateObjects, setCandidateObjects] = useState<RecordInstance[]>([]);
+  const [objectsByType, setObjectsByType] = useState<Record<string, RecordInstance[]>>({});
+  const [loadingTargets, setLoadingTargets] = useState(false);
 
   const ensureSandbox = useCallback(async (): Promise<string> => {
     if (sandboxIdRef.current) return sandboxIdRef.current;
@@ -104,25 +107,100 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
     [schema.actions, selectedAction]
   );
 
-  // Preload visible candidate objects of touched entity types for <datalist> ID hints
-  useEffect(() => {
-    const touched = selectedActDef?.touched_object_types || [];
-    if (!touched.length) {
-      setCandidateObjects([]);
-      return;
+  const entityMetaByName = useMemo(
+    () => new Map(schema.object_types.map((ot) => [ot.name, ot])),
+    [schema.object_types]
+  );
+
+  const paramTargetTypes = useMemo(() => {
+    const resolved: Record<string, string> = {};
+    const props = selectedActDef?.params?.properties || {};
+    const touched = new Set(selectedActDef?.touched_object_types || []);
+    const toSnake = (s: string) => s.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+
+    for (const [pname, pschema] of Object.entries(props)) {
+      if (Array.isArray(pschema.enum) && pschema.enum.length > 0) continue;
+      if (pschema.type === 'integer' || pschema.type === 'number' || pschema.type === 'boolean') {
+        continue;
+      }
+      const lowerP = pname.toLowerCase();
+
+      // 1. Primary key match (disambiguate with touched entity types if multiple)
+      const pkHits = schema.object_types.filter((ot) => ot.primary_key.toLowerCase() === lowerP);
+      if (pkHits.length > 0) {
+        const touchedHit = pkHits.find((ot) => touched.has(ot.name));
+        if (touchedHit) {
+          resolved[pname] = touchedHit.name;
+          continue;
+        }
+        if (pkHits.length === 1) {
+          resolved[pname] = pkHits[0].name;
+          continue;
+        }
+      }
+
+      // 2. Link property match on touched entity types
+      const propHits = schema.object_properties.filter(
+        (prop) =>
+          (touched.size === 0 || touched.has(prop.domain)) &&
+          prop.field &&
+          (prop.field.toLowerCase() === lowerP || `${prop.field.toLowerCase()}_id` === lowerP)
+      );
+      if (propHits.length === 1) {
+        resolved[pname] = propHits[0].range;
+        continue;
+      }
+
+      // 3. Exact `<entity_name>_id` match
+      const nameHits = schema.object_types.filter(
+        (ot) =>
+          `${ot.name.toLowerCase()}_id` === lowerP || `${toSnake(ot.name)}_id` === lowerP
+      );
+      if (nameHits.length > 0) {
+        const touchedHit = nameHits.find((ot) => touched.has(ot.name));
+        resolved[pname] = (touchedHit || nameHits[0]).name;
+      }
     }
+    return resolved;
+  }, [selectedActDef, schema]);
+
+  // Clear cached lists when actor changes
+  useEffect(() => {
+    setObjectsByType({});
+  }, [meta.actor.actor_id]);
+
+  // Preload visible objects strictly for resolved parameter target entity types
+  useEffect(() => {
+    const needed = Array.from(new Set(Object.values(paramTargetTypes))).filter(
+      (et) => objectsByType[et] === undefined
+    );
+    if (!needed.length) return;
     let active = true;
+    setLoadingTargets(true);
     Promise.all(
-      touched.map((ot) =>
-        consoleApi.listObjects(ot).then((r) => r.items || []).catch(() => [] as RecordInstance[])
+      needed.map(
+        (et): Promise<[string, RecordInstance[]]> =>
+          consoleApi
+            .listObjects(et)
+            .then((r): [string, RecordInstance[]] => [et, r.items || []])
+            .catch((): [string, RecordInstance[]] => [et, []])
       )
-    ).then((lists) => {
-      if (active) setCandidateObjects(lists.flat());
-    });
+    )
+      .then((pairs) => {
+        if (!active) return;
+        setObjectsByType((prev) => {
+          const next = { ...prev };
+          for (const [et, items] of pairs) next[et] = items;
+          return next;
+        });
+      })
+      .finally(() => {
+        if (active) setLoadingTargets(false);
+      });
     return () => {
       active = false;
     };
-  }, [selectedActDef, meta.actor.actor_id]);
+  }, [paramTargetTypes, objectsByType]);
 
   const runPreset = useCallback(
     async (preset: SandboxPreset) => {
@@ -459,6 +537,7 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-700">选择推演操作</label>
                 <select
+                  data-testid="sandbox-action-select"
                   value={selectedAction}
                   onChange={(e) => {
                     setSelectedAction(e.target.value);
@@ -482,22 +561,23 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
                 const label = displayFieldName('', pname, meta.display);
                 const hasDefault = pschema.default !== undefined && pschema.default !== '';
                 const isReq = Boolean(selectedActDef?.params?.required?.includes(pname));
-                const listId =
-                  pschema.type !== 'integer' && pschema.type !== 'number' && candidateObjects.length > 0
-                    ? `sbx-dl-${selectedAction}-${pname}`
-                    : undefined;
-                const matchingCandidates = listId
-                  ? candidateObjects.filter((obj) => {
-                      if (candidateObjects.length <= 8) return true;
-                      const pnameBase = pname.replace(/_id$/, '').toLowerCase();
-                      return (
-                        obj.object_type.toLowerCase().includes(pnameBase) ||
-                        obj.primary_key.toLowerCase() === pname.toLowerCase()
-                      );
-                    })
-                  : [];
-                const suggestions =
-                  matchingCandidates.length > 0 ? matchingCandidates : candidateObjects.slice(0, 12);
+                const enumVals = Array.isArray(pschema.enum) ? pschema.enum : [];
+                const targetTypeName = paramTargetTypes[pname];
+                const targetEntity = targetTypeName ? entityMetaByName.get(targetTypeName) : undefined;
+                const clearParamError = () => {
+                  if (fieldErrors[pname]) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next[pname];
+                      return next;
+                    });
+                  }
+                };
+                const formatEnumLabel = (rawVal: unknown, display?: DisplayDictionary) => {
+                  const key = String(rawVal ?? '');
+                  const localized = display?.values?.[key] || display?.statuses?.[key];
+                  return localized && localized !== key ? `${localized}（${key}）` : key;
+                };
 
                 return (
                   <div key={pname}>
@@ -505,38 +585,69 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
                       {label}
                       {isReq && <span className="ml-1 text-rose-500">*</span>}
                     </label>
-                    <input
-                      type={pschema.type === 'integer' || pschema.type === 'number' ? 'number' : 'text'}
-                      step="any"
-                      list={listId}
-                      data-testid={`sandbox-param-${pname}`}
-                      value={formValues[pname] ?? ''}
-                      onChange={(e) => {
-                        setFormValues((prev) => ({ ...prev, [pname]: e.target.value }));
-                        if (fieldErrors[pname]) {
-                          setFieldErrors((prev) => {
-                            const next = { ...prev };
-                            delete next[pname];
-                            return next;
-                          });
-                        }
-                      }}
-                      placeholder={hasDefault ? `默认：${String(pschema.default)}` : `请输入${label}`}
-                      className={`w-full rounded-lg border px-3 py-1.5 font-mono text-xs text-slate-900 focus:bg-white focus:outline-none ${
-                        fieldErrors[pname]
-                          ? 'border-rose-400 bg-rose-50/40 focus:border-rose-500'
-                          : 'border-slate-200 bg-slate-50 focus:border-blue-500'
-                      }`}
-                    />
-                    {listId && suggestions.length > 0 && (
-                      <datalist id={listId}>
-                        {suggestions.slice(0, 15).map((obj) => (
-                          <option key={`${obj.object_type}:${obj.object_id}`} value={obj.object_id}>
-                            {displayEntityName(obj.object_type, meta.display)} · {obj.title}
-                          </option>
-                        ))}
-                      </datalist>
+
+                    {enumVals.length > 0 ? (
+                      <select
+                        data-testid={`sandbox-param-${pname}`}
+                        value={formValues[pname] ?? ''}
+                        onChange={(e) => {
+                          setFormValues((prev) => ({ ...prev, [pname]: e.target.value }));
+                          clearParamError();
+                        }}
+                        className={`w-full rounded-lg border px-3 py-1.5 text-xs text-slate-900 focus:bg-white focus:outline-none ${
+                          fieldErrors[pname]
+                            ? 'border-rose-400 bg-rose-50/40 focus:border-rose-500'
+                            : 'border-slate-200 bg-slate-50 focus:border-blue-500'
+                        }`}
+                      >
+                        <option value="">
+                          {hasDefault
+                            ? `默认：${formatEnumLabel(pschema.default, meta.display)}`
+                            : `请选择${label}...`}
+                        </option>
+                        {enumVals.map((val) => {
+                          const sVal = String(val);
+                          return (
+                            <option key={sVal} value={sVal}>
+                              {formatEnumLabel(val, meta.display)}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    ) : targetEntity ? (
+                      <ObjectRefCombobox
+                        paramName={pname}
+                        testId={`sandbox-param-${pname}`}
+                        value={formValues[pname] ?? ''}
+                        onChange={(nextVal) => {
+                          setFormValues((prev) => ({ ...prev, [pname]: nextVal }));
+                          clearParamError();
+                        }}
+                        targetEntity={targetEntity}
+                        options={objectsByType[targetEntity.name] || []}
+                        loading={loadingTargets && objectsByType[targetEntity.name] === undefined}
+                        meta={meta}
+                        hasError={Boolean(fieldErrors[pname])}
+                      />
+                    ) : (
+                      <input
+                        type={pschema.type === 'integer' || pschema.type === 'number' ? 'number' : 'text'}
+                        step="any"
+                        data-testid={`sandbox-param-${pname}`}
+                        value={formValues[pname] ?? ''}
+                        onChange={(e) => {
+                          setFormValues((prev) => ({ ...prev, [pname]: e.target.value }));
+                          clearParamError();
+                        }}
+                        placeholder={hasDefault ? `默认：${String(pschema.default)}` : `请输入${label}`}
+                        className={`w-full rounded-lg border px-3 py-1.5 font-mono text-xs text-slate-900 focus:bg-white focus:outline-none ${
+                          fieldErrors[pname]
+                            ? 'border-rose-400 bg-rose-50/40 focus:border-rose-500'
+                            : 'border-slate-200 bg-slate-50 focus:border-blue-500'
+                        }`}
+                      />
                     )}
+
                     {fieldErrors[pname] && (
                       <p className="mt-1 text-[11px] text-rose-600">{fieldErrors[pname]}</p>
                     )}

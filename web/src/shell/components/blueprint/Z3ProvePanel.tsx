@@ -204,16 +204,22 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
           </button>
           <button
             type="button"
+            data-testid="z3-toggle-collapse-btn"
             onClick={onToggleCollapse}
             className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-50"
           >
             {collapsed ? (
               <>
-                <ChevronDown className="h-3.5 w-3.5" /> 展开明细
+                <ChevronDown className="h-3.5 w-3.5" />
+                <span>
+                  {result.action_proofs?.length
+                    ? `展开 ${result.action_proofs.length} 条证明明细`
+                    : '展开明细'}
+                </span>
               </>
             ) : (
               <>
-                <ChevronUp className="h-3.5 w-3.5" /> 收起明细
+                <ChevronUp className="h-3.5 w-3.5" /> <span>收起明细</span>
               </>
             )}
           </button>
@@ -290,7 +296,10 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
           )}
 
           {result.action_proofs && result.action_proofs.length > 0 && (
-            <div className="rounded-lg border border-slate-200/80 bg-white p-3">
+            <div
+              data-testid="z3-action-proof-list"
+              className="rounded-lg border border-slate-200/80 bg-white p-3"
+            >
               <div className="mb-2 flex items-center justify-between">
                 <span className="inline-flex items-center gap-1.5 font-semibold text-slate-800">
                   <Sparkles className="h-3.5 w-3.5 text-emerald-600" />

@@ -122,6 +122,17 @@ def test_blueprint_enterprise_standalone_rls_and_tripartite_kinetics() -> None:
         assert ef_act["edit_function_name"] == "post_o2c_invoice"
         assert ef_act["rule_summary"] is None
 
+        # WO-29B: generic rule precondition enum enrichment on /api/blueprint & /api/tbox
+        vip_bp_prop = act_by_name["upgrade_account_vip_tier"]["params_schema"]["properties"]["vip_tier"]
+        assert vip_bp_prop["enum"] == ["STANDARD", "VIP_KEY", "STRATEGIC"]
+        tbox_acts = {a["name"]: a for a in tbox["actions"]}
+        vip_tbox_prop = tbox_acts["upgrade_account_vip_tier"]["params"]["properties"]["vip_tier"]
+        assert vip_tbox_prop["enum"] == ["STANDARD", "VIP_KEY", "STRATEGIC"]
+        meta_payload = client.get("/api/meta").json()
+        assert meta_payload["display"]["values"]["STANDARD"] == "标准客户"
+        assert meta_payload["display"]["values"]["VIP_KEY"] == "重点大客户"
+        assert meta_payload["display"]["values"]["STRATEGIC"] == "战略级客户"
+
         # Strictly RLS-filtered visible_count (CFO vs North PM)
         pm_bp = client.get(
             "/api/blueprint",
@@ -158,6 +169,13 @@ def test_blueprint_starship_blind_and_coupled_ownership() -> None:
         assert by_type["Starship"]["terminal_statuses"] == ["retired"]
         assert by_type["Starship"]["visible_count"] == 2
         assert by_type["WarpCore"]["transitions"] == {}
+
+        # WO-29B: Literal param enum schema on /api/blueprint & /api/tbox
+        jump_bp_enum = next(a for a in bp["actions"] if a["name"] == "jump_sector")["params_schema"]["properties"]["target_sector"]["enum"]
+        assert jump_bp_enum == ["alpha", "beta", "omega", "gamma"]
+        tbox = client.get("/api/tbox").json()
+        jump_tbox_enum = next(a for a in tbox["actions"] if a["name"] == "jump_sector")["params"]["properties"]["target_sector"]["enum"]
+        assert jump_tbox_enum == ["alpha", "beta", "omega", "gamma"]
 
         alpha_bp = client.get(
             "/api/blueprint",
@@ -369,6 +387,15 @@ def test_blueprint_playwright_e2e_enterprise_and_starship() -> None:
             verdict_text = page.inner_text('[data-testid="z3-verdict-clean"]')
             assert "0 死锁" in verdict_text
             assert "EXACT_QF_LIA" in verdict_text
+
+            # WO-29B: PROVEN_CLEAN defaults to collapsed details so SVG topology stays visible above the fold
+            assert page.locator('[data-testid="z3-action-proof-list"]').count() == 0
+            toggle_text = page.inner_text('[data-testid="z3-toggle-collapse-btn"]')
+            assert "展开 33 条证明明细" in toggle_text
+            topo_box = page.locator('[data-testid="blueprint-topology-svg"]').bounding_box()
+            assert topo_box is not None and topo_box["y"] < 700
+            page.click('[data-testid="z3-toggle-collapse-btn"]')
+            page.wait_for_selector('[data-testid="z3-action-proof-list"]')
             page.close()
 
             # 2. Starship Pure L1 /blueprint (Zero enterprise copy + Z3 prove + FSM toggle)
@@ -385,6 +412,7 @@ def test_blueprint_playwright_e2e_enterprise_and_starship() -> None:
 
             star_page.click('[data-testid="run-z3-prove-btn"]')
             star_page.wait_for_selector('[data-testid="z3-verdict-clean"]')
+            assert star_page.locator('[data-testid="z3-action-proof-list"]').count() == 0
 
             star_body = star_page.inner_text("body")
             for forbidden in ("经营驾驶舱", "业务台账", "单据", "客户自有", "客户", "业务"):
@@ -394,6 +422,50 @@ def test_blueprint_playwright_e2e_enterprise_and_starship() -> None:
             for jargon in ("TBox", "ABox", "ObjectType", "state_fingerprint", "InvariantError"):
                 assert jargon not in star_body, (
                     f"Starship /blueprint 夹带底层技术黑话：{jargon}"
+                )
+
+            # 3. WO-29B: Starship /sandbox semantic 3-way pickers (Combobox + localized Enum <select>)
+            star_page.click('[data-testid="nav-sandbox"]')
+            star_page.wait_for_selector('[data-testid="sandbox-page"]')
+            star_page.select_option('[data-testid="sandbox-action-select"]', "jump_sector")
+            star_page.wait_for_selector('[data-testid="sandbox-param-ship_id"]')
+
+            # Open ship_id combobox -> strictly Starship records (Enterprise & Voyager), ZERO WarpCore
+            star_page.click('[data-testid="sandbox-param-ship_id"]')
+            star_page.wait_for_selector('[data-testid="combobox-menu-ship_id"]')
+            menu_text = star_page.inner_text('[data-testid="combobox-menu-ship_id"]')
+            assert "Enterprise" in menu_text
+            assert "Voyager" in menu_text
+            assert "WC-1" not in menu_text
+            assert "WC-2" not in menu_text
+
+            star_page.click('[data-testid="combobox-option-SS-01"]')
+            assert star_page.locator('[data-testid="sandbox-param-ship_id"]').input_value() == "SS-01"
+            resolved_pill = star_page.inner_text('[data-testid="combobox-resolved-ship_id"]')
+            assert "Enterprise" in resolved_pill
+            assert "SS-01" in resolved_pill
+
+            # Inspect target_sector <select> -> localized options, ZERO object IDs
+            sector_tag = star_page.locator('[data-testid="sandbox-param-target_sector"]').evaluate(
+                "el => el.tagName"
+            )
+            assert sector_tag == "SELECT"
+            sector_options_text = star_page.inner_text('[data-testid="sandbox-param-target_sector"]')
+            assert "Omega 星域（omega）" in sector_options_text
+            assert "SS-01" not in sector_options_text
+            assert "WC-1" not in sector_options_text
+
+            star_page.select_option('[data-testid="sandbox-param-target_sector"]', "omega")
+            star_page.click('[data-testid="sandbox-custom-submit"]')
+            star_page.wait_for_selector('[data-testid="sandbox-diff-list"]')
+            diff_text = star_page.inner_text('[data-testid="sandbox-diff-list"]')
+            assert "SS-01" in diff_text
+            assert "Enterprise" in diff_text
+
+            sandbox_body = star_page.inner_text("body")
+            for forbidden in ("经营驾驶舱", "业务台账", "单据", "客户自有", "客户", "业务"):
+                assert forbidden not in sandbox_body, (
+                    f"Starship /sandbox 泄漏企业词汇：{forbidden}"
                 )
             star_page.close()
 

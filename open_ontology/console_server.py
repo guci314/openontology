@@ -151,6 +151,7 @@ def _merge_display(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[st
         "interfaces",
         "roles",
         "statuses",
+        "values",
         "cardinalities",
         "kinds",
         "invariants",
@@ -171,6 +172,70 @@ def _merge_display(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[st
         if key not in merged:
             merged[key] = val
     return merged
+
+
+def _walk_param_enums(node: Any, out: dict[str, list[Any]]) -> None:
+    if not isinstance(node, Mapping):
+        return
+    op = node.get("op")
+    if op == "and":
+        for sub in node.get("args") or ():
+            _walk_param_enums(sub, out)
+        return
+    if op == "in":
+        left = node.get("left")
+        right = node.get("right")
+        if (
+            isinstance(left, Mapping)
+            and isinstance(left.get("ref"), str)
+            and left["ref"].startswith("param.")
+            and isinstance(right, Mapping)
+            and isinstance(right.get("lit"), list)
+            and len(right["lit"]) > 0
+            and all(isinstance(v, (str, int, float, bool)) for v in right["lit"])
+        ):
+            pname = left["ref"][len("param.") :]
+            if pname and "." not in pname:
+                out.setdefault(pname, list(right["lit"]))
+
+
+def _enrich_action_params_schema(
+    act_def: Any,
+    base_schema: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if base_schema is not None:
+        schema = copy.deepcopy(dict(base_schema))
+    elif act_def is not None and getattr(act_def, "params", None) is not None:
+        schema = act_def.params.model_json_schema()
+    else:
+        return {}
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return schema
+    for pschema in props.values():
+        if not isinstance(pschema, dict) or "enum" in pschema:
+            continue
+        branches = [
+            b
+            for b in (pschema.get("anyOf") or ())
+            if isinstance(b, Mapping) and b.get("type") != "null"
+        ]
+        if len(branches) == 1 and isinstance(branches[0].get("enum"), list):
+            pschema["enum"] = list(branches[0]["enum"])
+    if act_def is not None and getattr(act_def, "implementation_kind", None) == "rule":
+        param_enums: dict[str, list[Any]] = {}
+        for rule in getattr(act_def, "submission_criteria", ()) or ():
+            must_hold = (
+                rule.get("must_hold")
+                if isinstance(rule, Mapping)
+                else getattr(rule, "must_hold", None)
+            )
+            _walk_param_enums(must_hold, param_enums)
+        for pname, vals in param_enums.items():
+            prop_schema = props.get(pname)
+            if isinstance(prop_schema, dict) and "enum" not in prop_schema:
+                prop_schema["enum"] = list(vals)
+    return schema
 
 
 def _format_validation_error_zh(
@@ -985,6 +1050,7 @@ class ConsoleService:
                 enriched_actions.append(
                     {
                         **act,
+                        "params": _enrich_action_params_schema(act_def, act.get("params")),
                         "display_label": act_labels.get(act["name"]) or act["name"],
                         "touched_object_types": (
                             list(act_def.touched_object_types) if act_def is not None else []
@@ -1106,11 +1172,7 @@ class ConsoleService:
                         "allowed_roles": list(act_def.allowed_roles),
                         "in_role_scope": aname in scoped_action_names,
                         "touched_object_types": touched,
-                        "params_schema": (
-                            act_def.params.model_json_schema()
-                            if act_def.params is not None
-                            else {}
-                        ),
+                        "params_schema": _enrich_action_params_schema(act_def),
                         "rule_summary": rule_summary,
                         "autonomy_mode": self._resolve_action_autonomy_label(aname, actor),
                     }

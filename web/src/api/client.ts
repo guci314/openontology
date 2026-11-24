@@ -25,6 +25,7 @@ export interface DisplayDictionary {
   interfaces?: Record<string, string>;
   roles?: Record<string, string>;
   statuses?: Record<string, string>;
+  values?: Record<string, string>;
   cardinalities?: Record<string, string>;
   kinds?: Record<string, string>;
   invariants?: Record<string, string>;
@@ -136,7 +137,16 @@ export interface SchemaActionMeta {
   visibility: string;
   params: {
     type?: string;
-    properties?: Record<string, { type?: string; title?: string; default?: unknown; description?: string }>;
+    properties?: Record<
+      string,
+      {
+        type?: string;
+        title?: string;
+        default?: unknown;
+        description?: string;
+        enum?: unknown[];
+      }
+    >;
     required?: string[];
   };
 }

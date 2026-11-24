@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from pydantic import BaseModel
 
@@ -553,6 +553,11 @@ def _merge_std_display(spec: OntologySpec) -> None:
                 "CLOSED_WON": "已赢单",
                 "PROPOSAL": "方案报价",
                 "NEGOTIATION": "商务谈判",
+            },
+            "values": {
+                "STANDARD": "标准客户",
+                "VIP_KEY": "重点大客户",
+                "STRATEGIC": "战略级客户",
             },
             "errors": {
                 "ILLEGAL_DOCUMENT_TRANSITION": "当前单据状态不允许直接跃迁到目标状态。",
@@ -1884,7 +1889,7 @@ def build_starship_console(*, demo_actor_switch: bool = True) -> ConsoleService:
 
     class JumpSectorParams(BaseModel):
         ship_id: str
-        target_sector: str
+        target_sector: Literal["alpha", "beta", "omega", "gamma"]
         cost_cells: int = 2
 
     class RefuelCoreParams(BaseModel):
