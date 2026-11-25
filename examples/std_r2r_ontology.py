@@ -26,6 +26,7 @@ from open_ontology.induction.dsl import (
     ActionMutationSpec,
     DeclarativeBlueprint,
     InvariantRuleSpec,
+    enforce_edit_function_contracts,
     export_spec_blueprint,
     register_rule_action,
 )
@@ -341,6 +342,171 @@ def _compute_entity_trial_balance_dict(
     PostJournalEntryParams,
     description="复式总账凭证过账：校验正金额、借贷异目、同主体、科目激活、期间开放及大额手工调账 WorkCard 审批门禁。",
     touched_object_types=("JournalEntry", "GlAccount"),
+    modifies=("JournalEntry.status", "GlAccount.debit_total_cents", "GlAccount.credit_total_cents"),
+    ensures=(
+        {
+            "name": "post_je_status_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "JournalEntry",
+            "id_param": "entry_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "draft"}},
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "posted"}},
+                    {"op": "gt", "left": {"ref": "before.amount_cents"}, "right": {"lit": 0}},
+                    {
+                        "op": "ne",
+                        "left": {"ref": "before.debit_account"},
+                        "right": {"ref": "before.credit_account"},
+                    },
+                    {
+                        "op": "exists",
+                        "object_type": "GlAccount",
+                        "where": {
+                            "op": "eq",
+                            "left": {"ref": "target.account_code"},
+                            "right": {"ref": "before.debit_account"},
+                        },
+                    },
+                    {
+                        "op": "exists",
+                        "object_type": "GlAccount",
+                        "where": {
+                            "op": "eq",
+                            "left": {"ref": "target.account_code"},
+                            "right": {"ref": "before.credit_account"},
+                        },
+                    },
+                ],
+            },
+            "description": "记账凭证过账仅可由 draft 跃迁至 posted，正金额、借贷异目且借贷科目均存在。",
+        },
+        {
+            "name": "post_je_gl_debit_leg",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "GlAccount",
+            "when": {
+                "op": "exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {"op": "eq", "left": {"ref": "target.debit_account"}, "right": {"ref": "after.account_code"}},
+                    ],
+                },
+            },
+            "must_hold": {
+                "op": "exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.debit_total_cents"},
+                            "right": {
+                                "op": "add",
+                                "left": {"ref": "before.debit_total_cents"},
+                                "right": {"ref": "target.amount_cents"},
+                            },
+                        },
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.credit_total_cents"},
+                            "right": {"ref": "before.credit_total_cents"},
+                        },
+                    ],
+                },
+            },
+            "description": "过账后借方科目借方累计精确增加凭证金额且贷方累计不变。",
+        },
+        {
+            "name": "post_je_gl_credit_leg",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "GlAccount",
+            "when": {
+                "op": "exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {"op": "eq", "left": {"ref": "target.credit_account"}, "right": {"ref": "after.account_code"}},
+                    ],
+                },
+            },
+            "must_hold": {
+                "op": "exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.credit_total_cents"},
+                            "right": {
+                                "op": "add",
+                                "left": {"ref": "before.credit_total_cents"},
+                                "right": {"ref": "target.amount_cents"},
+                            },
+                        },
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.debit_total_cents"},
+                            "right": {"ref": "before.debit_total_cents"},
+                        },
+                    ],
+                },
+            },
+            "description": "过账后贷方科目贷方累计精确增加凭证金额且借方累计不变。",
+        },
+        {
+            "name": "post_je_gl_unchanged_rows",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "GlAccount",
+            "when": {
+                "op": "not_exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {
+                            "op": "or",
+                            "args": [
+                                {
+                                    "op": "eq",
+                                    "left": {"ref": "target.debit_account"},
+                                    "right": {"ref": "after.account_code"},
+                                },
+                                {
+                                    "op": "eq",
+                                    "left": {"ref": "target.credit_account"},
+                                    "right": {"ref": "after.account_code"},
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.debit_total_cents"}, "right": {"ref": "before.debit_total_cents"}},
+                    {
+                        "op": "eq",
+                        "left": {"ref": "after.credit_total_cents"},
+                        "right": {"ref": "before.credit_total_cents"},
+                    },
+                ],
+            },
+            "description": "无关总账科目过账前后借贷累计严格保持不变。",
+        },
+    ),
 )
 def post_journal_entry(ctx: Any, params: PostJournalEntryParams) -> None:
     entry = ctx.require(JournalEntry, params.entry_id)
@@ -428,6 +594,190 @@ spec.declare_action(
     ReverseJournalEntryParams,
     description="对已过账凭证执行借贷互换红字冲正（禁直接删改已过账凭证、禁重复冲正、禁跨关账期间冲正）。",
     touched_object_types=("JournalEntry", "GlAccount"),
+    modifies=("JournalEntry.status", "GlAccount.debit_total_cents", "GlAccount.credit_total_cents"),
+    creates=("JournalEntry",),
+    ensures=(
+        {
+            "name": "reverse_je_orig_status_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "JournalEntry",
+            "id_param": "entry_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "posted"}},
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "reversed"}},
+                    {"op": "ge", "left": {"ref": "before.amount_cents"}, "right": {"lit": 0}},
+                    {
+                        "op": "ne",
+                        "left": {"ref": "before.debit_account"},
+                        "right": {"ref": "before.credit_account"},
+                    },
+                    {
+                        "op": "exists",
+                        "object_type": "GlAccount",
+                        "where": {
+                            "op": "eq",
+                            "left": {"ref": "target.account_code"},
+                            "right": {"ref": "before.debit_account"},
+                        },
+                    },
+                    {
+                        "op": "exists",
+                        "object_type": "GlAccount",
+                        "where": {
+                            "op": "eq",
+                            "left": {"ref": "target.account_code"},
+                            "right": {"ref": "before.credit_account"},
+                        },
+                    },
+                ],
+            },
+            "description": "原已过账凭证冲正后必须由 posted 跃迁至 reversed，且原借贷科目均存在且相异。",
+        },
+        {
+            "name": "reverse_je_created_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "JournalEntry",
+            "when": {
+                "op": "ne",
+                "left": {"ref": "after.entry_id"},
+                "right": {"ref": "param.entry_id"},
+            },
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "posted"}},
+                    {"op": "ge", "left": {"ref": "after.amount_cents"}, "right": {"lit": 0}},
+                ],
+            },
+            "description": "新建红字冲正凭证初态必须为 posted 且金额非负。",
+        },
+        {
+            "name": "reverse_je_gl_debit_leg",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "GlAccount",
+            "when": {
+                "op": "exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {"op": "eq", "left": {"ref": "target.credit_account"}, "right": {"ref": "after.account_code"}},
+                    ],
+                },
+            },
+            "must_hold": {
+                "op": "exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.debit_total_cents"},
+                            "right": {
+                                "op": "add",
+                                "left": {"ref": "before.debit_total_cents"},
+                                "right": {"ref": "target.amount_cents"},
+                            },
+                        },
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.credit_total_cents"},
+                            "right": {"ref": "before.credit_total_cents"},
+                        },
+                    ],
+                },
+            },
+            "description": "红字冲正时原贷方科目的借方累计精确增加原凭证金额且贷方累计不变。",
+        },
+        {
+            "name": "reverse_je_gl_credit_leg",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "GlAccount",
+            "when": {
+                "op": "exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {"op": "eq", "left": {"ref": "target.debit_account"}, "right": {"ref": "after.account_code"}},
+                    ],
+                },
+            },
+            "must_hold": {
+                "op": "exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.credit_total_cents"},
+                            "right": {
+                                "op": "add",
+                                "left": {"ref": "before.credit_total_cents"},
+                                "right": {"ref": "target.amount_cents"},
+                            },
+                        },
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.debit_total_cents"},
+                            "right": {"ref": "before.debit_total_cents"},
+                        },
+                    ],
+                },
+            },
+            "description": "红字冲正时原借方科目的贷方累计精确增加原凭证金额且借方累计不变。",
+        },
+        {
+            "name": "reverse_je_gl_unchanged_rows",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "GlAccount",
+            "when": {
+                "op": "not_exists",
+                "object_type": "JournalEntry",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "target.entry_id"}, "right": {"ref": "param.entry_id"}},
+                        {
+                            "op": "or",
+                            "args": [
+                                {
+                                    "op": "eq",
+                                    "left": {"ref": "target.debit_account"},
+                                    "right": {"ref": "after.account_code"},
+                                },
+                                {
+                                    "op": "eq",
+                                    "left": {"ref": "target.credit_account"},
+                                    "right": {"ref": "after.account_code"},
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.debit_total_cents"}, "right": {"ref": "before.debit_total_cents"}},
+                    {
+                        "op": "eq",
+                        "left": {"ref": "after.credit_total_cents"},
+                        "right": {"ref": "before.credit_total_cents"},
+                    },
+                ],
+            },
+            "description": "无关总账科目红字冲正前后借贷累计严格保持不变。",
+        },
+    ),
 )
 def reverse_journal_entry(ctx: Any, params: ReverseJournalEntryParams) -> None:
     orig = ctx.require(JournalEntry, params.entry_id)
@@ -538,6 +888,49 @@ register_rule_action(
     CloseFiscalPeriodParams,
     description="关账前强制复核全实体试算平衡并落库不可变试算快照，将期间闭环为 closed。",
     touched_object_types=("FiscalPeriod", "TrialBalanceSnapshot"),
+    modifies=("FiscalPeriod.status",),
+    creates=("TrialBalanceSnapshot",),
+    ensures=(
+        {
+            "name": "close_period_status_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "FiscalPeriod",
+            "id_param": "period_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {
+                        "op": "in",
+                        "left": {"ref": "before.status"},
+                        "right": {"lit": ["open", "closing"]},
+                    },
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "closed"}},
+                ],
+            },
+            "description": "会计期间关账须由 open/closing 跃迁至 closed。",
+        },
+        {
+            "name": "close_period_snapshot_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "TrialBalanceSnapshot",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "verified"}},
+                    {"op": "ge", "left": {"ref": "after.total_debit_cents"}, "right": {"lit": 0}},
+                    {"op": "ge", "left": {"ref": "after.total_credit_cents"}, "right": {"lit": 0}},
+                    {"op": "ge", "left": {"ref": "after.entry_count"}, "right": {"lit": 0}},
+                    {"op": "eq", "left": {"ref": "after.is_balanced"}, "right": {"lit": True}},
+                    {
+                        "op": "eq",
+                        "left": {"ref": "after.total_debit_cents"},
+                        "right": {"ref": "after.total_credit_cents"},
+                    },
+                ],
+            },
+            "description": "关账生成的 TrialBalanceSnapshot 必须为 verified、数值非负且借贷试算严格平衡。",
+        },
+    ),
 )
 def close_fiscal_period(ctx: Any, params: CloseFiscalPeriodParams) -> None:
     period = ctx.require(FiscalPeriod, params.period_id)
@@ -658,3 +1051,6 @@ def build_std_r2r_blueprint() -> DeclarativeBlueprint:
         imports=("std_core_ontology",),
         description="标准 R2R 领域本体蓝图：在核心底座上组合会计期间、总账科目、复式记账凭证与试算平衡快照。",
     )
+
+
+enforce_edit_function_contracts(spec)

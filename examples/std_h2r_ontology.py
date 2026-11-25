@@ -26,6 +26,7 @@ from open_ontology.induction.dsl import (
     ActionMutationSpec,
     DeclarativeBlueprint,
     InvariantRuleSpec,
+    enforce_edit_function_contracts,
     export_spec_blueprint,
     register_rule_actions,
 )
@@ -730,6 +731,34 @@ register_rule_actions(
     ReparentDepartmentParams,
     description="变更部门上级归属节点；强制校验 DAG 防环（禁指向自身或任何后代）及同主体隔离。",
     touched_object_types=("Department",),
+    modifies=("Department.parent_department",),
+    ensures=(
+        {
+            "name": "reparent_dept_no_self_loop",
+            "code": "DEPARTMENT_CYCLE_DETECTED",
+            "target_type": "Department",
+            "id_param": "department_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "active"}},
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "active"}},
+                    {
+                        "op": "or",
+                        "args": [
+                            {"op": "eq", "left": {"ref": "after.parent_department"}, "right": {"lit": None}},
+                            {
+                                "op": "ne",
+                                "left": {"ref": "after.parent_department"},
+                                "right": {"ref": "after.department_id"},
+                            },
+                        ],
+                    },
+                ],
+            },
+            "description": "仅 active 部门可调整上级部门，且目标上级不得为自身。",
+        },
+    ),
 )
 def reparent_department(ctx: Any, params: ReparentDepartmentParams) -> None:
     dept = ctx.require(Department, params.department_id)
@@ -786,6 +815,46 @@ spec.declare_action(
     OffboardEmployeeParams,
     description="办理员工离职并在同一原子事务内自动吊销其作为授权人与被授权人的全部 active AuthorityMandate。",
     touched_object_types=("Employee", "AuthorityMandate"),
+    modifies=("Employee.status", "AuthorityMandate.status"),
+    ensures=(
+        {
+            "name": "offboard_emp_status_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "Employee",
+            "id_param": "employee_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {
+                        "op": "in",
+                        "left": {"ref": "before.status"},
+                        "right": {"lit": ["active", "suspended"]},
+                    },
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "offboarded"}},
+                ],
+            },
+            "description": "离职员工须由 active/suspended 原子跃迁为 offboarded。",
+        },
+        {
+            "name": "offboard_mandate_revoke_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "AuthorityMandate",
+            "must_hold": {
+                "op": "or",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"ref": "before.status"}},
+                    {
+                        "op": "and",
+                        "args": [
+                            {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "active"}},
+                            {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "revoked"}},
+                        ],
+                    },
+                ],
+            },
+            "description": "受员工离职连带影响的动态授权凭证仅允许维持原状态或由 active 吊销为 revoked。",
+        },
+    ),
 )
 def offboard_employee(ctx: Any, params: OffboardEmployeeParams) -> None:
     emp = ctx.require(Employee, params.employee_id)
@@ -935,3 +1004,6 @@ def build_std_h2r_blueprint() -> DeclarativeBlueprint:
         imports=("std_core_ontology",),
         description="标准 H2R 领域本体蓝图：在核心底座上组合部门组织、岗位定编、员工档案与动态授权委派。",
     )
+
+
+enforce_edit_function_contracts(spec)

@@ -647,10 +647,20 @@ def test_wo33_doal_dogfooding_expressiveness_and_z3_hoare_proofs() -> None:
             assert rep_std.conditional_deadlock_count == 0
             assert rep_std.invariant_violation_count == 0
             assert rep_std.redundant_rule_count == 0
+            assert rep_std.vacuous_contract_count == 0
+            assert rep_std.uncontracted_edit_function_count == 0
+            assert rep_std.exact_wp_proved_count == 22
+            assert rep_std.contract_proved_count == 9
             assert {r.action_name for r in rep_std.reachability if r.implementation_kind == "rule"} == set(std_rule_names)
             assert all(r.status == "REACHABLE" for r in rep_std.reachability if r.implementation_kind == "rule")
-            assert {p.action_name for p in rep_std.invariant_preservation} == set(std_rule_names)
-            assert all(p.status == "PROVED" for p in rep_std.invariant_preservation)
+            assert {p.action_name for p in rep_std.invariant_preservation} == set(std_rule_names) | expected_efs
+            for p in rep_std.invariant_preservation:
+                if p.action_name in expected_efs:
+                    assert p.status == "CONTRACT_PROVED"
+                    assert p.proof_kind == "contract_assume_guarantee"
+                else:
+                    assert p.status == "PROVED"
+                    assert p.proof_kind == "exact_wp"
 
             rep_ent = prove_blueprint(ent_spec, check_redundancy=True)
             assert rep_ent.ok is True
@@ -658,10 +668,20 @@ def test_wo33_doal_dogfooding_expressiveness_and_z3_hoare_proofs() -> None:
             assert rep_ent.total_deadlock_count == 0
             assert rep_ent.conditional_deadlock_count == 0
             assert rep_ent.invariant_violation_count == 0
+            assert rep_ent.vacuous_contract_count == 0
+            assert rep_ent.uncontracted_edit_function_count == 0
+            assert rep_ent.exact_wp_proved_count == 24
+            assert rep_ent.contract_proved_count == 9
             assert {r.action_name for r in rep_ent.reachability if r.implementation_kind == "rule"} == set(ent_rule_names)
             assert all(r.status == "REACHABLE" for r in rep_ent.reachability if r.implementation_kind == "rule")
-            assert {p.action_name for p in rep_ent.invariant_preservation} == set(ent_rule_names)
-            assert all(p.status == "PROVED" for p in rep_ent.invariant_preservation)
+            assert {p.action_name for p in rep_ent.invariant_preservation} == set(ent_rule_names) | expected_efs
+            for p in rep_ent.invariant_preservation:
+                if p.action_name in expected_efs:
+                    assert p.status == "CONTRACT_PROVED"
+                    assert p.proof_kind == "contract_assume_guarantee"
+                else:
+                    assert p.status == "PROVED"
+                    assert p.proof_kind == "exact_wp"
 
             rep_star = prove_blueprint(star_spec, check_redundancy=True)
             assert rep_star.ok is True

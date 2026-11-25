@@ -36,6 +36,7 @@ from open_ontology.induction import (
     apply_overlay_to_spec,
     compile_blueprint,
     compose_blueprints,
+    enforce_edit_function_contracts,
 )
 from open_ontology.spec import (
     EditFunctionDef,
@@ -239,6 +240,7 @@ def build_enterprise_standard_spec(
             }
         }
     )
+    enforce_edit_function_contracts(unified)
     return unified
 
 
@@ -305,6 +307,7 @@ def build_org_rls_enterprise_spec(
             rls_object_types=eff_rls,
             security_tag_field="org",
         )
+    enforce_edit_function_contracts(spec)
     return spec
 
 

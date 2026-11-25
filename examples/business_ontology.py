@@ -359,6 +359,19 @@ def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
     cid = params.card_id.strip() or f"WC-{uuid.uuid4().hex[:10].upper()}"
     if ctx.get(WorkCard, cid) is not None:
         raise InvariantError(f"WorkCard:{cid} already exists", code="WORK_CARD_EXISTS")
+    for existing in ctx.query(WorkCard):
+        if (
+            existing.status in ("OPEN", "IN_PROGRESS")
+            and existing.card_kind == params.card_kind
+            and existing.target_object_type == params.target_object_type
+            and existing.target_object_id == params.target_object_id
+            and existing.requested_action == params.requested_action
+        ):
+            raise InvariantError(
+                f"duplicate active WorkCard for {(params.card_kind, params.target_object_type, params.target_object_id, params.requested_action)}: "
+                f"{existing.card_id} and {cid}",
+                code="DUPLICATE_ACTIVE_WORK_CARD",
+            )
     if params.card_kind == "APPROVAL":
         try:
             act_def = ctx.spec.get_action(params.requested_action)
@@ -389,6 +402,11 @@ def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
 def _complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> None:
     card = ctx.require(WorkCard, params.card_id)
     _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
+    if card.status not in ("OPEN", "IN_PROGRESS", "SLA_BREACHED"):
+        raise InvariantError(
+            f"WorkCard:{card.card_id} illegal transition {card.status!r} -> 'COMPLETED'",
+            code="ILLEGAL_DOCUMENT_TRANSITION",
+        )
     if card.card_kind == "APPROVAL":
         target_action = ctx.spec.get_action(card.requested_action)
         if target_action.affects_source:
@@ -528,9 +546,100 @@ def register_work_card_primitives(
 
         target_spec.invariants["work_card_segregation_of_duties"].handler.__declarative_rule__ = wc_inv_rules[1]  # type: ignore[attr-defined]
 
+    open_work_card_ensures: tuple[dict[str, Any], ...] = (
+        {
+            "name": "open_work_card_ensures_initial",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "WorkCard",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "OPEN"}},
+                    {"op": "eq", "left": {"ref": "after.resolved_by_actor_id"}, "right": {"lit": ""}},
+                    {"op": "eq", "left": {"ref": "after.requester_actor_id"}, "right": {"ref": "actor.actor_id"}},
+                ],
+            },
+            "description": "新开立的 WorkCard 初态必须为 OPEN，requester 为当前操作者且未批结。",
+        },
+        {
+            "name": "open_work_card_ensures_unique_active",
+            "code": "DUPLICATE_ACTIVE_WORK_CARD",
+            "target_type": "WorkCard",
+            "must_hold": {
+                "op": "not_exists",
+                "object_type": "WorkCard",
+                "where": {
+                    "op": "and",
+                    "args": [
+                        {"op": "ne", "left": {"ref": "target.card_id"}, "right": {"ref": "after.card_id"}},
+                        {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"ref": "after.card_kind"}},
+                        {
+                            "op": "eq",
+                            "left": {"ref": "target.target_object_type"},
+                            "right": {"ref": "after.target_object_type"},
+                        },
+                        {
+                            "op": "eq",
+                            "left": {"ref": "target.target_object_id"},
+                            "right": {"ref": "after.target_object_id"},
+                        },
+                        {
+                            "op": "eq",
+                            "left": {"ref": "target.requested_action"},
+                            "right": {"ref": "after.requested_action"},
+                        },
+                        {
+                            "op": "in",
+                            "left": {"ref": "target.status"},
+                            "right": {"lit": ["OPEN", "IN_PROGRESS"]},
+                        },
+                    ],
+                },
+            },
+            "description": "新开立 WorkCard 不得与既有在途 OPEN/IN_PROGRESS 工单构成重复意图。",
+        },
+    )
+    complete_work_card_ensures: tuple[dict[str, Any], ...] = (
+        {
+            "name": "complete_work_card_ensures_completed_and_sod",
+            "code": "SOD_SELF_APPROVAL_FORBIDDEN",
+            "target_type": "WorkCard",
+            "id_param": "card_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {
+                        "op": "in",
+                        "left": {"ref": "before.status"},
+                        "right": {"lit": ["OPEN", "IN_PROGRESS", "SLA_BREACHED"]},
+                    },
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "COMPLETED"}},
+                    {"op": "eq", "left": {"ref": "after.resolved_by_actor_id"}, "right": {"ref": "actor.actor_id"}},
+                    {
+                        "op": "ne",
+                        "left": {"ref": "after.resolved_by_actor_id"},
+                        "right": {"ref": "before.requester_actor_id"},
+                    },
+                ],
+            },
+            "description": "批结 WorkCard 必须由非申请人完成合法状态跃迁至 COMPLETED 并写入 resolved_by_actor_id。",
+        },
+    )
+
     all_card_roles = tuple(dict.fromkeys([*eff_openers, *eff_resolvers]))
     edit_fn_work_card_specs: tuple[
-        tuple[str, type[BaseModel], Any, tuple[str, ...], tuple[str, ...], str], ...
+        tuple[
+            str,
+            type[BaseModel],
+            Any,
+            tuple[str, ...],
+            tuple[str, ...],
+            str,
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[dict[str, Any], ...],
+        ],
+        ...,
     ] = (
         (
             "open_work_card",
@@ -539,6 +648,9 @@ def register_work_card_primitives(
             eff_openers,
             (),
             "开立 M1 WorkCard（只记录原始意图与参数，绝不缓存 object_diff_json）。",
+            (),
+            ("WorkCard",),
+            open_work_card_ensures,
         ),
         (
             "complete_work_card",
@@ -547,16 +659,32 @@ def register_work_card_primitives(
             eff_resolvers,
             eff_resolvers,
             "批结 WorkCard；若为 APPROVAL 卡且目标动作纯自有则在 t1 当场重算执行，源系统写动作须经 settle_work_card 提供 settled_run_id。",
+            ("WorkCard.status", "WorkCard.resolved_by_actor_id", "WorkCard.resolution_note", "WorkCard.external_ref"),
+            (),
+            complete_work_card_ensures,
         ),
     )
 
-    for act_name, params_cls, ef_handler, act_allowed, act_revert, desc in edit_fn_work_card_specs:
+    for (
+        act_name,
+        params_cls,
+        ef_handler,
+        act_allowed,
+        act_revert,
+        desc,
+        c_modifies,
+        c_creates,
+        c_ensures,
+    ) in edit_fn_work_card_specs:
         if act_name not in target_spec.edit_functions:
             target_spec.edit_function(
                 act_name,
                 params_cls,
                 description=desc,
                 touched_object_types=("WorkCard",),
+                modifies=c_modifies,
+                creates=c_creates,
+                ensures=c_ensures,
             )(ef_handler)
         if act_name not in target_spec.actions:
             target_spec.declare_action(
@@ -889,6 +1017,9 @@ def register_work_card_primitives(
         }
     )
 
+    from open_ontology.induction.dsl import enforce_edit_function_contracts
+
+    enforce_edit_function_contracts(target_spec)
     return target_spec
 
 

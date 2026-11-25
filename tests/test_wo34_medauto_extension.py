@@ -82,14 +82,18 @@ def test_medauto_z3_formal_proof_clean() -> None:
     assert report.total_deadlock_count == 0
     assert report.conditional_deadlock_count == 0
     assert report.invariant_violation_count == 0
+    assert report.vacuous_contract_count == 0
+    assert report.uncontracted_edit_function_count == 0
+    assert report.exact_wp_proved_count == 29
+    assert report.contract_proved_count == 14
     assert report.redundant_rule_count == 0
 
     assert len(report.reachability) == 43
     rule_reach = [item for item in report.reachability if item.implementation_kind == "rule"]
     assert len(rule_reach) == 29
     assert all(item.status == "REACHABLE" for item in report.reachability)
-    assert len(report.invariant_preservation) == 29
-    assert all(item.status == "PROVED" for item in report.invariant_preservation)
+    assert len(report.invariant_preservation) == 43
+    assert all(item.status in ("PROVED", "CONTRACT_PROVED") for item in report.invariant_preservation)
 
 
 def test_medauto_doal_rule_actions_and_invariants_runtime() -> None:
@@ -438,7 +442,8 @@ def test_medauto_pure_l1_console_playwright_e2e() -> None:
             verdict.wait_for(state="visible", timeout=30000)
             verdict_text = verdict.inner_text()
             assert "0 死锁 / 0 不变量违例" in verdict_text
-            assert "29 / 29" in verdict_text
+            assert "43 / 43" in verdict_text
+            assert "Rule 精确 wp 29 + EditFn 契约证明 14" in verdict_text
             assert "冗余前置约束：0" in verdict_text.replace("\n", "")
 
             # 3. All 4 Sandbox presets execute cleanly without touching live DB

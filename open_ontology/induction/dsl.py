@@ -71,6 +71,7 @@ __all__ = [
     "migrate_m0_snapshot",
     "export_spec_blueprint",
     "compile_blueprint",
+    "enforce_edit_function_contracts",
     "register_rule_action",
     "register_rule_actions",
     "dsl_schema_prompt_guide",
@@ -310,11 +311,16 @@ class ActionBlueprint(BaseModel):
     params: list[FieldSpec] = Field(default_factory=list)
     preconditions: list[InvariantRuleSpec] = Field(default_factory=list)
     mutations: list[ActionMutationSpec] = Field(default_factory=list)
+    modifies: list[str] = Field(default_factory=list)
+    creates: list[str] = Field(default_factory=list)
+    deletes: list[str] = Field(default_factory=list)
+    ensures: list[InvariantRuleSpec] = Field(default_factory=list)
     view_tags: list[str] = Field(default_factory=list)
     display_label: str = ""
 
     @model_validator(mode="after")
     def _validate_edit_function_exclusive(self) -> "ActionBlueprint":
+        has_contract = bool(self.modifies or self.creates or self.deletes or self.ensures)
         if self.edit_function is not None:
             _assert_safe_identifier(self.edit_function, "edit_function")
             if self.mutations:
@@ -322,6 +328,35 @@ class ActionBlueprint(BaseModel):
                     f"ActionBlueprint {self.name!r} cannot specify both 'edit_function' "
                     "and declarative 'mutations'"
                 )
+        elif has_contract:
+            raise ValueError(
+                f"ActionBlueprint {self.name!r} cannot declare behavioral contracts "
+                "(modifies/creates/deletes/ensures) without 'edit_function'"
+            )
+        if self.mutations and has_contract:
+            raise ValueError(
+                f"ActionBlueprint {self.name!r} cannot combine 'mutations' with contracts"
+            )
+        for mod_item in self.modifies:
+            t_name, sep, f_name = str(mod_item).partition(".")
+            if sep != "." or not f_name or "." in f_name:
+                raise ValueError(
+                    f"ActionBlueprint {self.name!r} modifies entry {mod_item!r} "
+                    "must have format 'ObjectType.field' or 'ObjectType.*'"
+                )
+            _assert_safe_identifier(t_name, f"modifies target type in {self.name}")
+            if f_name != "*":
+                _assert_safe_identifier(f_name, f"modifies field in {self.name}")
+        for c_type in self.creates:
+            _assert_safe_identifier(c_type, f"creates target type in {self.name}")
+        for d_type in self.deletes:
+            _assert_safe_identifier(d_type, f"deletes target type in {self.name}")
+        ens_roots = frozenset({"before", "after", "obj", "param", "actor"})
+        for ens in self.ensures:
+            _assert_safe_identifier(ens.name, f"ensures name in {self.name}")
+            if ens.when is not None:
+                validate_predicate_ast(ens.when, allowed_roots=ens_roots, allow_view=True)
+            validate_predicate_ast(ens.must_hold, allowed_roots=ens_roots, allow_view=True)
         return self
 
 
@@ -1670,6 +1705,309 @@ def _wrap_spec_invariants_polymorphic(spec: OntologySpec) -> None:
         spec.transition_invariants[tinv_name] = tinv_def.model_copy(update={"handler": _wrapped_tinv})
 
 
+def _expr_uses_ref_root(node: Any, root: str) -> bool:
+    return any(r.split(".")[0] == root for r in _iter_ast_refs(node or {}))
+
+
+def _mro_spec_type_names(spec: OntologySpec, object_type: str) -> tuple[str, ...]:
+    cls = spec.object_types.get(object_type)
+    if cls is None:
+        return (object_type,)
+    names: list[str] = [object_type]
+    for base in cls.__mro__[1:]:
+        bname = getattr(base, "__name__", "")
+        if bname and bname in spec.object_types and bname not in names:
+            names.append(bname)
+    return tuple(names)
+
+
+def _compute_invocation_delta(
+    ctx: EditBatch,
+    pre_objs: dict[str, dict[str, Any]],
+    pre_kinds: dict[str, str],
+) -> tuple[dict[str, dict[str, Any]], set[str], dict[tuple[str, str], Any]]:
+    created: dict[str, dict[str, Any]] = {}
+    deleted: set[str] = set()
+    modified_vals: dict[tuple[str, str], Any] = {}
+
+    for key, kd in ctx._kinds.items():
+        if kd == "delete" and pre_kinds.get(key) != "delete":
+            deleted.add(key)
+
+    for key, after_props in ctx._objects.items():
+        kd = ctx._kinds.get(key)
+        if kd == "delete":
+            continue
+        if kd == "create" and key not in pre_objs:
+            created[key] = copy.deepcopy(after_props)
+            continue
+        if kd == "update" or (kd == "create" and key in pre_objs):
+            before_props = pre_objs.get(key)
+            if before_props is None:
+                before_props = ctx._original.get(key)
+            if before_props is None:
+                continue
+            for fname in set(before_props.keys()) | set(after_props.keys()):
+                a_val = after_props.get(fname)
+                if before_props.get(fname) != a_val:
+                    modified_vals[(key, fname)] = copy.deepcopy(a_val)
+
+    return created, deleted, modified_vals
+
+
+def _contract_handler_signature(act: ActionDef) -> tuple[Any, ...]:
+    return (
+        tuple(act.modifies),
+        tuple(act.creates),
+        tuple(act.deletes),
+        json.dumps(list(act.ensures), sort_keys=True, ensure_ascii=False),
+    )
+
+
+def enforce_edit_function_contracts(spec: OntologySpec) -> None:
+    """Wrap contracted ``EditFunction`` actions so frame & ``ensures`` hold at runtime."""
+    for act_name, act_def in list(spec.actions.items()):
+        has_contract = bool(
+            act_def.implementation_kind == "edit_function"
+            and (act_def.modifies or act_def.creates or act_def.deletes or act_def.ensures)
+        )
+        cur_handler = act_def.handler
+
+        if not has_contract:
+            if getattr(cur_handler, "__contract_delegation_tracked__", False) or getattr(
+                cur_handler, "__contract_guarded__", False
+            ):
+                continue
+
+            orig_decl_muts = getattr(cur_handler, "__declarative_mutations__", None)
+
+            def _tracked_passthrough(
+                ctx: EditBatch,
+                params: BaseModel,
+                _orig: Callable[..., Any] = cur_handler,
+            ) -> Any:
+                stack = getattr(ctx, "_contract_delegation_stack", None)
+                if not stack:
+                    return _orig(ctx, params)
+                pre_objs = {k: copy.deepcopy(v) for k, v in ctx._objects.items()}
+                pre_kinds = dict(ctx._kinds)
+                res = _orig(ctx, params)
+                created, deleted, mod_vals = _compute_invocation_delta(ctx, pre_objs, pre_kinds)
+                frame = stack[-1]
+                frame["created"].update(created)
+                frame["deleted"].update(deleted)
+                frame["modified"].update(mod_vals)
+                return res
+
+            _tracked_passthrough.__contract_delegation_tracked__ = True  # type: ignore[attr-defined]
+            if orig_decl_muts is not None:
+                _tracked_passthrough.__declarative_mutations__ = copy.deepcopy(orig_decl_muts)  # type: ignore[attr-defined]
+            spec.actions[act_name] = act_def.model_copy(update={"handler": _tracked_passthrough})
+            continue
+
+        sig = _contract_handler_signature(act_def)
+        if getattr(cur_handler, "__contract_guarded__", False) and getattr(
+            cur_handler, "__contract_sig__", None
+        ) == sig:
+            continue
+
+        base_handler = getattr(cur_handler, "__contract_unwrapped__", cur_handler)
+        orig_decl_muts = getattr(base_handler, "__declarative_mutations__", None)
+        allowed_modifies = frozenset(act_def.modifies)
+        allowed_creates = frozenset(act_def.creates)
+        allowed_deletes = frozenset(act_def.deletes)
+        ensures_specs = tuple(_normalize_ensures_specs(act_def.ensures))
+        modifies_list = list(act_def.modifies)
+        creates_list = list(act_def.creates)
+        deletes_list = list(act_def.deletes)
+
+        def _contract_guarded_handler(
+            ctx: EditBatch,
+            params: BaseModel,
+            _orig: Callable[..., Any] = base_handler,
+            _act_name: str = act_name,
+            _mod_set: frozenset[str] = allowed_modifies,
+            _cre_set: frozenset[str] = allowed_creates,
+            _del_set: frozenset[str] = allowed_deletes,
+            _ens_tuple: tuple[InvariantRuleSpec, ...] = ensures_specs,
+            _mod_list: list[str] = modifies_list,
+            _cre_list: list[str] = creates_list,
+            _del_list: list[str] = deletes_list,
+        ) -> Any:
+            if any(
+                not (
+                    getattr(a.handler, "__contract_guarded__", False)
+                    or getattr(a.handler, "__contract_delegation_tracked__", False)
+                )
+                for a in ctx.spec.actions.values()
+            ):
+                enforce_edit_function_contracts(ctx.spec)
+            pre_objs = {k: copy.deepcopy(v) for k, v in ctx._objects.items()}
+            pre_kinds = dict(ctx._kinds)
+            stack = getattr(ctx, "_contract_delegation_stack", None)
+            if stack is None:
+                stack = []
+                object.__setattr__(ctx, "_contract_delegation_stack", stack)
+            delegated: dict[str, Any] = {
+                "created": {},
+                "deleted": set(),
+                "modified": {},
+            }
+            stack.append(delegated)
+            try:
+                result = _orig(ctx, params)
+            finally:
+                if stack and stack[-1] is delegated:
+                    stack.pop()
+
+            created, deleted, mod_vals = _compute_invocation_delta(ctx, pre_objs, pre_kinds)
+            del_created: dict[str, dict[str, Any]] = delegated["created"]
+            del_deleted: set[str] = delegated["deleted"]
+            del_modified: dict[tuple[str, str], Any] = delegated["modified"]
+
+            # 1. Check deleted frame
+            for key in sorted(deleted):
+                if key in del_deleted:
+                    continue
+                ot_name, oid = ctx._split_key(key)
+                ancestors = _mro_spec_type_names(ctx.spec, ot_name)
+                if not any(t in _del_set for t in ancestors):
+                    raise InvariantError(
+                        f"Action {_act_name!r} deleted undeclared ObjectType {ot_name!r} ({oid!r}); "
+                        f"contract deletes={_del_list}",
+                        code="CONTRACT_FRAME_VIOLATION",
+                    )
+
+            # 2. Check created frame
+            for key, cre_props in sorted(created.items()):
+                if key in del_created:
+                    orig_cre = del_created[key]
+                    if cre_props != orig_cre:
+                        ot_name, oid = ctx._split_key(key)
+                        ancestors = _mro_spec_type_names(ctx.spec, ot_name)
+                        for fname in sorted(set(orig_cre.keys()) | set(cre_props.keys())):
+                            if orig_cre.get(fname) != cre_props.get(fname):
+                                if not any(
+                                    f"{t}.{fname}" in _mod_set or f"{t}.*" in _mod_set
+                                    for t in ancestors
+                                ):
+                                    raise InvariantError(
+                                        f"Action {_act_name!r} modified undeclared field {ot_name}.{fname} "
+                                        f"on created {oid!r}; contract modifies={_mod_list}",
+                                        code="CONTRACT_FRAME_VIOLATION",
+                                    )
+                    continue
+                ot_name, oid = ctx._split_key(key)
+                ancestors = _mro_spec_type_names(ctx.spec, ot_name)
+                if not any(t in _cre_set for t in ancestors):
+                    raise InvariantError(
+                        f"Action {_act_name!r} created undeclared ObjectType {ot_name!r} ({oid!r}); "
+                        f"contract creates={_cre_list}",
+                        code="CONTRACT_FRAME_VIOLATION",
+                    )
+
+            # 3. Check modified frame
+            for (key, fname), after_val in sorted(mod_vals.items()):
+                if (key, fname) in del_modified and del_modified[(key, fname)] == after_val:
+                    continue
+                ot_name, oid = ctx._split_key(key)
+                ancestors = _mro_spec_type_names(ctx.spec, ot_name)
+                if not any(f"{t}.{fname}" in _mod_set or f"{t}.*" in _mod_set for t in ancestors):
+                    raise InvariantError(
+                        f"Action {_act_name!r} modified undeclared field {ot_name}.{fname} "
+                        f"on {oid!r}; contract modifies={_mod_list}",
+                        code="CONTRACT_FRAME_VIOLATION",
+                    )
+
+            # 4. Check postconditions (ensures)
+            direct_mod_keys = {
+                k
+                for (k, _f), a_val in mod_vals.items()
+                if not ((k, _f) in del_modified and del_modified[(k, _f)] == a_val)
+            }
+            direct_cre_keys = {k for k in created if k not in del_created}
+
+            for ens in _ens_tuple:
+                target_cls = ctx.spec.get_object_type(ens.target_type)
+                subtype_names = {c.__name__ for c in ctx.spec.subtypes_of(target_cls)}
+                pairs: list[tuple[ObjectType, ObjectType]] = []
+                if ens.id_param:
+                    if not hasattr(params, ens.id_param):
+                        raise InvariantError(
+                            f"[{ens.code}] Action {_act_name!r} ensures {ens.name!r} "
+                            f"missing id_param {ens.id_param!r}",
+                            code="CONTRACT_ENSURES_VIOLATION",
+                        )
+                    pk_val = str(getattr(params, ens.id_param))
+                    after_model = _get_polymorphic(ctx, target_cls, pk_val)
+                    if after_model is not None:
+                        actual_key = f"{type(after_model).__name__}:{pk_val}"
+                        before_props = pre_objs.get(actual_key) or ctx._original.get(actual_key)
+                        before_model = (
+                            ctx._model_for(type(after_model), before_props)
+                            if before_props is not None
+                            else after_model
+                        )
+                        pairs.append((before_model, after_model))
+                else:
+                    uses_before = _expr_uses_ref_root(ens.when, "before") or _expr_uses_ref_root(
+                        ens.must_hold, "before"
+                    )
+                    candidate_keys = sorted(
+                        k
+                        for k in (direct_mod_keys if uses_before else (direct_mod_keys | direct_cre_keys))
+                        if ctx._split_key(k)[0] in subtype_names and ctx._kinds.get(k) != "delete"
+                    )
+                    for k in candidate_keys:
+                        after_props = ctx._objects.get(k)
+                        if after_props is None:
+                            continue
+                        k_type, _ = ctx._split_key(k)
+                        before_props = pre_objs.get(k) or ctx._original.get(k)
+                        after_m = ctx._model_for(k_type, after_props)
+                        before_m = (
+                            ctx._model_for(k_type, before_props)
+                            if before_props is not None
+                            else after_m
+                        )
+                        pairs.append((before_m, after_m))
+
+                for before_m, after_m in pairs:
+                    eval_ctx = {
+                        "before": before_m,
+                        "after": after_m,
+                        "obj": after_m,
+                        "param": params,
+                        "actor": ctx.actor,
+                    }
+                    if ens.when is not None and not eval_predicate(ens.when, eval_ctx, ctx):
+                        continue
+                    if not eval_predicate(ens.must_hold, eval_ctx, ctx):
+                        raise InvariantError(
+                            f"[{ens.code}] Action {_act_name!r} ensures contract {ens.name!r} "
+                            f"violated on {type(after_m).__name__}:{after_m.primary_key_value()}",
+                            code="CONTRACT_ENSURES_VIOLATION",
+                        )
+
+            if stack:
+                outer = stack[-1]
+                outer["created"].update(del_created)
+                outer["created"].update(created)
+                outer["deleted"].update(del_deleted)
+                outer["deleted"].update(deleted)
+                outer["modified"].update(del_modified)
+                outer["modified"].update(mod_vals)
+
+            return result
+
+        _contract_guarded_handler.__contract_guarded__ = True  # type: ignore[attr-defined]
+        _contract_guarded_handler.__contract_unwrapped__ = base_handler  # type: ignore[attr-defined]
+        _contract_guarded_handler.__contract_sig__ = sig  # type: ignore[attr-defined]
+        if orig_decl_muts is not None:
+            _contract_guarded_handler.__declarative_mutations__ = copy.deepcopy(orig_decl_muts)  # type: ignore[attr-defined]
+        spec.actions[act_name] = act_def.model_copy(update={"handler": _contract_guarded_handler})
+
+
 def _make_cardinality_invariant_handler(
     card_map: Mapping[str, dict[str, tuple[int, int | None]]],
 ) -> Callable[[InvariantView], bool]:
@@ -2106,6 +2444,114 @@ def _validate_action_mutations_ast(
             _validate_expr_schema_refs(
                 fv, ot_by_name=ot_by_name, root_types=ref_roots, param_names=param_names
             )
+    _validate_action_contract_for_spec(
+        act.name,
+        modifies=act.modifies,
+        creates=act.creates,
+        deletes=act.deletes,
+        ensures=act.ensures,
+        ot_by_name=ot_by_name,
+        param_names=param_names,
+    )
+
+
+def _normalize_ensures_specs(raw_ensures: Sequence[Any]) -> list[InvariantRuleSpec]:
+    out: list[InvariantRuleSpec] = []
+    for item in raw_ensures:
+        if isinstance(item, InvariantRuleSpec):
+            out.append(item)
+        elif isinstance(item, Mapping):
+            out.append(InvariantRuleSpec.model_validate(item))
+    return out
+
+
+def _validate_action_contract_for_spec(
+    act_name: str,
+    *,
+    modifies: Sequence[str],
+    creates: Sequence[str],
+    deletes: Sequence[str],
+    ensures: Sequence[Any],
+    ot_by_name: Mapping[str, ObjectTypeBlueprint],
+    param_names: set[str] | None = None,
+    valid_roles: set[str] | None = None,
+) -> None:
+    for mod_item in modifies:
+        t_name, sep, f_name = str(mod_item).partition(".")
+        if sep != "." or not f_name or "." in f_name:
+            raise InvariantError(
+                f"action {act_name!r} contract modifies {mod_item!r} must have format 'Type.field' or 'Type.*'",
+                code="INVALID_CONTRACT_FRAME",
+            )
+        if t_name not in ot_by_name:
+            raise InvariantError(
+                f"action {act_name!r} contract modifies unknown object type {t_name!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if f_name != "*":
+            ot = ot_by_name[t_name]
+            valid_fields = {ot.primary_key} | {f.name for f in ot.fields} | {r.field for r in ot.relations}
+            if f_name not in valid_fields:
+                raise InvariantError(
+                    f"action {act_name!r} contract modifies unknown field {mod_item!r}",
+                    code="UNKNOWN_FIELD_IN_REF",
+                )
+    for c_type in creates:
+        if c_type not in ot_by_name:
+            raise InvariantError(
+                f"action {act_name!r} contract creates unknown object type {c_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+    for d_type in deletes:
+        if d_type not in ot_by_name:
+            raise InvariantError(
+                f"action {act_name!r} contract deletes unknown object type {d_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+    ens_roots = frozenset({"before", "after", "obj", "param", "actor"})
+    for ens in _normalize_ensures_specs(ensures):
+        _assert_safe_identifier(ens.name, f"ensures name in {act_name}")
+        if ens.target_type not in ot_by_name:
+            raise InvariantError(
+                f"action {act_name!r} ensures {ens.name!r} targets unknown object type {ens.target_type!r}",
+                code="UNKNOWN_OBJECT_TYPE",
+            )
+        if ens.id_param and param_names is not None and ens.id_param not in param_names:
+            raise InvariantError(
+                f"action {act_name!r} ensures {ens.name!r} references missing id_param {ens.id_param!r}",
+                code="MISSING_ID_PARAM",
+            )
+        ens_ref_roots = {
+            "before": ens.target_type,
+            "after": ens.target_type,
+            "obj": ens.target_type,
+        }
+        if valid_roles:
+            _validate_expr_closed_roles(
+                ens.when,
+                valid_roles,
+                context=f"action {act_name}.ensures.{ens.name}.when",
+            )
+            _validate_expr_closed_roles(
+                ens.must_hold,
+                valid_roles,
+                context=f"action {act_name}.ensures.{ens.name}.must_hold",
+            )
+        if ens.when is not None:
+            validate_predicate_ast(ens.when, allowed_roots=ens_roots, allow_view=True)
+            _validate_expr_schema_refs(
+                ens.when,
+                ot_by_name=ot_by_name,
+                root_types=ens_ref_roots,
+                param_names=param_names,
+            )
+        validate_predicate_ast(ens.must_hold, allowed_roots=ens_roots, allow_view=True)
+        _validate_expr_schema_refs(
+            ens.must_hold,
+            ot_by_name=ot_by_name,
+            root_types=ens_ref_roots,
+            param_names=param_names,
+        )
 
 
 def _validate_action_update_monotonic(
@@ -2206,6 +2652,18 @@ def _validate_action_closed_roles(
                 valid_roles,
                 context=f"{context_prefix} {act.name}.mutations.{mut.object_type}",
             )
+    for ens in act.ensures:
+        if ens.when is not None:
+            _validate_expr_closed_roles(
+                ens.when,
+                valid_roles,
+                context=f"{context_prefix} {act.name}.ensures.{ens.name}.when",
+            )
+        _validate_expr_closed_roles(
+            ens.must_hold,
+            valid_roles,
+            context=f"{context_prefix} {act.name}.ensures.{ens.name}.must_hold",
+        )
 
 
 def apply_overlay(
@@ -3519,6 +3977,7 @@ def compile_blueprint(
     display_updates["actions"] = {**action_display, **blueprint.display.get("actions", {})}
     spec.update_display(display_updates)
     _wrap_spec_invariants_polymorphic(spec)
+    enforce_edit_function_contracts(spec)
     return spec
 
 
@@ -4004,6 +4463,24 @@ def _compile_and_register_action_blueprint(
             valid_roles=compiled_valid_roles,
             param_names=effective_param_names,
         )
+        eff_modifies = tuple(act.modifies) if act.modifies else ef.modifies
+        eff_creates = tuple(act.creates) if act.creates else ef.creates
+        eff_deletes = tuple(act.deletes) if act.deletes else ef.deletes
+        eff_ensures = (
+            tuple(e.model_dump(mode="json") for e in act.ensures)
+            if act.ensures
+            else ef.ensures
+        )
+        _validate_action_contract_for_spec(
+            act.name,
+            modifies=eff_modifies,
+            creates=eff_creates,
+            deletes=eff_deletes,
+            ensures=eff_ensures,
+            ot_by_name=ot_by_name,
+            param_names=effective_param_names,
+            valid_roles=compiled_valid_roles,
+        )
         touched_types = set(ef.touched_object_types) | {pre.target_type for pre in act.preconditions}
         action_def = spec.declare_action(
             act.name,
@@ -4016,6 +4493,10 @@ def _compile_and_register_action_blueprint(
             view_tags=tuple(act.view_tags),
             touched_object_types=tuple(sorted(touched_types)),
             submission_criteria=tuple(pre.model_dump(mode="json") for pre in act.preconditions),
+            modifies=eff_modifies,
+            creates=eff_creates,
+            deletes=eff_deletes,
+            ensures=eff_ensures,
         )
         if act.preconditions:
             orig_handler = action_def.handler
@@ -4239,10 +4720,18 @@ def _action_def_to_blueprint(act_def: ActionDef, display_label: str = "") -> Act
     if act_def.implementation_kind == "edit_function":
         ef_name: str | None = act_def.edit_function
         muts: list[ActionMutationSpec] = []
+        modifies_list = list(act_def.modifies)
+        creates_list = list(act_def.creates)
+        deletes_list = list(act_def.deletes)
+        ensures_list = _normalize_ensures_specs(act_def.ensures)
     else:
         ef_name = None
         raw_muts = getattr(act_def.handler, "__declarative_mutations__", ()) or ()
         muts = [ActionMutationSpec.model_validate(m) for m in raw_muts]
+        modifies_list = []
+        creates_list = []
+        deletes_list = []
+        ensures_list = []
 
     return ActionBlueprint(
         name=act_def.name,
@@ -4254,6 +4743,10 @@ def _action_def_to_blueprint(act_def: ActionDef, display_label: str = "") -> Act
         params=params_list,
         preconditions=pres,
         mutations=muts,
+        modifies=modifies_list,
+        creates=creates_list,
+        deletes=deletes_list,
+        ensures=ensures_list,
         view_tags=list(act_def.view_tags),
         display_label=display_label,
     )
@@ -5352,6 +5845,11 @@ def apply_overlay_to_spec(
 
             if orig_muts is not None:
                 _wrapped_action_handler.__declarative_mutations__ = copy.deepcopy(orig_muts)  # type: ignore[attr-defined]
+            if getattr(orig_handler, "__contract_guarded__", False):
+                _wrapped_action_handler.__contract_guarded__ = True  # type: ignore[attr-defined]
+                _wrapped_action_handler.__contract_sig__ = getattr(orig_handler, "__contract_sig__", None)  # type: ignore[attr-defined]
+            if getattr(orig_handler, "__contract_delegation_tracked__", False):
+                _wrapped_action_handler.__contract_delegation_tracked__ = True  # type: ignore[attr-defined]
 
             merged_touched = tuple(
                 dict.fromkeys([*cur_act.touched_object_types, *(p.target_type for p in to_prepend)])
@@ -5490,6 +5988,7 @@ def apply_overlay_to_spec(
             derived.update_display(clean_disp)
 
     _wrap_spec_invariants_polymorphic(derived)
+    enforce_edit_function_contracts(derived)
     return derived
 
 

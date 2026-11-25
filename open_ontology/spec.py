@@ -562,6 +562,37 @@ class FunctionDef(BaseModel):
     view_tags: tuple[str, ...] = ()
 
 
+def _normalize_contract_ensures(ensures: Sequence[Any] | None) -> tuple[Any, ...]:
+    if not ensures:
+        return ()
+    out: list[Any] = []
+    for item in ensures:
+        if isinstance(item, BaseModel):
+            out.append(item.model_dump(mode="json"))
+        elif isinstance(item, dict):
+            out.append(dict(item))
+        else:
+            out.append(item)
+    return tuple(out)
+
+
+def _contract_touched_types(
+    modifies: Iterable[str],
+    creates: Iterable[str],
+    deletes: Iterable[str],
+) -> tuple[str, ...]:
+    types: list[str] = []
+    for item in modifies:
+        head = str(item).partition(".")[0].strip()
+        if head and head != "*":
+            types.append(head)
+    for item in (*creates, *deletes):
+        clean = str(item).strip()
+        if clean and clean != "*":
+            types.append(clean)
+    return tuple(dict.fromkeys(types))
+
+
 class EditFunctionDef(BaseModel):
     """Atomic Turing-complete write transformation kernel (free of governance shell)."""
 
@@ -572,6 +603,10 @@ class EditFunctionDef(BaseModel):
     handler: Any  # Callable[[EditBatch, BaseModel], Any]
     description: str = ""
     touched_object_types: tuple[str, ...] = ()
+    modifies: tuple[str, ...] = ()
+    creates: tuple[str, ...] = ()
+    deletes: tuple[str, ...] = ()
+    ensures: tuple[Any, ...] = ()
 
 
 class ActionDef(BaseModel):
@@ -592,6 +627,10 @@ class ActionDef(BaseModel):
     view_tags: tuple[str, ...] = ()
     touched_object_types: tuple[str, ...] = ()
     submission_criteria: tuple[Any, ...] = ()
+    modifies: tuple[str, ...] = ()
+    creates: tuple[str, ...] = ()
+    deletes: tuple[str, ...] = ()
+    ensures: tuple[Any, ...] = ()
 
     @model_validator(mode="after")
     def _validate_implementation_binding(self) -> "ActionDef":
@@ -606,6 +645,11 @@ class ActionDef(BaseModel):
                 raise ValueError(
                     f"ActionDef {self.name!r} with implementation_kind='rule' "
                     "must have edit_function=None"
+                )
+            if self.modifies or self.creates or self.deletes or self.ensures:
+                raise ValueError(
+                    f"ActionDef {self.name!r} with implementation_kind='rule' "
+                    "cannot declare manual modifies/creates/deletes/ensures contracts"
                 )
         return self
 
@@ -1246,6 +1290,10 @@ class OntologySpec:
         *,
         description: str = "",
         touched_object_types: Iterable[str] = (),
+        modifies: Iterable[str] = (),
+        creates: Iterable[str] = (),
+        deletes: Iterable[str] = (),
+        ensures: Sequence[Any] = (),
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a pure Turing-complete write kernel (free of governance shell)."""
         clean = str(name).strip()
@@ -1253,6 +1301,13 @@ class OntologySpec:
             raise ValueError("edit_function name must not be empty")
         _validate_params(params, clean)
         self._rebuild_model(params)
+        norm_modifies = tuple(str(x).strip() for x in modifies if str(x).strip())
+        norm_creates = tuple(str(x).strip() for x in creates if str(x).strip())
+        norm_deletes = tuple(str(x).strip() for x in deletes if str(x).strip())
+        norm_ensures = _normalize_contract_ensures(ensures)
+        merged_touched = tuple(
+            dict.fromkeys([*touched_object_types, *_contract_touched_types(norm_modifies, norm_creates, norm_deletes)])
+        )
 
         def decorator(handler: Callable[..., Any]) -> Callable[..., Any]:
             self.edit_functions[clean] = EditFunctionDef(
@@ -1260,7 +1315,11 @@ class OntologySpec:
                 params=params,
                 handler=handler,
                 description=description or (handler.__doc__ or "").strip(),
-                touched_object_types=tuple(touched_object_types),
+                touched_object_types=merged_touched,
+                modifies=norm_modifies,
+                creates=norm_creates,
+                deletes=norm_deletes,
+                ensures=norm_ensures,
             )
             return handler
 
@@ -1286,6 +1345,10 @@ class OntologySpec:
         touched_object_types: Iterable[str] = (),
         submission_criteria: Sequence[Any] = (),
         params: type[BaseModel] | None = None,
+        modifies: Iterable[str] | None = None,
+        creates: Iterable[str] | None = None,
+        deletes: Iterable[str] | None = None,
+        ensures: Sequence[Any] | None = None,
     ) -> ActionDef:
         """Bind a governed Action shell onto an already-registered EditFunctionDef."""
         clean = str(name).strip()
@@ -1310,7 +1373,30 @@ class OntologySpec:
             eff_params = params
         self._validate_roles(allowed_roles, context=f"action {clean!r} allowed_roles")
         self._validate_roles(revert_roles, context=f"action {clean!r} revert_roles")
-        eff_touched = tuple(touched_object_types) or ef.touched_object_types
+        eff_modifies = (
+            tuple(str(x).strip() for x in modifies if str(x).strip())
+            if modifies is not None
+            else ef.modifies
+        )
+        eff_creates = (
+            tuple(str(x).strip() for x in creates if str(x).strip())
+            if creates is not None
+            else ef.creates
+        )
+        eff_deletes = (
+            tuple(str(x).strip() for x in deletes if str(x).strip())
+            if deletes is not None
+            else ef.deletes
+        )
+        eff_ensures = (
+            _normalize_contract_ensures(ensures)
+            if ensures is not None
+            else ef.ensures
+        )
+        base_touched = tuple(touched_object_types) or ef.touched_object_types
+        eff_touched = tuple(
+            dict.fromkeys([*base_touched, *_contract_touched_types(eff_modifies, eff_creates, eff_deletes)])
+        )
         eff_desc = description or ef.description
         action_def = ActionDef(
             name=clean,
@@ -1326,6 +1412,10 @@ class OntologySpec:
             view_tags=tuple(view_tags),
             touched_object_types=eff_touched,
             submission_criteria=tuple(submission_criteria),
+            modifies=eff_modifies,
+            creates=eff_creates,
+            deletes=eff_deletes,
+            ensures=eff_ensures,
         )
         self.actions[clean] = action_def
         return action_def

@@ -14,7 +14,11 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from open_ontology.induction.dsl import DeclarativeBlueprint, export_spec_blueprint
+from open_ontology.induction.dsl import (
+    DeclarativeBlueprint,
+    enforce_edit_function_contracts,
+    export_spec_blueprint,
+)
 from open_ontology.spec import ObjectProperty, OntologySpec
 
 try:
@@ -230,6 +234,7 @@ register_work_card_primitives(
     opener_roles=STD_WORK_CARD_OPENERS,
     resolver_roles=STD_WORK_CARD_RESOLVERS,
 )
+enforce_edit_function_contracts(spec)
 
 spec.update_display(
     {

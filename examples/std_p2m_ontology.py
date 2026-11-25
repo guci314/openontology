@@ -22,6 +22,7 @@ from open_ontology.induction.dsl import (
     ActionMutationSpec,
     DeclarativeBlueprint,
     InvariantRuleSpec,
+    enforce_edit_function_contracts,
     export_spec_blueprint,
     register_rule_action,
 )
@@ -364,6 +365,53 @@ register_rule_action(
     IssueMaterialToWorkOrderParams,
     description="向已下达或生产中工单领料投料，自动推进至 in_progress 并累加投入成本。",
     touched_object_types=("WorkOrder", "MaterialConsumption"),
+    modifies=("WorkOrder.issued_qty", "WorkOrder.issued_cost_cents", "WorkOrder.status"),
+    creates=("MaterialConsumption",),
+    ensures=(
+        {
+            "name": "issue_material_wo_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "WorkOrder",
+            "id_param": "work_order_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {
+                        "op": "in",
+                        "left": {"ref": "before.status"},
+                        "right": {"lit": ["released", "in_progress"]},
+                    },
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "in_progress"}},
+                    {
+                        "op": "ge",
+                        "left": {"ref": "after.issued_qty"},
+                        "right": {"ref": "before.issued_qty"},
+                    },
+                    {
+                        "op": "ge",
+                        "left": {"ref": "after.issued_cost_cents"},
+                        "right": {"ref": "before.issued_cost_cents"},
+                    },
+                ],
+            },
+            "description": "领料投料须由 released/in_progress 推进为 in_progress 且已领料数量与成本单调非减。",
+        },
+        {
+            "name": "issue_material_voucher_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "MaterialConsumption",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "recorded"}},
+                    {"op": "gt", "left": {"ref": "after.qty"}, "right": {"lit": 0.0}},
+                    {"op": "ge", "left": {"ref": "after.unit_cost_cents"}, "right": {"lit": 0}},
+                    {"op": "ge", "left": {"ref": "after.total_cost_cents"}, "right": {"lit": 0}},
+                ],
+            },
+            "description": "新建 MaterialConsumption 凭证须为 recorded 且数量正、单价与总成本非负。",
+        },
+    ),
 )
 def issue_material_to_work_order(ctx: Any, params: IssueMaterialToWorkOrderParams) -> None:
     wo = ctx.require(WorkOrder, params.work_order_id)
@@ -433,6 +481,48 @@ spec.declare_action(
     RecordProductionOutputParams,
     description="登记工单完工与报废产出；强守未投料禁报工、吸收成本守恒及超损耗率 WorkCard 审批门禁。",
     touched_object_types=("WorkOrder", "ProductionOutput"),
+    modifies=("WorkOrder.completed_good_qty", "WorkOrder.completed_scrap_qty"),
+    creates=("ProductionOutput",),
+    ensures=(
+        {
+            "name": "record_output_wo_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "WorkOrder",
+            "id_param": "work_order_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "in_progress"}},
+                    {
+                        "op": "ge",
+                        "left": {"ref": "after.completed_good_qty"},
+                        "right": {"ref": "before.completed_good_qty"},
+                    },
+                    {
+                        "op": "ge",
+                        "left": {"ref": "after.completed_scrap_qty"},
+                        "right": {"ref": "before.completed_scrap_qty"},
+                    },
+                ],
+            },
+            "description": "报工产出仅在 in_progress 工单上发生且良品/报废累计单调非减。",
+        },
+        {
+            "name": "record_output_voucher_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "ProductionOutput",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "recorded"}},
+                    {"op": "ge", "left": {"ref": "after.good_qty"}, "right": {"lit": 0.0}},
+                    {"op": "ge", "left": {"ref": "after.scrap_qty"}, "right": {"lit": 0.0}},
+                    {"op": "ge", "left": {"ref": "after.absorbed_cost_cents"}, "right": {"lit": 0}},
+                ],
+            },
+            "description": "新建 ProductionOutput 凭证须为 recorded 且良品/报废/吸收成本均非负。",
+        },
+    ),
 )
 def record_production_output(ctx: Any, params: RecordProductionOutputParams) -> None:
     wo = ctx.require(WorkOrder, params.work_order_id)
@@ -797,3 +887,6 @@ def build_std_p2m_blueprint() -> DeclarativeBlueprint:
         imports=("std_core_ontology",),
         description="标准 P2M 领域本体蓝图：在核心底座上组合 BOM 规格、生产工单、领料耗用与报工产出。",
     )
+
+
+enforce_edit_function_contracts(spec)

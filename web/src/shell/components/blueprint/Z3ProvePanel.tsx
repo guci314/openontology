@@ -103,7 +103,14 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
   const brokenClasses = (result.class_proofs || []).filter((c) => c.status !== 'SATISFIABLE');
   const deadlocked = (result.action_proofs || []).filter((p) => p.status !== 'REACHABLE');
   const violatedInvs = (result.invariant_proofs || []).filter((p) => p.status === 'VIOLATED');
+  const vacuousContracts = (result.invariant_proofs || []).filter(
+    (p) => p.status === 'VACUOUS_CONTRACT',
+  );
   const redundantRules = result.redundant_rules || [];
+  const hasContractProofs =
+    (summary?.contract_proved_count ?? 0) > 0 ||
+    (summary?.vacuous_contract_count ?? 0) > 0 ||
+    (summary?.uncontracted_edit_function_count ?? 0) > 0;
 
   return (
     <div
@@ -165,13 +172,30 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
                 动作可达：<strong>{summary?.reachable_actions ?? 0}</strong> /{' '}
                 {summary?.total_actions ?? 0}
               </span>
-              <span>
-                Hoare 保真校验：<strong>{summary?.preserved_invariants ?? 0}</strong> /{' '}
-                {summary?.total_invariants ?? 0}
-                {summary?.declared_invariant_count !== undefined
-                  ? `（总声明红线 ${summary.declared_invariant_count} 项）`
-                  : ''}
-              </span>
+              {hasContractProofs ? (
+                <span data-testid="z3-hoare-summary">
+                  全模型 Hoare 保真：<strong>{summary?.preserved_invariants ?? 0}</strong> /{' '}
+                  {summary?.total_invariants ?? 0}（Rule 精确 wp{' '}
+                  {summary?.exact_wp_proved_count ?? 0} + EditFn 契约证明{' '}
+                  {summary?.contract_proved_count ?? 0} ·{' '}
+                  {summary?.vacuous_contract_count ?? 0} 空真契约 · 运行期强验守约
+                  {(summary?.uncontracted_edit_function_count ?? 0) > 0
+                    ? ` · 未签契约跳过 ${summary?.uncontracted_edit_function_count}`
+                    : ''}
+                  {summary?.declared_invariant_count !== undefined
+                    ? ` · 总声明红线 ${summary.declared_invariant_count} 项`
+                    : ''}
+                  ）
+                </span>
+              ) : (
+                <span data-testid="z3-hoare-summary">
+                  Hoare 保真校验：<strong>{summary?.preserved_invariants ?? 0}</strong> /{' '}
+                  {summary?.total_invariants ?? 0}
+                  {summary?.declared_invariant_count !== undefined
+                    ? `（总声明红线 ${summary.declared_invariant_count} 项）`
+                    : ''}
+                </span>
+              )}
               <span>
                 冗余前置约束：<strong>{summary?.redundant_rule_count ?? 0}</strong>
               </span>
@@ -291,6 +315,35 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
                     {item.unsat_core.length > 0 && (
                       <div className="mt-1 font-mono text-[11px] text-rose-700">
                         UNSAT 冲突核：{item.unsat_core.join(' , ')}
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {vacuousContracts.length > 0 && (
+            <div
+              data-testid="z3-vacuous-contract-list"
+              className="rounded-lg border border-rose-300 bg-rose-50/70 p-3"
+            >
+              <div className="font-semibold text-rose-900">
+                空真契约阻断（PO-5 不可实现 · VACUOUS_CONTRACT）
+              </div>
+              <ul className="mt-2 space-y-1.5">
+                {vacuousContracts.map((vc) => (
+                  <li key={vc.action_name} className="text-slate-800">
+                    <span className="font-semibold text-slate-900">
+                      {vc.display_label || vc.action_name}
+                    </span>{' '}
+                    <code className="font-mono text-[11px] text-slate-500">
+                      ({vc.action_name})
+                    </code>{' '}
+                    · <span className="font-semibold text-rose-700">VACUOUS_CONTRACT</span>
+                    {vc.unsat_core && vc.unsat_core.length > 0 && (
+                      <div className="mt-1 font-mono text-[11px] text-rose-700">
+                        PO-5 UNSAT 冲突核：{vc.unsat_core.join(' , ')}
                       </div>
                     )}
                   </li>

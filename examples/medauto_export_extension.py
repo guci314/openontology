@@ -59,6 +59,7 @@ from open_ontology.induction import (
     ObjectTypeBlueprint,
     RelationSpec,
     apply_overlay_to_spec,
+    enforce_edit_function_contracts,
     export_spec_blueprint,
 )
 from open_ontology.spec import EditFunctionDef
@@ -902,9 +903,21 @@ def _batch_recall_defective_lot(ctx: Any, params: BatchRecallDefectiveLotParams)
         )
 
     existing_card_ids = {c.card_id for c in ctx.query(WcCls)}
+    existing_active_recall_sigs = {
+        (c.card_kind, c.target_object_type, c.target_object_id, c.requested_action)
+        for c in ctx.query(WcCls)
+        if c.status in ("OPEN", "IN_PROGRESS")
+    }
     for idx, (otype, row) in enumerate(sorted(targets, key=lambda pair: (pair[0], pair[1].primary_key_value())), start=1):
         ctx.modify(row, x_quarantined=True)
         oid = row.primary_key_value()
+        recall_sig = ("HUMAN_TASK", otype, oid, "batch_recall_defective_lot")
+        if recall_sig in existing_active_recall_sigs:
+            raise InvariantError(
+                f"duplicate active recall WorkCard for {recall_sig}",
+                code="DUPLICATE_ACTIVE_WORK_CARD",
+            )
+        existing_active_recall_sigs.add(recall_sig)
         cid = f"WC-RECALL-{clean_lot}-{idx:02d}"
         while cid in existing_card_ids:
             cid = f"{cid}-X"
@@ -1178,6 +1191,25 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         handler=_apply_export_tax_rebate_claim,
         description="基于清关后出口报关单的离岸货值 × 退税率 × 汇率执行非线性浮点精度出口退税核定。",
         touched_object_types=("CustomsDeclaration", "ExportSalesOrder"),
+        modifies=("CustomsDeclaration.rebate_amount_cents", "CustomsDeclaration.rebate_claimed"),
+        ensures=(
+            {
+                "name": "rebate_claim_post",
+                "code": "CONTRACT_ENSURES_VIOLATION",
+                "target_type": "CustomsDeclaration",
+                "id_param": "declaration_id",
+                "must_hold": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "cleared"}},
+                        {"op": "eq", "left": {"ref": "before.rebate_claimed"}, "right": {"lit": False}},
+                        {"op": "eq", "left": {"ref": "after.rebate_claimed"}, "right": {"lit": True}},
+                        {"op": "gt", "left": {"ref": "after.rebate_amount_cents"}, "right": {"lit": 0}},
+                    ],
+                },
+                "description": "出口退税核定仅针对未申报清关报关单，且核定后退税额正值并置位已申报。",
+            },
+        ),
     ),
     EditFunctionDef(
         name="batch_recall_defective_lot",
@@ -1185,6 +1217,61 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         handler=_batch_recall_defective_lot,
         description="按缺陷批次号跨生产工单、返工工单与发货单原子锁定隔离，并批量开立车间追踪协同工单。",
         touched_object_types=("WorkOrder", "ReworkWorkOrder", "O2cDelivery", "WorkCard"),
+        modifies=("WorkOrder.x_quarantined", "O2cDelivery.x_quarantined"),
+        creates=("WorkCard",),
+        ensures=(
+            {
+                "name": "batch_recall_card_open",
+                "code": "CONTRACT_ENSURES_VIOLATION",
+                "target_type": "WorkCard",
+                "must_hold": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "OPEN"}},
+                        {"op": "eq", "left": {"ref": "after.resolved_by_actor_id"}, "right": {"lit": ""}},
+                        {"op": "eq", "left": {"ref": "after.requester_actor_id"}, "right": {"ref": "actor.actor_id"}},
+                    ],
+                },
+                "description": "批次召回生成的协同追踪工单初态必须为 OPEN 且记录发起人。",
+            },
+            {
+                "name": "batch_recall_card_unique",
+                "code": "DUPLICATE_ACTIVE_WORK_CARD",
+                "target_type": "WorkCard",
+                "must_hold": {
+                    "op": "not_exists",
+                    "object_type": "WorkCard",
+                    "where": {
+                        "op": "and",
+                        "args": [
+                            {"op": "ne", "left": {"ref": "target.card_id"}, "right": {"ref": "after.card_id"}},
+                            {"op": "eq", "left": {"ref": "target.card_kind"}, "right": {"ref": "after.card_kind"}},
+                            {
+                                "op": "eq",
+                                "left": {"ref": "target.target_object_type"},
+                                "right": {"ref": "after.target_object_type"},
+                            },
+                            {
+                                "op": "eq",
+                                "left": {"ref": "target.target_object_id"},
+                                "right": {"ref": "after.target_object_id"},
+                            },
+                            {
+                                "op": "eq",
+                                "left": {"ref": "target.requested_action"},
+                                "right": {"ref": "after.requested_action"},
+                            },
+                            {
+                                "op": "in",
+                                "left": {"ref": "target.status"},
+                                "right": {"lit": ["OPEN", "IN_PROGRESS"]},
+                            },
+                        ],
+                    },
+                },
+                "description": "批次召回协同工单不得与已有在途工单重复意图。",
+            },
+        ),
     ),
     EditFunctionDef(
         name="explode_multilevel_substitute_bom",
@@ -1192,6 +1279,26 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         handler=_explode_multilevel_substitute_bom,
         description="多级 BOM 递归展算与主料短缺自动切换替代料配方（BFS 扣减可用库存并原子创建多级子工单）。",
         touched_object_types=("WorkOrder", "BomSpec", "TradeResource"),
+        creates=("WorkOrder",),
+        ensures=(
+            {
+                "name": "explode_bom_child_wo_post",
+                "code": "CONTRACT_ENSURES_VIOLATION",
+                "target_type": "WorkOrder",
+                "must_hold": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "draft"}},
+                        {"op": "gt", "left": {"ref": "after.planned_qty"}, "right": {"lit": 0.0}},
+                        {"op": "eq", "left": {"ref": "after.issued_qty"}, "right": {"lit": 0.0}},
+                        {"op": "eq", "left": {"ref": "after.issued_cost_cents"}, "right": {"lit": 0}},
+                        {"op": "eq", "left": {"ref": "after.completed_good_qty"}, "right": {"lit": 0.0}},
+                        {"op": "eq", "left": {"ref": "after.completed_scrap_qty"}, "right": {"lit": 0.0}},
+                    ],
+                },
+                "description": "多级 BOM 展算产生的子工单初态必须为 draft 且计划数量正值、已领料与产出均为零。",
+            },
+        ),
     ),
     EditFunctionDef(
         name="settle_annual_tiered_dealer_rebate",
@@ -1205,6 +1312,41 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
             "ExportSalesOrder",
             "O2cInvoice",
         ),
+        modifies=("O2cInvoice.amount_residual", "O2cInvoice.payment_state"),
+        creates=("DealerRebateSettlement",),
+        ensures=(
+            {
+                "name": "settle_rebate_invoice_post",
+                "code": "CONTRACT_ENSURES_VIOLATION",
+                "target_type": "O2cInvoice",
+                "must_hold": {
+                    "op": "and",
+                    "args": [
+                        {"op": "ge", "left": {"ref": "after.amount_residual"}, "right": {"lit": 0.0}},
+                        {
+                            "op": "le",
+                            "left": {"ref": "after.amount_residual"},
+                            "right": {"ref": "before.amount_residual"},
+                        },
+                    ],
+                },
+                "description": "返利冲抵后受影响应收发票未核销余额非负且单调非增。",
+            },
+            {
+                "name": "settle_rebate_voucher_post",
+                "code": "CONTRACT_ENSURES_VIOLATION",
+                "target_type": "DealerRebateSettlement",
+                "must_hold": {
+                    "op": "and",
+                    "args": [
+                        {"op": "gt", "left": {"ref": "after.annual_sales_cents"}, "right": {"lit": 0}},
+                        {"op": "ge", "left": {"ref": "after.rebate_cents"}, "right": {"lit": 0}},
+                        {"op": "ge", "left": {"ref": "after.offset_invoice_count"}, "right": {"lit": 0}},
+                    ],
+                },
+                "description": "新建返利结算凭证销售额正值、返利金额与冲抵笔数非负。",
+            },
+        ),
     ),
     EditFunctionDef(
         name="allocate_container_shipping_cost",
@@ -1212,6 +1354,20 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         handler=_allocate_container_shipping_cost,
         description="按集装箱毛重比例跨多张拼箱出口订单精确分摊海运运费（尾差归口，分厘守恒）。",
         touched_object_types=("ExportSalesOrder",),
+        modifies=("ExportSalesOrder.x_allocated_freight_cents",),
+        ensures=(
+            {
+                "name": "allocate_freight_non_negative_post",
+                "code": "CONTRACT_ENSURES_VIOLATION",
+                "target_type": "ExportSalesOrder",
+                "must_hold": {
+                    "op": "ge",
+                    "left": {"ref": "after.x_allocated_freight_cents"},
+                    "right": {"lit": 0},
+                },
+                "description": "拼箱出口海运费分摊后每张订单分摊运费非负。",
+            },
+        ),
     ),
 )
 
@@ -1424,6 +1580,7 @@ def build_medauto_spec() -> OntologySpec:
         if src.display:
             derived.update_display(src.display)
     derived.update_display(_MEDAUTO_DISPLAY_PATCH)
+    enforce_edit_function_contracts(derived)
     return derived
 
 

@@ -2368,6 +2368,16 @@ def run_design_prove(
                     ),
                     code="INVARIANT_VIOLATION",
                 )
+        elif inv_res.status == "VACUOUS_CONTRACT":
+            _add_error(
+                errors,
+                error_codes,
+                (
+                    f"VACUOUS_CONTRACT: action {inv_res.action_name!r} behavioral contract is "
+                    f"unrealizable (core={inv_res.unsat_core})"
+                ),
+                code="VACUOUS_CONTRACT",
+            )
     if report.upgrade_compatibility is not None and not report.upgrade_compatibility.compatible:
         for reg in report.upgrade_compatibility.regressions:
             _add_error(
@@ -2405,6 +2415,10 @@ def _format_prove_human_report(res: Mapping[str, Any]) -> str:
         f"dead_classes={rep.get('dead_class_count', 0)}, "
         f"dl_conflicts={rep.get('dl_conflict_count', 0)}, "
         f"lsp_violations={rep.get('lsp_violation_count', 0)}, "
+        f"exact_wp={rep.get('exact_wp_proved_count', 0)}, "
+        f"contract_proved={rep.get('contract_proved_count', 0)}, "
+        f"vacuous_contracts={rep.get('vacuous_contract_count', 0)}, "
+        f"uncontracted={rep.get('uncontracted_edit_function_count', 0)}, "
         f"redundant_rules={rep.get('redundant_rule_count')}",
         f"  logic_fragments={rep.get('logic_fragment_counts')}",
     ]
@@ -2430,6 +2444,10 @@ def _format_prove_human_report(res: Mapping[str, Any]) -> str:
                     f"  [INVARIANT_VIOLATION] {inv['action_name']} -> {ce['violated_invariant']} "
                     f"({ce.get('violated_code')}): params={ce.get('params')} after={ce.get('after')}"
                 )
+        elif inv.get("status") == "VACUOUS_CONTRACT":
+            lines.append(
+                f"  [VACUOUS_CONTRACT] {inv['action_name']}: unsat_core={inv.get('unsat_core')}"
+            )
     for rr in rep.get("redundant_rules") or ():
         lines.append(
             f"  [REDUNDANT_RULE] {rr['action_name']}.{rr['rule_name']} ({rr['reason']}): "

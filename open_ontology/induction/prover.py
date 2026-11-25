@@ -158,9 +158,20 @@ class InvariantPreservationProof(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action_name: str
-    status: Literal["PROVED", "VIOLATED", "VACUOUS_DEADLOCK", "UNKNOWN"]
+    status: Literal[
+        "PROVED",
+        "CONTRACT_PROVED",
+        "VIOLATED",
+        "VACUOUS_CONTRACT",
+        "VACUOUS_DEADLOCK",
+        "SKIPPED_UNCONTRACTED",
+        "UNKNOWN",
+    ]
+    proof_kind: Literal["exact_wp", "contract_assume_guarantee", "skipped"] = "exact_wp"
     checked_invariants: list[str] = Field(default_factory=list)
     violated_invariants: list[str] = Field(default_factory=list)
+    unsat_core: list[str] = Field(default_factory=list)
+    detail: str = ""
     counterexamples: list[InvariantCounterexample] = Field(default_factory=list)
     logic_fragment: str = "EXACT_QF_LIA"
     elapsed_ms: float = 0.0
@@ -174,6 +185,7 @@ class UpgradeRegressionItem(BaseModel):
         "NEW_TOTAL_DEADLOCK",
         "NEW_CONDITIONAL_DEADLOCK",
         "NEW_INVARIANT_VIOLATION",
+        "NEW_VACUOUS_CONTRACT",
         "STRUCTURAL_INCOMPATIBILITY",
     ]
     slice_name: str | None = None
@@ -234,6 +246,10 @@ class ProofReport(BaseModel):
     dead_class_count: int = 0
     dl_conflict_count: int = 0
     lsp_violation_count: int = 0
+    exact_wp_proved_count: int = 0
+    contract_proved_count: int = 0
+    vacuous_contract_count: int = 0
+    uncontracted_edit_function_count: int = 0
     logic_fragment_counts: dict[str, int] = Field(default_factory=dict)
     class_proofs: list[ClassSatisfiabilityProof] = Field(default_factory=list)
     reachability: list[ActionReachabilityProof] = Field(default_factory=list)
@@ -760,6 +776,9 @@ class _StringCodec:
                     _collect_expr_strings(mut.when, collected)
                 for val_expr in mut.set_fields.values():
                     _collect_expr_strings(val_expr, collected)
+            for ens in act.ensures:
+                _collect_expr_strings(ens.when, collected)
+                _collect_expr_strings(ens.must_hold, collected)
         for inv in bp.invariants:
             _collect_expr_strings(inv.when, collected)
             _collect_expr_strings(inv.must_hold, collected)
@@ -2645,6 +2664,684 @@ def _apply_mutations_symbolically(
     return post_tables, created_entities, modified_pairs, mut_guards
 
 
+def _make_raw_havoc_val(
+    comp: _Z3Compiler,
+    ot: ObjectTypeBlueprint,
+    fname: str,
+    tag: str,
+) -> _SymVal:
+    """Allocate an unconstrained post-state symbolic field (no non_negative or FSM axioms)."""
+    z3 = comp.z3
+    for fld in ot.fields:
+        if fld.name == fname:
+            sv = comp.make_scalar_var(tag, fld.field_type, add_domain_axioms=False)
+            if fld.field_type == "str":
+                comp.background.append(z3.And(sv.expr >= 1, sv.expr < comp.codec.max_id))
+            return sv
+    for rel in ot.relations:
+        if rel.field == fname:
+            nullable = (not rel.required) and (not rel.multiple)
+            sv = comp.make_scalar_var(tag, "str", nullable=nullable, add_domain_axioms=False)
+            min_code = 0 if nullable else 1
+            comp.background.append(z3.And(sv.expr >= min_code, sv.expr < comp.codec.max_id))
+            return sv
+    sv = comp.make_scalar_var(tag, "str", add_domain_axioms=False)
+    comp.background.append(z3.And(sv.expr >= 1, sv.expr < comp.codec.max_id))
+    return sv
+
+
+def _prove_edit_function_contract_action(
+    z3: Any,
+    bp: DeclarativeBlueprint,
+    act: ActionBlueprint,
+    codec: _StringCodec,
+    ancestors_map: Mapping[str, tuple[str, ...]],
+    *,
+    bmc_bound: int,
+    timeout_ms: int,
+) -> InvariantPreservationProof:
+    """Modular Assume-Guarantee verification for a contracted ``EditFunction`` action.
+
+    1. **PO-5 Realizability**: ``SAT(Background ∧ Pre(before) ∧ I(before) ∧ Frame ∧ Ensures)``;
+       if ``UNSAT``, return ``VACUOUS_CONTRACT`` with minimized ``unsat_core``.
+    2. **PO-4b Preservation**: ``UNSAT(Background ∧ Pre(before) ∧ I(before) ∧ Frame ∧ Ensures ∧ ¬I(after))``;
+       return ``CONTRACT_PROVED`` or ``VIOLATED`` with counterexample.
+    """
+    t0 = time.perf_counter()
+    comp = _Z3Compiler(z3, bp, codec, bmc_bound=bmc_bound)
+    actor = comp.build_actor(act.allowed_roles)
+    params = comp.build_params(act)
+
+    def _is_field_modified(ot_name: str, fname: str) -> bool:
+        return any(
+            f"{anc}.{fname}" in act.modifies or f"{anc}.*" in act.modifies
+            for anc in _ancestor_closure(ot_name, ancestors_map)
+        )
+
+    modified_ot_names = sorted(
+        ot.name
+        for ot in bp.object_types
+        if any(_is_field_modified(ot.name, f.name) for f in ot.fields)
+        or any(_is_field_modified(ot.name, r.field) for r in ot.relations)
+    )
+    created_types_set = set(act.creates)
+    deleted_types_set = set(act.deletes)
+
+    # Materialize keyed subjects from preconditions AND keyed ensures
+    pre_subjects: dict[tuple[str, str], _SymEntity] = {}
+    anchor: _SymEntity | None = None
+    for pre in act.preconditions:
+        if pre.target_type not in comp.ot_by_name:
+            continue
+        idp = _resolve_rule_id_param(pre, act, comp.ot_by_name)
+        key = (pre.target_type, idp)
+        if key not in pre_subjects:
+            ent = comp.build_entity(pre.target_type, f"subj_{pre.target_type}_{idp}")
+            if idp in params:
+                comp.background.append(ent.fields[ent.ot.primary_key].expr == params[idp].expr)
+            pre_subjects[key] = ent
+            if anchor is None:
+                anchor = ent
+
+    for ens in act.ensures:
+        if ens.id_param and ens.target_type in comp.ot_by_name:
+            key = (ens.target_type, ens.id_param)
+            if key not in pre_subjects:
+                ent = comp.build_entity(ens.target_type, f"subj_{ens.target_type}_{ens.id_param}")
+                if ens.id_param in params:
+                    comp.background.append(ent.fields[ent.ot.primary_key].expr == params[ens.id_param].expr)
+                pre_subjects[key] = ent
+                if anchor is None:
+                    anchor = ent
+
+    mutated_or_created_types = (
+        set(modified_ot_names)
+        | created_types_set
+        | deleted_types_set
+        | {ens.target_type for ens in act.ensures if ens.target_type in comp.ot_by_name}
+        | {ot_n for ot_n, _ in pre_subjects.keys()}
+    )
+    mutated_ancestors: set[str] = set()
+    for mt in mutated_or_created_types:
+        if mt in comp.ot_by_name:
+            mutated_ancestors.update(_ancestor_closure(mt, ancestors_map))
+
+    # Pre-initialize BMC tables for all touched/created/deleted/invariant-relevant types
+    needed_table_types: set[str] = {t for t in mutated_or_created_types if t in comp.ot_by_name}
+    applicable_invs: list[InvariantRuleSpec] = []
+    for inv in bp.invariants:
+        inv_qtypes: set[str] = set()
+        _collect_expr_refs(inv.when, set(), quant_types=inv_qtypes)
+        _collect_expr_refs(inv.must_hold, set(), quant_types=inv_qtypes)
+        if inv.target_type in mutated_ancestors or (inv_qtypes & mutated_ancestors):
+            applicable_invs.append(inv)
+            if inv.target_type in comp.ot_by_name:
+                needed_table_types.add(inv.target_type)
+            for ot in bp.object_types:
+                if inv.target_type in _ancestor_closure(ot.name, ancestors_map):
+                    needed_table_types.add(ot.name)
+            for qt in inv_qtypes:
+                if qt in comp.ot_by_name:
+                    needed_table_types.add(qt)
+    for ens in act.ensures:
+        qtypes_e: set[str] = set()
+        _collect_expr_refs(ens.when, set(), quant_types=qtypes_e)
+        _collect_expr_refs(ens.must_hold, set(), quant_types=qtypes_e)
+        for qt in qtypes_e:
+            if qt in comp.ot_by_name:
+                needed_table_types.add(qt)
+
+    for tbl_t in sorted(needed_table_types):
+        comp.get_bmc_table(tbl_t)
+
+    # Clone pre BMC tables into post_tables preserving untouched fields via identity (Frame Axiom)
+    post_tables: dict[str, list[_SymRow]] = {}
+    for tname, rows in comp.bmc_tables.items():
+        copied_rows: list[_SymRow] = []
+        for r in rows:
+            post_present = r.present
+            if deleted_types_set & set(_ancestor_closure(tname, ancestors_map)):
+                keep_b = z3.Bool(comp.next_name(f"keep_{tname}"))
+                post_present = z3.And(r.present, keep_b)
+            copied_rows.append(
+                _SymRow(
+                    present=post_present,
+                    entity=_SymEntity(
+                        ot=r.entity.ot,
+                        tag=f"{r.entity.tag}_post",
+                        fields=dict(r.entity.fields),
+                        linked=dict(r.entity.linked),
+                    ),
+                )
+            )
+        post_tables[tname] = copied_rows
+
+    # Identify which modified types are keyed-only (single instance mutated via id_param)
+    unkeyed_before_types: set[str] = set()
+    for ens in act.ensures:
+        if ens.id_param is None:
+            refs_e: set[str] = set()
+            _collect_expr_refs(ens.when, refs_e)
+            _collect_expr_refs(ens.must_hold, refs_e)
+            if any(r.startswith("before.") for r in refs_e):
+                unkeyed_before_types.add(ens.target_type)
+
+    keyed_param_for_type: dict[str, tuple[str, str]] = {}
+    for ot_name in modified_ot_names:
+        ancs = _ancestor_closure(ot_name, ancestors_map)
+        if any(ut in ancs for ut in unkeyed_before_types):
+            continue
+        for (subj_t, idp) in pre_subjects:
+            if subj_t in ancs and idp in params:
+                keyed_param_for_type[ot_name] = (subj_t, idp)
+                break
+
+    # Apply havoc on declared modified fields, keeping exact pre-state on untouched fields
+    modified_records: list[tuple[str, _SymEntity, _SymEntity, Any]] = []
+    for ot_name in modified_ot_names:
+        ot = comp.ot_by_name[ot_name]
+        pre_rows = comp.bmc_tables[ot_name]
+        post_rows = post_tables[ot_name]
+        key_pair = keyed_param_for_type.get(ot_name)
+        for r_idx, (pre_r, post_r) in enumerate(zip(pre_rows, post_rows)):
+            if key_pair is not None:
+                _, idp = key_pair
+                hit = z3.And(pre_r.present, pre_r.entity.fields[ot.primary_key].expr == params[idp].expr)
+            else:
+                hit = pre_r.present
+            for fname in list(post_r.entity.fields.keys()):
+                if fname == ot.primary_key or not _is_field_modified(ot_name, fname):
+                    continue
+                havoc_sv = _make_raw_havoc_val(
+                    comp, ot, fname, f"havoc_{ot_name}_{r_idx}_{fname}"
+                )
+                old_sv = pre_r.entity.fields[fname]
+                if key_pair is not None:
+                    post_r.entity.fields[fname] = _SymVal(
+                        z3.If(hit, havoc_sv.expr, old_sv.expr),
+                        havoc_sv.kind,
+                        is_null=_ite_is_null(z3, hit, havoc_sv.is_null, old_sv.is_null),
+                    )
+                else:
+                    post_r.entity.fields[fname] = havoc_sv
+            modified_records.append((ot_name, pre_r.entity, post_r.entity, hit))
+
+    # Build post-state views of keyed subjects so ensures + counterexample decode see exact writes
+    post_subjects: dict[tuple[str, str], _SymEntity] = {}
+    for (st, idp), pre_s in pre_subjects.items():
+        if st in post_tables:
+            post_subjects[(st, idp)] = comp._overlay_entity_lookup(
+                pre_s.fields[pre_s.ot.primary_key], pre_s, post_tables[st]
+            )
+        else:
+            post_subjects[(st, idp)] = pre_s
+
+    # Materialize symbolic newly created entities for act.creates (without assuming post-invariants)
+    created_entities: list[tuple[str, _SymEntity, Any]] = []
+    for c_idx, c_type in enumerate(act.creates):
+        if c_type not in comp.ot_by_name:
+            continue
+        c_ot = comp.ot_by_name[c_type]
+        c_ent = _SymEntity(ot=c_ot, tag=f"created_{c_idx}_{c_type}")
+        seen_c: set[str] = set()
+        for fld in c_ot.fields:
+            seen_c.add(fld.name)
+            c_ent.fields[fld.name] = _make_raw_havoc_val(
+                comp, c_ot, fld.name, f"cre_{c_idx}_{c_type}_{fld.name}"
+            )
+        if c_ot.primary_key not in seen_c:
+            c_ent.fields[c_ot.primary_key] = _make_raw_havoc_val(
+                comp, c_ot, c_ot.primary_key, f"cre_{c_idx}_{c_type}_{c_ot.primary_key}"
+            )
+        for rel in c_ot.relations:
+            if rel.field not in c_ent.fields:
+                c_ent.fields[rel.field] = _make_raw_havoc_val(
+                    comp, c_ot, rel.field, f"cre_{c_idx}_{c_type}_{rel.field}"
+                )
+        # Fresh PK distinct from existing rows of c_type
+        pk_name = c_ot.primary_key
+        for pre_r in comp.bmc_tables.get(c_type, ()):
+            comp.background.append(
+                z3.Implies(pre_r.present, c_ent.fields[pk_name].expr != pre_r.entity.fields[pk_name].expr)
+            )
+        c_guard = z3.BoolVal(True)
+        post_tables.setdefault(c_type, []).append(_SymRow(present=c_guard, entity=c_ent))
+        created_entities.append((c_type, c_ent, c_guard))
+
+    # Compile tracked assumptions for PO-5 Realizability and PO-4b Preservation
+    tracked_items: list[tuple[str, Any]] = []
+
+    # 1) Preconditions Pre(before)
+    for pre in act.preconditions:
+        idp = _resolve_rule_id_param(pre, act, comp.ot_by_name)
+        subj = pre_subjects[(pre.target_type, idp)]
+        p_ctx = {"obj": subj, "param": params, "actor": actor}
+        w_z3 = comp.compile_bool(pre.when, p_ctx) if pre.when is not None else z3.BoolVal(True)
+        m_z3 = comp.compile_bool(pre.must_hold, p_ctx)
+        tracked_items.append((f"pre:{pre.name}", z3.Implies(w_z3, m_z3)))
+
+    # 2) Pre-state invariants I(before) across pre_subjects and pre BMC tables
+    pre_entities_all: list[_SymEntity] = []
+    seen_ids: set[int] = set()
+    for ent in pre_subjects.values():
+        if id(ent) not in seen_ids:
+            seen_ids.add(id(ent))
+            pre_entities_all.append(ent)
+
+    for inv in applicable_invs:
+        rforms: list[Any] = []
+        for pre_ent in pre_entities_all:
+            if inv.target_type in _ancestor_closure(pre_ent.ot.name, ancestors_map):
+                sub_ctx = {"obj": pre_ent}
+                w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
+                m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
+                rforms.append(z3.Implies(w_z3, m_z3))
+        for bt in sorted(comp.bmc_tables.keys()):
+            if inv.target_type in _ancestor_closure(bt, ancestors_map):
+                for row in comp.bmc_tables[bt]:
+                    sub_ctx = {"obj": row.entity}
+                    w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
+                    m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
+                    rforms.append(z3.Implies(z3.And(row.present, w_z3), m_z3))
+        if rforms:
+            tracked_items.append((f"inv_pre:{inv.name}", z3.And(*rforms)))
+
+    # 3) Postconditions Ensures(before, after)
+    for ens in act.ensures:
+        if ens.id_param and (ens.target_type, ens.id_param) in pre_subjects:
+            pre_s = pre_subjects[(ens.target_type, ens.id_param)]
+            post_s = post_subjects[(ens.target_type, ens.id_param)]
+            ectx = {
+                "before": pre_s,
+                "after": post_s,
+                "obj": post_s,
+                "param": params,
+                "actor": actor,
+            }
+            w_e = (
+                comp.compile_bool(ens.when, ectx, pre_state=False, state_override=post_tables)
+                if ens.when is not None
+                else z3.BoolVal(True)
+            )
+            m_e = comp.compile_bool(ens.must_hold, ectx, pre_state=False, state_override=post_tables)
+            ens_forms = [z3.Implies(w_e, m_e)]
+            # Propagate keyed ensures cleanly to any modified concrete subtypes matching params[id_param]
+            for sub_t in modified_ot_names:
+                if sub_t != ens.target_type and ens.target_type in ancestors_map.get(sub_t, ()):
+                    sub_ot = comp.ot_by_name[sub_t]
+                    idp = ens.id_param
+                    for pre_r, post_r in zip(comp.bmc_tables[sub_t], post_tables[sub_t]):
+                        hit_sub = (
+                            z3.And(
+                                pre_r.present,
+                                pre_r.entity.fields[sub_ot.primary_key].expr == params[idp].expr,
+                            )
+                            if idp in params
+                            else pre_r.present
+                        )
+                        sctx = {
+                            "before": pre_r.entity,
+                            "after": post_r.entity,
+                            "obj": post_r.entity,
+                            "param": params,
+                            "actor": actor,
+                        }
+                        sw = (
+                            comp.compile_bool(ens.when, sctx, pre_state=False, state_override=post_tables)
+                            if ens.when is not None
+                            else z3.BoolVal(True)
+                        )
+                        sm = comp.compile_bool(
+                            ens.must_hold, sctx, pre_state=False, state_override=post_tables
+                        )
+                        ens_forms.append(z3.Implies(z3.And(hit_sub, sw), sm))
+            tracked_items.append((f"ensures:{ens.name}", z3.And(*ens_forms)))
+        else:
+            ens_refs: set[str] = set()
+            _collect_expr_refs(ens.when, ens_refs)
+            _collect_expr_refs(ens.must_hold, ens_refs)
+            uses_before = any(r.startswith("before.") for r in ens_refs)
+            matching_created = [
+                (c_ot, c_ent, c_guard)
+                for c_ot, c_ent, c_guard in created_entities
+                if ens.target_type in _ancestor_closure(c_ot, ancestors_map)
+            ]
+            ens_forms = []
+            if matching_created and not uses_before:
+                for _c_ot, c_ent, c_guard in matching_created:
+                    ectx = {
+                        "before": c_ent,
+                        "after": c_ent,
+                        "obj": c_ent,
+                        "param": params,
+                        "actor": actor,
+                    }
+                    w_e = (
+                        comp.compile_bool(ens.when, ectx, pre_state=False, state_override=post_tables)
+                        if ens.when is not None
+                        else z3.BoolVal(True)
+                    )
+                    m_e = comp.compile_bool(
+                        ens.must_hold, ectx, pre_state=False, state_override=post_tables
+                    )
+                    ens_forms.append(z3.Implies(z3.And(c_guard, w_e), m_e))
+            else:
+                target_tb_names = sorted(
+                    t
+                    for t in set(modified_ot_names) | ({ens.target_type} if ens.target_type in comp.bmc_tables else set())
+                    if t in comp.bmc_tables and ens.target_type in _ancestor_closure(t, ancestors_map)
+                )
+                for tb_name in target_tb_names:
+                    for pre_r, post_r in zip(comp.bmc_tables[tb_name], post_tables[tb_name]):
+                        ectx = {
+                            "before": pre_r.entity,
+                            "after": post_r.entity,
+                            "obj": post_r.entity,
+                            "param": params,
+                            "actor": actor,
+                        }
+                        w_e = (
+                            comp.compile_bool(ens.when, ectx, pre_state=False, state_override=post_tables)
+                            if ens.when is not None
+                            else z3.BoolVal(True)
+                        )
+                        m_e = comp.compile_bool(
+                            ens.must_hold, ectx, pre_state=False, state_override=post_tables
+                        )
+                        ens_forms.append(z3.Implies(z3.And(pre_r.present, w_e), m_e))
+            if ens_forms:
+                tracked_items.append((f"ensures:{ens.name}", z3.And(*ens_forms)))
+
+    # Compile Obligations A, B, C, D BEFORE running PO-5 so comp.background is 100% materialized
+    obligations: list[tuple[str, str, Any]] = []
+
+    # Obligation A: non_negative on created entities and modified fields
+    for ot_name, new_ent, c_guard in created_entities:
+        for fld in new_ent.ot.fields:
+            if fld.non_negative:
+                fv = new_ent.fields[fld.name]
+                if fv.kind == "float" or z3.is_real(fv.expr):
+                    comp.used_real = True
+                    cond = fv.expr >= z3.RealVal("0")
+                else:
+                    cond = fv.expr >= 0
+                obligations.append(
+                    (f"{ot_name}.{fld.name}_non_negative", "NEGATIVE_VALUE", z3.Implies(c_guard, cond))
+                )
+
+    seen_mod_nn: set[tuple[str, str]] = set()
+    for ot_name, _pre_ent, post_ent, hit in modified_records:
+        for fld in post_ent.ot.fields:
+            if fld.non_negative and _is_field_modified(ot_name, fld.name):
+                fv = post_ent.fields[fld.name]
+                if fv.kind == "float" or z3.is_real(fv.expr):
+                    comp.used_real = True
+                    cond = fv.expr >= z3.RealVal("0")
+                else:
+                    cond = fv.expr >= 0
+                ob_key = (ot_name, fld.name)
+                if ob_key not in seen_mod_nn:
+                    seen_mod_nn.add(ob_key)
+                obligations.append(
+                    (
+                        f"{ot_name}.{fld.name}_non_negative",
+                        "NEGATIVE_VALUE",
+                        z3.Implies(hit, cond),
+                    )
+                )
+
+    # Collapse per-(ot_name, fld_name) non_negative obligations across BMC rows for concise reporting
+    grouped_nn: dict[tuple[str, str, str], list[Any]] = {}
+    other_obs: list[tuple[str, str, Any]] = []
+    for oname, ocode, oform in obligations:
+        if ocode == "NEGATIVE_VALUE":
+            grouped_nn.setdefault((oname, ocode, oname), []).append(oform)
+        else:
+            other_obs.append((oname, ocode, oform))
+    obligations = [
+        (oname, ocode, z3.And(*forms))
+        for (oname, ocode, _), forms in grouped_nn.items()
+    ] + other_obs
+
+    # Obligation B: FSM initial statuses & transitions
+    for ot_name, new_ent, c_guard in created_entities:
+        ot = new_ent.ot
+        if ot.initial_statuses is not None:
+            sf = new_ent.fields.get(ot.status_field)
+            if sf is not None:
+                allowed = [sf.expr == codec.encode(s) for s in ot.initial_statuses]
+                obligations.append(
+                    (
+                        f"{ot_name}.initial_{ot.status_field}",
+                        "ILLEGAL_INITIAL_STATUS",
+                        z3.Implies(c_guard, z3.Or(*allowed) if allowed else z3.BoolVal(False)),
+                    )
+                )
+
+    fsm_by_type: dict[str, list[Any]] = {}
+    fsm_field_by_type: dict[str, str] = {}
+    for ot_name, pre_ent, post_ent, hit in modified_records:
+        ot = post_ent.ot
+        if ot.transitions and _is_field_modified(ot_name, ot.status_field):
+            sf_before = pre_ent.fields.get(ot.status_field)
+            sf_after = post_ent.fields.get(ot.status_field)
+            if sf_before is not None and sf_after is not None:
+                edge_disj = [sf_before.expr == sf_after.expr]
+                for src_s, dst_list in ot.transitions.items():
+                    src_c = codec.encode(src_s)
+                    for dst_s in dst_list:
+                        edge_disj.append(
+                            z3.And(sf_before.expr == src_c, sf_after.expr == codec.encode(dst_s))
+                        )
+                fsm_field_by_type[ot_name] = ot.status_field
+                fsm_by_type.setdefault(ot_name, []).append(z3.Implies(hit, z3.Or(*edge_disj)))
+    for ot_name, forms in fsm_by_type.items():
+        obligations.append(
+            (
+                f"{ot_name}.fsm_{fsm_field_by_type[ot_name]}",
+                "ILLEGAL_STATE_TRANSITION",
+                z3.And(*forms),
+            )
+        )
+
+    # Obligation C: voucher_delta_rules balance conservation
+    for ot in bp.object_types:
+        if not ot.voucher_delta_rules:
+            continue
+        for bal_field, (v_type, v_link, v_delta) in ot.voucher_delta_rules.items():
+            if ot.name not in mutated_ancestors and v_type not in mutated_ancestors:
+                continue
+            for m_ot, pre_ent, post_ent, hit in modified_records:
+                if ot.name not in _ancestor_closure(m_ot, ancestors_map):
+                    continue
+                if not _is_field_modified(m_ot, bal_field):
+                    continue
+                bf = pre_ent.fields[bal_field]
+                af = post_ent.fields[bal_field]
+                be, ae, _ = comp._coerce_arith_pair(bf, af)
+                ledger_delta = ae - be
+                pk_expr = pre_ent.fields[pre_ent.ot.primary_key].expr
+                v_terms = []
+                for c_ot, c_ent, c_guard in created_entities:
+                    if v_type not in _ancestor_closure(c_ot, ancestors_map):
+                        continue
+                    link_sv = c_ent.fields.get(v_link)
+                    delta_sv = c_ent.fields.get(v_delta)
+                    if link_sv is not None and delta_sv is not None:
+                        v_terms.append(
+                            z3.If(
+                                z3.And(c_guard, link_sv.expr == pk_expr),
+                                z3.ToReal(delta_sv.expr)
+                                if not z3.is_real(delta_sv.expr)
+                                else delta_sv.expr,
+                                z3.RealVal("0"),
+                            )
+                        )
+                v_sum = z3.Sum(*v_terms) if v_terms else z3.RealVal("0")
+                ld_real = z3.ToReal(ledger_delta) if not z3.is_real(ledger_delta) else ledger_delta
+                diff_abs = ld_real - v_sum
+                obligations.append(
+                    (
+                        f"{ot.name}.{bal_field}_voucher_conservation",
+                        "UNBACKED_BALANCE_MUTATION",
+                        z3.Implies(
+                            hit,
+                            z3.And(diff_abs <= z3.RealVal("1e-9"), diff_abs >= z3.RealVal("-1e-9")),
+                        ),
+                    )
+                )
+
+    # Obligation D: Declarative invariants I(after)
+    for inv in applicable_invs:
+        post_formulas: list[Any] = []
+        checked_table_types = sorted(
+            t
+            for t in (set(post_tables.keys()) | set(comp.bmc_tables.keys()))
+            if inv.target_type in _ancestor_closure(t, ancestors_map)
+        )
+        for tb_type in checked_table_types:
+            rows = post_tables.get(tb_type)
+            if rows is None:
+                rows = comp.bmc_tables.get(tb_type)
+            if rows is not None:
+                for row in rows:
+                    sub_ctx = {"obj": row.entity}
+                    w_post = (
+                        comp.compile_bool(inv.when, sub_ctx, pre_state=False, state_override=post_tables)
+                        if inv.when
+                        else z3.BoolVal(True)
+                    )
+                    m_post = comp.compile_bool(
+                        inv.must_hold, sub_ctx, pre_state=False, state_override=post_tables
+                    )
+                    post_formulas.append(z3.Implies(z3.And(row.present, w_post), m_post))
+        if post_formulas:
+            obligations.append((inv.name, inv.code, z3.And(*post_formulas)))
+
+    # Step PO-5: Anti-Vacuous Contract Realizability
+    po5_solver = z3.Solver()
+    po5_solver.set("unsat_core", True)
+    po5_solver.set("core.minimize", True)
+    po5_solver.set("timeout", int(timeout_ms))
+    for bg in comp.background:
+        po5_solver.add(bg)
+    track_map: dict[str, str] = {}
+    for t_name, t_form in tracked_items:
+        t_bool = z3.Bool(comp.next_name(f"po5_{t_name}"))
+        track_map[str(t_bool)] = t_name
+        po5_solver.assert_and_track(t_form, t_bool)
+
+    po5_chk = po5_solver.check()
+    frag = comp.logic_fragment()
+    if po5_chk == z3.unknown:
+        return InvariantPreservationProof(
+            action_name=act.name,
+            status="UNKNOWN",
+            proof_kind="contract_assume_guarantee",
+            logic_fragment="UNKNOWN",
+            detail="Z3 returned unknown during PO-5 contract realizability check.",
+            elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+        )
+    if po5_chk == z3.unsat:
+        raw_core = [track_map[str(b)] for b in po5_solver.unsat_core() if str(b) in track_map]
+        if not raw_core:
+            raw_core = [name for name, _ in tracked_items]
+        min_core = _minimize_class_unsat_core(z3, comp.background, tracked_items, raw_core, timeout_ms)
+        return InvariantPreservationProof(
+            action_name=act.name,
+            status="VACUOUS_CONTRACT",
+            proof_kind="contract_assume_guarantee",
+            unsat_core=min_core,
+            logic_fragment=frag,
+            detail=f"Contract is unrealizable (PO-5 UNSAT); minimal unsat_core={min_core}",
+            elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+        )
+
+    # Step PO-4b: Modular Hoare Preservation
+    check_solver = z3.Solver()
+    check_solver.set("timeout", int(timeout_ms))
+    for bg in comp.background:
+        check_solver.add(bg)
+    for _, t_form in tracked_items:
+        check_solver.add(t_form)
+
+    checked_names: list[str] = []
+    violated_names: list[str] = []
+    counterexamples: list[InvariantCounterexample] = []
+    any_unknown = False
+
+    for ob_name, ob_code, post_holds in obligations:
+        checked_names.append(ob_name)
+        check_solver.push()
+        check_solver.add(z3.Not(post_holds))
+        c_res = check_solver.check()
+        if c_res == z3.sat:
+            mdl = check_solver.model()
+            check_solver.pop()
+            violated_names.append(ob_name)
+            before_map: dict[str, dict[str, Any]] = {
+                f"{ot_n}:{idp}": _decode_entity(z3, mdl, ent, codec)
+                for (ot_n, idp), ent in pre_subjects.items()
+            }
+            after_map: dict[str, dict[str, Any]] = {
+                f"{ot_n}:{idp}(after)": _decode_entity(z3, mdl, ent, codec)
+                for (ot_n, idp), ent in post_subjects.items()
+            }
+            for m_idx, (ot_n, b_ent, a_ent, hit) in enumerate(modified_records):
+                if _eval_model_bool(z3, mdl, hit):
+                    b_dec = _decode_entity(z3, mdl, b_ent, codec)
+                    a_dec = _decode_entity(z3, mdl, a_ent, codec)
+                    if f"{ot_n}(before_{m_idx})" not in before_map:
+                        before_map.setdefault(f"{ot_n}({m_idx})", b_dec)
+                    after_map.setdefault(f"{ot_n}(modified_{m_idx})", a_dec)
+            for idx, (ot_n, c_ent, c_guard) in enumerate(created_entities):
+                if _eval_model_bool(z3, mdl, c_guard):
+                    after_map[f"{ot_n}(created_{idx})"] = _decode_entity(z3, mdl, c_ent, codec)
+            counterexamples.append(
+                InvariantCounterexample(
+                    violated_invariant=ob_name,
+                    violated_code=ob_code,
+                    actor={k: _decode_z3_scalar(z3, mdl, v, codec) for k, v in actor.items()},
+                    params={k: _decode_z3_scalar(z3, mdl, v, codec) for k, v in params.items()},
+                    before=before_map,
+                    after=after_map,
+                )
+            )
+        elif c_res == z3.unknown:
+            check_solver.pop()
+            any_unknown = True
+        else:
+            check_solver.pop()
+
+    if violated_names:
+        status: Literal[
+            "PROVED",
+            "CONTRACT_PROVED",
+            "VIOLATED",
+            "VACUOUS_CONTRACT",
+            "VACUOUS_DEADLOCK",
+            "SKIPPED_UNCONTRACTED",
+            "UNKNOWN",
+        ] = "VIOLATED"
+    elif any_unknown:
+        status = "UNKNOWN"
+        frag = "UNKNOWN"
+    else:
+        status = "CONTRACT_PROVED"
+
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    return InvariantPreservationProof(
+        action_name=act.name,
+        status=status,
+        proof_kind="contract_assume_guarantee",
+        checked_invariants=checked_names,
+        violated_invariants=violated_names,
+        counterexamples=counterexamples,
+        logic_fragment=frag,
+        elapsed_ms=round(elapsed, 3),
+    )
+
+
 def prove_invariant_preservation(
     blueprint_or_spec: DeclarativeBlueprint | OntologySpec | Mapping[str, Any],
     *,
@@ -2657,7 +3354,7 @@ def prove_invariant_preservation(
     bmc_bound: int = 4,
     timeout_ms: int = 5000,
 ) -> list[InvariantPreservationProof]:
-    """Prove inductive invariant preservation ``{Pre ∧ I} RuleAction {I'}`` via Hoare triples."""
+    """Prove inductive invariant preservation ``{Pre ∧ I} Action {I'}`` via exact wp or modular contracts."""
     z3 = _require_z3()
     raw_bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
     bp, ancestors_map, _ = _prepare_blueprint_for_prover(raw_bp)
@@ -2668,7 +3365,35 @@ def prove_invariant_preservation(
     for act in bp.actions:
         if target_filter is not None and act.name not in target_filter:
             continue
-        if act.edit_function is not None or not act.mutations:
+        if act.edit_function is not None:
+            has_contract = bool(act.modifies or act.creates or act.deletes or act.ensures)
+            if not has_contract:
+                results.append(
+                    InvariantPreservationProof(
+                        action_name=act.name,
+                        status="SKIPPED_UNCONTRACTED",
+                        proof_kind="skipped",
+                        logic_fragment="EXACT_QF_LIA",
+                        detail=(
+                            f"EditFunction {act.edit_function!r} has no behavioral contract "
+                            "(modifies/creates/deletes/ensures) declared."
+                        ),
+                    )
+                )
+            else:
+                results.append(
+                    _prove_edit_function_contract_action(
+                        z3,
+                        bp,
+                        act,
+                        codec,
+                        ancestors_map,
+                        bmc_bound=bmc_bound,
+                        timeout_ms=timeout_ms,
+                    )
+                )
+            continue
+        if not act.mutations:
             continue
 
         t0 = time.perf_counter()
@@ -3000,7 +3725,15 @@ def prove_invariant_preservation(
                 check_solver.pop()
 
         if violated_names:
-            status: Literal["PROVED", "VIOLATED", "VACUOUS_DEADLOCK", "UNKNOWN"] = "VIOLATED"
+            status: Literal[
+                "PROVED",
+                "CONTRACT_PROVED",
+                "VIOLATED",
+                "VACUOUS_CONTRACT",
+                "VACUOUS_DEADLOCK",
+                "SKIPPED_UNCONTRACTED",
+                "UNKNOWN",
+            ] = "VIOLATED"
         elif any_unknown:
             status = "UNKNOWN"
             frag = "UNKNOWN"
@@ -3012,6 +3745,7 @@ def prove_invariant_preservation(
             InvariantPreservationProof(
                 action_name=act.name,
                 status=status,
+                proof_kind="exact_wp",
                 checked_invariants=checked_names,
                 violated_invariants=violated_names,
                 counterexamples=counterexamples,
@@ -3134,6 +3868,17 @@ def prove_upgrade_compatibility(
                     v2_status=inv2.status,
                     unsat_core=list(inv2.violated_invariants),
                     detail=f"new invariant violation(s): {inv2.violated_invariants}",
+                )
+            )
+        elif inv2.status == "VACUOUS_CONTRACT" and prev_ist != "VACUOUS_CONTRACT":
+            regressions.append(
+                UpgradeRegressionItem(
+                    action_name=act_name,
+                    regression_kind="NEW_VACUOUS_CONTRACT",
+                    v1_status=prev_ist,
+                    v2_status=inv2.status,
+                    unsat_core=list(inv2.unsat_core),
+                    detail=f"contract became unrealizable (PO-5 UNSAT): {inv2.unsat_core}",
                 )
             )
 
@@ -3448,6 +4193,12 @@ def prove_blueprint(
     total_deadlocks = sum(1 for r in reachability if r.status == "TOTAL_DEADLOCK")
     cond_deadlocks = sum(len(r.deadlocked_slices) for r in reachability)
     inv_violations = sum(1 for p in inv_pres if p.status == "VIOLATED")
+    exact_wp_proved = sum(
+        1 for p in inv_pres if p.status == "PROVED" and p.proof_kind == "exact_wp"
+    )
+    contract_proved = sum(1 for p in inv_pres if p.status == "CONTRACT_PROVED")
+    vacuous_contracts = sum(1 for p in inv_pres if p.status == "VACUOUS_CONTRACT")
+    uncontracted_efs = sum(1 for p in inv_pres if p.status == "SKIPPED_UNCONTRACTED")
     dead_classes = sum(1 for c in class_proofs if c.status == "UNSATISFIABLE_CLASS")
     dl_conflicts = sum(1 for c in class_proofs if c.status == "DL_AXIOM_CONFLICT")
     lsp_violations = sum(1 for c in class_proofs if c.status == "LSP_VIOLATION")
@@ -3460,6 +4211,7 @@ def prove_blueprint(
         total_deadlocks == 0
         and cond_deadlocks == 0
         and inv_violations == 0
+        and vacuous_contracts == 0
         and dead_classes == 0
         and dl_conflicts == 0
         and lsp_violations == 0
@@ -3486,6 +4238,10 @@ def prove_blueprint(
         dead_class_count=dead_classes,
         dl_conflict_count=dl_conflicts,
         lsp_violation_count=lsp_violations,
+        exact_wp_proved_count=exact_wp_proved,
+        contract_proved_count=contract_proved,
+        vacuous_contract_count=vacuous_contracts,
+        uncontracted_edit_function_count=uncontracted_efs,
         logic_fragment_counts=frag_counts,
         class_proofs=class_proofs,
         reachability=reachability,

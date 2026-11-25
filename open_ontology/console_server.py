@@ -1436,6 +1436,17 @@ class ConsoleService:
                     "touched_object_types": touched,
                     "params_schema": _enrich_action_params_schema(act_def),
                     "rule_summary": rule_summary,
+                    "contract": (
+                        {
+                            "modifies": list(act_def.modifies),
+                            "creates": list(act_def.creates),
+                            "deletes": list(act_def.deletes),
+                            "ensures": [dict(e) if isinstance(e, Mapping) else e for e in act_def.ensures],
+                        }
+                        if act_def.implementation_kind == "edit_function"
+                        and (act_def.modifies or act_def.creates or act_def.deletes or act_def.ensures)
+                        else None
+                    ),
                     "autonomy_mode": self._resolve_action_autonomy_label(aname, actor),
                     "draft_status": act_status,
                 }
@@ -1717,9 +1728,17 @@ class ConsoleService:
         )
         total_invariants = len(report.invariant_preservation)
         preserved_invariants = sum(
-            1 for p in report.invariant_preservation if p.status == "PROVED"
+            1
+            for p in report.invariant_preservation
+            if p.status in ("PROVED", "CONTRACT_PROVED")
         )
         violated_invariants = report.invariant_violation_count
+        exact_wp_proved_count = int(getattr(report, "exact_wp_proved_count", 0))
+        contract_proved_count = int(getattr(report, "contract_proved_count", 0))
+        vacuous_contract_count = int(getattr(report, "vacuous_contract_count", 0))
+        uncontracted_edit_function_count = int(
+            getattr(report, "uncontracted_edit_function_count", 0)
+        )
         total_classes = len(report.class_proofs)
         satisfiable_classes = sum(
             1 for c in report.class_proofs if c.status == "SATISFIABLE"
@@ -1794,6 +1813,7 @@ class ConsoleService:
                 report.ok
                 and deadlocked_actions == 0
                 and violated_invariants == 0
+                and vacuous_contract_count == 0
                 and report.dead_class_count == 0
                 and report.dl_conflict_count == 0
                 and report.lsp_violation_count == 0
@@ -1820,6 +1840,10 @@ class ConsoleService:
                 "total_invariants": total_invariants,
                 "preserved_invariants": preserved_invariants,
                 "violated_invariants": violated_invariants,
+                "exact_wp_proved_count": exact_wp_proved_count,
+                "contract_proved_count": contract_proved_count,
+                "vacuous_contract_count": vacuous_contract_count,
+                "uncontracted_edit_function_count": uncontracted_edit_function_count,
                 "declared_invariant_count": len(declared_invs),
                 "redundant_rule_count": report.redundant_rule_count,
                 "exact_linear_ratio": exact_linear_ratio,

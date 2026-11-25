@@ -547,6 +547,46 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({
                             ))}
                           </div>
                         )}
+
+                        {!isRule && act.contract && (
+                          <div
+                            data-testid={`ef-contract-${act.name}`}
+                            className="mt-2.5 space-y-1.5 rounded-lg border border-violet-200/80 bg-white p-2.5 text-[11px]"
+                          >
+                            <div className="font-semibold text-violet-900">
+                              模块化行为契约（Z3 PO-5 非空真 + PO-4b 保真证明 · 运行期强验）
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {act.contract.modifies.map((m) => (
+                                <span
+                                  key={`mod-${m}`}
+                                  className="rounded border border-violet-200 bg-violet-50 px-1.5 py-0.5 font-mono text-[10px] text-violet-800"
+                                >
+                                  modifies: {m}
+                                </span>
+                              ))}
+                              {act.contract.creates.map((c) => (
+                                <span
+                                  key={`cre-${c}`}
+                                  className="rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 font-mono text-[10px] text-emerald-800"
+                                >
+                                  creates: {c}
+                                </span>
+                              ))}
+                              {act.contract.deletes.map((d) => (
+                                <span
+                                  key={`del-${d}`}
+                                  className="rounded border border-rose-200 bg-rose-50 px-1.5 py-0.5 font-mono text-[10px] text-rose-800"
+                                >
+                                  deletes: {d}
+                                </span>
+                              ))}
+                              <span className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[10px] text-slate-700">
+                                ensures × {act.contract.ensures.length}
+                              </span>
+                            </div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/70 pt-2.5 text-[11px]">

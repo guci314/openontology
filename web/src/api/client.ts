@@ -516,6 +516,12 @@ export interface BlueprintActionMeta {
   touched_object_types: string[];
   params_schema: Record<string, unknown>;
   rule_summary: BlueprintRuleSummary | null;
+  contract?: {
+    modifies: string[];
+    creates: string[];
+    deletes: string[];
+    ensures: Array<Record<string, unknown>>;
+  } | null;
   autonomy_mode: string;
   draft_status?: 'base' | 'draft_added' | 'draft_modified';
 }
@@ -593,7 +599,17 @@ export interface BlueprintActionProof {
 export interface BlueprintInvariantProof {
   action_name: string;
   display_label?: string;
-  status: 'PROVED' | 'VIOLATED' | 'VACUOUS_DEADLOCK' | 'UNKNOWN';
+  status:
+    | 'PROVED'
+    | 'CONTRACT_PROVED'
+    | 'VIOLATED'
+    | 'VACUOUS_CONTRACT'
+    | 'VACUOUS_DEADLOCK'
+    | 'SKIPPED_UNCONTRACTED'
+    | 'UNKNOWN';
+  proof_kind?: 'exact_wp' | 'contract_assume_guarantee' | 'skipped';
+  unsat_core?: string[];
+  detail?: string;
   checked_invariants: string[];
   violated_invariants: string[];
   checked_invariant_labels?: string[];
@@ -655,6 +671,10 @@ export interface BlueprintProveSummary {
   total_invariants: number;
   preserved_invariants: number;
   violated_invariants: number;
+  exact_wp_proved_count?: number;
+  contract_proved_count?: number;
+  vacuous_contract_count?: number;
+  uncontracted_edit_function_count?: number;
   declared_invariant_count?: number;
   redundant_rule_count: number;
   exact_linear_ratio: number;
