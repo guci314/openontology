@@ -17,10 +17,12 @@ interface AssistantMessage {
 interface AssistantDrawerProps {
   open: boolean;
   meta: ConsoleMeta;
+  activeSandboxId?: string | null;
   onClose: () => void;
   onInspectObject: (entityType: string, recordId: string) => void;
   onSelectSandboxPreset?: (presetId: string) => void;
   onOpenSandboxSession?: (sandboxId: string) => void;
+  onSandboxUpdated?: (sandboxId: string) => void;
 }
 
 const FALLBACK_QUICK_PROMPTS = [
@@ -33,15 +35,16 @@ const FALLBACK_QUICK_PROMPTS = [
 export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
   open,
   meta,
+  activeSandboxId = null,
   onClose,
   onInspectObject,
   onSelectSandboxPreset,
   onOpenSandboxSession,
+  onSandboxUpdated,
 }) => {
   const navigate = useNavigate();
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
-  const [activeSandboxId, setActiveSandboxId] = useState<string | null>(null);
   const welcomeText =
     meta.assistant_welcome ||
     `您好 ${meta.actor.display_name}！我是运行在「${meta.actor.title}」权限视角内的智能助手，可为您检索可见记录、待办审批与平行沙盘推演。`;
@@ -53,10 +56,6 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
     },
   ]);
   const streamEndRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    setActiveSandboxId(null);
-  }, [meta.actor.actor_id]);
 
   useEffect(() => {
     if (!open) return;
@@ -107,7 +106,7 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
         history: historyTurns,
       });
       if (res.sandbox_id) {
-        setActiveSandboxId(res.sandbox_id);
+        onSandboxUpdated?.(res.sandbox_id);
       }
       setMessages((prev) => [
         ...prev,
@@ -161,8 +160,18 @@ export const AssistantDrawer: React.FC<AssistantDrawerProps> = ({
                   {modeBadgeLabel}
                 </span>
               </div>
-              <p className="mt-0.5 text-xs text-slate-500">
-                当前视角：{meta.actor.display_name}（{meta.actor.unit_name || meta.actor.title}）
+              <p className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-slate-500">
+                <span>
+                  当前视角：{meta.actor.display_name}（{meta.actor.unit_name || meta.actor.title}）
+                </span>
+                {activeSandboxId && (
+                  <span
+                    data-testid="assistant-active-sandbox-badge"
+                    className="inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 font-mono text-[10px] font-medium text-blue-700 ring-1 ring-blue-200/80"
+                  >
+                    已同步沙盘 {activeSandboxId}
+                  </span>
+                )}
               </p>
             </div>
           </div>

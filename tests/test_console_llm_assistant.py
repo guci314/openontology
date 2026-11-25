@@ -462,3 +462,149 @@ def test_5_playwright_e2e_assistant_to_sandbox_handoff() -> None:
     assert console_errors == []
     assert page_errors == []
     assert bad_responses == []
+
+
+def test_6_playwright_e2e_bidirectional_sandbox_drawer_sync() -> None:
+    """WO-34B: SandboxPage <-> AssistantDrawer share single activeSandboxId & live-refresh behind drawer."""
+    playwright_sync = pytest.importorskip("playwright.sync_api")
+    sync_playwright = playwright_sync.sync_playwright
+
+    dist_index = ROOT / "web" / "dist" / "index.html"
+    assert dist_index.is_file(), f"Frontend dist build missing at {dist_index}"
+
+    captured_diffs: list[dict[str, Any]] = []
+    chat_requests: list[dict[str, Any]] = []
+
+    def _sync_mock(req: dict[str, Any]) -> dict[str, Any]:
+        user_msgs = [m["content"] for m in req["messages"] if m.get("role") == "user"]
+        latest_user = user_msgs[-1] if user_msgs else ""
+        outs = [json.loads(m["content"]) for m in req["messages"] if m.get("role") == "tool"]
+
+        if "Voyager" in latest_user:
+            if not outs:
+                return _tool_call_resp(
+                    "tc-sync-act",
+                    "run_sandbox_action",
+                    {
+                        "action_name": "jump_sector",
+                        "params": {"ship_id": "SS-02", "target_sector": "alpha", "cost_cells": 2},
+                    },
+                )
+            assert outs[-1]["ok"] is True
+            return _text_resp("已在同一沙盘追加第 2 步推演：Voyager (SS-02) 跃迁至 Alpha 星域。")
+
+        if not outs:
+            return _tool_call_resp("tc-sync-diff", "get_sandbox_diff", {})
+        captured_diffs.append(outs[0])
+        return _text_resp(
+            f"当前沙盘共 {outs[0].get('step_count', 0)} 步推演，变更 {outs[0].get('total_changes', 0)} 个对象。"
+        )
+
+    svc = build_console_service(
+        mode="starship",
+        demo_actor_switch=True,
+        assistant_llm_client=_sync_mock,
+    )
+    handle = start_console_server(
+        svc, host="127.0.0.1", port=0, static_dir=ROOT / "web" / "dist"
+    )
+
+    console_errors: list[str] = []
+    page_errors: list[str] = []
+    bad_responses: list[str] = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(viewport={"width": 1280, "height": 800})
+            page = context.new_page()
+            page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
+            page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+            page.on(
+                "response",
+                lambda resp: bad_responses.append(f"{resp.status} {resp.url}")
+                if resp.status >= 400
+                else None,
+            )
+            page.on(
+                "request",
+                lambda req: chat_requests.append(dict(req.post_data_json or {}))
+                if req.method == "POST" and req.url.endswith("/api/assistant/chat")
+                else None,
+            )
+
+            # 1. Start on /sandbox and run 1-step preset creating SBX-xxxx
+            page.goto(f"{handle.base_url}/sandbox", wait_until="networkidle")
+            page.wait_for_selector('[data-testid="sandbox-page"]')
+            page.get_by_test_id("sandbox-preset-starship_jump_omega").click()
+            page.wait_for_selector('[data-testid="sandbox-diff-list"]')
+            assert "(1)" in page.get_by_test_id("sandbox-promote-btn").inner_text()
+
+            # 2. Open AssistantDrawer immediately on /sandbox -> shared SBX badge visible
+            page.get_by_test_id("open-assistant-btn").click()
+            badge = page.get_by_test_id("assistant-active-sandbox-badge")
+            badge.wait_for(state="visible", timeout=10000)
+            badge_text = badge.inner_text()
+            assert "已同步沙盘 SBX-" in badge_text
+            shared_sid = badge_text.split("已同步沙盘 ", 1)[1].strip()
+
+            # 3. Ask assistant about current diff -> tool get_sandbox_diff receives exact shared SBX with step_count==1
+            page.get_by_test_id("assistant-input").fill("看看当前沙盘推演的 diff 有哪些变化？")
+            page.get_by_test_id("assistant-send-btn").click()
+            page.wait_for_selector("text=当前沙盘共 1 步推演", timeout=10000)
+
+            assert chat_requests[0]["sandbox_id"] == shared_sid
+            assert len(captured_diffs) == 1
+            assert captured_diffs[0]["sandbox_id"] == shared_sid
+            assert captured_diffs[0]["step_count"] == 1
+            assert any(u["object_id"] == "SS-01" for u in captured_diffs[0]["updated"])
+
+            # 4. Have assistant run 2nd step in same sandbox -> /sandbox behind drawer live-refreshes to (2)
+            page.get_by_test_id("assistant-input").fill("再在同一个沙盘里让 Voyager 跃迁到 Alpha 星域")
+            page.get_by_test_id("assistant-send-btn").click()
+            page.wait_for_selector("text=已在同一沙盘追加第 2 步推演", timeout=10000)
+            assert chat_requests[1]["sandbox_id"] == shared_sid
+
+            page.wait_for_function(
+                "() => document.querySelector('[data-testid=\"sandbox-promote-btn\"]')?.textContent?.includes('(2)')"
+            )
+            diff_txt = page.get_by_test_id("sandbox-diff-list").inner_text()
+            assert "SS-01" in diff_txt
+            assert "SS-02" in diff_txt
+
+            # 5. Navigate away to / and back to /sandbox -> SandboxPage adopts same shared_sid with 2 steps intact
+            page.get_by_test_id("close-assistant-drawer").click()
+            page.get_by_test_id("nav-cockpit").click()
+            page.wait_for_selector('[data-testid="cockpit-page"]')
+            page.get_by_test_id("nav-sandbox").click()
+            page.wait_for_selector('[data-testid="sandbox-diff-list"]')
+            assert "(2)" in page.get_by_test_id("sandbox-promote-btn").inner_text()
+
+            # 6. Switch actor -> activeSandboxId resets to null cleanly with zero 403/IDOR errors
+            page.get_by_test_id("nav-cockpit").click()
+            page.wait_for_selector('[data-testid="cockpit-page"]')
+            page.get_by_test_id("actor-switcher").select_option("nav-alpha")
+            page.wait_for_function(
+                "() => document.querySelector('[data-testid=\"actor-switcher\"]')?.value === 'nav-alpha'"
+            )
+            page.get_by_test_id("open-assistant-btn").click()
+            page.wait_for_selector('[data-testid="assistant-drawer"]')
+            assert page.get_by_test_id("assistant-active-sandbox-badge").count() == 0
+            page.get_by_test_id("close-assistant-drawer").click()
+
+            # Entering /sandbox as new actor forks a clean actor-owned sandbox (!= shared_sid, 0 steps)
+            page.get_by_test_id("nav-sandbox").click()
+            page.wait_for_selector('[data-testid="sandbox-page"]')
+            page.get_by_test_id("open-assistant-btn").click()
+            new_badge = page.get_by_test_id("assistant-active-sandbox-badge")
+            new_badge.wait_for(state="visible", timeout=10000)
+            assert new_badge.inner_text().split("已同步沙盘 ", 1)[1].strip() != shared_sid
+
+            browser.close()
+    finally:
+        handle.stop()
+        svc.runtime.close()
+
+    assert console_errors == []
+    assert page_errors == []
+    assert bad_responses == []

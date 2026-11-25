@@ -32,6 +32,9 @@ interface SandboxPageProps {
   meta: ConsoleMeta;
   schema: SchemaCatalog;
   pack: DomainViewPack | null;
+  activeSandboxId?: string | null;
+  sandboxSyncTick?: number;
+  onActiveSandboxChange?: (sid: string | null) => void;
   pendingPresetId: string | null;
   onConsumePendingPreset: () => void;
   pendingSandboxId?: string | null;
@@ -43,6 +46,9 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
   meta,
   schema,
   pack,
+  activeSandboxId = null,
+  sandboxSyncTick = 0,
+  onActiveSandboxChange,
   pendingPresetId,
   onConsumePendingPreset,
   pendingSandboxId,
@@ -50,8 +56,9 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
   onPromotedToPrimary,
 }) => {
   const terms = resolveShellTerminology(pack);
-  const [sandboxId, setSandboxId] = useState<string | null>(null);
-  const sandboxIdRef = useRef<string | null>(null);
+  const [sandboxId, setSandboxId] = useState<string | null>(activeSandboxId);
+  const sandboxIdRef = useRef<string | null>(activeSandboxId);
+  const lastSyncTickRef = useRef<number>(sandboxSyncTick);
   const [diff, setDiff] = useState<SandboxDiffResponse | null>(null);
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -63,13 +70,21 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
   const [objectsByType, setObjectsByType] = useState<Record<string, RecordInstance[]>>({});
   const [loadingTargets, setLoadingTargets] = useState(false);
 
+  const updateSandboxSession = useCallback(
+    (nextSid: string | null) => {
+      sandboxIdRef.current = nextSid;
+      setSandboxId(nextSid);
+      onActiveSandboxChange?.(nextSid);
+    },
+    [onActiveSandboxChange]
+  );
+
   const ensureSandbox = useCallback(async (): Promise<string> => {
     if (sandboxIdRef.current) return sandboxIdRef.current;
     const created = await consoleApi.createSandbox();
-    sandboxIdRef.current = created.sandbox_id;
-    setSandboxId(created.sandbox_id);
+    updateSandboxSession(created.sandbox_id);
     return created.sandbox_id;
-  }, []);
+  }, [updateSandboxSession]);
 
   const refreshDiff = useCallback(async (sid: string) => {
     const d = await consoleApi.diffSandbox(sid);
@@ -80,23 +95,51 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
   useEffect(() => {
     if (pendingPresetId || pendingSandboxId) return;
     let active = true;
-    consoleApi
-      .createSandbox()
-      .then((res) => {
-        if (!active) return;
-        sandboxIdRef.current = res.sandbox_id;
-        setSandboxId(res.sandbox_id);
-        return consoleApi.diffSandbox(res.sandbox_id).then((d) => {
+    const initSandbox = async () => {
+      const existingSid = activeSandboxId;
+      if (existingSid) {
+        updateSandboxSession(existingSid);
+        try {
+          const d = await consoleApi.diffSandbox(existingSid);
           if (active) setDiff(d);
-        });
+          return;
+        } catch {
+          updateSandboxSession(null);
+        }
+      }
+      const created = await consoleApi.createSandbox();
+      if (!active) return;
+      updateSandboxSession(created.sandbox_id);
+      const d = await consoleApi.diffSandbox(created.sandbox_id);
+      if (active) setDiff(d);
+    };
+    initSandbox().catch(() => {});
+    return () => {
+      active = false;
+    };
+    // Adopt shared activeSandboxId or initialize a clean fork per actor mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meta.actor.actor_id]);
+
+  useEffect(() => {
+    if (!sandboxSyncTick || sandboxSyncTick === lastSyncTickRef.current) return;
+    lastSyncTickRef.current = sandboxSyncTick;
+    if (!activeSandboxId) return;
+    let active = true;
+    if (sandboxIdRef.current !== activeSandboxId) {
+      sandboxIdRef.current = activeSandboxId;
+      setSandboxId(activeSandboxId);
+    }
+    consoleApi
+      .diffSandbox(activeSandboxId)
+      .then((d) => {
+        if (active) setDiff(d);
       })
       .catch(() => {});
     return () => {
       active = false;
     };
-    // Initialize a clean fork per actor mount when not jumping straight into a preset
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta.actor.actor_id]);
+  }, [sandboxSyncTick, activeSandboxId]);
 
   useEffect(() => {
     if (schema.actions.length && !schema.actions.some((a) => a.name === selectedAction)) {
@@ -214,12 +257,11 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
         const oldSid = sandboxIdRef.current;
         if (oldSid) {
           await consoleApi.destroySandbox(oldSid).catch(() => {});
-          sandboxIdRef.current = null;
+          updateSandboxSession(null);
         }
         const created = await consoleApi.createSandbox();
         const sid = created.sandbox_id;
-        sandboxIdRef.current = sid;
-        setSandboxId(sid);
+        updateSandboxSession(sid);
 
         const res = await consoleApi.submitSandbox(sid, { steps: preset.steps });
         await refreshDiff(sid);
@@ -257,7 +299,7 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
         setBusy(false);
       }
     },
-    [refreshDiff]
+    [refreshDiff, updateSandboxSession]
   );
 
   useEffect(() => {
@@ -279,8 +321,7 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
     if (oldSid && oldSid !== targetSid) {
       consoleApi.destroySandbox(oldSid).catch(() => {});
     }
-    sandboxIdRef.current = targetSid;
-    setSandboxId(targetSid);
+    updateSandboxSession(targetSid);
     refreshDiff(targetSid)
       .then(() => {
         if (!active) return;
@@ -304,7 +345,7 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
     return () => {
       active = false;
     };
-  }, [pendingSandboxId, onConsumePendingSandbox, refreshDiff]);
+  }, [pendingSandboxId, onConsumePendingSandbox, refreshDiff, updateSandboxSession]);
 
   const handleRunCustomStep = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -400,11 +441,10 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
       const oldSid = sandboxIdRef.current;
       if (oldSid) {
         await consoleApi.destroySandbox(oldSid).catch(() => {});
-        sandboxIdRef.current = null;
+        updateSandboxSession(null);
       }
       const created = await consoleApi.createSandbox();
-      sandboxIdRef.current = created.sandbox_id;
-      setSandboxId(created.sandbox_id);
+      updateSandboxSession(created.sandbox_id);
       await refreshDiff(created.sandbox_id);
       setStatusBanner({
         ok: true,
@@ -431,11 +471,10 @@ export const SandboxPage: React.FC<SandboxPageProps> = ({
         const oldSid = sandboxIdRef.current;
         if (oldSid) {
           await consoleApi.destroySandbox(oldSid).catch(() => {});
-          sandboxIdRef.current = null;
+          updateSandboxSession(null);
         }
         const created = await consoleApi.createSandbox();
-        sandboxIdRef.current = created.sandbox_id;
-        setSandboxId(created.sandbox_id);
+        updateSandboxSession(created.sandbox_id);
         await refreshDiff(created.sandbox_id);
         onPromotedToPrimary();
       } else {

@@ -42,8 +42,16 @@ const AppShell: React.FC = () => {
   const [m1Draft, setM1Draft] = useState<M1DraftResponse | null>(null);
   const [pendingPresetId, setPendingPresetId] = useState<string | null>(null);
   const [pendingSandboxId, setPendingSandboxId] = useState<string | null>(null);
+  const [activeSandboxId, setActiveSandboxId] = useState<string | null>(null);
+  const [sandboxSyncTick, setSandboxSyncTick] = useState(0);
   const consumePendingPreset = useCallback(() => setPendingPresetId(null), []);
   const consumePendingSandbox = useCallback(() => setPendingSandboxId(null), []);
+  const handleAssistantSandboxUpdated = useCallback((sid: string) => {
+    if (sid) {
+      setActiveSandboxId(sid);
+      setSandboxSyncTick((t) => t + 1);
+    }
+  }, []);
 
   useEffect(() => {
     if (location.pathname.startsWith('/blueprint')) {
@@ -99,6 +107,7 @@ const AppShell: React.FC = () => {
       setM1Draft(null);
       setPendingPresetId(null);
       setPendingSandboxId(null);
+      setActiveSandboxId(null);
       await loadBootstrap();
       setRefreshTick((t) => t + 1);
     },
@@ -233,6 +242,9 @@ const AppShell: React.FC = () => {
               meta={meta}
               schema={schema}
               pack={activePack}
+              activeSandboxId={activeSandboxId}
+              sandboxSyncTick={sandboxSyncTick}
+              onActiveSandboxChange={setActiveSandboxId}
               pendingPresetId={pendingPresetId}
               onConsumePendingPreset={consumePendingPreset}
               pendingSandboxId={pendingSandboxId}
@@ -284,6 +296,7 @@ const AppShell: React.FC = () => {
         key={`m0-${meta.actor.actor_id}`}
         open={assistantOpen}
         meta={meta}
+        activeSandboxId={activeSandboxId}
         onClose={() => setAssistantOpen(false)}
         onInspectObject={openRootObject}
         onSelectSandboxPreset={(pid) => setPendingPresetId(pid)}
@@ -291,6 +304,7 @@ const AppShell: React.FC = () => {
           setPendingPresetId(null);
           setPendingSandboxId(sid);
         }}
+        onSandboxUpdated={handleAssistantSandboxUpdated}
       />
 
       <OntologyExpertDrawer
