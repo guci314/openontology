@@ -83,7 +83,7 @@ def test_blueprint_enterprise_standalone_rls_and_tripartite_kinetics() -> None:
             summary["rule_action_count"] + summary["edit_function_action_count"]
         )
         assert summary["edit_function_count"] == 9
-        assert summary["function_count"] == 3
+        assert summary["function_count"] == 12
         assert summary["invariant_count"] >= 13
         assert summary["fsm_object_count"] >= 20
 

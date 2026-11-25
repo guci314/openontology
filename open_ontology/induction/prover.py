@@ -1282,11 +1282,14 @@ class _Z3Compiler:
         out = _SymEntity(ot=base_ent.ot, tag=f"{base_ent.tag}_post", linked=dict(base_ent.linked))
         for fname, base_sv in base_ent.fields.items():
             expr = base_sv.expr
+            is_null = base_sv.is_null
             for row in post_rows:
                 row_pk = row.entity.fields[pk_name].expr
-                row_fv = row.entity.fields[fname].expr
-                expr = z3.If(z3.And(row.present, row_pk == fk_sv.expr), row_fv, expr)
-            out.fields[fname] = _SymVal(expr, base_sv.kind, is_null=base_sv.is_null)
+                row_fv = row.entity.fields[fname]
+                cond = z3.And(row.present, row_pk == fk_sv.expr)
+                expr = z3.If(cond, row_fv.expr, expr)
+                is_null = _ite_is_null(z3, cond, row_fv.is_null, is_null)
+            out.fields[fname] = _SymVal(expr, base_sv.kind, is_null=is_null)
         return out
 
     def _literal_val(self, val: Any) -> _SymVal:

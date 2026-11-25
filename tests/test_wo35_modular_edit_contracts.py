@@ -226,13 +226,13 @@ def test_subtype_frame_inheritance_and_blueprint_roundtrip() -> None:
     act_bp = next(a for a in bp.actions if a.name == "batch_recall_defective_lot")
     assert "WorkOrder.x_quarantined" in act_bp.modifies
     assert "WorkCard" in act_bp.creates
-    assert len(act_bp.ensures) == 2
+    assert len(act_bp.ensures) == 4
 
     recompiled = compile_blueprint(bp, base_specs=(spec,), edit_functions=spec.edit_functions)
     re_act = recompiled.get_action("batch_recall_defective_lot")
     assert set(re_act.modifies) == set(act_bp.modifies)
     assert set(re_act.creates) == set(act_bp.creates)
-    assert len(re_act.ensures) == 2
+    assert len(re_act.ensures) == len(act_bp.ensures) == 4
 
 
 # ---------------------------------------------------------------------------

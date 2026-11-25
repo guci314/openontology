@@ -355,7 +355,45 @@ def _assert_work_card_assignee_and_sod(
         )
 
 
-def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
+def collect_read_set(ctx: Any) -> list[dict[str, Any]]:
+    """Collect sorted Read-Set CAS pins from a read-only planner's ``EditBatch``."""
+    out: list[dict[str, Any]] = []
+    for key, ver in sorted(getattr(ctx, "read_versions", {}).items()):
+        ot_name, _, oid = str(key).partition(":")
+        if ot_name and oid:
+            out.append(
+                {
+                    "object_type": ot_name,
+                    "object_id": oid,
+                    "expected_version": int(ver),
+                }
+            )
+    return out
+
+
+def apply_planned_ops(ctx: Any, ops: Sequence[dict[str, Any]]) -> None:
+    """Apply flat M2.5 ``WriteOp`` dicts onto an ``EditBatch`` without external imports (Gate 1 pure)."""
+    for op in ops:
+        kind = op["op"]
+        cls = ctx.spec.get_object_type(op["object_type"])
+        if kind == "create":
+            payload = dict(op.get("set_fields") or {})
+            pk_name = cls.primary_key_name()
+            if op.get("object_id") is not None and pk_name not in payload:
+                payload[pk_name] = op["object_id"]
+            ctx.create(cls(**payload))
+        elif kind == "modify":
+            obj = ctx.require(cls, op["object_id"])
+            ctx.modify(obj, **dict(op.get("set_fields") or {}))
+        elif kind == "delete":
+            obj = ctx.require(cls, op["object_id"])
+            ctx.delete(obj)
+        else:
+            raise InvariantError(f"unsupported planned op {kind!r}", code="INVALID_WRITE_OP")
+
+
+def _plan_open_work_card(ctx: Any, params: OpenWorkCardParams) -> dict[str, Any]:
+    """Pure read-only M2.5 planner (zero write handle): emit WorkCard creation proposal."""
     cid = params.card_id.strip() or f"WC-{uuid.uuid4().hex[:10].upper()}"
     if ctx.get(WorkCard, cid) is not None:
         raise InvariantError(f"WorkCard:{cid} already exists", code="WORK_CARD_EXISTS")
@@ -381,22 +419,83 @@ def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
                 f"invalid APPROVAL intent for action {params.requested_action!r}: {exc}",
                 code="INVALID_WORK_CARD_INTENT",
             ) from exc
-    ctx.create(
-        WorkCard(
-            card_id=cid,
-            card_kind=params.card_kind,
-            target_object_type=params.target_object_type,
-            target_object_id=params.target_object_id,
-            requested_action=params.requested_action,
-            requested_params_json=params.requested_params_json or "{}",
-            requester_actor_id=ctx.actor.actor_id,
-            assignee_role=params.assignee_role,
-            assignee_dept=params.assignee_dept,
-            status="OPEN",
-            sla_due_at=params.sla_due_at,
-            external_ref=params.external_ref,
+    return {
+        "contract_name": "open_work_card",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": [
+            {
+                "op": "create",
+                "object_type": "WorkCard",
+                "object_id": cid,
+                "set_fields": {
+                    "card_id": cid,
+                    "card_kind": params.card_kind,
+                    "target_object_type": params.target_object_type,
+                    "target_object_id": params.target_object_id,
+                    "requested_action": params.requested_action,
+                    "requested_params_json": params.requested_params_json or "{}",
+                    "requester_actor_id": ctx.actor.actor_id,
+                    "assignee_role": params.assignee_role,
+                    "assignee_dept": params.assignee_dept,
+                    "status": "OPEN",
+                    "sla_due_at": params.sla_due_at,
+                    "external_ref": params.external_ref,
+                },
+            }
+        ],
+        "brain_source": "pure_function:plan_open_work_card",
+    }
+
+
+def _open_work_card(ctx: Any, params: OpenWorkCardParams) -> None:
+    plan = _plan_open_work_card(ctx, params)
+    apply_planned_ops(ctx, plan["ops"])
+
+
+def _plan_complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> dict[str, Any]:
+    """Pure read-only M2.5 planner (zero write handle): emit WorkCard completion proposal."""
+    card = ctx.require(WorkCard, params.card_id)
+    _assert_work_card_assignee_and_sod(ctx, card, enforce_sod=True)
+    if card.status not in ("OPEN", "IN_PROGRESS", "SLA_BREACHED"):
+        raise InvariantError(
+            f"WorkCard:{card.card_id} illegal transition {card.status!r} -> 'COMPLETED'",
+            code="ILLEGAL_DOCUMENT_TRANSITION",
         )
-    )
+    if card.card_kind == "APPROVAL":
+        target_action = ctx.spec.get_action(card.requested_action)
+        if target_action.affects_source:
+            if not params.settled_run_id.strip():
+                raise InvariantError(
+                    f"APPROVAL WorkCard:{card.card_id} for source-backed action "
+                    f"{card.requested_action!r} requires settled_run_id via settle_work_card",
+                    code="SOURCE_APPROVAL_REQUIRES_SETTLED_RUN",
+                )
+        else:
+            raise InvariantError(
+                f"APPROVAL WorkCard:{card.card_id} dynamically dispatches owned action "
+                f"{card.requested_action!r} outside WorkCard Frame; execute via governed submit_action",
+                code="DELEGATED_APPROVAL_REQUIRES_DIRECT_DISPATCH",
+            )
+    return {
+        "contract_name": "complete_work_card",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": [
+            {
+                "op": "modify",
+                "object_type": "WorkCard",
+                "object_id": str(card.card_id),
+                "set_fields": {
+                    "status": "COMPLETED",
+                    "resolved_by_actor_id": ctx.actor.actor_id,
+                    "resolution_note": params.resolution_note or card.resolution_note,
+                    "external_ref": params.external_ref or card.external_ref,
+                },
+            }
+        ],
+        "brain_source": "pure_function:plan_complete_work_card",
+    }
 
 
 def _complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> None:
@@ -429,12 +528,21 @@ def _complete_work_card(ctx: Any, params: CompleteWorkCardParams) -> None:
                 card.requested_params_json or "{}"
             )
             target_action.handler(ctx, target_params)
-    ctx.modify(
-        card,
-        status="COMPLETED",
-        resolved_by_actor_id=ctx.actor.actor_id,
-        resolution_note=params.resolution_note or card.resolution_note,
-        external_ref=params.external_ref or card.external_ref,
+    apply_planned_ops(
+        ctx,
+        [
+            {
+                "op": "modify",
+                "object_type": "WorkCard",
+                "object_id": str(card.card_id),
+                "set_fields": {
+                    "status": "COMPLETED",
+                    "resolved_by_actor_id": ctx.actor.actor_id,
+                    "resolution_note": params.resolution_note or card.resolution_note,
+                    "external_ref": params.external_ref or card.external_ref,
+                },
+            }
+        ],
     )
 
 
@@ -627,20 +735,7 @@ def register_work_card_primitives(
     )
 
     all_card_roles = tuple(dict.fromkeys([*eff_openers, *eff_resolvers]))
-    edit_fn_work_card_specs: tuple[
-        tuple[
-            str,
-            type[BaseModel],
-            Any,
-            tuple[str, ...],
-            tuple[str, ...],
-            str,
-            tuple[str, ...],
-            tuple[str, ...],
-            tuple[dict[str, Any], ...],
-        ],
-        ...,
-    ] = (
+    edit_fn_work_card_specs: tuple[tuple[Any, ...], ...] = (
         (
             "open_work_card",
             OpenWorkCardParams,
@@ -651,6 +746,11 @@ def register_work_card_primitives(
             (),
             ("WorkCard",),
             open_work_card_ensures,
+            "untrusted_verifiable",
+            (),
+            "plan_open_work_card",
+            _plan_open_work_card,
+            "M2.5 纯算大脑（零写句柄）：检验防重复意图与动作参数，生成 WorkCard 开卡提案。",
         ),
         (
             "complete_work_card",
@@ -662,6 +762,11 @@ def register_work_card_primitives(
             ("WorkCard.status", "WorkCard.resolved_by_actor_id", "WorkCard.resolution_note", "WorkCard.external_ref"),
             (),
             complete_work_card_ensures,
+            "attested_provider",
+            ("plan_complete_work_card",),
+            "plan_complete_work_card",
+            _plan_complete_work_card,
+            "M2.5 权威纯算大脑（Class B · 零写句柄）：核验 SoD 职责分离与指派角色，生成 WorkCard 批结提案。",
         ),
     )
 
@@ -675,7 +780,18 @@ def register_work_card_primitives(
         c_modifies,
         c_creates,
         c_ensures,
+        c_trust_mode,
+        c_providers,
+        planner_name,
+        planner_fn,
+        planner_desc,
     ) in edit_fn_work_card_specs:
+        if planner_name not in target_spec.functions:
+            target_spec.function(
+                planner_name,
+                params=params_cls,
+                description=planner_desc,
+            )(planner_fn)
         if act_name not in target_spec.edit_functions:
             target_spec.edit_function(
                 act_name,
@@ -685,6 +801,10 @@ def register_work_card_primitives(
                 modifies=c_modifies,
                 creates=c_creates,
                 ensures=c_ensures,
+                trust_mode=c_trust_mode,
+                attested_providers=c_providers,
+                require_read_set_cas=True,
+                planner_function=planner_name,
             )(ef_handler)
         if act_name not in target_spec.actions:
             target_spec.declare_action(
@@ -989,6 +1109,10 @@ def register_work_card_primitives(
                 "reject_work_card": "驳回协同工单卡",
                 "mark_work_card_sla_breached": "标记工单卡超时",
                 "cancel_work_card": "撤销协同工单卡",
+            },
+            "functions": {
+                "plan_open_work_card": "M2.5 纯算大脑 · 发起协同工单卡提案",
+                "plan_complete_work_card": "M2.5 权威纯算大脑 · 批结协同工单卡提案",
             },
             "fields": {
                 "card_id": "工单卡编号",

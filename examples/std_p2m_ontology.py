@@ -29,7 +29,12 @@ from open_ontology.induction.dsl import (
 from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
 
 try:
-    from .business_ontology import MasterEntity, ProcessDocument
+    from .business_ontology import (
+        MasterEntity,
+        ProcessDocument,
+        apply_planned_ops,
+        collect_read_set,
+    )
     from .std_core_ontology import (
         AccountingEntity,
         FulfillmentEvent,
@@ -39,7 +44,12 @@ try:
         spec as std_core_spec,
     )
 except ImportError:  # pragma: no cover - script execution fallback
-    from examples.business_ontology import MasterEntity, ProcessDocument
+    from examples.business_ontology import (
+        MasterEntity,
+        ProcessDocument,
+        apply_planned_ops,
+        collect_read_set,
+    )
     from examples.std_core_ontology import (
         AccountingEntity,
         FulfillmentEvent,
@@ -360,6 +370,84 @@ register_rule_action(
 )
 
 
+@spec.function(
+    "plan_issue_material_to_work_order",
+    IssueMaterialToWorkOrderParams,
+    description="M2.5 权威纯算大脑（Class B · 零写句柄）：按 BOM 规格与单价试算工单领料投料提案。",
+)
+def plan_issue_material_to_work_order(
+    ctx: Any, params: IssueMaterialToWorkOrderParams
+) -> dict[str, Any]:
+    wo = ctx.require(WorkOrder, params.work_order_id)
+    if wo.status not in ("released", "in_progress"):
+        raise InvariantError(
+            f"WorkOrder:{wo.work_order_id} status {wo.status!r} is not open for material issue",
+            code="WORK_ORDER_NOT_OPEN_FOR_ISSUE",
+        )
+    if ctx.get(MaterialConsumption, params.consumption_id) is not None:
+        raise InvariantError(
+            f"MaterialConsumption:{params.consumption_id} already exists",
+            code="CONSUMPTION_ALREADY_EXISTS",
+        )
+    if params.qty <= 0:
+        raise InvariantError("qty must be > 0", code="NON_POSITIVE_ISSUE_QTY")
+    if params.unit_cost_cents < 0:
+        raise InvariantError("unit_cost_cents must be >= 0", code="NEGATIVE_UNIT_COST")
+    if params.allocation_rule not in ("EXACT_LOT", "FIFO"):
+        raise InvariantError(
+            f"allocation_rule {params.allocation_rule!r} must be 'EXACT_LOT' or 'FIFO'",
+            code="INVALID_ALLOCATION_RULE",
+        )
+    bom = ctx.require(BomSpec, wo.bom)
+    if params.input_resource != bom.input_resource:
+        raise InvariantError(
+            f"input_resource={params.input_resource!r} does not match BomSpec:{bom.bom_id}.input_resource={bom.input_resource!r}",
+            code="MATERIAL_NOT_IN_BOM",
+        )
+    expected_cost = int(round(params.qty * params.unit_cost_cents))
+    if params.total_cost_cents >= 0 and params.total_cost_cents != expected_cost:
+        raise InvariantError(
+            f"total_cost_cents={params.total_cost_cents} != round(qty * unit_cost_cents)={expected_cost}",
+            code="ISSUE_COST_MISMATCH",
+        )
+    eff_cost = params.total_cost_cents if params.total_cost_cents >= 0 else expected_cost
+    rule: Literal["EXACT_LOT", "FIFO"] = "FIFO" if params.allocation_rule == "FIFO" else "EXACT_LOT"
+    return {
+        "contract_name": "issue_material_to_work_order",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": [
+            {
+                "op": "create",
+                "object_type": "MaterialConsumption",
+                "object_id": str(params.consumption_id),
+                "set_fields": {
+                    "consumption_id": params.consumption_id,
+                    "work_order": wo.work_order_id,
+                    "input_resource": params.input_resource,
+                    "qty": params.qty,
+                    "unit_cost_cents": params.unit_cost_cents,
+                    "total_cost_cents": eff_cost,
+                    "allocation_rule": rule,
+                    "source_event": params.source_event or None,
+                    "status": "recorded",
+                },
+            },
+            {
+                "op": "modify",
+                "object_type": "WorkOrder",
+                "object_id": str(wo.work_order_id),
+                "set_fields": {
+                    "issued_qty": round(wo.issued_qty + params.qty, 6),
+                    "issued_cost_cents": wo.issued_cost_cents + eff_cost,
+                    "status": "in_progress",
+                },
+            },
+        ],
+        "brain_source": "pure_function:plan_issue_material_to_work_order",
+    }
+
+
 @spec.edit_function(
     "issue_material_to_work_order",
     IssueMaterialToWorkOrderParams,
@@ -367,6 +455,10 @@ register_rule_action(
     touched_object_types=("WorkOrder", "MaterialConsumption"),
     modifies=("WorkOrder.issued_qty", "WorkOrder.issued_cost_cents", "WorkOrder.status"),
     creates=("MaterialConsumption",),
+    trust_mode="attested_provider",
+    attested_providers=("plan_issue_material_to_work_order",),
+    require_read_set_cas=True,
+    planner_function="plan_issue_material_to_work_order",
     ensures=(
         {
             "name": "issue_material_wo_post",
@@ -414,59 +506,8 @@ register_rule_action(
     ),
 )
 def issue_material_to_work_order(ctx: Any, params: IssueMaterialToWorkOrderParams) -> None:
-    wo = ctx.require(WorkOrder, params.work_order_id)
-    if wo.status not in ("released", "in_progress"):
-        raise InvariantError(
-            f"WorkOrder:{wo.work_order_id} status {wo.status!r} is not open for material issue",
-            code="WORK_ORDER_NOT_OPEN_FOR_ISSUE",
-        )
-    if ctx.get(MaterialConsumption, params.consumption_id) is not None:
-        raise InvariantError(
-            f"MaterialConsumption:{params.consumption_id} already exists",
-            code="CONSUMPTION_ALREADY_EXISTS",
-        )
-    if params.qty <= 0:
-        raise InvariantError("qty must be > 0", code="NON_POSITIVE_ISSUE_QTY")
-    if params.unit_cost_cents < 0:
-        raise InvariantError("unit_cost_cents must be >= 0", code="NEGATIVE_UNIT_COST")
-    if params.allocation_rule not in ("EXACT_LOT", "FIFO"):
-        raise InvariantError(
-            f"allocation_rule {params.allocation_rule!r} must be 'EXACT_LOT' or 'FIFO'",
-            code="INVALID_ALLOCATION_RULE",
-        )
-    bom = ctx.require(BomSpec, wo.bom)
-    if params.input_resource != bom.input_resource:
-        raise InvariantError(
-            f"input_resource={params.input_resource!r} does not match BomSpec:{bom.bom_id}.input_resource={bom.input_resource!r}",
-            code="MATERIAL_NOT_IN_BOM",
-        )
-    expected_cost = int(round(params.qty * params.unit_cost_cents))
-    if params.total_cost_cents >= 0 and params.total_cost_cents != expected_cost:
-        raise InvariantError(
-            f"total_cost_cents={params.total_cost_cents} != round(qty * unit_cost_cents)={expected_cost}",
-            code="ISSUE_COST_MISMATCH",
-        )
-    eff_cost = params.total_cost_cents if params.total_cost_cents >= 0 else expected_cost
-    rule: Literal["EXACT_LOT", "FIFO"] = "FIFO" if params.allocation_rule == "FIFO" else "EXACT_LOT"
-    ctx.create(
-        MaterialConsumption(
-            consumption_id=params.consumption_id,
-            work_order=wo.work_order_id,
-            input_resource=params.input_resource,
-            qty=params.qty,
-            unit_cost_cents=params.unit_cost_cents,
-            total_cost_cents=eff_cost,
-            allocation_rule=rule,
-            source_event=params.source_event or None,
-            status="recorded",
-        )
-    )
-    ctx.modify(
-        wo,
-        issued_qty=round(wo.issued_qty + params.qty, 6),
-        issued_cost_cents=wo.issued_cost_cents + eff_cost,
-        status="in_progress",
-    )
+    plan = plan_issue_material_to_work_order(ctx, params)
+    apply_planned_ops(ctx, plan["ops"])
 
 spec.declare_action(
     "issue_material_to_work_order",
@@ -476,55 +517,14 @@ spec.declare_action(
 )
 
 
-@spec.edit_function(
-    "record_production_output",
+@spec.function(
+    "plan_record_production_output",
     RecordProductionOutputParams,
-    description="登记工单完工与报废产出；强守未投料禁报工、吸收成本守恒及超损耗率 WorkCard 审批门禁。",
-    touched_object_types=("WorkOrder", "ProductionOutput"),
-    modifies=("WorkOrder.completed_good_qty", "WorkOrder.completed_scrap_qty"),
-    creates=("ProductionOutput",),
-    ensures=(
-        {
-            "name": "record_output_wo_post",
-            "code": "CONTRACT_ENSURES_VIOLATION",
-            "target_type": "WorkOrder",
-            "id_param": "work_order_id",
-            "must_hold": {
-                "op": "and",
-                "args": [
-                    {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "in_progress"}},
-                    {
-                        "op": "ge",
-                        "left": {"ref": "after.completed_good_qty"},
-                        "right": {"ref": "before.completed_good_qty"},
-                    },
-                    {
-                        "op": "ge",
-                        "left": {"ref": "after.completed_scrap_qty"},
-                        "right": {"ref": "before.completed_scrap_qty"},
-                    },
-                ],
-            },
-            "description": "报工产出仅在 in_progress 工单上发生且良品/报废累计单调非减。",
-        },
-        {
-            "name": "record_output_voucher_post",
-            "code": "CONTRACT_ENSURES_VIOLATION",
-            "target_type": "ProductionOutput",
-            "must_hold": {
-                "op": "and",
-                "args": [
-                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "recorded"}},
-                    {"op": "ge", "left": {"ref": "after.good_qty"}, "right": {"lit": 0.0}},
-                    {"op": "ge", "left": {"ref": "after.scrap_qty"}, "right": {"lit": 0.0}},
-                    {"op": "ge", "left": {"ref": "after.absorbed_cost_cents"}, "right": {"lit": 0}},
-                ],
-            },
-            "description": "新建 ProductionOutput 凭证须为 recorded 且良品/报废/吸收成本均非负。",
-        },
-    ),
+    description="M2.5 权威纯算大脑（Class B · 零写句柄）：校验成本守恒与累计损耗率审批门禁，生成报工产出提案。",
 )
-def record_production_output(ctx: Any, params: RecordProductionOutputParams) -> None:
+def plan_record_production_output(
+    ctx: Any, params: RecordProductionOutputParams
+) -> dict[str, Any]:
     wo = ctx.require(WorkOrder, params.work_order_id)
     if wo.status in ("completed", "cancelled"):
         raise InvariantError(
@@ -580,23 +580,95 @@ def record_production_output(ctx: Any, params: RecordProductionOutputParams) -> 
             code="APPROVAL_REQUIRED_SCRAP_RATIO_EXCEEDED",
         )
 
-    ctx.create(
-        ProductionOutput(
-            output_id=params.output_id,
-            work_order=wo.work_order_id,
-            output_resource=params.output_resource,
-            good_qty=params.good_qty,
-            scrap_qty=params.scrap_qty,
-            absorbed_cost_cents=params.absorbed_cost_cents,
-            output_event=params.output_event or None,
-            status="recorded",
-        )
-    )
-    ctx.modify(
-        wo,
-        completed_good_qty=cum_good,
-        completed_scrap_qty=cum_scrap,
-    )
+    return {
+        "contract_name": "record_production_output",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": [
+            {
+                "op": "create",
+                "object_type": "ProductionOutput",
+                "object_id": str(params.output_id),
+                "set_fields": {
+                    "output_id": params.output_id,
+                    "work_order": wo.work_order_id,
+                    "output_resource": params.output_resource,
+                    "good_qty": params.good_qty,
+                    "scrap_qty": params.scrap_qty,
+                    "absorbed_cost_cents": params.absorbed_cost_cents,
+                    "output_event": params.output_event or None,
+                    "status": "recorded",
+                },
+            },
+            {
+                "op": "modify",
+                "object_type": "WorkOrder",
+                "object_id": str(wo.work_order_id),
+                "set_fields": {
+                    "completed_good_qty": cum_good,
+                    "completed_scrap_qty": cum_scrap,
+                },
+            },
+        ],
+        "brain_source": "pure_function:plan_record_production_output",
+    }
+
+
+@spec.edit_function(
+    "record_production_output",
+    RecordProductionOutputParams,
+    description="登记工单完工与报废产出；强守未投料禁报工、吸收成本守恒及超损耗率 WorkCard 审批门禁。",
+    touched_object_types=("WorkOrder", "ProductionOutput"),
+    modifies=("WorkOrder.completed_good_qty", "WorkOrder.completed_scrap_qty"),
+    creates=("ProductionOutput",),
+    trust_mode="attested_provider",
+    attested_providers=("plan_record_production_output",),
+    require_read_set_cas=True,
+    planner_function="plan_record_production_output",
+    ensures=(
+        {
+            "name": "record_output_wo_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "WorkOrder",
+            "id_param": "work_order_id",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "in_progress"}},
+                    {
+                        "op": "ge",
+                        "left": {"ref": "after.completed_good_qty"},
+                        "right": {"ref": "before.completed_good_qty"},
+                    },
+                    {
+                        "op": "ge",
+                        "left": {"ref": "after.completed_scrap_qty"},
+                        "right": {"ref": "before.completed_scrap_qty"},
+                    },
+                ],
+            },
+            "description": "报工产出仅在 in_progress 工单上发生且良品/报废累计单调非减。",
+        },
+        {
+            "name": "record_output_voucher_post",
+            "code": "CONTRACT_ENSURES_VIOLATION",
+            "target_type": "ProductionOutput",
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "recorded"}},
+                    {"op": "ge", "left": {"ref": "after.good_qty"}, "right": {"lit": 0.0}},
+                    {"op": "ge", "left": {"ref": "after.scrap_qty"}, "right": {"lit": 0.0}},
+                    {"op": "ge", "left": {"ref": "after.absorbed_cost_cents"}, "right": {"lit": 0}},
+                ],
+            },
+            "description": "新建 ProductionOutput 凭证须为 recorded 且良品/报废/吸收成本均非负。",
+        },
+    ),
+)
+def record_production_output(ctx: Any, params: RecordProductionOutputParams) -> None:
+    plan = plan_record_production_output(ctx, params)
+    apply_planned_ops(ctx, plan["ops"])
 
 spec.declare_action(
     "record_production_output",
@@ -842,6 +914,8 @@ spec.update_display(
         },
         "functions": {
             "diagnose_work_order_conservation": "诊断工单成本守恒",
+            "plan_issue_material_to_work_order": "M2.5 权威纯算大脑 · 工单领料投料提案",
+            "plan_record_production_output": "M2.5 权威纯算大脑 · 工单报工产出提案",
         },
         "fields": {
             "bom_id": "BOM 编码",

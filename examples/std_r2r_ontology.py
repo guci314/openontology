@@ -33,7 +33,12 @@ from open_ontology.induction.dsl import (
 from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
 
 try:
-    from .business_ontology import MasterEntity, ProcessDocument
+    from .business_ontology import (
+        MasterEntity,
+        ProcessDocument,
+        apply_planned_ops,
+        collect_read_set,
+    )
     from .std_core_ontology import (
         AccountingEntity,
         FulfillmentEvent,
@@ -41,7 +46,12 @@ try:
         spec as std_core_spec,
     )
 except ImportError:  # pragma: no cover - script execution fallback
-    from examples.business_ontology import MasterEntity, ProcessDocument
+    from examples.business_ontology import (
+        MasterEntity,
+        ProcessDocument,
+        apply_planned_ops,
+        collect_read_set,
+    )
     from examples.std_core_ontology import (
         AccountingEntity,
         FulfillmentEvent,
@@ -337,12 +347,117 @@ def _compute_entity_trial_balance_dict(
     }
 
 
+@spec.function(
+    "plan_post_journal_entry",
+    PostJournalEntryParams,
+    description="M2.5 纯算大脑（Class A · 零写句柄）：校验同主体、期间开放与大额手工调账审批门禁，生成复式过账提案。",
+)
+def plan_post_journal_entry(ctx: Any, params: PostJournalEntryParams) -> dict[str, Any]:
+    entry = ctx.require(JournalEntry, params.entry_id)
+    if entry.status != "draft":
+        raise InvariantError(
+            f"JournalEntry:{entry.entry_id} status is {entry.status!r}, expected 'draft'",
+            code="ENTRY_NOT_DRAFT",
+        )
+    if entry.amount_cents <= 0:
+        raise InvariantError(
+            f"JournalEntry:{entry.entry_id} amount_cents={entry.amount_cents} must be > 0",
+            code="NON_POSITIVE_JOURNAL_AMOUNT",
+        )
+    if entry.debit_account == entry.credit_account:
+        raise InvariantError(
+            f"JournalEntry:{entry.entry_id} debit_account == credit_account == {entry.debit_account!r}",
+            code="SELF_BALANCING_ACCOUNT_FORBIDDEN",
+        )
+
+    debit_acc = ctx.require(GlAccount, entry.debit_account)
+    credit_acc = ctx.require(GlAccount, entry.credit_account)
+    period = ctx.require(FiscalPeriod, entry.fiscal_period)
+
+    if (
+        debit_acc.accounting_entity != entry.accounting_entity
+        or credit_acc.accounting_entity != entry.accounting_entity
+        or period.accounting_entity != entry.accounting_entity
+    ):
+        raise InvariantError(
+            f"JournalEntry:{entry.entry_id} spans multiple AccountingEntity scopes",
+            code="CROSS_ENTITY_JOURNAL_FORBIDDEN",
+        )
+    if debit_acc.status != "active" or credit_acc.status != "active":
+        raise InvariantError(
+            f"JournalEntry:{entry.entry_id} references frozen GlAccount",
+            code="GL_ACCOUNT_FROZEN",
+        )
+    if period.status != "open":
+        raise InvariantError(
+            f"FiscalPeriod:{period.period_id} status is {period.status!r}; posting is forbidden",
+            code="PERIOD_CLOSED_POSTING_FORBIDDEN",
+        )
+
+    is_manual = True
+    if entry.source_event:
+        ev = ctx.require(FulfillmentEvent, entry.source_event)
+        if ev.status != "confirmed":
+            raise InvariantError(
+                f"JournalEntry:{entry.entry_id} source_event {ev.event_id!r} status is {ev.status!r}, expected 'confirmed'",
+                code="SOURCE_EVENT_NOT_CONFIRMED",
+            )
+        if ev.amount > 0:
+            max_cents = int(round(ev.amount * 100))
+            if entry.amount_cents > max_cents:
+                raise InvariantError(
+                    f"JournalEntry:{entry.entry_id} amount_cents={entry.amount_cents} exceeds source_event amount_cents={max_cents}",
+                    code="JOURNAL_EXCEEDS_SOURCE_EVENT",
+                )
+            is_manual = False
+    if (
+        is_manual
+        and entry.amount_cents >= MANUAL_JOURNAL_APPROVAL_THRESHOLD_CENTS
+        and ctx.actor.role not in ("finance_director", "admin")
+        and not _has_completed_manual_journal_work_card(ctx, entry.entry_id)
+    ):
+        raise InvariantError(
+            f"Manual JournalEntry:{entry.entry_id} amount_cents={entry.amount_cents} >= {MANUAL_JOURNAL_APPROVAL_THRESHOLD_CENTS} requires finance_director approval",
+            code="APPROVAL_REQUIRED_MANUAL_JOURNAL",
+        )
+
+    return {
+        "contract_name": "post_journal_entry",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": [
+            {
+                "op": "modify",
+                "object_type": "GlAccount",
+                "object_id": str(debit_acc.account_code),
+                "set_fields": {"debit_total_cents": debit_acc.debit_total_cents + entry.amount_cents},
+            },
+            {
+                "op": "modify",
+                "object_type": "GlAccount",
+                "object_id": str(credit_acc.account_code),
+                "set_fields": {"credit_total_cents": credit_acc.credit_total_cents + entry.amount_cents},
+            },
+            {
+                "op": "modify",
+                "object_type": "JournalEntry",
+                "object_id": str(entry.entry_id),
+                "set_fields": {"status": "posted"},
+            },
+        ],
+        "brain_source": "pure_function:plan_post_journal_entry",
+    }
+
+
 @spec.edit_function(
     "post_journal_entry",
     PostJournalEntryParams,
     description="复式总账凭证过账：校验正金额、借贷异目、同主体、科目激活、期间开放及大额手工调账 WorkCard 审批门禁。",
     touched_object_types=("JournalEntry", "GlAccount"),
     modifies=("JournalEntry.status", "GlAccount.debit_total_cents", "GlAccount.credit_total_cents"),
+    trust_mode="untrusted_verifiable",
+    require_read_set_cas=True,
+    planner_function="plan_post_journal_entry",
     ensures=(
         {
             "name": "post_je_status_post",
@@ -509,77 +624,8 @@ def _compute_entity_trial_balance_dict(
     ),
 )
 def post_journal_entry(ctx: Any, params: PostJournalEntryParams) -> None:
-    entry = ctx.require(JournalEntry, params.entry_id)
-    if entry.status != "draft":
-        raise InvariantError(
-            f"JournalEntry:{entry.entry_id} status is {entry.status!r}, expected 'draft'",
-            code="ENTRY_NOT_DRAFT",
-        )
-    if entry.amount_cents <= 0:
-        raise InvariantError(
-            f"JournalEntry:{entry.entry_id} amount_cents={entry.amount_cents} must be > 0",
-            code="NON_POSITIVE_JOURNAL_AMOUNT",
-        )
-    if entry.debit_account == entry.credit_account:
-        raise InvariantError(
-            f"JournalEntry:{entry.entry_id} debit_account == credit_account == {entry.debit_account!r}",
-            code="SELF_BALANCING_ACCOUNT_FORBIDDEN",
-        )
-
-    debit_acc = ctx.require(GlAccount, entry.debit_account)
-    credit_acc = ctx.require(GlAccount, entry.credit_account)
-    period = ctx.require(FiscalPeriod, entry.fiscal_period)
-
-    if (
-        debit_acc.accounting_entity != entry.accounting_entity
-        or credit_acc.accounting_entity != entry.accounting_entity
-        or period.accounting_entity != entry.accounting_entity
-    ):
-        raise InvariantError(
-            f"JournalEntry:{entry.entry_id} spans multiple AccountingEntity scopes",
-            code="CROSS_ENTITY_JOURNAL_FORBIDDEN",
-        )
-    if debit_acc.status != "active" or credit_acc.status != "active":
-        raise InvariantError(
-            f"JournalEntry:{entry.entry_id} references frozen GlAccount",
-            code="GL_ACCOUNT_FROZEN",
-        )
-    if period.status != "open":
-        raise InvariantError(
-            f"FiscalPeriod:{period.period_id} status is {period.status!r}; posting is forbidden",
-            code="PERIOD_CLOSED_POSTING_FORBIDDEN",
-        )
-
-    is_manual = True
-    if entry.source_event:
-        ev = ctx.require(FulfillmentEvent, entry.source_event)
-        if ev.status != "confirmed":
-            raise InvariantError(
-                f"JournalEntry:{entry.entry_id} source_event {ev.event_id!r} status is {ev.status!r}, expected 'confirmed'",
-                code="SOURCE_EVENT_NOT_CONFIRMED",
-            )
-        if ev.amount > 0:
-            max_cents = int(round(ev.amount * 100))
-            if entry.amount_cents > max_cents:
-                raise InvariantError(
-                    f"JournalEntry:{entry.entry_id} amount_cents={entry.amount_cents} exceeds source_event amount_cents={max_cents}",
-                    code="JOURNAL_EXCEEDS_SOURCE_EVENT",
-                )
-            is_manual = False
-    if (
-        is_manual
-        and entry.amount_cents >= MANUAL_JOURNAL_APPROVAL_THRESHOLD_CENTS
-        and ctx.actor.role not in ("finance_director", "admin")
-        and not _has_completed_manual_journal_work_card(ctx, entry.entry_id)
-    ):
-        raise InvariantError(
-            f"Manual JournalEntry:{entry.entry_id} amount_cents={entry.amount_cents} >= {MANUAL_JOURNAL_APPROVAL_THRESHOLD_CENTS} requires finance_director approval",
-            code="APPROVAL_REQUIRED_MANUAL_JOURNAL",
-        )
-
-    ctx.modify(debit_acc, debit_total_cents=debit_acc.debit_total_cents + entry.amount_cents)
-    ctx.modify(credit_acc, credit_total_cents=credit_acc.credit_total_cents + entry.amount_cents)
-    ctx.modify(entry, status="posted")
+    plan = plan_post_journal_entry(ctx, params)
+    apply_planned_ops(ctx, plan["ops"])
 
 spec.declare_action(
     "post_journal_entry",
@@ -589,6 +635,108 @@ spec.declare_action(
 )
 
 
+@spec.function(
+    "plan_reverse_journal_entry",
+    ReverseJournalEntryParams,
+    description="M2.5 权威纯算大脑（Class B · 零写句柄）：校验防重复冲正与目标期间开放，生成确定性红字冲正提案。",
+)
+def plan_reverse_journal_entry(ctx: Any, params: ReverseJournalEntryParams) -> dict[str, Any]:
+    orig = ctx.require(JournalEntry, params.entry_id)
+    if orig.reversal_of:
+        raise InvariantError(
+            f"JournalEntry:{orig.entry_id} is itself a reversal entry of {orig.reversal_of!r} and cannot be reversed",
+            code="CANNOT_REVERSE_REVERSAL_ENTRY",
+        )
+    if orig.status == "reversed" or any(
+        e.reversal_of == orig.entry_id for e in ctx.query(JournalEntry)
+    ):
+        raise InvariantError(
+            f"JournalEntry:{orig.entry_id} is already reversed",
+            code="ENTRY_ALREADY_REVERSED",
+        )
+    if orig.status != "posted":
+        raise InvariantError(
+            f"JournalEntry:{orig.entry_id} status is {orig.status!r}, expected 'posted' to reverse",
+            code="ENTRY_NOT_POSTED",
+        )
+
+    target_period_id = params.target_period_id.strip() or orig.fiscal_period
+    period = ctx.require(FiscalPeriod, target_period_id)
+    if period.accounting_entity != orig.accounting_entity:
+        raise InvariantError(
+            f"Target FiscalPeriod:{period.period_id} belongs to {period.accounting_entity!r}, expected {orig.accounting_entity!r}",
+            code="CROSS_ENTITY_JOURNAL_FORBIDDEN",
+        )
+    if period.status != "open":
+        raise InvariantError(
+            f"FiscalPeriod:{period.period_id} status is {period.status!r}; reversal posting is forbidden",
+            code="PERIOD_CLOSED_POSTING_FORBIDDEN",
+        )
+
+    orig_debit = ctx.require(GlAccount, orig.debit_account)
+    orig_credit = ctx.require(GlAccount, orig.credit_account)
+    if orig_debit.status != "active" or orig_credit.status != "active":
+        raise InvariantError(
+            f"JournalEntry:{orig.entry_id} references frozen GlAccount",
+            code="GL_ACCOUNT_FROZEN",
+        )
+
+    if params.reversal_entry_id.strip():
+        rev_id = params.reversal_entry_id.strip()
+        if ctx.get(JournalEntry, rev_id) is not None:
+            raise InvariantError(f"JournalEntry:{rev_id} already exists", code="JOURNAL_ENTRY_EXISTS")
+    else:
+        rev_id = f"{orig.entry_id}-REV"
+        suffix = 2
+        while ctx.get(JournalEntry, rev_id) is not None:
+            rev_id = f"{orig.entry_id}-REV-{suffix}"
+            suffix += 1
+
+    return {
+        "contract_name": "reverse_journal_entry",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": [
+            {
+                "op": "create",
+                "object_type": "JournalEntry",
+                "object_id": rev_id,
+                "set_fields": {
+                    "entry_id": rev_id,
+                    "accounting_entity": orig.accounting_entity,
+                    "fiscal_period": period.period_id,
+                    "source_event": orig.source_event,
+                    "debit_account": orig.credit_account,
+                    "credit_account": orig.debit_account,
+                    "amount_cents": orig.amount_cents,
+                    "memo": params.memo.strip() or f"Reversal of {orig.entry_id}",
+                    "reversal_of": orig.entry_id,
+                    "status": "posted",
+                },
+            },
+            {
+                "op": "modify",
+                "object_type": "GlAccount",
+                "object_id": str(orig_credit.account_code),
+                "set_fields": {"debit_total_cents": orig_credit.debit_total_cents + orig.amount_cents},
+            },
+            {
+                "op": "modify",
+                "object_type": "GlAccount",
+                "object_id": str(orig_debit.account_code),
+                "set_fields": {"credit_total_cents": orig_debit.credit_total_cents + orig.amount_cents},
+            },
+            {
+                "op": "modify",
+                "object_type": "JournalEntry",
+                "object_id": str(orig.entry_id),
+                "set_fields": {"status": "reversed"},
+            },
+        ],
+        "brain_source": "pure_function:plan_reverse_journal_entry",
+    }
+
+
 @spec.edit_function(
     "reverse_journal_entry",
     ReverseJournalEntryParams,
@@ -596,6 +744,10 @@ spec.declare_action(
     touched_object_types=("JournalEntry", "GlAccount"),
     modifies=("JournalEntry.status", "GlAccount.debit_total_cents", "GlAccount.credit_total_cents"),
     creates=("JournalEntry",),
+    trust_mode="attested_provider",
+    attested_providers=("plan_reverse_journal_entry",),
+    require_read_set_cas=True,
+    planner_function="plan_reverse_journal_entry",
     ensures=(
         {
             "name": "reverse_je_orig_status_post",
@@ -780,67 +932,8 @@ spec.declare_action(
     ),
 )
 def reverse_journal_entry(ctx: Any, params: ReverseJournalEntryParams) -> None:
-    orig = ctx.require(JournalEntry, params.entry_id)
-    if orig.reversal_of:
-        raise InvariantError(
-            f"JournalEntry:{orig.entry_id} is itself a reversal entry of {orig.reversal_of!r} and cannot be reversed",
-            code="CANNOT_REVERSE_REVERSAL_ENTRY",
-        )
-    if orig.status == "reversed" or any(
-        e.reversal_of == orig.entry_id for e in ctx.query(JournalEntry)
-    ):
-        raise InvariantError(
-            f"JournalEntry:{orig.entry_id} is already reversed",
-            code="ENTRY_ALREADY_REVERSED",
-        )
-    if orig.status != "posted":
-        raise InvariantError(
-            f"JournalEntry:{orig.entry_id} status is {orig.status!r}, expected 'posted' to reverse",
-            code="ENTRY_NOT_POSTED",
-        )
-
-    target_period_id = params.target_period_id.strip() or orig.fiscal_period
-    period = ctx.require(FiscalPeriod, target_period_id)
-    if period.accounting_entity != orig.accounting_entity:
-        raise InvariantError(
-            f"Target FiscalPeriod:{period.period_id} belongs to {period.accounting_entity!r}, expected {orig.accounting_entity!r}",
-            code="CROSS_ENTITY_JOURNAL_FORBIDDEN",
-        )
-    if period.status != "open":
-        raise InvariantError(
-            f"FiscalPeriod:{period.period_id} status is {period.status!r}; reversal posting is forbidden",
-            code="PERIOD_CLOSED_POSTING_FORBIDDEN",
-        )
-
-    orig_debit = ctx.require(GlAccount, orig.debit_account)
-    orig_credit = ctx.require(GlAccount, orig.credit_account)
-    if orig_debit.status != "active" or orig_credit.status != "active":
-        raise InvariantError(
-            f"JournalEntry:{orig.entry_id} references frozen GlAccount",
-            code="GL_ACCOUNT_FROZEN",
-        )
-
-    rev_id = params.reversal_entry_id.strip() or f"{orig.entry_id}-REV-{uuid.uuid4().hex[:8].upper()}"
-    if ctx.get(JournalEntry, rev_id) is not None:
-        raise InvariantError(f"JournalEntry:{rev_id} already exists", code="JOURNAL_ENTRY_EXISTS")
-
-    ctx.create(
-        JournalEntry(
-            entry_id=rev_id,
-            accounting_entity=orig.accounting_entity,
-            fiscal_period=period.period_id,
-            source_event=orig.source_event,
-            debit_account=orig.credit_account,
-            credit_account=orig.debit_account,
-            amount_cents=orig.amount_cents,
-            memo=params.memo.strip() or f"Reversal of {orig.entry_id}",
-            reversal_of=orig.entry_id,
-            status="posted",
-        )
-    )
-    ctx.modify(orig_credit, debit_total_cents=orig_credit.debit_total_cents + orig.amount_cents)
-    ctx.modify(orig_debit, credit_total_cents=orig_debit.credit_total_cents + orig.amount_cents)
-    ctx.modify(orig, status="reversed")
+    plan = plan_reverse_journal_entry(ctx, params)
+    apply_planned_ops(ctx, plan["ops"])
 
 spec.declare_action(
     "reverse_journal_entry",
@@ -883,6 +976,65 @@ register_rule_action(
 )
 
 
+@spec.function(
+    "plan_close_fiscal_period",
+    CloseFiscalPeriodParams,
+    description="M2.5 权威纯算大脑（Class B · 零写句柄）：全实体试算平衡核验并生成关账快照提案。",
+)
+def plan_close_fiscal_period(ctx: Any, params: CloseFiscalPeriodParams) -> dict[str, Any]:
+    period = ctx.require(FiscalPeriod, params.period_id)
+    if period.status not in ("open", "closing"):
+        raise InvariantError(
+            f"FiscalPeriod:{period.period_id} is already {period.status!r}",
+            code="PERIOD_ALREADY_CLOSED",
+        )
+
+    tb = _compute_entity_trial_balance_dict(ctx, period.accounting_entity, period.period_id)
+    if not tb["is_balanced"] or not tb["accounting_equation_holds"]:
+        raise InvariantError(
+            f"Trial balance unbalanced for AccountingEntity:{period.accounting_entity}: "
+            f"debit={tb['total_debit_cents']} != credit={tb['total_credit_cents']}",
+            code="TRIAL_BALANCE_UNBALANCED",
+        )
+
+    snap_id = params.snapshot_id.strip() or f"TBS-{period.accounting_entity}-{period.period_id}"
+    if ctx.get(TrialBalanceSnapshot, snap_id) is not None:
+        raise InvariantError(
+            f"TrialBalanceSnapshot:{snap_id} already exists",
+            code="TRIAL_BALANCE_SNAPSHOT_EXISTS",
+        )
+
+    return {
+        "contract_name": "close_fiscal_period",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": [
+            {
+                "op": "create",
+                "object_type": "TrialBalanceSnapshot",
+                "object_id": snap_id,
+                "set_fields": {
+                    "snapshot_id": snap_id,
+                    "accounting_entity": period.accounting_entity,
+                    "fiscal_period": period.period_id,
+                    "total_debit_cents": tb["total_debit_cents"],
+                    "total_credit_cents": tb["total_credit_cents"],
+                    "is_balanced": True,
+                    "entry_count": tb["entry_count"],
+                    "status": "verified",
+                },
+            },
+            {
+                "op": "modify",
+                "object_type": "FiscalPeriod",
+                "object_id": str(period.period_id),
+                "set_fields": {"status": "closed"},
+            },
+        ],
+        "brain_source": "pure_function:plan_close_fiscal_period",
+    }
+
+
 @spec.edit_function(
     "close_fiscal_period",
     CloseFiscalPeriodParams,
@@ -890,6 +1042,10 @@ register_rule_action(
     touched_object_types=("FiscalPeriod", "TrialBalanceSnapshot"),
     modifies=("FiscalPeriod.status",),
     creates=("TrialBalanceSnapshot",),
+    trust_mode="attested_provider",
+    attested_providers=("plan_close_fiscal_period",),
+    require_read_set_cas=True,
+    planner_function="plan_close_fiscal_period",
     ensures=(
         {
             "name": "close_period_status_post",
@@ -933,41 +1089,8 @@ register_rule_action(
     ),
 )
 def close_fiscal_period(ctx: Any, params: CloseFiscalPeriodParams) -> None:
-    period = ctx.require(FiscalPeriod, params.period_id)
-    if period.status not in ("open", "closing"):
-        raise InvariantError(
-            f"FiscalPeriod:{period.period_id} is already {period.status!r}",
-            code="PERIOD_ALREADY_CLOSED",
-        )
-
-    tb = _compute_entity_trial_balance_dict(ctx, period.accounting_entity, period.period_id)
-    if not tb["is_balanced"] or not tb["accounting_equation_holds"]:
-        raise InvariantError(
-            f"Trial balance unbalanced for AccountingEntity:{period.accounting_entity}: "
-            f"debit={tb['total_debit_cents']} != credit={tb['total_credit_cents']}",
-            code="TRIAL_BALANCE_UNBALANCED",
-        )
-
-    snap_id = params.snapshot_id.strip() or f"TBS-{period.accounting_entity}-{period.period_id}"
-    if ctx.get(TrialBalanceSnapshot, snap_id) is not None:
-        raise InvariantError(
-            f"TrialBalanceSnapshot:{snap_id} already exists",
-            code="TRIAL_BALANCE_SNAPSHOT_EXISTS",
-        )
-
-    ctx.create(
-        TrialBalanceSnapshot(
-            snapshot_id=snap_id,
-            accounting_entity=period.accounting_entity,
-            fiscal_period=period.period_id,
-            total_debit_cents=tb["total_debit_cents"],
-            total_credit_cents=tb["total_credit_cents"],
-            is_balanced=True,
-            entry_count=tb["entry_count"],
-            status="verified",
-        )
-    )
-    ctx.modify(period, status="closed")
+    plan = plan_close_fiscal_period(ctx, params)
+    apply_planned_ops(ctx, plan["ops"])
 
 spec.declare_action(
     "close_fiscal_period",
@@ -1010,6 +1133,9 @@ spec.update_display(
         },
         "functions": {
             "compute_trial_balance": "计算实时试算平衡",
+            "plan_post_journal_entry": "M2.5 纯算大脑 · 总账凭证过账提案",
+            "plan_reverse_journal_entry": "M2.5 权威纯算大脑 · 凭证红字冲正提案",
+            "plan_close_fiscal_period": "M2.5 权威纯算大脑 · 会计期间关账提案",
         },
         "fields": {
             "period_id": "会计期间编码",

@@ -33,7 +33,12 @@ from open_ontology.induction.dsl import (
 from open_ontology.spec import InvariantError, ObjectProperty, OntologySpec
 
 try:
-    from .business_ontology import MasterEntity, ProcessDocument
+    from .business_ontology import (
+        MasterEntity,
+        ProcessDocument,
+        apply_planned_ops,
+        collect_read_set,
+    )
     from .std_core_ontology import (
         STD_ROLES,
         AccountingEntity,
@@ -42,7 +47,12 @@ try:
         spec as std_core_spec,
     )
 except ImportError:  # pragma: no cover - script execution fallback
-    from examples.business_ontology import MasterEntity, ProcessDocument
+    from examples.business_ontology import (
+        MasterEntity,
+        ProcessDocument,
+        apply_planned_ops,
+        collect_read_set,
+    )
     from examples.std_core_ontology import (
         STD_ROLES,
         AccountingEntity,
@@ -726,12 +736,76 @@ register_rule_actions(
 )
 
 
+@spec.function(
+    "plan_reparent_department",
+    ReparentDepartmentParams,
+    description="M2.5 纯算大脑（Class A · 零写句柄）：执行部门 DAG 无环与同核算主体校验，输出调整上级部门的 WriteBatchProposal。",
+)
+def plan_reparent_department(ctx: Any, params: ReparentDepartmentParams) -> dict[str, Any]:
+    dept = ctx.require(Department, params.department_id)
+    if dept.status != "active":
+        raise InvariantError(
+            f"Department:{dept.department_id} status is {dept.status!r}, expected 'active'",
+            code="DEPARTMENT_ARCHIVED",
+        )
+    new_pid = params.new_parent_id.strip()
+    target_parent_id: str | None = None
+    if new_pid:
+        if new_pid == dept.department_id:
+            raise InvariantError(
+                f"Department:{dept.department_id} cannot reference itself as parent",
+                code="DEPARTMENT_CYCLE_DETECTED",
+            )
+        parent = ctx.require(Department, new_pid)
+        if parent.status != "active":
+            raise InvariantError(
+                f"Target parent Department:{parent.department_id} status is {parent.status!r}, expected 'active'",
+                code="DEPARTMENT_ARCHIVED",
+            )
+        if parent.accounting_entity != dept.accounting_entity:
+            raise InvariantError(
+                f"Department:{dept.department_id} ({dept.accounting_entity}) cannot be reparented under {parent.department_id} ({parent.accounting_entity})",
+                code="CROSS_ENTITY_DEPARTMENT_FORBIDDEN",
+            )
+
+        seen: set[str] = {dept.department_id}
+        cur_id: str | None = parent.department_id
+        while cur_id:
+            if cur_id in seen:
+                raise InvariantError(
+                    f"Reparenting Department:{dept.department_id} under {parent.department_id} creates cycle at {cur_id!r}",
+                    code="DEPARTMENT_CYCLE_DETECTED",
+                )
+            seen.add(cur_id)
+            cur = ctx.get(Department, cur_id)
+            cur_id = cur.parent_department if cur is not None else None
+        target_parent_id = parent.department_id
+
+    return {
+        "contract_name": "reparent_department",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": [
+            {
+                "op": "modify",
+                "object_type": "Department",
+                "object_id": str(dept.department_id),
+                "set_fields": {"parent_department": target_parent_id},
+            }
+        ],
+        "brain_source": "pure_function:plan_reparent_department",
+    }
+
+
 @spec.edit_function(
     "reparent_department",
     ReparentDepartmentParams,
     description="变更部门上级归属节点；强制校验 DAG 防环（禁指向自身或任何后代）及同主体隔离。",
     touched_object_types=("Department",),
     modifies=("Department.parent_department",),
+    trust_mode="untrusted_verifiable",
+    require_read_set_cas=True,
+    planner_function="plan_reparent_department",
     ensures=(
         {
             "name": "reparent_dept_no_self_loop",
@@ -758,49 +832,38 @@ register_rule_actions(
             },
             "description": "仅 active 部门可调整上级部门，且目标上级不得为自身。",
         },
+        {
+            "name": "reparent_dept_parent_valid",
+            "code": "CROSS_ENTITY_DEPARTMENT_FORBIDDEN",
+            "target_type": "Department",
+            "id_param": "department_id",
+            "when": {
+                "op": "ne",
+                "left": {"ref": "after.parent_department"},
+                "right": {"lit": None},
+            },
+            "must_hold": {
+                "op": "and",
+                "args": [
+                    {
+                        "op": "eq",
+                        "left": {"ref": "after.parent_department.status"},
+                        "right": {"lit": "active"},
+                    },
+                    {
+                        "op": "eq",
+                        "left": {"ref": "after.parent_department.accounting_entity"},
+                        "right": {"ref": "after.accounting_entity"},
+                    },
+                ],
+            },
+            "description": "若指定新上级部门，目标上级必须为 active 且隶属同一核算主体。",
+        },
     ),
 )
 def reparent_department(ctx: Any, params: ReparentDepartmentParams) -> None:
-    dept = ctx.require(Department, params.department_id)
-    if dept.status != "active":
-        raise InvariantError(
-            f"Department:{dept.department_id} status is {dept.status!r}, expected 'active'",
-            code="DEPARTMENT_ARCHIVED",
-        )
-    new_pid = params.new_parent_id.strip()
-    if not new_pid:
-        ctx.modify(dept, parent_department=None)
-        return
-    if new_pid == dept.department_id:
-        raise InvariantError(
-            f"Department:{dept.department_id} cannot reference itself as parent",
-            code="DEPARTMENT_CYCLE_DETECTED",
-        )
-    parent = ctx.require(Department, new_pid)
-    if parent.status != "active":
-        raise InvariantError(
-            f"Target parent Department:{parent.department_id} status is {parent.status!r}, expected 'active'",
-            code="DEPARTMENT_ARCHIVED",
-        )
-    if parent.accounting_entity != dept.accounting_entity:
-        raise InvariantError(
-            f"Department:{dept.department_id} ({dept.accounting_entity}) cannot be reparented under {parent.department_id} ({parent.accounting_entity})",
-            code="CROSS_ENTITY_DEPARTMENT_FORBIDDEN",
-        )
-
-    seen: set[str] = {dept.department_id}
-    cur_id: str | None = parent.department_id
-    while cur_id:
-        if cur_id in seen:
-            raise InvariantError(
-                f"Reparenting Department:{dept.department_id} under {parent.department_id} creates cycle at {cur_id!r}",
-                code="DEPARTMENT_CYCLE_DETECTED",
-            )
-        seen.add(cur_id)
-        cur = ctx.get(Department, cur_id)
-        cur_id = cur.parent_department if cur is not None else None
-
-    ctx.modify(dept, parent_department=parent.department_id)
+    plan = plan_reparent_department(ctx, params)
+    apply_planned_ops(ctx, plan["ops"])
 
 spec.declare_action(
     "reparent_department",
@@ -810,12 +873,77 @@ spec.declare_action(
 )
 
 
+@spec.function(
+    "plan_offboard_employee",
+    OffboardEmployeeParams,
+    description="M2.5 纯算大脑（Class A · 零写句柄）：扫描员工名下全部 active 动态授权并输出离职+原子收权 WriteBatchProposal。",
+)
+def plan_offboard_employee(ctx: Any, params: OffboardEmployeeParams) -> dict[str, Any]:
+    emp = ctx.require(Employee, params.employee_id)
+    if emp.status == "offboarded":
+        raise InvariantError(
+            f"Employee:{emp.employee_id} is already offboarded",
+            code="EMPLOYEE_ALREADY_OFFBOARDED",
+        )
+    if emp.status not in ("active", "suspended"):
+        raise InvariantError(
+            f"Employee:{emp.employee_id} status is {emp.status!r}; must be active/suspended to offboard",
+            code="INVALID_EMPLOYEE_OFFBOARD_STATUS",
+        )
+    same_authority = (
+        ctx.spec.get_object_type(Employee).is_fully_owned()
+        == ctx.spec.get_object_type(AuthorityMandate).is_fully_owned()
+    )
+    active_mandates = sorted(
+        (
+            mandate
+            for mandate in ctx.query(AuthorityMandate)
+            if (mandate.grantee == emp.employee_id or mandate.grantor == emp.employee_id)
+            and mandate.status == "active"
+        ),
+        key=lambda m: str(m.mandate_id),
+    )
+    if active_mandates and not same_authority:
+        raise InvariantError(
+            f"Employee:{emp.employee_id} has {len(active_mandates)} active AuthorityMandate(s) "
+            "across split ownership boundary; revoke them before offboarding",
+            code="OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN",
+        )
+    ops: list[dict[str, Any]] = [
+        {
+            "op": "modify",
+            "object_type": "AuthorityMandate",
+            "object_id": str(mandate.mandate_id),
+            "set_fields": {"status": "revoked"},
+        }
+        for mandate in active_mandates
+    ]
+    ops.append(
+        {
+            "op": "modify",
+            "object_type": "Employee",
+            "object_id": str(emp.employee_id),
+            "set_fields": {"status": "offboarded"},
+        }
+    )
+    return {
+        "contract_name": "offboard_employee",
+        "params": params.model_dump(mode="json"),
+        "read_set": collect_read_set(ctx),
+        "ops": ops,
+        "brain_source": "pure_function:plan_offboard_employee",
+    }
+
+
 @spec.edit_function(
     "offboard_employee",
     OffboardEmployeeParams,
     description="办理员工离职并在同一原子事务内自动吊销其作为授权人与被授权人的全部 active AuthorityMandate。",
     touched_object_types=("Employee", "AuthorityMandate"),
     modifies=("Employee.status", "AuthorityMandate.status"),
+    trust_mode="untrusted_verifiable",
+    require_read_set_cas=True,
+    planner_function="plan_offboard_employee",
     ensures=(
         {
             "name": "offboard_emp_status_post",
@@ -848,45 +976,32 @@ spec.declare_action(
                         "args": [
                             {"op": "eq", "left": {"ref": "before.status"}, "right": {"lit": "active"}},
                             {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "revoked"}},
+                            {
+                                "op": "or",
+                                "args": [
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "before.grantor"},
+                                        "right": {"ref": "param.employee_id"},
+                                    },
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "before.grantee"},
+                                        "right": {"ref": "param.employee_id"},
+                                    },
+                                ],
+                            },
                         ],
                     },
                 ],
             },
-            "description": "受员工离职连带影响的动态授权凭证仅允许维持原状态或由 active 吊销为 revoked。",
+            "description": "受员工离职连带影响的动态授权凭证仅允许维持原状态，或针对该离职员工相关 active 凭证吊销为 revoked。",
         },
     ),
 )
 def offboard_employee(ctx: Any, params: OffboardEmployeeParams) -> None:
-    emp = ctx.require(Employee, params.employee_id)
-    if emp.status == "offboarded":
-        raise InvariantError(
-            f"Employee:{emp.employee_id} is already offboarded",
-            code="EMPLOYEE_ALREADY_OFFBOARDED",
-        )
-    if emp.status not in ("active", "suspended"):
-        raise InvariantError(
-            f"Employee:{emp.employee_id} status is {emp.status!r}; must be active/suspended to offboard",
-            code="INVALID_EMPLOYEE_OFFBOARD_STATUS",
-        )
-    same_authority = (
-        ctx.spec.get_object_type(Employee).is_fully_owned()
-        == ctx.spec.get_object_type(AuthorityMandate).is_fully_owned()
-    )
-    active_mandates = [
-        mandate
-        for mandate in ctx.query(AuthorityMandate)
-        if (mandate.grantee == emp.employee_id or mandate.grantor == emp.employee_id)
-        and mandate.status == "active"
-    ]
-    if active_mandates and not same_authority:
-        raise InvariantError(
-            f"Employee:{emp.employee_id} has {len(active_mandates)} active AuthorityMandate(s) "
-            "across split ownership boundary; revoke them before offboarding",
-            code="OFFBOARDED_GRANTEE_ACTIVE_MANDATE_FORBIDDEN",
-        )
-    for mandate in active_mandates:
-        ctx.modify(mandate, status="revoked")
-    ctx.modify(emp, status="offboarded")
+    plan = plan_offboard_employee(ctx, params)
+    apply_planned_ops(ctx, plan["ops"])
 
 spec.declare_action(
     "offboard_employee",
@@ -967,6 +1082,8 @@ spec.update_display(
         },
         "functions": {
             "resolve_employee_effective_mandates": "解析员工有效权限委派",
+            "plan_reparent_department": "M2.5 纯算大脑 · 部门上级调整提案",
+            "plan_offboard_employee": "M2.5 纯算大脑 · 员工离职与原子收权提案",
         },
         "fields": {
             "department_id": "部门编码",

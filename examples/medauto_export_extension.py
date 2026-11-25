@@ -908,7 +908,10 @@ class BatchRecallDefectiveLotParams(BaseModel):
     reason: str = "质量异常批次紧急召回隔离"
 
 
-def _batch_recall_defective_lot(ctx: Any, params: BatchRecallDefectiveLotParams) -> None:
+def _plan_batch_recall_defective_lot(
+    ctx: Any, params: BatchRecallDefectiveLotParams
+) -> dict[str, Any]:
+    """Pure read-only M2.5 planner (Class A · zero write handle): recall defective lot & open tracking cards."""
     clean_lot = params.lot_code.strip()
     if not clean_lot:
         raise InvariantError("lot_code must not be empty", code="EMPTY_LOT_CODE")
@@ -932,7 +935,6 @@ def _batch_recall_defective_lot(ctx: Any, params: BatchRecallDefectiveLotParams)
                     seen_targets.add(key)
                     targets.append((sub_cls.__name__, row))
 
-    # Also track any ExportSalesOrder lot tagging if needed (does not set x_quarantined unless field exists)
     _ = ExpCls
 
     if not targets:
@@ -941,15 +943,26 @@ def _batch_recall_defective_lot(ctx: Any, params: BatchRecallDefectiveLotParams)
             code="LOT_NOT_FOUND_OR_ALREADY_QUARANTINED",
         )
 
-    existing_card_ids = {c.card_id for c in ctx.query(WcCls)}
+    all_cards = list(ctx.query(WcCls))
+    existing_card_ids = {c.card_id for c in all_cards}
     existing_active_recall_sigs = {
         (c.card_kind, c.target_object_type, c.target_object_id, c.requested_action)
-        for c in ctx.query(WcCls)
+        for c in all_cards
         if c.status in ("OPEN", "IN_PROGRESS")
     }
-    for idx, (otype, row) in enumerate(sorted(targets, key=lambda pair: (pair[0], pair[1].primary_key_value())), start=1):
-        ctx.modify(row, x_quarantined=True)
-        oid = row.primary_key_value()
+    ops: list[dict[str, Any]] = []
+    for idx, (otype, row) in enumerate(
+        sorted(targets, key=lambda pair: (pair[0], pair[1].primary_key_value())), start=1
+    ):
+        oid = str(row.primary_key_value())
+        ops.append(
+            {
+                "op": "modify",
+                "object_type": otype,
+                "object_id": oid,
+                "set_fields": {"x_quarantined": True},
+            }
+        )
         recall_sig = ("HUMAN_TASK", otype, oid, "batch_recall_defective_lot")
         if recall_sig in existing_active_recall_sigs:
             raise InvariantError(
@@ -961,21 +974,43 @@ def _batch_recall_defective_lot(ctx: Any, params: BatchRecallDefectiveLotParams)
         while cid in existing_card_ids:
             cid = f"{cid}-X"
         existing_card_ids.add(cid)
-        ctx.create(
-            WcCls(
-                card_id=cid,
-                card_kind="HUMAN_TASK",
-                target_object_type=otype,
-                target_object_id=oid,
-                requested_action="batch_recall_defective_lot",
-                requested_params_json=json.dumps({"lot_code": clean_lot, "reason": params.reason}, ensure_ascii=False),
-                requester_actor_id=ctx.actor.actor_id,
-                assignee_role="plant_manager",
-                assignee_dept="品质工程与制造管理部",
-                status="OPEN",
-                external_ref=f"[{clean_lot}] {otype}:{oid} 缺陷批次锁定隔离 — {params.reason}",
-            )
+        ops.append(
+            {
+                "op": "create",
+                "object_type": "WorkCard",
+                "object_id": cid,
+                "set_fields": {
+                    "card_id": cid,
+                    "card_kind": "HUMAN_TASK",
+                    "target_object_type": otype,
+                    "target_object_id": oid,
+                    "requested_action": "batch_recall_defective_lot",
+                    "requested_params_json": json.dumps(
+                        {"lot_code": clean_lot, "reason": params.reason}, ensure_ascii=False
+                    ),
+                    "requester_actor_id": ctx.actor.actor_id,
+                    "assignee_role": "plant_manager",
+                    "assignee_dept": "品质工程与制造管理部",
+                    "status": "OPEN",
+                    "external_ref": f"[{clean_lot}] {otype}:{oid} 缺陷批次锁定隔离 — {params.reason}",
+                },
+            }
         )
+
+    return {
+        "contract_name": "batch_recall_defective_lot",
+        "params": params.model_dump(mode="json"),
+        "read_set": _build_read_set_from_batch(ctx),
+        "ops": ops,
+        "brain_source": "pure_function:plan_batch_recall_defective_lot",
+    }
+
+
+def _batch_recall_defective_lot(ctx: Any, params: BatchRecallDefectiveLotParams) -> None:
+    from open_ontology.contract_gate import WriteOp, apply_ops_to_batch
+
+    plan = _plan_batch_recall_defective_lot(ctx, params)
+    apply_ops_to_batch(ctx, [WriteOp.model_validate(o) for o in plan["ops"]])
 
 
 class ExplodeMultilevelSubstituteBomParams(BaseModel):
@@ -1134,7 +1169,10 @@ def _compute_progressive_rebate_cents(annual_sales_cents: int) -> int:
     return (rebate_num + 50) // 100
 
 
-def _settle_annual_tiered_dealer_rebate(ctx: Any, params: SettleAnnualTieredDealerRebateParams) -> None:
+def _plan_annual_tiered_dealer_rebate(
+    ctx: Any, params: SettleAnnualTieredDealerRebateParams
+) -> dict[str, Any]:
+    """Pure read-only M2.5 planner (Class B · zero write handle): compute 4-tier progressive rebate & FIFO invoice offset."""
     AccCls = ctx.spec.get_object_type("CrmAccount")
     OrderCls = ctx.spec.get_object_type("O2cOrder")
     CustCls = ctx.spec.get_object_type("O2cCustomerProfile")
@@ -1168,6 +1206,7 @@ def _settle_annual_tiered_dealer_rebate(ctx: Any, params: SettleAnnualTieredDeal
     rebate_cents = _compute_progressive_rebate_cents(annual_sales_cents)
     remaining_cents = rebate_cents
     offset_count = 0
+    ops: list[dict[str, Any]] = []
 
     open_invoices = sorted(
         (
@@ -1187,22 +1226,48 @@ def _settle_annual_tiered_dealer_rebate(ctx: Any, params: SettleAnnualTieredDeal
         new_res_cents = res_cents - apply_cents
         remaining_cents -= apply_cents
         offset_count += 1
-        ctx.modify(
-            inv,
-            amount_residual=round(new_res_cents / 100.0, 2),
-            payment_state="paid" if new_res_cents == 0 else "partial",
+        ops.append(
+            {
+                "op": "modify",
+                "object_type": "O2cInvoice",
+                "object_id": str(inv.invoice_id),
+                "set_fields": {
+                    "amount_residual": round(new_res_cents / 100.0, 2),
+                    "payment_state": "paid" if new_res_cents == 0 else "partial",
+                },
+            }
         )
 
-    ctx.create(
-        SettleCls(
-            settlement_id=params.settlement_id,
-            settlement_code=params.settlement_code,
-            account=account.account_id,
-            annual_sales_cents=annual_sales_cents,
-            rebate_cents=rebate_cents,
-            offset_invoice_count=offset_count,
-        )
+    ops.append(
+        {
+            "op": "create",
+            "object_type": "DealerRebateSettlement",
+            "object_id": str(params.settlement_id),
+            "set_fields": {
+                "settlement_id": str(params.settlement_id),
+                "settlement_code": str(params.settlement_code),
+                "account": str(account.account_id),
+                "annual_sales_cents": annual_sales_cents,
+                "rebate_cents": rebate_cents,
+                "offset_invoice_count": offset_count,
+            },
+        }
     )
+
+    return {
+        "contract_name": "settle_annual_tiered_dealer_rebate",
+        "params": params.model_dump(mode="json"),
+        "read_set": _build_read_set_from_batch(ctx),
+        "ops": ops,
+        "brain_source": "pure_function:plan_annual_tiered_dealer_rebate",
+    }
+
+
+def _settle_annual_tiered_dealer_rebate(ctx: Any, params: SettleAnnualTieredDealerRebateParams) -> None:
+    from open_ontology.contract_gate import WriteOp, apply_ops_to_batch
+
+    plan = _plan_annual_tiered_dealer_rebate(ctx, params)
+    apply_ops_to_batch(ctx, [WriteOp.model_validate(o) for o in plan["ops"]])
 
 
 class AllocateContainerShippingCostParams(BaseModel):
@@ -1312,7 +1377,78 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         touched_object_types=("WorkOrder", "ReworkWorkOrder", "O2cDelivery", "WorkCard"),
         modifies=("WorkOrder.x_quarantined", "O2cDelivery.x_quarantined"),
         creates=("WorkCard",),
+        trust_mode="untrusted_verifiable",
+        require_read_set_cas=True,
+        planner_function="plan_batch_recall_defective_lot",
         ensures=(
+            {
+                "name": "batch_recall_wo_post",
+                "code": "CONTRACT_ENSURES_VIOLATION",
+                "target_type": "WorkOrder",
+                "must_hold": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "before.x_lot_code"}, "right": {"ref": "param.lot_code"}},
+                        {"op": "eq", "left": {"ref": "before.x_quarantined"}, "right": {"lit": False}},
+                        {"op": "eq", "left": {"ref": "after.x_quarantined"}, "right": {"lit": True}},
+                        {
+                            "op": "exists",
+                            "object_type": "WorkCard",
+                            "where": {
+                                "op": "and",
+                                "args": [
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "target.target_object_id"},
+                                        "right": {"ref": "after.work_order_id"},
+                                    },
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "target.requested_action"},
+                                        "right": {"lit": "batch_recall_defective_lot"},
+                                    },
+                                    {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "OPEN"}},
+                                ],
+                            },
+                        },
+                    ],
+                },
+                "description": "被召回隔离的生产/返工工单必须命中缺陷批次号、由未隔离跃迁为已隔离并生成对应 OPEN 追踪工单。",
+            },
+            {
+                "name": "batch_recall_delivery_post",
+                "code": "CONTRACT_ENSURES_VIOLATION",
+                "target_type": "O2cDelivery",
+                "must_hold": {
+                    "op": "and",
+                    "args": [
+                        {"op": "eq", "left": {"ref": "before.x_lot_code"}, "right": {"ref": "param.lot_code"}},
+                        {"op": "eq", "left": {"ref": "before.x_quarantined"}, "right": {"lit": False}},
+                        {"op": "eq", "left": {"ref": "after.x_quarantined"}, "right": {"lit": True}},
+                        {
+                            "op": "exists",
+                            "object_type": "WorkCard",
+                            "where": {
+                                "op": "and",
+                                "args": [
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "target.target_object_id"},
+                                        "right": {"ref": "after.delivery_id"},
+                                    },
+                                    {
+                                        "op": "eq",
+                                        "left": {"ref": "target.requested_action"},
+                                        "right": {"lit": "batch_recall_defective_lot"},
+                                    },
+                                    {"op": "eq", "left": {"ref": "target.status"}, "right": {"lit": "OPEN"}},
+                                ],
+                            },
+                        },
+                    ],
+                },
+                "description": "被召回隔离的发货单必须命中缺陷批次号、由未隔离跃迁为已隔离并生成对应 OPEN 追踪工单。",
+            },
             {
                 "name": "batch_recall_card_open",
                 "code": "CONTRACT_ENSURES_VIOLATION",
@@ -1321,11 +1457,39 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
                     "op": "and",
                     "args": [
                         {"op": "eq", "left": {"ref": "after.status"}, "right": {"lit": "OPEN"}},
+                        {"op": "eq", "left": {"ref": "after.card_kind"}, "right": {"lit": "HUMAN_TASK"}},
+                        {
+                            "op": "eq",
+                            "left": {"ref": "after.requested_action"},
+                            "right": {"lit": "batch_recall_defective_lot"},
+                        },
                         {"op": "eq", "left": {"ref": "after.resolved_by_actor_id"}, "right": {"lit": ""}},
                         {"op": "eq", "left": {"ref": "after.requester_actor_id"}, "right": {"ref": "actor.actor_id"}},
+                        {
+                            "op": "not_exists",
+                            "object_type": "WorkOrder",
+                            "where": {
+                                "op": "and",
+                                "args": [
+                                    {"op": "eq", "left": {"ref": "target.x_lot_code"}, "right": {"ref": "param.lot_code"}},
+                                    {"op": "eq", "left": {"ref": "target.x_quarantined"}, "right": {"lit": False}},
+                                ],
+                            },
+                        },
+                        {
+                            "op": "not_exists",
+                            "object_type": "O2cDelivery",
+                            "where": {
+                                "op": "and",
+                                "args": [
+                                    {"op": "eq", "left": {"ref": "target.x_lot_code"}, "right": {"ref": "param.lot_code"}},
+                                    {"op": "eq", "left": {"ref": "target.x_quarantined"}, "right": {"lit": False}},
+                                ],
+                            },
+                        },
                     ],
                 },
-                "description": "批次召回生成的协同追踪工单初态必须为 OPEN 且记录发起人。",
+                "description": "批次召回生成的协同追踪工单初态必须为 OPEN 且提交后同批次不得遗留未隔离工单或发货单。",
             },
             {
                 "name": "batch_recall_card_unique",
@@ -1410,6 +1574,10 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         ),
         modifies=("O2cInvoice.amount_residual", "O2cInvoice.payment_state"),
         creates=("DealerRebateSettlement",),
+        trust_mode="attested_provider",
+        attested_providers=("plan_annual_tiered_dealer_rebate",),
+        require_read_set_cas=True,
+        planner_function="plan_annual_tiered_dealer_rebate",
         ensures=(
             {
                 "name": "settle_rebate_invoice_post",
@@ -1615,6 +1783,8 @@ _MEDAUTO_DISPLAY_PATCH: dict[str, dict[str, str]] = {
         "plan_container_shipping_cost": "M2.5 纯算大脑 · 拼箱运费分摊提案",
         "plan_multilevel_substitute_bom": "M2.5 纯算大脑 · 多级替代料 BOM 展算提案",
         "plan_export_tax_rebate_claim": "M2.5 权威纯算大脑 · 法定出口退税核定提案",
+        "plan_batch_recall_defective_lot": "M2.5 纯算大脑 · 缺陷批次召回隔离提案",
+        "plan_annual_tiered_dealer_rebate": "M2.5 权威纯算大脑 · 年度阶梯返利与 FIFO 冲账提案",
     },
     "statuses": {
         "pending": "待处理/待检",
@@ -1706,18 +1876,28 @@ def build_medauto_spec() -> OntologySpec:
     derived.function(
         "plan_container_shipping_cost",
         params=AllocateContainerShippingCostParams,
-        description="M2.5 纯算大脑（零写句柄）：按集装箱毛重比例试算拼箱海运费分摊提案（WriteBatchProposal + Read-Set CAS）。",
+        description="M2.5 纯算大脑（Class A · 零写句柄）：按集装箱毛重比例试算拼箱海运费分摊提案（WriteBatchProposal + Read-Set CAS）。",
     )(_plan_container_shipping_cost)
     derived.function(
         "plan_multilevel_substitute_bom",
         params=ExplodeMultilevelSubstituteBomParams,
-        description="M2.5 纯算大脑（零写句柄）：递归展算多级替代料 BOM 并输出子工单创建提案（WriteBatchProposal + Read-Set CAS）。",
+        description="M2.5 纯算大脑（Class A · 零写句柄）：递归展算多级替代料 BOM 并输出子工单创建提案（WriteBatchProposal + Read-Set CAS）。",
     )(_plan_multilevel_substitute_bom)
     derived.function(
         "plan_export_tax_rebate_claim",
         params=ApplyExportTaxRebateParams,
         description="M2.5 权威纯算大脑（Class B · 零写句柄）：按法定退税率与汇率试算报关单退税提案供契约门禁签验。",
     )(_plan_export_tax_rebate_claim)
+    derived.function(
+        "plan_batch_recall_defective_lot",
+        params=BatchRecallDefectiveLotParams,
+        description="M2.5 纯算大脑（Class A · 零写句柄）：跨生产工单、返工工单与发货单扫描缺陷批次并输出锁定隔离+追踪工单提案。",
+    )(_plan_batch_recall_defective_lot)
+    derived.function(
+        "plan_annual_tiered_dealer_rebate",
+        params=SettleAnnualTieredDealerRebateParams,
+        description="M2.5 权威纯算大脑（Class B · 零写句柄）：按四档超额累进规则核算年度返利并输出 FIFO 冲账与凭证提案供契约门禁签验。",
+    )(_plan_annual_tiered_dealer_rebate)
 
     for src in (
         std_core_spec,
