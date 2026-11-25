@@ -659,6 +659,64 @@ export interface BlueprintClassProof {
   elapsed_ms: number;
 }
 
+export interface BlueprintWhenBranchProof {
+  action_name: string;
+  display_label?: string;
+  status:
+    | 'EXHAUSTIVE'
+    | 'CONDITIONAL_SIDE_EFFECT'
+    | 'INCOMPLETE_WHEN_BRANCHES'
+    | 'DEAD_BRANCH'
+    | 'OVERLAPPING_WHEN_BRANCHES'
+    | 'UNKNOWN';
+  branch_count: number;
+  dead_branch_indices: number[];
+  overlapping_pairs: Array<[number, number]>;
+  uncovered_witness?: Record<string, unknown> | null;
+  overlap_witness?: Record<string, unknown> | null;
+  detail: string;
+  logic_fragment: string;
+  elapsed_ms: number;
+}
+
+export interface BlueprintWorkflowLivenessProof {
+  object_type: string;
+  display_label?: string;
+  extends?: string | null;
+  extends_display_label?: string | null;
+  status_field: string;
+  status:
+    | 'LIVE'
+    | 'GRAPH_LIVE_PARTIAL_ACTIONS'
+    | 'NO_INITIAL_STATE'
+    | 'UNREACHABLE_STATE'
+    | 'NO_TERMINAL_STATE'
+    | 'TRAP_STATE'
+    | 'ACTION_CHAIN_DEADLOCKED'
+    | 'UNKNOWN';
+  action_terminal_status:
+    | 'TRIVIAL_TERMINAL'
+    | 'ACTION_TERMINAL_REACHABLE'
+    | 'PARTIAL_ACTION_COVERAGE'
+    | 'ACTION_CHAIN_DEADLOCKED'
+    | 'SKIPPED_STRUCTURAL_FAILURE'
+    | 'UNKNOWN';
+  initial_statuses: string[];
+  reachable_states: string[];
+  terminal_states: string[];
+  unreachable_states: string[];
+  pruned_inherited_states: string[];
+  trap_states: string[];
+  missing_action_edges: string[];
+  terminal_witness_trace: string[];
+  terminal_witness_trace_labels?: string[];
+  reached_terminal_status?: string | null;
+  max_steps: number;
+  detail: string;
+  logic_fragment: string;
+  elapsed_ms: number;
+}
+
 export interface BlueprintProveSummary {
   total_classes?: number;
   satisfiable_classes?: number;
@@ -675,6 +733,12 @@ export interface BlueprintProveSummary {
   contract_proved_count?: number;
   vacuous_contract_count?: number;
   uncontracted_edit_function_count?: number;
+  when_branch_checked_count?: number;
+  when_branch_issue_count?: number;
+  workflow_checked_count?: number;
+  workflow_live_count?: number;
+  workflow_action_verified_count?: number;
+  workflow_issue_count?: number;
   declared_invariant_count?: number;
   redundant_rule_count: number;
   exact_linear_ratio: number;
@@ -695,6 +759,8 @@ export interface BlueprintProveResponse {
   class_proofs?: BlueprintClassProof[];
   action_proofs?: BlueprintActionProof[];
   invariant_proofs?: BlueprintInvariantProof[];
+  when_branch_proofs?: BlueprintWhenBranchProof[];
+  workflow_liveness_proofs?: BlueprintWorkflowLivenessProof[];
   redundant_rules?: BlueprintRedundantRuleFinding[];
 }
 

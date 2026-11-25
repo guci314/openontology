@@ -51,6 +51,8 @@ __all__ = [
     "RedundantRuleFinding",
     "InvariantCounterexample",
     "InvariantPreservationProof",
+    "WhenBranchProof",
+    "WorkflowLivenessProof",
     "UpgradeRegressionItem",
     "UpgradeCompatibilityReport",
     "ProofReport",
@@ -58,6 +60,8 @@ __all__ = [
     "prove_action_reachability",
     "prove_redundant_rules",
     "prove_invariant_preservation",
+    "prove_when_branches",
+    "prove_workflow_liveness",
     "prove_upgrade_compatibility",
     "prove_blueprint",
 ]
@@ -65,6 +69,7 @@ __all__ = [
 LogicFragment = Literal[
     "EXACT_QF_LIA",
     "EXACT_QF_LRA",
+    "EXACT_GRAPH",
     "QF_NIA_HEURISTIC",
     "UNKNOWN",
 ] | str
@@ -229,6 +234,71 @@ class ClassSatisfiabilityProof(BaseModel):
     elapsed_ms: float = 0.0
 
 
+class WhenBranchProof(BaseModel):
+    """PO-6: Guarded `when` branch reachability, exhaustiveness, and pairwise disjointness proof."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_name: str
+    status: Literal[
+        "EXHAUSTIVE",
+        "CONDITIONAL_SIDE_EFFECT",
+        "INCOMPLETE_WHEN_BRANCHES",
+        "DEAD_BRANCH",
+        "OVERLAPPING_WHEN_BRANCHES",
+        "UNKNOWN",
+    ]
+    branch_count: int = 0
+    dead_branch_indices: list[int] = Field(default_factory=list)
+    overlapping_pairs: list[tuple[int, int]] = Field(default_factory=list)
+    uncovered_witness: dict[str, Any] | None = None
+    overlap_witness: dict[str, Any] | None = None
+    detail: str = ""
+    logic_fragment: str = "EXACT_QF_LIA"
+    elapsed_ms: float = 0.0
+
+
+class WorkflowLivenessProof(BaseModel):
+    """PO-7: FSM structural liveness + bounded Z3 multi-step action terminal reachability proof."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    object_type: str
+    extends: str | None = None
+    status_field: str = "status"
+    status: Literal[
+        "LIVE",
+        "GRAPH_LIVE_PARTIAL_ACTIONS",
+        "NO_INITIAL_STATE",
+        "UNREACHABLE_STATE",
+        "NO_TERMINAL_STATE",
+        "TRAP_STATE",
+        "ACTION_CHAIN_DEADLOCKED",
+        "UNKNOWN",
+    ]
+    action_terminal_status: Literal[
+        "TRIVIAL_TERMINAL",
+        "ACTION_TERMINAL_REACHABLE",
+        "PARTIAL_ACTION_COVERAGE",
+        "ACTION_CHAIN_DEADLOCKED",
+        "SKIPPED_STRUCTURAL_FAILURE",
+        "UNKNOWN",
+    ] = "PARTIAL_ACTION_COVERAGE"
+    initial_statuses: list[str] = Field(default_factory=list)
+    reachable_states: list[str] = Field(default_factory=list)
+    terminal_states: list[str] = Field(default_factory=list)
+    unreachable_states: list[str] = Field(default_factory=list)
+    pruned_inherited_states: list[str] = Field(default_factory=list)
+    trap_states: list[str] = Field(default_factory=list)
+    missing_action_edges: list[str] = Field(default_factory=list)
+    terminal_witness_trace: list[str] = Field(default_factory=list)
+    reached_terminal_status: str | None = None
+    max_steps: int = 4
+    detail: str = ""
+    logic_fragment: str = "EXACT_GRAPH"
+    elapsed_ms: float = 0.0
+
+
 class ProofReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -250,11 +320,19 @@ class ProofReport(BaseModel):
     contract_proved_count: int = 0
     vacuous_contract_count: int = 0
     uncontracted_edit_function_count: int = 0
+    when_branch_checked_count: int = 0
+    when_branch_issue_count: int = 0
+    workflow_checked_count: int = 0
+    workflow_live_count: int = 0
+    workflow_action_verified_count: int = 0
+    workflow_issue_count: int = 0
     logic_fragment_counts: dict[str, int] = Field(default_factory=dict)
     class_proofs: list[ClassSatisfiabilityProof] = Field(default_factory=list)
     reachability: list[ActionReachabilityProof] = Field(default_factory=list)
     redundant_rules: list[RedundantRuleFinding] = Field(default_factory=list)
     invariant_preservation: list[InvariantPreservationProof] = Field(default_factory=list)
+    when_branch_proofs: list[WhenBranchProof] = Field(default_factory=list)
+    workflow_liveness_proofs: list[WorkflowLivenessProof] = Field(default_factory=list)
     upgrade_compatibility: UpgradeCompatibilityReport | None = None
     elapsed_ms: float = 0.0
 
@@ -4115,6 +4193,1000 @@ def prove_class_satisfiability(
     return proofs
 
 
+# ---------------------------------------------------------------------------
+# PO-6: Guarded `when` Branch Reachability, Exhaustiveness & Disjointness
+# ---------------------------------------------------------------------------
+def prove_when_branches(
+    blueprint_or_spec: DeclarativeBlueprint | OntologySpec | Mapping[str, Any],
+    *,
+    overlay: CustomerOverlaySpec
+    | EvolutionPatch
+    | Mapping[str, Any]
+    | Sequence[CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any]]
+    | None = None,
+    action_names: Sequence[str] | None = None,
+    bmc_bound: int = 4,
+    timeout_ms: int = 5000,
+) -> list[WhenBranchProof]:
+    """PO-6: Verify reachability, exhaustiveness, and pairwise disjointness of `when`-guarded Rule branches."""
+    z3 = _require_z3()
+    raw_bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
+    bp, ancestors_map, _ = _prepare_blueprint_for_prover(raw_bp)
+    codec = _StringCodec(bp)
+    target_filter = set(action_names) if action_names is not None else None
+    results: list[WhenBranchProof] = []
+
+    for act in bp.actions:
+        if target_filter is not None and act.name not in target_filter:
+            continue
+        if act.edit_function is not None or not act.mutations:
+            continue
+        guarded_indices = [idx for idx, m in enumerate(act.mutations) if m.when is not None]
+        if not guarded_indices:
+            continue
+
+        t0 = time.perf_counter()
+        comp = _Z3Compiler(z3, bp, codec, bmc_bound=bmc_bound)
+        actor, params, subjects, anchor = _build_action_pre_context(comp, act)
+
+        # Ensure every mutation target has a symbolic entity in `subjects`
+        for mut in act.mutations:
+            if mut.op in ("modify", "delete") and mut.object_type in comp.ot_by_name:
+                if mut.target_ref is None:
+                    key = (mut.object_type, mut.id_param)
+                    if key not in subjects:
+                        ent = comp.build_entity(mut.object_type, f"subj_{mut.object_type}_{mut.id_param}")
+                        if mut.id_param in params:
+                            comp.background.append(ent.fields[ent.ot.primary_key].expr == params[mut.id_param].expr)
+                        subjects[key] = ent
+                        if anchor is None:
+                            anchor = ent
+
+        # Compile preconditions
+        pre_formulas: list[Any] = []
+        for pre in act.preconditions:
+            idp = _resolve_rule_id_param(pre, act, comp.ot_by_name)
+            subj = subjects[(pre.target_type, idp)]
+            p_ctx = {"obj": subj, "param": params, "actor": actor}
+            w_z3 = comp.compile_bool(pre.when, p_ctx) if pre.when is not None else z3.BoolVal(True)
+            m_z3 = comp.compile_bool(pre.must_hold, p_ctx)
+            pre_formulas.append(z3.Implies(w_z3, m_z3))
+
+        # Compile each guarded mutation's `when` predicate against its target context
+        compiled_guards: dict[int, Any] = {}
+        for idx in guarded_indices:
+            mut = act.mutations[idx]
+            eval_ctx: dict[str, Any] = {"param": params, "actor": actor}
+            if anchor is not None:
+                eval_ctx["source_obj"] = anchor
+            if mut.op in ("modify", "delete") and mut.object_type in comp.ot_by_name:
+                if mut.target_ref is not None:
+                    parts = mut.target_ref.split(".")
+                    if parts[0] in ("obj", "source_obj") and anchor is not None and len(parts) >= 2:
+                        cur_t = anchor
+                        for seg in parts[1:]:
+                            cur_t, _ = comp.resolve_linked_entity(cur_t, seg, pre_state=True)
+                        eval_ctx["obj"] = cur_t
+                    elif parts[0] == "param" and len(parts) >= 2:
+                        key_p = (mut.object_type, parts[1])
+                        if key_p not in subjects:
+                            p_ent = comp.build_entity(mut.object_type, f"subj_{mut.object_type}_{parts[1]}")
+                            if parts[1] in params:
+                                comp.background.append(
+                                    p_ent.fields[p_ent.ot.primary_key].expr == params[parts[1]].expr
+                                )
+                            subjects[key_p] = p_ent
+                        eval_ctx["obj"] = subjects[key_p]
+                    else:
+                        eval_ctx["obj"] = subjects.get((mut.object_type, mut.id_param), anchor)
+                else:
+                    eval_ctx["obj"] = subjects[(mut.object_type, mut.id_param)]
+            compiled_guards[idx] = comp.compile_bool(mut.when, eval_ctx)
+
+        # Applicable pre-state invariants across all referenced types
+        ref_types = _collect_action_referenced_types(act, subjects) | set(comp.named_entities.keys())
+        inv_scope_ancestors: set[str] = set()
+        for tname in ref_types:
+            inv_scope_ancestors.update(_ancestor_closure(tname, ancestors_map))
+
+        inv_formulas: list[Any] = []
+        for inv in bp.invariants:
+            if inv.target_type not in inv_scope_ancestors:
+                continue
+            for tname in sorted(ref_types):
+                if inv.target_type not in _ancestor_closure(tname, ancestors_map):
+                    continue
+                for ent in comp.named_entities.get(tname, ()):
+                    sub_ctx = {"obj": ent}
+                    w_i = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
+                    m_i = comp.compile_bool(inv.must_hold, sub_ctx)
+                    inv_formulas.append(z3.Implies(w_i, m_i))
+
+        solver = z3.Solver()
+        solver.set("timeout", int(timeout_ms))
+        for bg in comp.background:
+            solver.add(bg)
+        for inv_f in inv_formulas:
+            solver.add(inv_f)
+        for pre_f in pre_formulas:
+            solver.add(pre_f)
+
+        frag = comp.logic_fragment()
+        saw_unknown = False
+
+        # 1) Dead branch check: every guarded mutation must be satisfiable under Domain ∧ Pre
+        dead_indices: list[int] = []
+        for idx in guarded_indices:
+            solver.push()
+            solver.add(compiled_guards[idx])
+            chk = solver.check()
+            solver.pop()
+            if chk == z3.unsat:
+                dead_indices.append(idx)
+            elif chk == z3.unknown:
+                saw_unknown = True
+
+        # Group mutations by target key (op, object_type, id_param or target_ref)
+        target_guarded_groups: dict[tuple[str, str, str], list[int]] = {}
+        target_has_uncond: set[tuple[str, str, str]] = set()
+        for idx, mut in enumerate(act.mutations):
+            tkey = (mut.op, mut.object_type, str(mut.target_ref or mut.id_param or ""))
+            if mut.when is None:
+                target_has_uncond.add(tkey)
+            else:
+                target_guarded_groups.setdefault(tkey, []).append(idx)
+
+        # 2) Pairwise overlap check on shared modified fields within the same target group
+        overlapping_pairs: list[tuple[int, int]] = []
+        overlap_witness: dict[str, Any] | None = None
+        for tkey, grp in target_guarded_groups.items():
+            if tkey[0] != "modify" or len(grp) < 2:
+                continue
+            for pos_a in range(len(grp)):
+                for pos_b in range(pos_a + 1, len(grp)):
+                    ia, ib = grp[pos_a], grp[pos_b]
+                    shared_fields = set(act.mutations[ia].set_fields.keys()) & set(
+                        act.mutations[ib].set_fields.keys()
+                    )
+                    if not shared_fields:
+                        continue
+                    solver.push()
+                    solver.add(z3.And(compiled_guards[ia], compiled_guards[ib]))
+                    chk = solver.check()
+                    if chk == z3.sat:
+                        overlapping_pairs.append((ia, ib))
+                        if overlap_witness is None:
+                            overlap_witness = _decode_witness(
+                                z3, solver.model(), comp, actor, params, subjects
+                            )
+                    elif chk == z3.unknown:
+                        saw_unknown = True
+                    solver.pop()
+
+        # 3) Exhaustiveness check:
+        #    (a) action has NO unconditional mutation anywhere (silent NO-OP risk), OR
+        #    (b) same-target group has >= 2 guarded branches with no unconditional fallback on that target
+        exhaustiveness_groups: list[tuple[int, ...]] = []
+        seen_groups: set[tuple[int, ...]] = set()
+        has_any_uncond = any(m.when is None for m in act.mutations)
+        if not has_any_uncond:
+            g_all = tuple(guarded_indices)
+            exhaustiveness_groups.append(g_all)
+            seen_groups.add(g_all)
+        for tkey, grp in target_guarded_groups.items():
+            if len(grp) >= 2 and tkey not in target_has_uncond:
+                g_tup = tuple(grp)
+                if g_tup not in seen_groups:
+                    exhaustiveness_groups.append(g_tup)
+                    seen_groups.add(g_tup)
+
+        uncovered_witness: dict[str, Any] | None = None
+        checked_exhaustiveness = bool(exhaustiveness_groups)
+        for grp in exhaustiveness_groups:
+            solver.push()
+            solver.add(z3.Not(z3.Or(*[compiled_guards[i] for i in grp])))
+            chk = solver.check()
+            if chk == z3.sat:
+                if uncovered_witness is None:
+                    uncovered_witness = _decode_witness(
+                        z3, solver.model(), comp, actor, params, subjects
+                    )
+            elif chk == z3.unknown:
+                saw_unknown = True
+            solver.pop()
+
+        elapsed = round((time.perf_counter() - t0) * 1000.0, 3)
+        if dead_indices:
+            status: Literal[
+                "EXHAUSTIVE",
+                "CONDITIONAL_SIDE_EFFECT",
+                "INCOMPLETE_WHEN_BRANCHES",
+                "DEAD_BRANCH",
+                "OVERLAPPING_WHEN_BRANCHES",
+                "UNKNOWN",
+            ] = "DEAD_BRANCH"
+            detail = f"Action {act.name!r} has unreachable guarded branch(es) at index {dead_indices}"
+        elif uncovered_witness is not None:
+            status = "INCOMPLETE_WHEN_BRANCHES"
+            detail = (
+                f"Action {act.name!r} has uncovered input space where none of the guarded `when` branches fire"
+            )
+        elif overlapping_pairs:
+            status = "OVERLAPPING_WHEN_BRANCHES"
+            detail = (
+                f"Action {act.name!r} has overlapping guarded branches writing shared fields: {overlapping_pairs}"
+            )
+        elif saw_unknown:
+            status = "UNKNOWN"
+            detail = f"Z3 returned unknown while verifying guarded branches for {act.name!r}"
+        elif checked_exhaustiveness:
+            status = "EXHAUSTIVE"
+            detail = (
+                f"All {len(guarded_indices)} guarded `when` branches are reachable, exhaustive, and mutually disjoint"
+            )
+        else:
+            status = "CONDITIONAL_SIDE_EFFECT"
+            detail = (
+                f"Single conditional side-effect branch alongside unconditional mutation is reachable"
+            )
+
+        results.append(
+            WhenBranchProof(
+                action_name=act.name,
+                status=status,
+                branch_count=len(guarded_indices),
+                dead_branch_indices=dead_indices,
+                overlapping_pairs=overlapping_pairs,
+                uncovered_witness=uncovered_witness,
+                overlap_witness=overlap_witness,
+                detail=detail,
+                logic_fragment=frag,
+                elapsed_ms=elapsed,
+            )
+        )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# PO-7: Workflow FSM Structural Liveness & Z3 Multi-Step Terminal Reachability
+# ---------------------------------------------------------------------------
+def _extract_literal_strings_from_val(expr: Any) -> set[str] | None:
+    """Return all concrete string literals an expression may evaluate to, or None if non-literal."""
+    if not isinstance(expr, Mapping):
+        return None
+    if "lit" in expr:
+        val = expr["lit"]
+        return {str(val)} if isinstance(val, str) else None
+    if expr.get("op") == "if_else":
+        t_set = _extract_literal_strings_from_val(expr.get("then"))
+        e_set = _extract_literal_strings_from_val(expr.get("else"))
+        if t_set is not None and e_set is not None:
+            return t_set | e_set
+    return None
+
+
+def _extract_status_constraints_from_pred(
+    expr: Any, ref_prefix: str, status_field: str
+) -> set[str] | None:
+    """Best-effort sound over-approximation of allowed status strings from a conjunction predicate."""
+    if not isinstance(expr, Mapping):
+        return None
+    op = expr.get("op")
+    target_ref = f"{ref_prefix}.{status_field}"
+    if op == "and":
+        allowed: set[str] | None = None
+        for arg in expr.get("args") or ():
+            sub = _extract_status_constraints_from_pred(arg, ref_prefix, status_field)
+            if sub is not None:
+                allowed = sub if allowed is None else (allowed & sub)
+        return allowed
+    if op == "eq":
+        left, right = expr.get("left"), expr.get("right")
+        if isinstance(left, Mapping) and left.get("ref") == target_ref and isinstance(right, Mapping) and "lit" in right:
+            return {str(right["lit"])} if isinstance(right["lit"], str) else None
+        if isinstance(right, Mapping) and right.get("ref") == target_ref and isinstance(left, Mapping) and "lit" in left:
+            return {str(left["lit"])} if isinstance(left["lit"], str) else None
+    if op == "in":
+        left, right = expr.get("left"), expr.get("right")
+        if (
+            isinstance(left, Mapping)
+            and left.get("ref") == target_ref
+            and isinstance(right, Mapping)
+            and isinstance(right.get("lit"), list)
+        ):
+            return {str(x) for x in right["lit"] if isinstance(x, str)}
+    return None
+
+
+def _verify_workflow_action_chain(
+    z3: Any,
+    bp: DeclarativeBlueprint,
+    ot: ObjectTypeBlueprint,
+    anc_set: set[str],
+    ancestors_map: Mapping[str, Sequence[str]],
+    codec: _StringCodec,
+    chain_acts: Sequence[ActionBlueprint],
+    terminal_states: Sequence[str],
+    *,
+    bmc_bound: int,
+    timeout_ms: int,
+) -> tuple[Literal["SAT", "UNSAT", "UNKNOWN"], str | None, str]:
+    """Symbolically compose `chain_acts` on a single tracked entity from initial_statuses to terminal_states."""
+    sf = ot.status_field or "status"
+    comp = _Z3Compiler(z3, bp, codec, bmc_bound=bmc_bound)
+    solver = z3.Solver()
+    solver.set("timeout", int(timeout_ms))
+
+    # Track entity across steps without cross-step UNA congruence collapse
+    cur_ent = comp.build_entity(ot.name, f"wf_{ot.name}_s0", pre_state=True, register_congruence=False)
+
+    # Initial status constraint
+    if ot.initial_statuses:
+        solver.add(
+            z3.Or(*[cur_ent.fields[sf].expr == codec.encode(s) for s in ot.initial_statuses])
+        )
+
+    own_invs = [inv for inv in bp.invariants if inv.target_type in anc_set]
+
+    def _assert_entity_invs(ent: _SymEntity) -> None:
+        for inv in own_invs:
+            sub_ctx = {"obj": ent}
+            w_z3 = comp.compile_bool(inv.when, sub_ctx) if inv.when else z3.BoolVal(True)
+            m_z3 = comp.compile_bool(inv.must_hold, sub_ctx)
+            solver.add(z3.Implies(w_z3, m_z3))
+
+    _assert_entity_invs(cur_ent)
+
+    def _is_mod_for_ot(act_obj: ActionBlueprint, fname: str) -> bool:
+        return any(
+            f"{anc}.{fname}" in act_obj.modifies or f"{anc}.*" in act_obj.modifies
+            for anc in anc_set
+        )
+
+    for step_idx, act in enumerate(chain_acts):
+        actor_t = comp.build_actor(act.allowed_roles)
+        params_t = comp.build_params(act)
+
+        step_subjects: dict[tuple[str, str], _SymEntity] = {}
+        anchor_t: _SymEntity | None = None
+
+        # Determine if any mutation targets `ot` via `target_ref` from a companion anchor (e.g. Delivery.order)
+        target_ref_rel: str | None = None
+        for mut in act.mutations:
+            if (
+                mut.op == "modify"
+                and mut.object_type in anc_set
+                and mut.target_ref
+                and mut.target_ref.startswith(("obj.", "source_obj."))
+            ):
+                parts = mut.target_ref.split(".")
+                if len(parts) == 2:
+                    target_ref_rel = parts[1]
+                    break
+
+        # Materialize subjects for preconditions
+        for pre in act.preconditions:
+            if pre.target_type not in comp.ot_by_name:
+                continue
+            idp = _resolve_rule_id_param(pre, act, comp.ot_by_name)
+            key = (pre.target_type, idp)
+            if key in step_subjects:
+                continue
+            if pre.target_type in anc_set and target_ref_rel is None:
+                step_subjects[key] = cur_ent
+                if idp in params_t:
+                    solver.add(cur_ent.fields[ot.primary_key].expr == params_t[idp].expr)
+                if anchor_t is None:
+                    anchor_t = cur_ent
+            else:
+                aux_ent = comp.build_entity(
+                    pre.target_type,
+                    f"wf_s{step_idx}_{pre.target_type}_{idp}",
+                    pre_state=True,
+                    register_congruence=False,
+                )
+                if idp in params_t:
+                    solver.add(aux_ent.fields[aux_ent.ot.primary_key].expr == params_t[idp].expr)
+                # Bind companion anchor relation to tracked `cur_ent` if mutated via `target_ref`
+                if target_ref_rel and target_ref_rel in aux_ent.fields:
+                    solver.add(
+                        aux_ent.fields[target_ref_rel].expr == cur_ent.fields[ot.primary_key].expr
+                    )
+                    aux_ent.linked[target_ref_rel] = cur_ent
+                # Assert companion class invariants
+                aux_ancs = _ancestor_closure(pre.target_type, ancestors_map)
+                for inv in bp.invariants:
+                    if inv.target_type in aux_ancs:
+                        sctx = {"obj": aux_ent}
+                        wi = comp.compile_bool(inv.when, sctx) if inv.when else z3.BoolVal(True)
+                        mi = comp.compile_bool(inv.must_hold, sctx)
+                        solver.add(z3.Implies(wi, mi))
+                step_subjects[key] = aux_ent
+                if anchor_t is None:
+                    anchor_t = aux_ent
+
+        # Assert action preconditions
+        for pre in act.preconditions:
+            if pre.target_type not in comp.ot_by_name:
+                continue
+            idp = _resolve_rule_id_param(pre, act, comp.ot_by_name)
+            subj = step_subjects[(pre.target_type, idp)]
+            p_ctx = {"obj": subj, "param": params_t, "actor": actor_t}
+            w_p = comp.compile_bool(pre.when, p_ctx) if pre.when is not None else z3.BoolVal(True)
+            m_p = comp.compile_bool(pre.must_hold, p_ctx)
+            solver.add(z3.Implies(w_p, m_p))
+
+        # Construct next-step tracked entity `next_ent`
+        next_fields = dict(cur_ent.fields)
+        next_ent = _SymEntity(
+            ot=ot,
+            tag=f"wf_{ot.name}_s{step_idx + 1}",
+            fields=next_fields,
+            linked=dict(cur_ent.linked),
+        )
+
+        if act.edit_function is None:
+            # Declarative Rule: apply mutations targeting `ot` (or ancestor) via SSA ITE
+            for mut in act.mutations:
+                if mut.op != "modify" or mut.object_type not in anc_set:
+                    continue
+                if mut.target_ref is not None and anchor_t is not None:
+                    eval_ctx: dict[str, Any] = {
+                        "obj": next_ent,
+                        "source_obj": anchor_t,
+                        "param": params_t,
+                        "actor": actor_t,
+                    }
+                else:
+                    if mut.id_param in params_t:
+                        solver.add(cur_ent.fields[ot.primary_key].expr == params_t[mut.id_param].expr)
+                    eval_ctx = {
+                        "obj": next_ent,
+                        "source_obj": anchor_t or next_ent,
+                        "param": params_t,
+                        "actor": actor_t,
+                    }
+                w_m = comp.compile_bool(mut.when, eval_ctx) if mut.when is not None else z3.BoolVal(True)
+                for fname, val_ast in mut.set_fields.items():
+                    if fname not in next_ent.fields:
+                        continue
+                    branch_guards: list[Any] = []
+                    new_sv = comp.compile_value(val_ast, eval_ctx, guards=branch_guards)
+                    if branch_guards:
+                        solver.add(z3.Implies(w_m, z3.And(*branch_guards)))
+                    old_sv = next_ent.fields[fname]
+                    if mut.when is not None:
+                        if new_sv.kind in ("int", "float") and old_sv.kind in ("int", "float"):
+                            ne_, oe_, rk = comp._coerce_arith_pair(new_sv, old_sv)
+                            next_ent.fields[fname] = _SymVal(
+                                z3.If(w_m, ne_, oe_),
+                                rk,
+                                is_null=_ite_is_null(z3, w_m, new_sv.is_null, old_sv.is_null),
+                            )
+                        else:
+                            next_ent.fields[fname] = _SymVal(
+                                z3.If(w_m, new_sv.expr, old_sv.expr),
+                                new_sv.kind if new_sv.kind != "null" else old_sv.kind,
+                                is_null=_ite_is_null(z3, w_m, new_sv.is_null, old_sv.is_null),
+                            )
+                    else:
+                        if new_sv.kind == "int" and old_sv.kind == "float":
+                            ne_, _oe, rk = comp._coerce_arith_pair(new_sv, old_sv)
+                            next_ent.fields[fname] = _SymVal(ne_, rk, is_null=new_sv.is_null)
+                        else:
+                            next_ent.fields[fname] = new_sv
+            # Domain axioms (non_negative / valid FSM states) on post-state
+            for dom_ax in comp.domain_axioms_for_entity(next_ent):
+                solver.add(dom_ax)
+        else:
+            # Contracted EditFunction: havoc modified fields, Frame-preserve untouched fields, assert ensures
+            for fname in list(next_ent.fields.keys()):
+                if fname == ot.primary_key or not _is_mod_for_ot(act, fname):
+                    continue
+                next_ent.fields[fname] = _make_raw_havoc_val(
+                    comp, ot, fname, f"wf_s{step_idx}_{ot.name}_{fname}"
+                )
+            for dom_ax in comp.domain_axioms_for_entity(next_ent):
+                solver.add(dom_ax)
+
+            # Assert ensures targeting `ot` / ancestor (skipping pure-created ensures when `id_param is None` & no `before.`)
+            creates_anc = bool(set(act.creates) & anc_set)
+            for ens in act.ensures:
+                if ens.target_type not in anc_set:
+                    continue
+                ens_refs: set[str] = set()
+                _collect_expr_refs(ens.when, ens_refs)
+                _collect_expr_refs(ens.must_hold, ens_refs)
+                uses_before = any(r.startswith("before.") for r in ens_refs)
+                if ens.id_param is None and creates_anc and not uses_before:
+                    continue
+                if ens.id_param and ens.id_param in params_t:
+                    solver.add(cur_ent.fields[ot.primary_key].expr == params_t[ens.id_param].expr)
+                ectx = {
+                    "before": cur_ent,
+                    "after": next_ent,
+                    "obj": next_ent,
+                    "param": params_t,
+                    "actor": actor_t,
+                }
+                w_e = comp.compile_bool(ens.when, ectx) if ens.when is not None else z3.BoolVal(True)
+                m_e = comp.compile_bool(ens.must_hold, ectx)
+                solver.add(z3.Implies(w_e, m_e))
+
+        # Enforce `ot`'s own (possibly subtype-narrowed) FSM transition legality
+        if ot.transitions and sf in cur_ent.fields:
+            pre_s = cur_ent.fields[sf].expr
+            post_s = next_ent.fields[sf].expr
+            edge_disj = [pre_s == post_s]
+            for src_s, dsts in ot.transitions.items():
+                src_code = codec.encode(src_s)
+                for dst_s in dsts:
+                    edge_disj.append(z3.And(pre_s == src_code, post_s == codec.encode(dst_s)))
+            solver.add(z3.Or(*edge_disj))
+
+        _assert_entity_invs(next_ent)
+        cur_ent = next_ent
+
+    # Terminal goal on final step `E_m`
+    solver.add(z3.Or(*[cur_ent.fields[sf].expr == codec.encode(t) for t in terminal_states]))
+
+    for bg in comp.background:
+        solver.add(bg)
+
+    chk = solver.check()
+    frag = f"BMC_BOUNDED(k={len(chain_acts)})"
+    if chk == z3.sat:
+        reached = _decode_z3_scalar(z3, solver.model(), cur_ent.fields[sf], codec)
+        return "SAT", str(reached), frag
+    if chk == z3.unknown:
+        return "UNKNOWN", None, "UNKNOWN"
+    return "UNSAT", None, frag
+
+
+def prove_workflow_liveness(
+    blueprint_or_spec: DeclarativeBlueprint | OntologySpec | Mapping[str, Any],
+    *,
+    overlay: CustomerOverlaySpec
+    | EvolutionPatch
+    | Mapping[str, Any]
+    | Sequence[CustomerOverlaySpec | EvolutionPatch | Mapping[str, Any]]
+    | None = None,
+    object_types: Sequence[str] | None = None,
+    max_steps: int = 4,
+    bmc_bound: int = 4,
+    timeout_ms: int = 5000,
+) -> list[WorkflowLivenessProof]:
+    """PO-7: Prove FSM structural liveness + bounded Z3 multi-step action terminal reachability."""
+    z3 = _require_z3()
+    raw_bp = _resolve_effective_blueprint(blueprint_or_spec, overlay=overlay)
+    bp, ancestors_map, _ = _prepare_blueprint_for_prover(raw_bp)
+    codec = _StringCodec(bp)
+    ot_by_name = {ot.name: ot for ot in bp.object_types}
+    raw_ot_by_name = {ot.name: ot for ot in raw_bp.object_types}
+    target_filter = set(object_types) if object_types is not None else None
+    results: list[WorkflowLivenessProof] = []
+
+    for ot in bp.object_types:
+        if target_filter is not None and ot.name not in target_filter:
+            continue
+        if not ot.transitions and not ot.initial_statuses:
+            continue
+
+        t0 = time.perf_counter()
+        sf = ot.status_field or "status"
+        inits = list(ot.initial_statuses or ())
+        trans = {str(k): [str(v) for v in vs] for k, vs in (ot.transitions or {}).items()}
+        declared_states = set(inits) | set(trans.keys())
+        for dsts in trans.values():
+            declared_states.update(dsts)
+
+        # Missing initial states when transitions exist
+        if trans and not inits:
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="NO_INITIAL_STATE",
+                    action_terminal_status="SKIPPED_STRUCTURAL_FAILURE",
+                    initial_statuses=[],
+                    reachable_states=[],
+                    terminal_states=[],
+                    unreachable_states=sorted(declared_states),
+                    max_steps=max_steps,
+                    detail=f"FSM for {ot.name!r} declares transitions without any initial_statuses",
+                    logic_fragment="EXACT_GRAPH",
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+            continue
+
+        # 1) Forward BFS from initial_statuses
+        reachable: set[str] = set(inits)
+        q = list(inits)
+        while q:
+            u = q.pop(0)
+            for v in trans.get(u, ()):
+                if v not in reachable:
+                    reachable.add(v)
+                    q.append(v)
+
+        # Partition unreachable states into subtype-pruned inherited leaves vs true orphan states
+        ancestor_fsm_states: set[str] = set()
+        for anc_name in ancestors_map.get(ot.name, ()):
+            anc_ot = raw_ot_by_name.get(anc_name) or ot_by_name.get(anc_name)
+            if anc_ot is not None:
+                ancestor_fsm_states.update(anc_ot.initial_statuses or ())
+                ancestor_fsm_states.update((anc_ot.transitions or {}).keys())
+                for dsts in (anc_ot.transitions or {}).values():
+                    ancestor_fsm_states.update(dsts)
+
+        pruned_inherited: list[str] = []
+        unreachable_orphans: list[str] = []
+        for s in sorted(declared_states - reachable):
+            if ot.extends and s in ancestor_fsm_states and not trans.get(s):
+                pruned_inherited.append(s)
+            else:
+                unreachable_orphans.append(s)
+
+        terminals = sorted(s for s in reachable if not trans.get(s))
+
+        # Reverse BFS from terminals restricted to reachable subgraph
+        rev: dict[str, list[str]] = {s: [] for s in reachable}
+        for u in reachable:
+            for v in trans.get(u, ()):
+                if v in reachable:
+                    rev.setdefault(v, []).append(u)
+        can_term: set[str] = set(terminals)
+        rq = list(terminals)
+        while rq:
+            u = rq.pop(0)
+            for prev in rev.get(u, ()):
+                if prev not in can_term:
+                    can_term.add(prev)
+                    rq.append(prev)
+        traps = sorted(reachable - can_term)
+
+        if unreachable_orphans:
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="UNREACHABLE_STATE",
+                    action_terminal_status="SKIPPED_STRUCTURAL_FAILURE",
+                    initial_statuses=sorted(inits),
+                    reachable_states=sorted(reachable),
+                    terminal_states=terminals,
+                    unreachable_states=unreachable_orphans,
+                    pruned_inherited_states=pruned_inherited,
+                    trap_states=traps,
+                    max_steps=max_steps,
+                    detail=f"FSM for {ot.name!r} has unreachable orphan state(s): {unreachable_orphans}",
+                    logic_fragment="EXACT_GRAPH",
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+            continue
+
+        if len(reachable) > 1 and not terminals:
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="NO_TERMINAL_STATE",
+                    action_terminal_status="SKIPPED_STRUCTURAL_FAILURE",
+                    initial_statuses=sorted(inits),
+                    reachable_states=sorted(reachable),
+                    terminal_states=[],
+                    pruned_inherited_states=pruned_inherited,
+                    trap_states=sorted(reachable),
+                    max_steps=max_steps,
+                    detail=f"FSM for {ot.name!r} has no terminal state (infinite cycle across {sorted(reachable)})",
+                    logic_fragment="EXACT_GRAPH",
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+            continue
+
+        if traps:
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="TRAP_STATE",
+                    action_terminal_status="SKIPPED_STRUCTURAL_FAILURE",
+                    initial_statuses=sorted(inits),
+                    reachable_states=sorted(reachable),
+                    terminal_states=terminals,
+                    pruned_inherited_states=pruned_inherited,
+                    trap_states=traps,
+                    max_steps=max_steps,
+                    detail=f"FSM for {ot.name!r} has inescapable trap/livelock state(s): {traps}",
+                    logic_fragment="EXACT_GRAPH",
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+            continue
+
+        # Trivial terminal: an initial status is already a terminal state
+        init_terms = sorted(set(inits) & set(terminals))
+        if init_terms:
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="LIVE",
+                    action_terminal_status="TRIVIAL_TERMINAL",
+                    initial_statuses=sorted(inits),
+                    reachable_states=sorted(reachable),
+                    terminal_states=terminals,
+                    pruned_inherited_states=pruned_inherited,
+                    reached_terminal_status=init_terms[0],
+                    max_steps=max_steps,
+                    detail=f"Initial state {init_terms[0]!r} is already terminal (0 steps required)",
+                    logic_fragment="EXACT_GRAPH",
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+            continue
+
+        # 2) Build abstract action-edge graph polymorphically over `anc_set`
+        anc_set = _ancestor_closure(ot.name, ancestors_map)
+        action_edges: dict[str, list[tuple[str, ActionBlueprint]]] = {}
+        covered_edges: set[tuple[str, str]] = set()
+        prep_actions: list[ActionBlueprint] = []
+        status_act_names: set[str] = set()
+
+        for act in bp.actions:
+            touches_sf = False
+            possible_dsts: set[str] | None = set()
+            possible_srcs: set[str] | None = None
+
+            if act.edit_function is None:
+                muts_on_ot = [
+                    m for m in act.mutations if m.op == "modify" and m.object_type in anc_set
+                ]
+                if not muts_on_ot:
+                    continue
+                sf_muts = [m for m in muts_on_ot if sf in m.set_fields]
+                if sf_muts:
+                    touches_sf = True
+                    for m in sf_muts:
+                        lits = _extract_literal_strings_from_val(m.set_fields[sf])
+                        if lits is None:
+                            possible_dsts = None
+                            break
+                        assert possible_dsts is not None
+                        possible_dsts.update(lits)
+                    for pre in act.preconditions:
+                        if pre.target_type in anc_set and pre.when is None:
+                            cset = _extract_status_constraints_from_pred(pre.must_hold, "obj", sf)
+                            if cset is not None:
+                                possible_srcs = cset if possible_srcs is None else (possible_srcs & cset)
+                else:
+                    # Non-status field modifier on `ot` (potential prep action e.g. verify_export_letter_of_credit)
+                    prep_actions.append(act)
+                    continue
+            else:
+                if not (act.modifies or act.ensures):
+                    continue
+                modifies_sf = any(
+                    f"{anc}.{sf}" in act.modifies or f"{anc}.*" in act.modifies for anc in anc_set
+                )
+                if not modifies_sf:
+                    if any(
+                        m.startswith(f"{anc}.") for anc in anc_set for m in act.modifies
+                    ):
+                        prep_actions.append(act)
+                    continue
+                touches_sf = True
+                possible_dsts = None
+                creates_anc = bool(set(act.creates) & anc_set)
+                for ens in act.ensures:
+                    if ens.target_type not in anc_set or ens.when is not None:
+                        continue
+                    ens_refs: set[str] = set()
+                    _collect_expr_refs(ens.must_hold, ens_refs)
+                    if ens.id_param is None and creates_anc and not any(r.startswith("before.") for r in ens_refs):
+                        continue
+                    d_cset = _extract_status_constraints_from_pred(ens.must_hold, "after", sf)
+                    if d_cset is not None:
+                        possible_dsts = d_cset if possible_dsts is None else (possible_dsts & d_cset)
+                    s_cset = _extract_status_constraints_from_pred(ens.must_hold, "before", sf)
+                    if s_cset is not None:
+                        possible_srcs = s_cset if possible_srcs is None else (possible_srcs & s_cset)
+                for pre in act.preconditions:
+                    if pre.target_type in anc_set and pre.when is None:
+                        s_cset = _extract_status_constraints_from_pred(pre.must_hold, "obj", sf)
+                        if s_cset is not None:
+                            possible_srcs = s_cset if possible_srcs is None else (possible_srcs & s_cset)
+
+            if not touches_sf:
+                continue
+            status_act_names.add(act.name)
+            for src_s in reachable:
+                if possible_srcs is not None and src_s not in possible_srcs:
+                    continue
+                for dst_s in trans.get(src_s, ()):
+                    if dst_s == src_s:
+                        continue
+                    if possible_dsts is not None and dst_s not in possible_dsts:
+                        continue
+                    action_edges.setdefault(src_s, []).append((dst_s, act))
+                    covered_edges.add((src_s, dst_s))
+
+        missing_edges = sorted(
+            f"{u}->{v}"
+            for u in reachable
+            for v in trans.get(u, ())
+            if (u, v) not in covered_edges
+        )
+
+        # Abstract BFS for candidate action chains from initial_statuses to terminal_states (length <= max_steps)
+        candidate_chains: list[list[ActionBlueprint]] = []
+        seen_chain_keys: set[tuple[str, ...]] = set()
+        bfs_q: list[tuple[str, list[ActionBlueprint], frozenset[str]]] = [
+            (s, [], frozenset({s})) for s in sorted(inits)
+        ]
+        while bfs_q and len(candidate_chains) < 24:
+            curr_s, chain, visited = bfs_q.pop(0)
+            if len(chain) >= max_steps:
+                continue
+            for nxt_s, act in action_edges.get(curr_s, ()):
+                nxt_chain = [*chain, act]
+                ckey = tuple(a.name for a in nxt_chain)
+                if nxt_s in terminals:
+                    if ckey not in seen_chain_keys:
+                        seen_chain_keys.add(ckey)
+                        candidate_chains.append(nxt_chain)
+                elif nxt_s not in visited and len(nxt_chain) < max_steps:
+                    bfs_q.append((nxt_s, nxt_chain, visited | {nxt_s}))
+
+        if not candidate_chains:
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="GRAPH_LIVE_PARTIAL_ACTIONS",
+                    action_terminal_status="PARTIAL_ACTION_COVERAGE",
+                    initial_statuses=sorted(inits),
+                    reachable_states=sorted(reachable),
+                    terminal_states=terminals,
+                    pruned_inherited_states=pruned_inherited,
+                    missing_action_edges=missing_edges,
+                    max_steps=max_steps,
+                    detail=(
+                        f"FSM graph for {ot.name!r} is structurally live, but no complete governed action "
+                        f"chain covers initial -> terminal within {max_steps} steps"
+                    ),
+                    logic_fragment="EXACT_GRAPH",
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                )
+            )
+            continue
+
+        # 3) Run Z3 multi-step symbolic composition on candidate chains (direct chains first, then +1 prep action if needed)
+        witness_trace: list[str] | None = None
+        reached_term: str | None = None
+        final_frag = "BMC_BOUNDED(k=1)"
+        saw_unknown = False
+
+        for chain in candidate_chains:
+            verdict, term_s, frag = _verify_workflow_action_chain(
+                z3, bp, ot, anc_set, ancestors_map, codec, chain, terminals,
+                bmc_bound=bmc_bound, timeout_ms=timeout_ms,
+            )
+            final_frag = frag
+            if verdict == "SAT":
+                witness_trace = [a.name for a in chain]
+                reached_term = term_s
+                break
+            if verdict == "UNKNOWN":
+                saw_unknown = True
+
+        # Retry with up to 1 non-status prep action inserted if direct chains were blocked by a field flag
+        if witness_trace is None and prep_actions:
+            prep_candidates: list[list[ActionBlueprint]] = []
+            for base_chain in candidate_chains[:6]:
+                if len(base_chain) >= max_steps:
+                    continue
+                for prep_act in prep_actions[:4]:
+                    for ins_pos in range(len(base_chain)):
+                        augmented = [*base_chain[:ins_pos], prep_act, *base_chain[ins_pos:]]
+                        akey = tuple(a.name for a in augmented)
+                        if akey not in seen_chain_keys:
+                            seen_chain_keys.add(akey)
+                            prep_candidates.append(augmented)
+            for chain in prep_candidates[:16]:
+                verdict, term_s, frag = _verify_workflow_action_chain(
+                    z3, bp, ot, anc_set, ancestors_map, codec, chain, terminals,
+                    bmc_bound=bmc_bound, timeout_ms=timeout_ms,
+                )
+                final_frag = frag
+                if verdict == "SAT":
+                    witness_trace = [a.name for a in chain]
+                    reached_term = term_s
+                    break
+                if verdict == "UNKNOWN":
+                    saw_unknown = True
+
+        elapsed = round((time.perf_counter() - t0) * 1000.0, 3)
+        if witness_trace is not None:
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="LIVE",
+                    action_terminal_status="ACTION_TERMINAL_REACHABLE",
+                    initial_statuses=sorted(inits),
+                    reachable_states=sorted(reachable),
+                    terminal_states=terminals,
+                    pruned_inherited_states=pruned_inherited,
+                    missing_action_edges=missing_edges,
+                    terminal_witness_trace=witness_trace,
+                    reached_terminal_status=reached_term,
+                    max_steps=max_steps,
+                    detail=(
+                        f"Z3 verified {len(witness_trace)}-step governed chain to terminal "
+                        f"{reached_term!r}: {' -> '.join(witness_trace)}"
+                    ),
+                    logic_fragment=final_frag,
+                    elapsed_ms=elapsed,
+                )
+            )
+        elif saw_unknown:
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="UNKNOWN",
+                    action_terminal_status="UNKNOWN",
+                    initial_statuses=sorted(inits),
+                    reachable_states=sorted(reachable),
+                    terminal_states=terminals,
+                    pruned_inherited_states=pruned_inherited,
+                    missing_action_edges=missing_edges,
+                    max_steps=max_steps,
+                    detail=f"Z3 returned unknown while verifying multi-step workflow liveness for {ot.name!r}",
+                    logic_fragment="UNKNOWN",
+                    elapsed_ms=elapsed,
+                )
+            )
+        else:
+            tried_preview = [" -> ".join(a.name for a in c) for c in candidate_chains[:3]]
+            results.append(
+                WorkflowLivenessProof(
+                    object_type=ot.name,
+                    extends=ot.extends,
+                    status_field=sf,
+                    status="ACTION_CHAIN_DEADLOCKED",
+                    action_terminal_status="ACTION_CHAIN_DEADLOCKED",
+                    initial_statuses=sorted(inits),
+                    reachable_states=sorted(reachable),
+                    terminal_states=terminals,
+                    pruned_inherited_states=pruned_inherited,
+                    missing_action_edges=missing_edges,
+                    max_steps=max_steps,
+                    detail=(
+                        f"All {len(candidate_chains)} abstract action chain(s) for {ot.name!r} "
+                        f"deadlocked in Z3 multi-step composition (e.g. {tried_preview})"
+                    ),
+                    logic_fragment=final_frag,
+                    elapsed_ms=elapsed,
+                )
+            )
+
+    return results
+
+
 def prove_blueprint(
     blueprint_or_spec: DeclarativeBlueprint | OntologySpec | Mapping[str, Any],
     *,
@@ -4178,6 +5250,24 @@ def prove_blueprint(
         bmc_bound=bmc_bound,
         timeout_ms=timeout_ms,
     )
+    when_proofs = prove_when_branches(
+        eff_bp,
+        action_names=safe_action_names,
+        bmc_bound=bmc_bound,
+        timeout_ms=timeout_ms,
+    )
+    safe_ot_names: list[str] | None = (
+        [ot.name for ot in eff_bp.object_types if ot.name not in broken_cycle_types]
+        if broken_cycle_types
+        else None
+    )
+    workflow_proofs = prove_workflow_liveness(
+        eff_bp,
+        object_types=safe_ot_names,
+        max_steps=4,
+        bmc_bound=bmc_bound,
+        timeout_ms=timeout_ms,
+    )
     upgrade_report = (
         prove_upgrade_compatibility(
             base_bp,
@@ -4202,9 +5292,21 @@ def prove_blueprint(
     dead_classes = sum(1 for c in class_proofs if c.status == "UNSATISFIABLE_CLASS")
     dl_conflicts = sum(1 for c in class_proofs if c.status == "DL_AXIOM_CONFLICT")
     lsp_violations = sum(1 for c in class_proofs if c.status == "LSP_VIOLATION")
+    when_issues = sum(
+        1 for w in when_proofs if w.status not in ("EXHAUSTIVE", "CONDITIONAL_SIDE_EFFECT")
+    )
+    wf_live = sum(
+        1 for wf in workflow_proofs if wf.status in ("LIVE", "GRAPH_LIVE_PARTIAL_ACTIONS")
+    )
+    wf_action_verified = sum(
+        1 for wf in workflow_proofs if wf.action_terminal_status == "ACTION_TERMINAL_REACHABLE"
+    )
+    wf_issues = sum(
+        1 for wf in workflow_proofs if wf.status not in ("LIVE", "GRAPH_LIVE_PARTIAL_ACTIONS")
+    )
 
     frag_counts: dict[str, int] = {}
-    for item in [*class_proofs, *reachability, *redundant, *inv_pres]:
+    for item in [*class_proofs, *reachability, *redundant, *inv_pres, *when_proofs, *workflow_proofs]:
         frag_counts[item.logic_fragment] = frag_counts.get(item.logic_fragment, 0) + 1
 
     ok = (
@@ -4215,9 +5317,13 @@ def prove_blueprint(
         and dead_classes == 0
         and dl_conflicts == 0
         and lsp_violations == 0
+        and when_issues == 0
+        and wf_issues == 0
         and all(c.status != "UNKNOWN" for c in class_proofs)
         and all(r.status != "UNKNOWN" for r in reachability)
         and all(p.status != "UNKNOWN" for p in inv_pres)
+        and all(w.status != "UNKNOWN" for w in when_proofs)
+        and all(wf.status != "UNKNOWN" for wf in workflow_proofs)
         and (upgrade_report is None or upgrade_report.compatible)
     )
     total_rules = sum(len(a.preconditions) for a in eff_bp.actions)
@@ -4242,11 +5348,19 @@ def prove_blueprint(
         contract_proved_count=contract_proved,
         vacuous_contract_count=vacuous_contracts,
         uncontracted_edit_function_count=uncontracted_efs,
+        when_branch_checked_count=len(when_proofs),
+        when_branch_issue_count=when_issues,
+        workflow_checked_count=len(workflow_proofs),
+        workflow_live_count=wf_live,
+        workflow_action_verified_count=wf_action_verified,
+        workflow_issue_count=wf_issues,
         logic_fragment_counts=frag_counts,
         class_proofs=class_proofs,
         reachability=reachability,
         redundant_rules=redundant,
         invariant_preservation=inv_pres,
+        when_branch_proofs=when_proofs,
+        workflow_liveness_proofs=workflow_proofs,
         upgrade_compatibility=upgrade_report,
         elapsed_ms=round(elapsed, 3),
     )

@@ -1739,6 +1739,14 @@ class ConsoleService:
         uncontracted_edit_function_count = int(
             getattr(report, "uncontracted_edit_function_count", 0)
         )
+        when_branch_checked_count = int(getattr(report, "when_branch_checked_count", 0))
+        when_branch_issue_count = int(getattr(report, "when_branch_issue_count", 0))
+        workflow_checked_count = int(getattr(report, "workflow_checked_count", 0))
+        workflow_live_count = int(getattr(report, "workflow_live_count", 0))
+        workflow_action_verified_count = int(
+            getattr(report, "workflow_action_verified_count", 0)
+        )
+        workflow_issue_count = int(getattr(report, "workflow_issue_count", 0))
         total_classes = len(report.class_proofs)
         satisfiable_classes = sum(
             1 for c in report.class_proofs if c.status == "SATISFIABLE"
@@ -1749,7 +1757,9 @@ class ConsoleService:
         exact_frags = sum(
             cnt
             for frag, cnt in frag_counts.items()
-            if frag.startswith("EXACT_QF_LIA") or frag.startswith("EXACT_QF_LRA")
+            if frag.startswith("EXACT_QF_LIA")
+            or frag.startswith("EXACT_QF_LRA")
+            or frag == "EXACT_GRAPH"
         )
         exact_linear_ratio = (
             round(exact_frags / total_frags, 4) if total_frags > 0 else 1.0
@@ -1794,6 +1804,30 @@ class ConsoleService:
             }
             for item in report.invariant_preservation
         ]
+        when_branch_proofs = [
+            {
+                **item.model_dump(mode="json"),
+                "display_label": str(
+                    act_labels.get(item.action_name) or item.action_name
+                ),
+            }
+            for item in getattr(report, "when_branch_proofs", ())
+        ]
+        workflow_liveness_proofs = [
+            {
+                **item.model_dump(mode="json"),
+                "display_label": str(obj_labels.get(item.object_type) or item.object_type),
+                "extends_display_label": (
+                    str(obj_labels.get(item.extends) or item.extends)
+                    if item.extends
+                    else None
+                ),
+                "terminal_witness_trace_labels": [
+                    str(act_labels.get(an) or an) for an in item.terminal_witness_trace
+                ],
+            }
+            for item in getattr(report, "workflow_liveness_proofs", ())
+        ]
         redundant_rules = [
             {
                 **item.model_dump(mode="json"),
@@ -1814,6 +1848,8 @@ class ConsoleService:
                 and deadlocked_actions == 0
                 and violated_invariants == 0
                 and vacuous_contract_count == 0
+                and when_branch_issue_count == 0
+                and workflow_issue_count == 0
                 and report.dead_class_count == 0
                 and report.dl_conflict_count == 0
                 and report.lsp_violation_count == 0
@@ -1844,6 +1880,12 @@ class ConsoleService:
                 "contract_proved_count": contract_proved_count,
                 "vacuous_contract_count": vacuous_contract_count,
                 "uncontracted_edit_function_count": uncontracted_edit_function_count,
+                "when_branch_checked_count": when_branch_checked_count,
+                "when_branch_issue_count": when_branch_issue_count,
+                "workflow_checked_count": workflow_checked_count,
+                "workflow_live_count": workflow_live_count,
+                "workflow_action_verified_count": workflow_action_verified_count,
+                "workflow_issue_count": workflow_issue_count,
                 "declared_invariant_count": len(declared_invs),
                 "redundant_rule_count": report.redundant_rule_count,
                 "exact_linear_ratio": exact_linear_ratio,
@@ -1852,6 +1894,8 @@ class ConsoleService:
             "class_proofs": class_proofs,
             "action_proofs": action_proofs,
             "invariant_proofs": invariant_proofs,
+            "when_branch_proofs": when_branch_proofs,
+            "workflow_liveness_proofs": workflow_liveness_proofs,
             "redundant_rules": redundant_rules,
         }
 
@@ -4753,7 +4797,7 @@ class ConsoleService:
             "   - 引用 `{\"ref\": \"obj.<字段>\"}`、`{\"ref\": \"param.<参数>\"}`、`{\"ref\": \"actor.role\"}`；字面量 `{\"lit\": 值}`；\n"
             "   - 创建子类时若沿用父类主键，无需重传 `primary_key`；给 `extend_base_object` 加扩展字段建议优先 `x_` 前缀；新增 Rule 动作若希望立即通过 Hoare `wp` 证明且无违例，请注意为减值/上限等操作配齐声明式前置条件 `preconditions` 或分支守卫 `when`！\n"
             "3. **图灵完备边界升级 (AG-3)**：遇到任意深度图递归、动态循环遍历、非线性数值迭代或需自定义外部代码原语的需求，必须调用 `escalate_to_edit_function`，绝不伪造近似规则。\n"
-            "4. **修改即证明**：每次修改草稿后，务必调用 `prove_draft_mathematics` 获取 Z3 PO-1~PO-4 数学证明结果（关注死类 `UNSATISFIABLE_CLASS` 极小冲突核、Hoare 反例），并用精准中文汇报变更条款与数学核验结论。\n\n"
+            "4. **修改即证明**：每次修改草稿后，务必调用 `prove_draft_mathematics` 获取 Z3 PO-1~PO-7 数学证明结果（关注死类 `UNSATISFIABLE_CLASS` 极小冲突核、Hoare / EditFunction 契约反例、空真契约 `VACUOUS_CONTRACT`、`when` 分支缺口/重叠与工作流死锁 `ACTION_CHAIN_DEADLOCKED`），并在分析 EditFunction 冲突时准确引用 `inspect_m1_blueprint` 返回的 `contract`（`modifies`/`ensures`）条款。\n\n"
             f"当前 M1 建模上下文：\n{summary_json}"
         )
 
@@ -4819,7 +4863,19 @@ class ConsoleService:
                     ap for ap in (proof.get("action_proofs") or ()) if ap.get("status") != "REACHABLE"
                 ],
                 "invariant_proofs": [
-                    ip for ip in (proof.get("invariant_proofs") or ()) if ip.get("status") != "PROVED"
+                    ip
+                    for ip in (proof.get("invariant_proofs") or ())
+                    if ip.get("status") not in ("PROVED", "CONTRACT_PROVED")
+                ],
+                "when_branch_proofs": [
+                    wp
+                    for wp in (proof.get("when_branch_proofs") or ())
+                    if wp.get("status") not in ("EXHAUSTIVE", "CONDITIONAL_SIDE_EFFECT")
+                ],
+                "workflow_liveness_proofs": [
+                    wf
+                    for wf in (proof.get("workflow_liveness_proofs") or ())
+                    if wf.get("status") not in ("LIVE", "GRAPH_LIVE_PARTIAL_ACTIONS")
                 ],
                 "redundant_rules": proof.get("redundant_rules") or [],
                 "draft_clauses_zh": clauses_zh,
@@ -4911,6 +4967,11 @@ class ConsoleService:
                             "name": a["name"],
                             "implementation_kind": a["implementation_kind"],
                             "draft_status": a.get("draft_status", "base"),
+                            **(
+                                {"contract": a["contract"]}
+                                if a.get("contract") is not None
+                                else {}
+                            ),
                         }
                         for a in bp_dict["actions"]
                     ],

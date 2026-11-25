@@ -106,6 +106,17 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
   const vacuousContracts = (result.invariant_proofs || []).filter(
     (p) => p.status === 'VACUOUS_CONTRACT',
   );
+  const whenProofs = result.when_branch_proofs || [];
+  const brokenWhenBranches = whenProofs.filter(
+    (w) => w.status !== 'EXHAUSTIVE' && w.status !== 'CONDITIONAL_SIDE_EFFECT',
+  );
+  const workflowProofs = result.workflow_liveness_proofs || [];
+  const brokenWorkflows = workflowProofs.filter(
+    (wf) => wf.status !== 'LIVE' && wf.status !== 'GRAPH_LIVE_PARTIAL_ACTIONS',
+  );
+  const actionVerifiedWorkflows = workflowProofs.filter(
+    (wf) => wf.action_terminal_status === 'ACTION_TERMINAL_REACHABLE',
+  );
   const redundantRules = result.redundant_rules || [];
   const hasContractProofs =
     (summary?.contract_proved_count ?? 0) > 0 ||
@@ -199,6 +210,23 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
               <span>
                 冗余前置约束：<strong>{summary?.redundant_rule_count ?? 0}</strong>
               </span>
+              {(summary?.when_branch_checked_count ?? 0) > 0 && (
+                <span data-testid="z3-when-branch-summary">
+                  分支穷尽/互斥：
+                  <strong>
+                    {(summary?.when_branch_checked_count ?? 0) -
+                      (summary?.when_branch_issue_count ?? 0)}
+                  </strong>{' '}
+                  / {summary?.when_branch_checked_count ?? 0}
+                </span>
+              )}
+              {(summary?.workflow_checked_count ?? 0) > 0 && (
+                <span data-testid="z3-workflow-liveness-summary">
+                  工作流活性：<strong>{summary?.workflow_live_count ?? 0}</strong> /{' '}
+                  {summary?.workflow_checked_count ?? 0}（Z3 多步终端可达{' '}
+                  {summary?.workflow_action_verified_count ?? 0}）
+                </span>
+              )}
               <span>
                 精确可判定段占比：
                 <strong>{Math.round((summary?.exact_linear_ratio ?? 1) * 100)}%</strong>
@@ -376,6 +404,101 @@ export const Z3ProvePanel: React.FC<Z3ProvePanelProps> = ({
                   </li>
                 ))}
               </ul>
+            </div>
+          )}
+
+          {brokenWhenBranches.length > 0 && (
+            <div
+              data-testid="z3-when-branch-issues"
+              className="rounded-lg border border-rose-200 bg-white p-3"
+            >
+              <div className="font-semibold text-rose-800">
+                PO-6 `when` 分支穷尽 / 重叠 / 死分支告警
+              </div>
+              <ul className="mt-2 space-y-2">
+                {brokenWhenBranches.map((wp) => (
+                  <li key={wp.action_name} className="text-slate-700">
+                    <span className="font-semibold text-slate-900">
+                      {wp.display_label || wp.action_name}
+                    </span>{' '}
+                    <code className="font-mono text-[11px] text-slate-500">({wp.action_name})</code>{' '}
+                    · <span className="font-semibold text-rose-700">{wp.status}</span>
+                    {wp.detail && (
+                      <div className="mt-0.5 text-[11px] text-slate-600">{wp.detail}</div>
+                    )}
+                    {(wp.uncovered_witness || wp.overlap_witness) && (
+                      <pre className="mt-1 overflow-x-auto rounded bg-slate-50 p-2 font-mono text-[11px] text-slate-700">
+                        {JSON.stringify(wp.uncovered_witness || wp.overlap_witness, null, 2)}
+                      </pre>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {brokenWorkflows.length > 0 && (
+            <div
+              data-testid="z3-workflow-issues"
+              className="rounded-lg border border-rose-200 bg-white p-3"
+            >
+              <div className="font-semibold text-rose-800">
+                PO-7 工作流 FSM 活性 / 多步终端不可达告警
+              </div>
+              <ul className="mt-2 space-y-1.5">
+                {brokenWorkflows.map((wf) => (
+                  <li key={wf.object_type} className="text-slate-700">
+                    <span className="font-semibold text-slate-900">
+                      {wf.display_label || wf.object_type}
+                    </span>{' '}
+                    <code className="font-mono text-[11px] text-slate-500">({wf.object_type})</code>{' '}
+                    · <span className="font-semibold text-rose-700">{wf.status}</span>
+                    {wf.detail && (
+                      <div className="mt-0.5 text-[11px] text-slate-600">{wf.detail}</div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {actionVerifiedWorkflows.length > 0 && (
+            <div
+              data-testid="z3-workflow-traces"
+              className="rounded-lg border border-slate-200/80 bg-white p-3"
+            >
+              <div className="mb-2 flex items-center justify-between">
+                <span className="font-semibold text-slate-800">
+                  PO-7 工作流 Z3 多步终端可达见证轨迹 ({actionVerifiedWorkflows.length} /{' '}
+                  {workflowProofs.length})
+                </span>
+                <span className="text-[11px] text-slate-400">
+                  跨步字段状态串联符号证成（k ≤ 4）
+                </span>
+              </div>
+              <div className="grid max-h-48 grid-cols-1 gap-1.5 overflow-y-auto pr-1 md:grid-cols-2">
+                {actionVerifiedWorkflows.map((wf) => (
+                  <div
+                    key={wf.object_type}
+                    className="rounded-lg border border-slate-100 bg-slate-50/70 px-2.5 py-1.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate font-medium text-slate-800">
+                        {wf.display_label || wf.object_type}
+                      </span>
+                      <span className="rounded bg-emerald-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-800">
+                        → {wf.reached_terminal_status}
+                      </span>
+                    </div>
+                    <div className="mt-0.5 truncate font-mono text-[10px] text-slate-500">
+                      {(wf.terminal_witness_trace_labels?.length
+                        ? wf.terminal_witness_trace_labels
+                        : wf.terminal_witness_trace
+                      ).join(' → ')}
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 
