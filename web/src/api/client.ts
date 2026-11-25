@@ -521,6 +521,10 @@ export interface BlueprintActionMeta {
     creates: string[];
     deletes: string[];
     ensures: Array<Record<string, unknown>>;
+    trust_mode?: 'untrusted_verifiable' | 'attested_provider';
+    attested_providers?: string[];
+    require_read_set_cas?: boolean;
+    planner_function?: string | null;
   } | null;
   autonomy_mode: string;
   draft_status?: 'base' | 'draft_added' | 'draft_modified';

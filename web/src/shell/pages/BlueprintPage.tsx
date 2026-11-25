@@ -584,6 +584,29 @@ export const BlueprintPage: React.FC<BlueprintPageProps> = ({
                               <span className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[10px] text-slate-700">
                                 ensures × {act.contract.ensures.length}
                               </span>
+                              {act.contract.planner_function && (
+                                <span
+                                  data-testid={`m25-planner-${act.name}`}
+                                  className="rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-sky-800"
+                                >
+                                  M2.5 纯算大脑: {act.contract.planner_function}
+                                </span>
+                              )}
+                              {act.contract.planner_function && (
+                                <span
+                                  data-testid={`m25-trust-${act.name}`}
+                                  className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold ${
+                                    act.contract.trust_mode === 'attested_provider'
+                                      ? 'border-indigo-200 bg-indigo-50 text-indigo-800'
+                                      : 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                                  }`}
+                                >
+                                  {act.contract.trust_mode === 'attested_provider'
+                                    ? 'Class B · 权威公式签验'
+                                    : 'Class A · 免信任可验真'}
+                                  {act.contract.require_read_set_cas ? ' · Read-Set CAS' : ''}
+                                </span>
+                              )}
                             </div>
                           </div>
                         )}

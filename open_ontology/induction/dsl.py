@@ -315,6 +315,10 @@ class ActionBlueprint(BaseModel):
     creates: list[str] = Field(default_factory=list)
     deletes: list[str] = Field(default_factory=list)
     ensures: list[InvariantRuleSpec] = Field(default_factory=list)
+    trust_mode: Literal["untrusted_verifiable", "attested_provider"] = "untrusted_verifiable"
+    attested_providers: list[str] = Field(default_factory=list)
+    require_read_set_cas: bool = True
+    planner_function: str | None = None
     view_tags: list[str] = Field(default_factory=list)
     display_label: str = ""
 
@@ -1762,6 +1766,157 @@ def _contract_handler_signature(act: ActionDef) -> tuple[Any, ...]:
         tuple(act.deletes),
         json.dumps(list(act.ensures), sort_keys=True, ensure_ascii=False),
     )
+
+
+def verify_action_contract_delta(
+    ctx: EditBatch,
+    action_def: ActionDef,
+    params: BaseModel,
+    pre_objs: Mapping[str, dict[str, Any]],
+    pre_kinds: Mapping[str, str],
+    *,
+    delegated: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, dict[str, Any]], set[str], dict[tuple[str, str], Any]]:
+    """Verify Frame (`modifies`/`creates`/`deletes`) and `ensures` postconditions on staged `EditBatch` delta."""
+    act_name = action_def.name
+    mod_set = frozenset(action_def.modifies)
+    cre_set = frozenset(action_def.creates)
+    del_set = frozenset(action_def.deletes)
+    ens_tuple = tuple(_normalize_ensures_specs(action_def.ensures))
+    mod_list = list(action_def.modifies)
+    cre_list = list(action_def.creates)
+    del_list = list(action_def.deletes)
+
+    created, deleted, mod_vals = _compute_invocation_delta(ctx, dict(pre_objs), dict(pre_kinds))
+    del_created: dict[str, dict[str, Any]] = dict((delegated or {}).get("created") or {})
+    del_deleted: set[str] = set((delegated or {}).get("deleted") or ())
+    del_modified: dict[tuple[str, str], Any] = dict((delegated or {}).get("modified") or {})
+
+    # 1. Check deleted frame
+    for key in sorted(deleted):
+        if key in del_deleted:
+            continue
+        ot_name, oid = ctx._split_key(key)
+        ancestors = _mro_spec_type_names(ctx.spec, ot_name)
+        if not any(t in del_set for t in ancestors):
+            raise InvariantError(
+                f"Action {act_name!r} deleted undeclared ObjectType {ot_name!r} ({oid!r}); "
+                f"contract deletes={del_list}",
+                code="CONTRACT_FRAME_VIOLATION",
+            )
+
+    # 2. Check created frame
+    for key, cre_props in sorted(created.items()):
+        if key in del_created:
+            orig_cre = del_created[key]
+            if cre_props != orig_cre:
+                ot_name, oid = ctx._split_key(key)
+                ancestors = _mro_spec_type_names(ctx.spec, ot_name)
+                for fname in sorted(set(orig_cre.keys()) | set(cre_props.keys())):
+                    if orig_cre.get(fname) != cre_props.get(fname):
+                        if not any(
+                            f"{t}.{fname}" in mod_set or f"{t}.*" in mod_set
+                            for t in ancestors
+                        ):
+                            raise InvariantError(
+                                f"Action {act_name!r} modified undeclared field {ot_name}.{fname} "
+                                f"on created {oid!r}; contract modifies={mod_list}",
+                                code="CONTRACT_FRAME_VIOLATION",
+                            )
+            continue
+        ot_name, oid = ctx._split_key(key)
+        ancestors = _mro_spec_type_names(ctx.spec, ot_name)
+        if not any(t in cre_set for t in ancestors):
+            raise InvariantError(
+                f"Action {act_name!r} created undeclared ObjectType {ot_name!r} ({oid!r}); "
+                f"contract creates={cre_list}",
+                code="CONTRACT_FRAME_VIOLATION",
+            )
+
+    # 3. Check modified frame
+    for (key, fname), after_val in sorted(mod_vals.items()):
+        if (key, fname) in del_modified and del_modified[(key, fname)] == after_val:
+            continue
+        ot_name, oid = ctx._split_key(key)
+        ancestors = _mro_spec_type_names(ctx.spec, ot_name)
+        if not any(f"{t}.{fname}" in mod_set or f"{t}.*" in mod_set for t in ancestors):
+            raise InvariantError(
+                f"Action {act_name!r} modified undeclared field {ot_name}.{fname} "
+                f"on {oid!r}; contract modifies={mod_list}",
+                code="CONTRACT_FRAME_VIOLATION",
+            )
+
+    # 4. Check postconditions (ensures)
+    direct_mod_keys = {
+        k
+        for (k, _f), a_val in mod_vals.items()
+        if not ((k, _f) in del_modified and del_modified[(k, _f)] == a_val)
+    }
+    direct_cre_keys = {k for k in created if k not in del_created}
+
+    for ens in ens_tuple:
+        target_cls = ctx.spec.get_object_type(ens.target_type)
+        subtype_names = {c.__name__ for c in ctx.spec.subtypes_of(target_cls)}
+        pairs: list[tuple[ObjectType, ObjectType]] = []
+        if ens.id_param:
+            if not hasattr(params, ens.id_param):
+                raise InvariantError(
+                    f"[{ens.code}] Action {act_name!r} ensures {ens.name!r} "
+                    f"missing id_param {ens.id_param!r}",
+                    code="CONTRACT_ENSURES_VIOLATION",
+                )
+            pk_val = str(getattr(params, ens.id_param))
+            after_model = _get_polymorphic(ctx, target_cls, pk_val)
+            if after_model is not None:
+                actual_key = f"{type(after_model).__name__}:{pk_val}"
+                before_props = pre_objs.get(actual_key) or ctx._original.get(actual_key)
+                before_model = (
+                    ctx._model_for(type(after_model), before_props)
+                    if before_props is not None
+                    else after_model
+                )
+                pairs.append((before_model, after_model))
+        else:
+            uses_before = _expr_uses_ref_root(ens.when, "before") or _expr_uses_ref_root(
+                ens.must_hold, "before"
+            )
+            candidate_keys = sorted(
+                k
+                for k in (direct_mod_keys if uses_before else (direct_mod_keys | direct_cre_keys))
+                if ctx._split_key(k)[0] in subtype_names and ctx._kinds.get(k) != "delete"
+            )
+            for k in candidate_keys:
+                after_props = ctx._objects.get(k)
+                if after_props is None:
+                    continue
+                k_type, _ = ctx._split_key(k)
+                before_props = pre_objs.get(k) or ctx._original.get(k)
+                after_m = ctx._model_for(k_type, after_props)
+                before_m = (
+                    ctx._model_for(k_type, before_props)
+                    if before_props is not None
+                    else after_m
+                )
+                pairs.append((before_m, after_m))
+
+        for before_m, after_m in pairs:
+            eval_ctx = {
+                "before": before_m,
+                "after": after_m,
+                "obj": after_m,
+                "param": params,
+                "actor": ctx.actor,
+            }
+            if ens.when is not None and not eval_predicate(ens.when, eval_ctx, ctx):
+                continue
+            if not eval_predicate(ens.must_hold, eval_ctx, ctx):
+                raise InvariantError(
+                    f"[{ens.code}] Action {act_name!r} ensures contract {ens.name!r} "
+                    f"violated on {type(after_m).__name__}:{after_m.primary_key_value()}",
+                    code="CONTRACT_ENSURES_VIOLATION",
+                )
+
+    return created, deleted, mod_vals
 
 
 def enforce_edit_function_contracts(spec: OntologySpec) -> None:
@@ -4497,6 +4652,10 @@ def _compile_and_register_action_blueprint(
             creates=eff_creates,
             deletes=eff_deletes,
             ensures=eff_ensures,
+            trust_mode=act.trust_mode if act.trust_mode != "untrusted_verifiable" else ef.trust_mode,
+            attested_providers=tuple(act.attested_providers) if act.attested_providers else ef.attested_providers,
+            require_read_set_cas=act.require_read_set_cas,
+            planner_function=act.planner_function or ef.planner_function,
         )
         if act.preconditions:
             orig_handler = action_def.handler
@@ -4747,6 +4906,10 @@ def _action_def_to_blueprint(act_def: ActionDef, display_label: str = "") -> Act
         creates=creates_list,
         deletes=deletes_list,
         ensures=ensures_list,
+        trust_mode=act_def.trust_mode,
+        attested_providers=list(act_def.attested_providers),
+        require_read_set_cas=act_def.require_read_set_cas,
+        planner_function=act_def.planner_function,
         view_tags=list(act_def.view_tags),
         display_label=display_label,
     )

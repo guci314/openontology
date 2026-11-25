@@ -841,7 +841,23 @@ class ApplyExportTaxRebateParams(BaseModel):
     fx_rate: float = Field(default=7.20, gt=0.0)
 
 
-def _apply_export_tax_rebate_claim(ctx: Any, params: ApplyExportTaxRebateParams) -> None:
+def _build_read_set_from_batch(ctx: Any) -> list[dict[str, Any]]:
+    read_set: list[dict[str, Any]] = []
+    for key, ver in sorted(getattr(ctx, "read_versions", {}).items()):
+        ot_name, _, oid = str(key).partition(":")
+        if ot_name and oid:
+            read_set.append(
+                {
+                    "object_type": ot_name,
+                    "object_id": oid,
+                    "expected_version": int(ver),
+                }
+            )
+    return read_set
+
+
+def _plan_export_tax_rebate_claim(ctx: Any, params: ApplyExportTaxRebateParams) -> dict[str, Any]:
+    """Pure read-only M2.5 planner (zero write handle): compute statutory export tax rebate proposal."""
     DeclCls = ctx.spec.get_object_type("CustomsDeclaration")
     ExpOrderCls = ctx.spec.get_object_type("ExportSalesOrder")
     decl = ctx.require(DeclCls, params.declaration_id)
@@ -861,7 +877,30 @@ def _apply_export_tax_rebate_claim(ctx: Any, params: ApplyExportTaxRebateParams)
     )
     if rebate_cents <= 0:
         raise InvariantError("computed rebate_amount_cents must be > 0", code="NON_POSITIVE_REBATE")
-    ctx.modify(decl, rebate_amount_cents=rebate_cents, rebate_claimed=True)
+    return {
+        "contract_name": "apply_export_tax_rebate_claim",
+        "params": params.model_dump(mode="json"),
+        "read_set": _build_read_set_from_batch(ctx),
+        "ops": [
+            {
+                "op": "modify",
+                "object_type": "CustomsDeclaration",
+                "object_id": str(decl.declaration_id),
+                "set_fields": {
+                    "rebate_amount_cents": rebate_cents,
+                    "rebate_claimed": True,
+                },
+            }
+        ],
+        "brain_source": "pure_function:plan_export_tax_rebate_claim",
+    }
+
+
+def _apply_export_tax_rebate_claim(ctx: Any, params: ApplyExportTaxRebateParams) -> None:
+    from open_ontology.contract_gate import WriteOp, apply_ops_to_batch
+
+    plan = _plan_export_tax_rebate_claim(ctx, params)
+    apply_ops_to_batch(ctx, [WriteOp.model_validate(o) for o in plan["ops"]])
 
 
 class BatchRecallDefectiveLotParams(BaseModel):
@@ -945,7 +984,10 @@ class ExplodeMultilevelSubstituteBomParams(BaseModel):
     child_wo_prefix: str = "SUB-WO"
 
 
-def _explode_multilevel_substitute_bom(ctx: Any, params: ExplodeMultilevelSubstituteBomParams) -> None:
+def _plan_multilevel_substitute_bom(
+    ctx: Any, params: ExplodeMultilevelSubstituteBomParams
+) -> dict[str, Any]:
+    """Pure read-only M2.5 planner (zero write handle): recursively explode multi-level substitute BOM."""
     WoCls = ctx.spec.get_object_type("WorkOrder")
     BomCls = ctx.spec.get_object_type("BomSpec")
 
@@ -988,6 +1030,7 @@ def _explode_multilevel_substitute_bom(ctx: Any, params: ExplodeMultilevelSubsti
             (parent_wo.output_resource, root_bom.input_resource),
         )
     ]
+    ops: list[dict[str, Any]] = []
     created_seq = 0
     max_children = 24
     while queue:
@@ -1015,17 +1058,22 @@ def _explode_multilevel_substitute_bom(ctx: Any, params: ExplodeMultilevelSubsti
             created_seq += 1
             wo_id = f"{params.child_wo_prefix}-{created_seq:02d}"
         existing_wo_ids.add(wo_id)
-        ctx.create(
-            WoCls(
-                work_order_id=wo_id,
-                accounting_entity=parent_wo.accounting_entity,
-                bom=chosen.bom_id,
-                commitment=parent_wo.commitment,
-                output_resource=chosen.output_resource,
-                planned_qty=shortage,
-                status="draft",
-                x_lot_code=getattr(parent_wo, "x_lot_code", ""),
-            )
+        ops.append(
+            {
+                "op": "create",
+                "object_type": "WorkOrder",
+                "object_id": wo_id,
+                "set_fields": {
+                    "work_order_id": wo_id,
+                    "accounting_entity": parent_wo.accounting_entity,
+                    "bom": chosen.bom_id,
+                    "commitment": parent_wo.commitment,
+                    "output_resource": chosen.output_resource,
+                    "planned_qty": shortage,
+                    "status": "draft",
+                    "x_lot_code": getattr(parent_wo, "x_lot_code", ""),
+                },
+            }
         )
         next_res = chosen.input_resource
         next_qty = round(shortage * float(chosen.input_per_unit), 6)
@@ -1039,6 +1087,21 @@ def _explode_multilevel_substitute_bom(ctx: Any, params: ExplodeMultilevelSubsti
             f"no shortage sub-BOM explosion required for WorkOrder:{parent_wo.work_order_id}",
             code="NO_BOM_SHORTAGE",
         )
+
+    return {
+        "contract_name": "explode_multilevel_substitute_bom",
+        "params": params.model_dump(mode="json"),
+        "read_set": _build_read_set_from_batch(ctx),
+        "ops": ops,
+        "brain_source": "pure_function:plan_multilevel_substitute_bom",
+    }
+
+
+def _explode_multilevel_substitute_bom(ctx: Any, params: ExplodeMultilevelSubstituteBomParams) -> None:
+    from open_ontology.contract_gate import WriteOp, apply_ops_to_batch
+
+    plan = _plan_multilevel_substitute_bom(ctx, params)
+    apply_ops_to_batch(ctx, [WriteOp.model_validate(o) for o in plan["ops"]])
 
 
 class SettleAnnualTieredDealerRebateParams(BaseModel):
@@ -1147,7 +1210,10 @@ class AllocateContainerShippingCostParams(BaseModel):
     total_freight_cents: int = Field(..., gt=0)
 
 
-def _allocate_container_shipping_cost(ctx: Any, params: AllocateContainerShippingCostParams) -> None:
+def _plan_container_shipping_cost(
+    ctx: Any, params: AllocateContainerShippingCostParams
+) -> dict[str, Any]:
+    """Pure read-only M2.5 planner (zero write handle): allocate container freight by gross weight."""
     cntr = params.container_no.strip()
     if not cntr:
         raise InvariantError("container_no must not be empty", code="EMPTY_CONTAINER_NO")
@@ -1173,6 +1239,7 @@ def _allocate_container_shipping_cost(ctx: Any, params: AllocateContainerShippin
             code="ZERO_CONTAINER_WEIGHT",
         )
 
+    ops: list[dict[str, Any]] = []
     allocated_so_far = 0
     last_idx = len(orders) - 1
     for idx, order in enumerate(orders):
@@ -1181,7 +1248,29 @@ def _allocate_container_shipping_cost(ctx: Any, params: AllocateContainerShippin
             allocated_so_far += share
         else:
             share = int(params.total_freight_cents) - allocated_so_far
-        ctx.modify(order, x_allocated_freight_cents=share)
+        ops.append(
+            {
+                "op": "modify",
+                "object_type": "ExportSalesOrder",
+                "object_id": str(order.order_id),
+                "set_fields": {"x_allocated_freight_cents": share},
+            }
+        )
+
+    return {
+        "contract_name": "allocate_container_shipping_cost",
+        "params": params.model_dump(mode="json"),
+        "read_set": _build_read_set_from_batch(ctx),
+        "ops": ops,
+        "brain_source": "pure_function:plan_container_shipping_cost",
+    }
+
+
+def _allocate_container_shipping_cost(ctx: Any, params: AllocateContainerShippingCostParams) -> None:
+    from open_ontology.contract_gate import WriteOp, apply_ops_to_batch
+
+    plan = _plan_container_shipping_cost(ctx, params)
+    apply_ops_to_batch(ctx, [WriteOp.model_validate(o) for o in plan["ops"]])
 
 
 MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
@@ -1192,6 +1281,10 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         description="基于清关后出口报关单的离岸货值 × 退税率 × 汇率执行非线性浮点精度出口退税核定。",
         touched_object_types=("CustomsDeclaration", "ExportSalesOrder"),
         modifies=("CustomsDeclaration.rebate_amount_cents", "CustomsDeclaration.rebate_claimed"),
+        trust_mode="attested_provider",
+        attested_providers=("plan_export_tax_rebate_claim",),
+        require_read_set_cas=True,
+        planner_function="plan_export_tax_rebate_claim",
         ensures=(
             {
                 "name": "rebate_claim_post",
@@ -1280,6 +1373,9 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         description="多级 BOM 递归展算与主料短缺自动切换替代料配方（BFS 扣减可用库存并原子创建多级子工单）。",
         touched_object_types=("WorkOrder", "BomSpec", "TradeResource"),
         creates=("WorkOrder",),
+        trust_mode="untrusted_verifiable",
+        require_read_set_cas=True,
+        planner_function="plan_multilevel_substitute_bom",
         ensures=(
             {
                 "name": "explode_bom_child_wo_post",
@@ -1355,17 +1451,50 @@ MEDAUTO_CUSTOM_EDIT_FUNCTIONS: tuple[EditFunctionDef, ...] = (
         description="按集装箱毛重比例跨多张拼箱出口订单精确分摊海运运费（尾差归口，分厘守恒）。",
         touched_object_types=("ExportSalesOrder",),
         modifies=("ExportSalesOrder.x_allocated_freight_cents",),
+        trust_mode="untrusted_verifiable",
+        require_read_set_cas=True,
+        planner_function="plan_container_shipping_cost",
         ensures=(
             {
-                "name": "allocate_freight_non_negative_post",
+                "name": "allocate_freight_conservation_post",
                 "code": "CONTRACT_ENSURES_VIOLATION",
                 "target_type": "ExportSalesOrder",
                 "must_hold": {
-                    "op": "ge",
-                    "left": {"ref": "after.x_allocated_freight_cents"},
-                    "right": {"lit": 0},
+                    "op": "and",
+                    "args": [
+                        {
+                            "op": "ge",
+                            "left": {"ref": "after.x_allocated_freight_cents"},
+                            "right": {"lit": 0},
+                        },
+                        {
+                            "op": "eq",
+                            "left": {
+                                "op": "sum",
+                                "object_type": "ExportSalesOrder",
+                                "field": "x_allocated_freight_cents",
+                                "where": {
+                                    "op": "and",
+                                    "args": [
+                                        {
+                                            "op": "eq",
+                                            "left": {"ref": "target.x_container_no"},
+                                            "right": {"ref": "param.container_no"},
+                                        },
+                                        {
+                                            "op": "ne",
+                                            "left": {"ref": "target.status"},
+                                            "right": {"lit": "cancelled"},
+                                        },
+                                    ],
+                                },
+                                "default": 0,
+                            },
+                            "right": {"ref": "param.total_freight_cents"},
+                        },
+                    ],
                 },
-                "description": "拼箱出口海运费分摊后每张订单分摊运费非负。",
+                "description": "拼箱出口海运费分摊后每单非负且整柜分摊总额严格守恒等于总运费。",
             },
         ),
     ),
@@ -1482,6 +1611,11 @@ _MEDAUTO_DISPLAY_PATCH: dict[str, dict[str, str]] = {
         "settle_annual_tiered_dealer_rebate": "结算年度阶梯返利并冲账",
         "allocate_container_shipping_cost": "拼箱出口运费按重精确分摊",
     },
+    "functions": {
+        "plan_container_shipping_cost": "M2.5 纯算大脑 · 拼箱运费分摊提案",
+        "plan_multilevel_substitute_bom": "M2.5 纯算大脑 · 多级替代料 BOM 展算提案",
+        "plan_export_tax_rebate_claim": "M2.5 权威纯算大脑 · 法定出口退税核定提案",
+    },
     "statuses": {
         "pending": "待处理/待检",
         "passed": "首件检验合格",
@@ -1567,6 +1701,23 @@ def build_medauto_spec() -> OntologySpec:
             description=ef.description,
             touched_object_types=ef.touched_object_types,
         )
+
+    # Register M2.5 strictly read-only Pure Planners (zero write handle; emit WriteBatchProposal)
+    derived.function(
+        "plan_container_shipping_cost",
+        params=AllocateContainerShippingCostParams,
+        description="M2.5 纯算大脑（零写句柄）：按集装箱毛重比例试算拼箱海运费分摊提案（WriteBatchProposal + Read-Set CAS）。",
+    )(_plan_container_shipping_cost)
+    derived.function(
+        "plan_multilevel_substitute_bom",
+        params=ExplodeMultilevelSubstituteBomParams,
+        description="M2.5 纯算大脑（零写句柄）：递归展算多级替代料 BOM 并输出子工单创建提案（WriteBatchProposal + Read-Set CAS）。",
+    )(_plan_multilevel_substitute_bom)
+    derived.function(
+        "plan_export_tax_rebate_claim",
+        params=ApplyExportTaxRebateParams,
+        description="M2.5 权威纯算大脑（Class B · 零写句柄）：按法定退税率与汇率试算报关单退税提案供契约门禁签验。",
+    )(_plan_export_tax_rebate_claim)
 
     for src in (
         std_core_spec,

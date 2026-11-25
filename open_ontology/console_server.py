@@ -1442,6 +1442,10 @@ class ConsoleService:
                             "creates": list(act_def.creates),
                             "deletes": list(act_def.deletes),
                             "ensures": [dict(e) if isinstance(e, Mapping) else e for e in act_def.ensures],
+                            "trust_mode": act_def.trust_mode,
+                            "attested_providers": list(act_def.attested_providers),
+                            "require_read_set_cas": bool(act_def.require_read_set_cas),
+                            "planner_function": act_def.planner_function,
                         }
                         if act_def.implementation_kind == "edit_function"
                         and (act_def.modifies or act_def.creates or act_def.deletes or act_def.ensures)
@@ -2776,6 +2780,116 @@ class ConsoleService:
                 "state_fingerprint": self.runtime.state_fingerprint(),
             }
 
+    def plan_contract(
+        self,
+        contract_name: str,
+        params: Mapping[str, Any] | None,
+        actor: Actor,
+        *,
+        sandbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a contract's strictly read-only M2.5 planner_function to emit a WriteBatchProposal."""
+        from .contract_gate import plan_contract_proposal
+
+        with self._lock:
+            target_rt = self.runtime
+            if sandbox_id:
+                target_rt = self._require_sandbox(sandbox_id, actor).fork_runtime
+            prop = plan_contract_proposal(
+                target_rt,
+                contract_name,
+                dict(params or {}),
+                actor,
+            )
+            act = target_rt.spec.get_action(contract_name)
+            return {
+                "ok": True,
+                "sandbox_id": sandbox_id,
+                "trust_mode": act.trust_mode,
+                "require_read_set_cas": bool(act.require_read_set_cas),
+                "planner_function": act.planner_function,
+                "proposal": prop.model_dump(mode="json"),
+            }
+
+    def propose_contract(
+        self,
+        raw_proposal: Mapping[str, Any],
+        actor: Actor,
+        *,
+        sandbox_id: str | None = None,
+        simulate: bool = False,
+    ) -> dict[str, Any]:
+        """Validate & apply (or simulate) an M2.5 WriteBatchProposal via the Thin IO Contract Gate."""
+        from .contract_gate import WriteBatchProposal, apply_contract_proposal
+        from .spec import ConcurrencyConflictError
+
+        with self._lock:
+            display = self._merged_display()
+            prop = WriteBatchProposal.model_validate(raw_proposal)
+            sbx_session = None
+            target_rt = self.runtime
+            if sandbox_id:
+                sbx_session = self._require_sandbox(sandbox_id, actor)
+                target_rt = sbx_session.fork_runtime
+
+            try:
+                res = apply_contract_proposal(
+                    target_rt,
+                    prop,
+                    actor,
+                    simulate=simulate,
+                )
+            except OpenOntologyError as exc:
+                err_code = getattr(exc, "code", None) or (
+                    "CONCURRENCY_CONFLICT"
+                    if isinstance(exc, ConcurrencyConflictError)
+                    else "CONTRACT_PROPOSAL_REJECTED"
+                )
+                return {
+                    "ok": False,
+                    "sandbox_id": sandbox_id,
+                    "proposal_id": prop.proposal_id,
+                    "contract_name": prop.contract_name,
+                    "error_code": err_code,
+                    "error": str(exc),
+                    "hint_zh": _translate_error_hint(err_code, str(exc), display=display),
+                }
+
+            if simulate:
+                assert isinstance(res, SimulationResult)
+                return {
+                    "ok": bool(res.valid),
+                    "simulated": True,
+                    "sandbox_id": sandbox_id,
+                    "proposal_id": prop.proposal_id,
+                    "contract_name": prop.contract_name,
+                    "diff": res.diff.to_dict(),
+                    "read_versions": dict(res.read_versions),
+                    "error_code": res.error_code,
+                    "error": res.error,
+                }
+
+            if sbx_session is not None:
+                sbx_session.steps.append(
+                    {
+                        "action": prop.contract_name,
+                        "params": dict(prop.params),
+                        "proposal_id": prop.proposal_id,
+                        "brain_source": prop.brain_source,
+                        "kind": "contract_proposal",
+                        "run_id": res.get("run_id"),
+                    }
+                )
+            return {
+                "ok": True,
+                "simulated": False,
+                "sandbox_id": sandbox_id,
+                "proposal_id": prop.proposal_id,
+                "contract_name": prop.contract_name,
+                "brain_source": prop.brain_source,
+                "run": res,
+            }
+
     def destroy_sandbox(self, sid: str, actor: Actor) -> dict[str, Any]:
         with self._lock:
             session = self._require_sandbox(sid, actor)
@@ -3339,9 +3453,9 @@ class ConsoleService:
 
     # -- NL assistant (Pure M2 LLM sandbox agent + offline fallback) -------
     @staticmethod
-    def _build_m2_llm_tools() -> list[dict[str, Any]]:
+    def _build_m2_llm_tools(*, include_contract_proposals: bool = False) -> list[dict[str, Any]]:
         """Declare strictly read + isolated-sandbox tools (never primary write/promote)."""
-        return [
+        tools = [
             {
                 "type": "function",
                 "function": {
@@ -3432,6 +3546,44 @@ class ConsoleService:
                 },
             },
         ]
+        if include_contract_proposals:
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "submit_sandbox_contract_proposal",
+                        "description": (
+                            "以 M2.5 外置纯算大脑身份，向隔离平行沙盘中的契约门禁提交扁平 WriteBatchProposal"
+                            "（带 read_set 版本号乐观锁 + create/modify/delete 提案）；永不写入真实主世界。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "contract_name": {
+                                    "type": "string",
+                                    "description": "目标契约动作内部名称（如 allocate_container_shipping_cost）",
+                                },
+                                "params": {
+                                    "type": "object",
+                                    "description": "动作参数字典",
+                                },
+                                "read_set": {
+                                    "type": "array",
+                                    "description": "读取对象的版本锁清单 [{object_type, object_id, expected_version}]",
+                                    "items": {"type": "object"},
+                                },
+                                "ops": {
+                                    "type": "array",
+                                    "description": "扁平写操作列表 [{op: create|modify|delete, object_type, object_id, set_fields}]",
+                                    "items": {"type": "object"},
+                                },
+                            },
+                            "required": ["contract_name", "ops"],
+                        },
+                    },
+                }
+            )
+        return tools
 
     @staticmethod
     def _sanitize_llm_history(
@@ -3604,6 +3756,7 @@ class ConsoleService:
                 compact_items = [
                     {
                         "object_id": it["object_id"],
+                        "version": it.get("version", 1),
                         "title": it["title"],
                         "properties": it["properties"],
                     }
@@ -3784,6 +3937,59 @@ class ConsoleService:
                 ]
                 return {"ok": True, "summary": aud["summary"], "recent_runs": compact_runs}
 
+            if tool_name == "submit_sandbox_contract_proposal":
+                contract_name = str(raw_args.get("contract_name") or "").strip()
+                act_label = act_labels.get(contract_name) or contract_name or "未知契约"
+                if not active_sid:
+                    created = self.create_sandbox(actor)
+                    active_sid = str(created["sandbox_id"])
+                    sandbox_holder["sid"] = active_sid
+                else:
+                    self._require_sandbox(active_sid, actor)
+
+                proposal_dict = {
+                    "contract_name": contract_name,
+                    "params": dict(raw_args.get("params") or {}),
+                    "read_set": list(raw_args.get("read_set") or ()),
+                    "ops": list(raw_args.get("ops") or ()),
+                    "brain_source": f"ai_assistant:{actor.actor_id}",
+                }
+                prop_res = self.propose_contract(
+                    proposal_dict,
+                    actor,
+                    sandbox_id=active_sid,
+                    simulate=False,
+                )
+                diff = self.diff_sandbox(active_sid, actor)
+                sandbox_holder["last_diff"] = diff
+                if prop_res.get("ok"):
+                    tool_trace.append(
+                        {
+                            "tool": "submit_sandbox_contract_proposal",
+                            "summary": f"沙盘契约提案 {act_label}（{diff['total_changes']} 项变更）",
+                            "ok": True,
+                        }
+                    )
+                else:
+                    err_code = str(prop_res.get("error_code") or "CONTRACT_PROPOSAL_REJECTED")
+                    tool_trace.append(
+                        {
+                            "tool": "submit_sandbox_contract_proposal",
+                            "summary": f"沙盘契约提案 {act_label}（拦截：{err_code}）",
+                            "ok": False,
+                        }
+                    )
+                return {
+                    **prop_res,
+                    "diff_summary": {
+                        "step_count": diff["step_count"],
+                        "total_changes": diff["total_changes"],
+                        "updated": diff["updated"],
+                        "created": diff["created"],
+                        "deleted": diff["deleted"],
+                    },
+                }
+
             tool_trace.append(
                 {"tool": tool_name, "summary": f"未知工具 {tool_name}", "ok": False}
             )
@@ -3808,7 +4014,10 @@ class ConsoleService:
             if initial_sid:
                 self._require_sandbox(initial_sid, actor)
             sys_prompt = self._build_m2_llm_system_prompt(actor, initial_sid)
-        tools = self._build_m2_llm_tools()
+            has_planners = any(
+                getattr(a, "planner_function", None) for a in self.runtime.spec.actions.values()
+            )
+        tools = self._build_m2_llm_tools(include_contract_proposals=has_planners)
         history = self._sanitize_llm_history(payload.history)
 
         messages: list[dict[str, Any]] = [
@@ -5946,6 +6155,51 @@ def create_console_app(
     @app.post("/api/sandboxes/{sid}/promote")
     def api_sandbox_promote(sid: str, req: Request) -> dict[str, Any]:
         return service.promote_sandbox(sid, _actor_from_request(req))
+
+    @app.post("/api/contracts/plan")
+    def api_contracts_plan(
+        req: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        contract_name = str(body.get("contract_name") or "").strip()
+        params = body.get("params") if isinstance(body.get("params"), Mapping) else {}
+        sid = str(body.get("sandbox_id") or "").strip() or None
+        return service.plan_contract(
+            contract_name,
+            params,
+            _actor_from_request(req),
+            sandbox_id=sid,
+        )
+
+    @app.post("/api/contracts/propose")
+    def api_contracts_propose(
+        req: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        proposal = body.get("proposal") if isinstance(body.get("proposal"), Mapping) else body
+        sid = str(body.get("sandbox_id") or "").strip() or None
+        simulate = bool(body.get("simulate", False))
+        return service.propose_contract(
+            proposal,
+            _actor_from_request(req),
+            sandbox_id=sid,
+            simulate=simulate,
+        )
+
+    @app.post("/api/sandboxes/{sid}/propose")
+    def api_sandbox_propose(
+        sid: str,
+        req: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        proposal = body.get("proposal") if isinstance(body.get("proposal"), Mapping) else body
+        simulate = bool(body.get("simulate", False))
+        return service.propose_contract(
+            proposal,
+            _actor_from_request(req),
+            sandbox_id=sid,
+            simulate=simulate,
+        )
 
     @app.delete("/api/sandboxes/{sid}")
     def api_sandbox_destroy(sid: str, req: Request) -> dict[str, Any]:

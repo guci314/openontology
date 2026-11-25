@@ -607,6 +607,10 @@ class EditFunctionDef(BaseModel):
     creates: tuple[str, ...] = ()
     deletes: tuple[str, ...] = ()
     ensures: tuple[Any, ...] = ()
+    trust_mode: Literal["untrusted_verifiable", "attested_provider"] = "untrusted_verifiable"
+    attested_providers: tuple[str, ...] = ()
+    require_read_set_cas: bool = True
+    planner_function: str | None = None
 
 
 class ActionDef(BaseModel):
@@ -631,6 +635,10 @@ class ActionDef(BaseModel):
     creates: tuple[str, ...] = ()
     deletes: tuple[str, ...] = ()
     ensures: tuple[Any, ...] = ()
+    trust_mode: Literal["untrusted_verifiable", "attested_provider"] = "untrusted_verifiable"
+    attested_providers: tuple[str, ...] = ()
+    require_read_set_cas: bool = True
+    planner_function: str | None = None
 
     @model_validator(mode="after")
     def _validate_implementation_binding(self) -> "ActionDef":
@@ -1294,6 +1302,10 @@ class OntologySpec:
         creates: Iterable[str] = (),
         deletes: Iterable[str] = (),
         ensures: Sequence[Any] = (),
+        trust_mode: Literal["untrusted_verifiable", "attested_provider"] = "untrusted_verifiable",
+        attested_providers: Iterable[str] = (),
+        require_read_set_cas: bool = True,
+        planner_function: str | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a pure Turing-complete write kernel (free of governance shell)."""
         clean = str(name).strip()
@@ -1305,6 +1317,7 @@ class OntologySpec:
         norm_creates = tuple(str(x).strip() for x in creates if str(x).strip())
         norm_deletes = tuple(str(x).strip() for x in deletes if str(x).strip())
         norm_ensures = _normalize_contract_ensures(ensures)
+        norm_providers = tuple(str(x).strip() for x in attested_providers if str(x).strip())
         merged_touched = tuple(
             dict.fromkeys([*touched_object_types, *_contract_touched_types(norm_modifies, norm_creates, norm_deletes)])
         )
@@ -1320,6 +1333,10 @@ class OntologySpec:
                 creates=norm_creates,
                 deletes=norm_deletes,
                 ensures=norm_ensures,
+                trust_mode=trust_mode,
+                attested_providers=norm_providers,
+                require_read_set_cas=bool(require_read_set_cas),
+                planner_function=(str(planner_function).strip() or None) if planner_function else None,
             )
             return handler
 
@@ -1349,6 +1366,10 @@ class OntologySpec:
         creates: Iterable[str] | None = None,
         deletes: Iterable[str] | None = None,
         ensures: Sequence[Any] | None = None,
+        trust_mode: Literal["untrusted_verifiable", "attested_provider"] | None = None,
+        attested_providers: Iterable[str] | None = None,
+        require_read_set_cas: bool | None = None,
+        planner_function: str | None = None,
     ) -> ActionDef:
         """Bind a governed Action shell onto an already-registered EditFunctionDef."""
         clean = str(name).strip()
@@ -1397,6 +1418,18 @@ class OntologySpec:
         eff_touched = tuple(
             dict.fromkeys([*base_touched, *_contract_touched_types(eff_modifies, eff_creates, eff_deletes)])
         )
+        eff_trust_mode = trust_mode if trust_mode is not None else ef.trust_mode
+        eff_providers = (
+            tuple(str(x).strip() for x in attested_providers if str(x).strip())
+            if attested_providers is not None
+            else ef.attested_providers
+        )
+        eff_cas = bool(require_read_set_cas) if require_read_set_cas is not None else ef.require_read_set_cas
+        eff_planner = (
+            (str(planner_function).strip() or None)
+            if planner_function is not None
+            else ef.planner_function
+        )
         eff_desc = description or ef.description
         action_def = ActionDef(
             name=clean,
@@ -1416,6 +1449,10 @@ class OntologySpec:
             creates=eff_creates,
             deletes=eff_deletes,
             ensures=eff_ensures,
+            trust_mode=eff_trust_mode,
+            attested_providers=eff_providers,
+            require_read_set_cas=eff_cas,
+            planner_function=eff_planner,
         )
         self.actions[clean] = action_def
         return action_def
