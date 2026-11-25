@@ -2378,6 +2378,22 @@ def run_design_prove(
                 ),
                 code="VACUOUS_CONTRACT",
             )
+    for wb in getattr(report, "when_branch_proofs", ()) or ():
+        if wb.status not in ("EXHAUSTIVE", "CONDITIONAL_SIDE_EFFECT"):
+            _add_error(
+                errors,
+                error_codes,
+                f"{wb.status}: action {wb.action_name!r} guarded `when` branches ({wb.detail})",
+                code=wb.status,
+            )
+    for wf in getattr(report, "workflow_liveness_proofs", ()) or ():
+        if wf.status not in ("LIVE", "GRAPH_LIVE_PARTIAL_ACTIONS"):
+            _add_error(
+                errors,
+                error_codes,
+                f"{wf.status}: workflow {wf.object_type!r} ({wf.detail})",
+                code=wf.status,
+            )
     if report.upgrade_compatibility is not None and not report.upgrade_compatibility.compatible:
         for reg in report.upgrade_compatibility.regressions:
             _add_error(
@@ -2419,6 +2435,8 @@ def _format_prove_human_report(res: Mapping[str, Any]) -> str:
         f"contract_proved={rep.get('contract_proved_count', 0)}, "
         f"vacuous_contracts={rep.get('vacuous_contract_count', 0)}, "
         f"uncontracted={rep.get('uncontracted_edit_function_count', 0)}, "
+        f"when_branches={rep.get('when_branch_checked_count', 0)}(issues={rep.get('when_branch_issue_count', 0)}), "
+        f"workflows={rep.get('workflow_live_count', 0)}/{rep.get('workflow_checked_count', 0)}(issues={rep.get('workflow_issue_count', 0)}), "
         f"redundant_rules={rep.get('redundant_rule_count')}",
         f"  logic_fragments={rep.get('logic_fragment_counts')}",
     ]
@@ -2448,6 +2466,12 @@ def _format_prove_human_report(res: Mapping[str, Any]) -> str:
             lines.append(
                 f"  [VACUOUS_CONTRACT] {inv['action_name']}: unsat_core={inv.get('unsat_core')}"
             )
+    for wb in rep.get("when_branch_proofs") or ():
+        if wb.get("status") not in ("EXHAUSTIVE", "CONDITIONAL_SIDE_EFFECT"):
+            lines.append(f"  [{wb.get('status')}] {wb.get('action_name')}: {wb.get('detail')}")
+    for wf in rep.get("workflow_liveness_proofs") or ():
+        if wf.get("status") not in ("LIVE", "GRAPH_LIVE_PARTIAL_ACTIONS"):
+            lines.append(f"  [{wf.get('status')}] {wf.get('object_type')}: {wf.get('detail')}")
     for rr in rep.get("redundant_rules") or ():
         lines.append(
             f"  [REDUNDANT_RULE] {rr['action_name']}.{rr['rule_name']} ({rr['reason']}): "

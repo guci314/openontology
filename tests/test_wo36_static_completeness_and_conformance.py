@@ -28,6 +28,7 @@ from open_ontology.induction import (
     RelationSpec,
     WhenBranchProof,
     WorkflowLivenessProof,
+    ProofReport,
     apply_overlay_to_spec,
     compile_blueprint,
     export_spec_blueprint,
@@ -253,6 +254,75 @@ class TestPO6WhenBranches:
         assert len(proofs) == 1
         assert proofs[0].status == "CONDITIONAL_SIDE_EFFECT"
 
+    def test_multihop_target_ref_when_branch(self) -> None:
+        bp = DeclarativeBlueprint(
+            model_id="wo36_multihop_ref",
+            version="1.0.0",
+            roles=["operator"],
+            object_types=[
+                ObjectTypeBlueprint(
+                    name="Customer",
+                    primary_key="customer_id",
+                    fields=[
+                        FieldSpec(name="customer_id", field_type="str", required=True, primary_key=True),
+                        FieldSpec(name="vip", field_type="bool", default=False),
+                    ],
+                ),
+                ObjectTypeBlueprint(
+                    name="Order",
+                    primary_key="order_id",
+                    fields=[
+                        FieldSpec(name="order_id", field_type="str", required=True, primary_key=True),
+                        FieldSpec(name="amount", field_type="int", default=0),
+                    ],
+                    relations=[RelationSpec(field="customer", target_type="Customer", required=True)],
+                ),
+                ObjectTypeBlueprint(
+                    name="Delivery",
+                    primary_key="delivery_id",
+                    fields=[
+                        FieldSpec(name="delivery_id", field_type="str", required=True, primary_key=True),
+                        FieldSpec(name="status", field_type="str", default="pending"),
+                    ],
+                    relations=[RelationSpec(field="order", target_type="Order", required=True)],
+                ),
+            ],
+            actions=[
+                ActionBlueprint(
+                    name="complete_delivery",
+                    allowed_roles=["operator"],
+                    params=[FieldSpec(name="delivery_id", field_type="str", required=True)],
+                    preconditions=[
+                        InvariantRuleSpec(
+                            name="must_be_pending",
+                            code="NOT_PENDING",
+                            target_type="Delivery",
+                            id_param="delivery_id",
+                            must_hold={"op": "eq", "left": {"ref": "obj.status"}, "right": {"lit": "pending"}},
+                        )
+                    ],
+                    mutations=[
+                        ActionMutationSpec(
+                            op="modify",
+                            object_type="Delivery",
+                            id_param="delivery_id",
+                            set_fields={"status": {"lit": "done"}},
+                        ),
+                        ActionMutationSpec(
+                            op="modify",
+                            object_type="Customer",
+                            target_ref="obj.order.customer",
+                            when={"op": "eq", "left": {"ref": "obj.vip"}, "right": {"lit": False}},
+                            set_fields={"vip": {"lit": True}},
+                        ),
+                    ],
+                )
+            ],
+        )
+        proofs = prove_when_branches(bp)
+        assert len(proofs) == 1
+        assert proofs[0].status == "CONDITIONAL_SIDE_EFFECT"
+
 
 # ===========================================================================
 # 2. PO-7: Workflow FSM Structural Liveness & Z3 Multi-Step Terminal Reachability
@@ -303,6 +373,19 @@ class TestPO7WorkflowLiveness:
         )
         wfs = prove_workflow_liveness(bp)
         assert wfs[0].status == "NO_TERMINAL_STATE"
+        assert prove_blueprint(bp).ok is False
+
+    def test_no_initial_state_caught(self) -> None:
+        bp = _make_ticket_bp(
+            mutations=[],
+            transitions={
+                "draft": ["closed"],
+                "closed": [],
+            },
+            initial_statuses=[],
+        )
+        wfs = prove_workflow_liveness(bp)
+        assert wfs[0].status == "NO_INITIAL_STATE"
         assert prove_blueprint(bp).ok is False
 
     def test_cross_step_data_deadlock_caught_by_z3_multistep_chaining(self) -> None:
@@ -540,6 +623,11 @@ class TestRealModelsAndM1ExpertFixes:
         assert med_rep.workflow_live_count == 25
         assert med_rep.workflow_issue_count == 0
         wf_by_name = {w.object_type: w for w in med_rep.workflow_liveness_proofs}
+        for multi_ot in ("O2cOrder", "ExportSalesOrder", "P2pPurchaseOrder", "WorkOrder", "FiscalPeriod", "JournalEntry"):
+            assert wf_by_name[multi_ot].status == "LIVE"
+            assert wf_by_name[multi_ot].action_terminal_status == "ACTION_TERMINAL_REACHABLE"
+            assert len(wf_by_name[multi_ot].terminal_witness_trace) >= 1
+        assert len(wf_by_name["P2pPurchaseOrder"].terminal_witness_trace) >= 3
         # Subtype pruned inherited states are tolerated & transparently recorded
         assert wf_by_name["ExportSalesOrder"].status == "LIVE"
         assert wf_by_name["ExportSalesOrder"].pruned_inherited_states == ["invoiced"]
@@ -605,8 +693,56 @@ class TestRealModelsAndM1ExpertFixes:
             assert proved["summary"]["when_branch_checked_count"] == 3
             assert proved["summary"]["workflow_checked_count"] == 25
             assert proved["summary"]["workflow_action_verified_count"] >= 17
+
+            # 3) REST endpoint `/api/blueprint/prove` surfaces PO-6 + PO-7 summary & witnesses
+            from fastapi.testclient import TestClient
+            from open_ontology.console_server import create_console_app
+
+            svc_demo = ConsoleService(rt, demo_actor_switch=True, pack_hint="none")
+            client = TestClient(create_console_app(svc_demo))
+            api_rep = client.post("/api/blueprint/prove", json={})
+            assert api_rep.status_code == 200
+            api_json = api_rep.json()
+            assert api_json["verdict"] == "PROVEN_CLEAN"
+            assert api_json["summary"]["when_branch_checked_count"] == 3
+            assert api_json["summary"]["when_branch_issue_count"] == 0
+            assert api_json["summary"]["workflow_checked_count"] == 25
+            assert api_json["summary"]["workflow_live_count"] == 25
+            assert api_json["summary"]["workflow_issue_count"] == 0
+            assert len(api_json["when_branch_proofs"]) == 3
+            assert len(api_json["workflow_liveness_proofs"]) == 25
         finally:
             rt.close()
+
+    def test_design_cli_prove_surfaces_po6_and_po7_failures(self, tmp_path: Path) -> None:
+        from open_ontology.design import run_design_prove
+
+        bad_bp = _make_ticket_bp(
+            mutations=[
+                ActionMutationSpec(
+                    op="modify",
+                    object_type="Order",
+                    id_param="order_id",
+                    when={"op": "gt", "left": {"ref": "obj.amount"}, "right": {"lit": 500}},
+                    set_fields={"tier": {"lit": "HIGH"}},
+                ),
+                ActionMutationSpec(
+                    op="modify",
+                    object_type="Order",
+                    id_param="order_id",
+                    when={"op": "lt", "left": {"ref": "obj.amount"}, "right": {"lit": 200}},
+                    set_fields={"tier": {"lit": "LOW"}},
+                ),
+            ],
+            transitions={"draft": ["loop_a"], "loop_a": ["loop_a"]},
+            initial_statuses=["draft"],
+        )
+        bp_path = tmp_path / "bad_wo36.json"
+        bp_path.write_text(bad_bp.model_dump_json(indent=2), encoding="utf-8")
+        res = run_design_prove(blueprints=[str(bp_path)])
+        assert res["ok"] is False
+        assert "INCOMPLETE_WHEN_BRANCHES" in res["error_codes"]
+        assert "NO_TERMINAL_STATE" in res["error_codes"]
 
 
 # ===========================================================================
@@ -727,6 +863,7 @@ class TestDOALv12ConformanceGates:
             CustomerOverlaySpec,
             WhenBranchProof,
             WorkflowLivenessProof,
+            ProofReport,
         ):
             assert model_cls.model_config.get("extra") == "forbid", f"{model_cls.__name__} missing extra=forbid"
 
@@ -751,9 +888,14 @@ class TestDOALv12ConformanceGates:
 
         # Prover raises ProverUnavailableError cleanly when z3 is absent
         monkeypatch.setitem(sys.modules, "z3", None)
-        with pytest.raises(ProverUnavailableError) as exc_info:
-            prover_mod.prove_blueprint(bp)
-        assert exc_info.value.code == "PROVER_UNAVAILABLE"
+        for fn in (
+            prover_mod.prove_blueprint,
+            prover_mod.prove_when_branches,
+            prover_mod.prove_workflow_liveness,
+        ):
+            with pytest.raises(ProverUnavailableError) as exc_info:
+                fn(bp)
+            assert exc_info.value.code == "PROVER_UNAVAILABLE"
 
     def test_docs_doal_spec_section_8_2_json_example_validates_and_proves_live(self) -> None:
         from examples.std_enterprise_world_model import build_enterprise_standard_spec
